@@ -166,7 +166,7 @@ def test_worker_retreats_from_nearby_visible_enemy() -> None:
         objects=[
             core(),
             unit(2, "WORKER", position=(2, 0)),
-            unit(3, "WORKER", controlled=False, position=(3, 0)),
+            unit(3, "VANGUARD", controlled=False, position=(3, 0)),
         ]
     )
     report = decide(turn)
@@ -186,7 +186,7 @@ def test_worker_can_retreat_into_core_cell_when_threatened() -> None:
         objects=[
             core(),
             unit(2, "WORKER", position=(1, 0)),
-            unit(3, "WORKER", controlled=False, position=(2, 0)),
+            unit(3, "VANGUARD", controlled=False, position=(2, 0)),
         ]
     )
     decide(turn)
@@ -230,6 +230,22 @@ def test_worker_retreat_prefers_distance_from_enemy_over_shortest_path() -> None
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
     assert action.direction is Direction.LEFT
+
+
+def test_worker_does_not_retreat_from_noncombat_enemy_worker() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(5, 0)),
+            unit(3, "WORKER", controlled=False, position=(6, 0)),
+        ]
+    )
+    report = decide(turn)
+
+    assert not any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
 
 
 def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:

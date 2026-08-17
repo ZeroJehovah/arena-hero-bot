@@ -313,12 +313,21 @@ class AggressiveStrategy:
             self._record_wait(worker, context, "Core cell is not currently reachable")
             return
 
-        if any(
-            manhattan(worker.position, enemy.position)
-            <= self.config.worker_threat_radius
+        worker_threats = tuple(
+            enemy
             for enemy in context.turn.visible_enemies
-        ):
-            if not self._retreat_worker(worker, core.position, context):
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(worker.position, enemy.position)
+            <= self.config.worker_threat_radius
+        )
+        if worker_threats:
+            if not self._retreat_worker(
+                worker,
+                core.position,
+                context,
+                worker_threats,
+            ):
                 self._record_wait(
                     worker,
                     context,
@@ -531,6 +540,7 @@ class AggressiveStrategy:
         worker: Worker,
         core_position: Position,
         context: _TurnContext,
+        threats: tuple[UnitView, ...],
     ) -> bool:
         """Choose a one-step retreat that never needlessly closes on an enemy."""
 
@@ -550,8 +560,7 @@ class AggressiveStrategy:
             if destination in blocked or destination in context.enemy_positions:
                 continue
             nearest_enemy = min(
-                manhattan(destination, enemy.position)
-                for enemy in context.turn.visible_enemies
+                manhattan(destination, enemy.position) for enemy in threats
             )
             candidates.append(
                 (
