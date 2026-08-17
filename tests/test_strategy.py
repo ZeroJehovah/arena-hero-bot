@@ -197,6 +197,41 @@ def test_worker_can_retreat_into_core_cell_when_threatened() -> None:
     assert action.direction is Direction.LEFT
 
 
+def test_worker_retreat_prefers_distance_from_enemy_over_shortest_path() -> None:
+    worker_id = str(object_id(2))
+    memory = WorldMemory(
+        obstacles={
+            (-423, 824),
+            (-422, 823),
+            (-421, 822),
+            (-418, 825),
+            (-423, 828),
+            (-421, 828),
+            (-420, 828),
+            (-418, 828),
+            (-419, 830),
+            (-422, 829),
+            (-421, 830),
+        },
+        position_history={
+            worker_id: [(-422, 824), (-421, 824), (-420, 824), (-419, 824)]
+        },
+    )
+    turn = make_turn(
+        objects=[
+            core(position=(-521, 882)),
+            unit(2, "WORKER", position=(-418, 824)),
+            unit(3, "WORKER", controlled=False, position=(-415, 824)),
+            unit(4, "RANGER", controlled=False, position=(-415, 824)),
+        ]
+    )
+    decide(turn, memory=memory)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+
+
 def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:
     turn = make_turn(
         objects=[

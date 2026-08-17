@@ -22,6 +22,7 @@ from arena_hero import (
 )
 
 from .geometry import (
+    DIRECTIONS,
     add,
     adjacent_positions,
     direction_between,
@@ -317,13 +318,12 @@ class AggressiveStrategy:
             <= self.config.worker_threat_radius
             for enemy in context.turn.visible_enemies
         ):
-            self._move_or_wait(
-                worker,
-                core.position,
-                context,
-                reason="retreat from visible enemy pressure",
-                allow_goal=True,
-            )
+            if not self._retreat_worker(worker, core.position, context):
+                self._record_wait(
+                    worker,
+                    context,
+                    "no safe path for: retreat from visible enemy pressure",
+                )
             return
 
         assigned_resource = context.resource_assignments.get(worker.id)
@@ -526,6 +526,59 @@ class AggressiveStrategy:
         ):
             self._record_wait(unit, context, f"no safe path for: {reason}")
 
+    def _retreat_worker(
+        self,
+        worker: Worker,
+        core_position: Position,
+        context: _TurnContext,
+    ) -> bool:
+        """Choose a one-step retreat that never needlessly closes on an enemy."""
+
+        blocked = set(self.memory.obstacles)
+        blocked.update(context.turn.obstacle_cells)
+        blocked.update(context.occupied)
+        blocked.update(context.reserved)
+        blocked.discard(worker.position)
+        blocked.discard(core_position)
+        directions = (
+            DIRECTIONS[self._direction_offset(worker.id) :]
+            + DIRECTIONS[: self._direction_offset(worker.id)]
+        )
+        candidates: list[tuple[int, int, int, Direction]] = []
+        for order, direction in enumerate(directions):
+            destination = add(worker.position, direction)
+            if destination in blocked or destination in context.enemy_positions:
+                continue
+            nearest_enemy = min(
+                manhattan(destination, enemy.position)
+                for enemy in context.turn.visible_enemies
+            )
+            candidates.append(
+                (
+                    nearest_enemy,
+                    -manhattan(destination, core_position),
+                    -order,
+                    direction,
+                )
+            )
+
+        if candidates:
+            _, _, _, direction = max(candidates)
+            return self._queue_move(
+                worker,
+                direction,
+                context,
+                reason="retreat from visible enemy pressure",
+                target=core_position,
+            )
+        return self._move(
+            worker,
+            core_position,
+            context,
+            reason="retreat from visible enemy pressure",
+            allow_goal=True,
+        )
+
     def _move(
         self,
         unit: Unit,
@@ -554,6 +607,26 @@ class AggressiveStrategy:
         destination = add(unit.position, direction)
         if destination in context.reserved:
             return False
+        return self._queue_move(
+            unit,
+            direction,
+            context,
+            reason=reason,
+            target=goal,
+        )
+
+    def _queue_move(
+        self,
+        unit: Unit,
+        direction: Direction,
+        context: _TurnContext,
+        *,
+        reason: str,
+        target: Position,
+    ) -> bool:
+        destination = add(unit.position, direction)
+        if destination in context.reserved:
+            return False
         unit.move(direction)
         context.reserved.add(destination)
         if (
@@ -566,7 +639,7 @@ class AggressiveStrategy:
             actor_kind=unit.unit_type.value,
             action="MOVE",
             reason=reason,
-            target=goal,
+            target=target,
         )
         return True
 
