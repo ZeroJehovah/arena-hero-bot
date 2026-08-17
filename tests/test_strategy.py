@@ -496,6 +496,22 @@ def test_exploration_goal_remains_stable_across_turns() -> None:
     assert memory.goal_for(object_id(2)) == goal
 
 
+def test_exploration_goal_uses_aggressive_default_stride() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    turn = make_turn(
+        tick=0,
+        objects=[core(), unit(2, "WORKER", position=(-100, 100))],
+    )
+
+    strategy.decide(turn)
+
+    goal = memory.goal_for(object_id(2))
+    assert goal is not None
+    assert goal.position == (-76, 76)
+    assert goal.purpose == "explore-center-v3"
+
+
 def test_reaching_exploration_goal_immediately_advances_toward_center() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)

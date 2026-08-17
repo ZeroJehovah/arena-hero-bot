@@ -33,7 +33,7 @@ from .geometry import (
 from .memory import EnemySighting, UnitGoal, WorldMemory
 from .models import DecisionReport
 
-EXPLORATION_PURPOSE = "explore-center-v2"
+EXPLORATION_PURPOSE = "explore-center-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +44,7 @@ class StrategyConfig:
     max_population: int = 12
     enemy_memory_ttl: int = 160
     exploration_goal_ttl: int = 80
-    exploration_radius: int = 18
+    exploration_radius: int = 24
     worker_threat_radius: int = 6
 
 
