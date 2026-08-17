@@ -816,6 +816,7 @@ class AggressiveStrategy:
             current is not None
             and current.purpose == EXPLORATION_PURPOSE
             and worker.position != current.position
+            and current.position not in self.memory.obstacles
         ):
             if current.last_progress_position is None:
                 current = UnitGoal(

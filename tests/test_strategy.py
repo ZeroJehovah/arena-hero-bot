@@ -636,6 +636,27 @@ def test_legacy_exploration_goal_initializes_progress_baseline() -> None:
     assert renewed.assigned_tick == progressed.tick
 
 
+def test_exploration_goal_is_replaced_when_target_becomes_obstacle() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(objects=[core(), unit(2, "WORKER", position=(100, 100))])
+    strategy.decide(first)
+    initial = memory.goal_for(object_id(2))
+    assert initial is not None
+
+    blocked = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(99, 100))],
+        obstacles=[initial.position],
+    )
+    strategy.decide(blocked)
+    replacement = memory.goal_for(object_id(2))
+
+    assert replacement is not None
+    assert replacement.position != initial.position
+    assert replacement.position not in memory.obstacles
+
+
 def test_exploration_goal_expires_after_worker_stalls() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)
