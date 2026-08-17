@@ -421,6 +421,58 @@ def test_core_stays_receptive_while_worker_returns_cargo() -> None:
     assert turn.plan.core_action is None
 
 
+def test_worker_stages_cargo_at_migrating_core_destination() -> None:
+    turn = make_turn(
+        objects=[
+            core(
+                position=(0, 0),
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+        ]
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert any(
+        item.reason == "stage carried resources at migrating Core destination"
+        for item in report.decisions
+    )
+
+
+def test_worker_never_deposits_while_core_is_migrating() -> None:
+    turn = make_turn(
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=3,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(0, 0), cargo=1),
+        ]
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.RIGHT
+    assert action.type != "DEPOSIT"
+    assert any(
+        item.reason == "stage carried resources at migrating Core destination"
+        for item in report.decisions
+    )
+
+
 def test_population_cap_stops_production() -> None:
     units = [unit(number, "RANGER", position=(number, 2)) for number in range(2, 14)]
     turn = make_turn(resources=100, objects=[core(), *units])

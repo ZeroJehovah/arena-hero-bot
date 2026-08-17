@@ -260,6 +260,30 @@ class AggressiveStrategy:
 
         if worker.cargo > 0:
             self.memory.clear_goal(str(worker.id))
+            if core.view.state is CoreState.MOVING:
+                destination = core.view.destination
+                if (
+                    destination is not None
+                    and worker.position != destination
+                    and destination not in context.occupied | context.reserved
+                    and self._move(
+                        worker,
+                        destination,
+                        context,
+                        reason=(
+                            "stage carried resources at migrating Core destination"
+                        ),
+                        allow_goal=True,
+                    )
+                ):
+                    return
+                self._record_wait(
+                    worker,
+                    context,
+                    "Core migration is in progress; wait before depositing cargo",
+                )
+                return
+
             if worker.position == core.position:
                 if context.remaining_resource_space > 0:
                     deposited = min(worker.cargo, context.remaining_resource_space)
