@@ -1,0 +1,64 @@
+[project]
+name = "arena-hero-bot"
+version = "0.1.0"
+description = "An aggressive, telemetry-first Arena Hero tactic bot"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "arena-hero>=0.2.9,<0.3",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.scripts]
+arena-hero-bot = "arena_hero_bot.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-cov>=7,<8",
+    "ruff>=0.16,<0.17",
+    "ty>=0.0.64",
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov=arena_hero_bot --cov-report=term-missing --cov-fail-under=85"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "ANN",
+    "B",
+    "C4",
+    "E",
+    "F",
+    "I",
+    "N",
+    "PERF",
+    "PIE",
+    "RUF",
+    "S",
+    "SIM",
+    "UP",
+    "W",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "S101", "S105", "S106"]
