@@ -248,6 +248,26 @@ def test_worker_does_not_retreat_from_noncombat_enemy_worker() -> None:
     )
 
 
+def test_cargo_worker_retreats_from_visible_combat_enemy() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+            unit(3, "RANGER", controlled=False, position=(3, 0)),
+        ]
+    )
+    report = decide(turn)
+
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+
 def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:
     turn = make_turn(
         objects=[

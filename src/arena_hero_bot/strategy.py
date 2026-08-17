@@ -259,6 +259,28 @@ class AggressiveStrategy:
             self._record_wait(worker, context, "no Core while respawning")
             return
 
+        worker_threats = self._worker_threats(worker, context)
+        if worker.cargo > 0 and worker_threats:
+            retreat_goal = core.position
+            if (
+                core.view.state is CoreState.MOVING
+                and core.view.destination is not None
+            ):
+                retreat_goal = core.view.destination
+            if self._retreat_worker(
+                worker,
+                retreat_goal,
+                context,
+                worker_threats,
+            ):
+                return
+            self._record_wait(
+                worker,
+                context,
+                "no safe path for: retreat carried resources from enemy pressure",
+            )
+            return
+
         if worker.cargo > 0:
             self.memory.clear_goal(str(worker.id))
             if core.view.state is CoreState.MOVING:
@@ -313,14 +335,6 @@ class AggressiveStrategy:
             self._record_wait(worker, context, "Core cell is not currently reachable")
             return
 
-        worker_threats = tuple(
-            enemy
-            for enemy in context.turn.visible_enemies
-            if isinstance(enemy, UnitView)
-            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-            and manhattan(worker.position, enemy.position)
-            <= self.config.worker_threat_radius
-        )
         if worker_threats:
             if not self._retreat_worker(
                 worker,
@@ -586,6 +600,20 @@ class AggressiveStrategy:
             context,
             reason="retreat from visible enemy pressure",
             allow_goal=True,
+        )
+
+    def _worker_threats(
+        self,
+        worker: Worker,
+        context: _TurnContext,
+    ) -> tuple[UnitView, ...]:
+        return tuple(
+            enemy
+            for enemy in context.turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(worker.position, enemy.position)
+            <= self.config.worker_threat_radius
         )
 
     def _move(
