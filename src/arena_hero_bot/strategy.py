@@ -45,6 +45,7 @@ class StrategyConfig:
     enemy_memory_ttl: int = 160
     exploration_goal_ttl: int = 80
     exploration_radius: int = 18
+    worker_threat_radius: int = 6
 
 
 @dataclass(slots=True)
@@ -103,7 +104,11 @@ class AggressiveStrategy:
             self._decide_ranger(ranger, context, recent_enemies)
         for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
             self._decide_vanguard(vanguard, context, recent_enemies)
-        for worker in sorted(turn.workers, key=lambda unit: unit.id.bytes):
+        core_position = turn.core.position if turn.core is not None else None
+        for worker in sorted(
+            turn.workers,
+            key=lambda unit: self._worker_priority(unit, core_position),
+        ):
             self._decide_worker(worker, context)
         self._decide_core(context)
         return report
@@ -281,6 +286,19 @@ class AggressiveStrategy:
             ):
                 return
             self._record_wait(worker, context, "Core cell is not currently reachable")
+            return
+
+        if any(
+            manhattan(worker.position, enemy.position)
+            <= self.config.worker_threat_radius
+            for enemy in context.turn.visible_enemies
+        ):
+            self._move_or_wait(
+                worker,
+                core.position,
+                context,
+                reason="retreat from visible enemy pressure",
+            )
             return
 
         assigned_resource = context.resource_assignments.get(worker.id)
@@ -694,6 +712,8 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None or context.turn.state.population >= self.config.max_population:
             return False
+        if core.position in context.reserved:
+            return False
         occupants = [
             unit
             for unit in context.turn.units
@@ -724,6 +744,13 @@ class AggressiveStrategy:
     @staticmethod
     def _direction_offset(unit_id: UUID) -> int:
         return unit_id.int % 4
+
+    @staticmethod
+    def _worker_priority(
+        worker: Worker, core_position: Position | None
+    ) -> tuple[bool, bytes]:
+        vacates_core = worker.position == core_position and worker.cargo == 0
+        return not vacates_core, worker.id.bytes
 
     @staticmethod
     def _enemy_label(enemy: CoreView | UnitView) -> str:

@@ -128,6 +128,59 @@ def test_only_one_worker_reserves_the_core_cell() -> None:
     )
 
 
+def test_empty_worker_vacates_core_before_returning_worker_moves() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0), cargo=1),
+            unit(3, "WORKER", position=(0, 0)),
+        ]
+    )
+    decide(turn)
+
+    returning = turn.workers[0]
+    action = turn.plan.unit_actions[returning.id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+
+
+def test_core_does_not_spawn_into_worker_reserved_cell() -> None:
+    turn = make_turn(
+        resources=10,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0), cargo=1),
+            unit(3, "WORKER", position=(0, 0)),
+        ],
+    )
+    decide(turn)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert turn.plan.core_action is None
+
+
+def test_worker_retreats_from_nearby_visible_enemy() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(2, 0)),
+            unit(3, "WORKER", controlled=False, position=(3, 0)),
+        ]
+    )
+    report = decide(turn)
+
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+
 def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:
     turn = make_turn(
         objects=[
