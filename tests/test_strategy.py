@@ -232,6 +232,53 @@ def test_worker_retreat_prefers_distance_from_enemy_over_shortest_path() -> None
     assert action.direction is Direction.LEFT
 
 
+def test_cargo_worker_does_not_oscillate_around_enemy() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 2), cargo=1),
+            unit(3, "RANGER", controlled=False, position=(-1, -3)),
+        ],
+    )
+    strategy.decide(first)
+    first_action = first.plan.unit_actions[first.workers[0].id]
+    assert first_action.type == "MOVE"
+    assert first_action.direction is Direction.DOWN
+
+    second = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 3), cargo=1),
+            unit(3, "RANGER", controlled=False, position=(-1, -3)),
+        ],
+    )
+    strategy.decide(second)
+    second_action = second.plan.unit_actions[second.workers[0].id]
+    assert second_action.type == "MOVE"
+    assert second_action.direction is Direction.LEFT
+
+    third = make_turn(
+        tick=102,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(-1, 3), cargo=1),
+            unit(3, "RANGER", controlled=False, position=(-1, -3)),
+        ],
+    )
+    report = strategy.decide(third)
+    action = third.plan.unit_actions[third.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is not Direction.RIGHT
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+
 def test_worker_does_not_retreat_from_noncombat_enemy_worker() -> None:
     turn = make_turn(
         objects=[

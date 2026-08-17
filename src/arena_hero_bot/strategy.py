@@ -570,7 +570,8 @@ class AggressiveStrategy:
             DIRECTIONS[self._direction_offset(worker.id) :]
             + DIRECTIONS[: self._direction_offset(worker.id)]
         )
-        candidates: list[tuple[int, int, int, Direction]] = []
+        recent = set(self.memory.recent_positions(str(worker.id)))
+        candidates: list[tuple[int, int, int, int, int, Direction]] = []
         for order, direction in enumerate(directions):
             destination = add(worker.position, direction)
             if (
@@ -580,9 +581,26 @@ class AggressiveStrategy:
             ):
                 continue
             nearest_enemy = min(manhattan(destination, enemy) for enemy in threats)
+            direct_away = int(
+                any(
+                    (
+                        worker.position[0] == enemy[0] == destination[0]
+                        and abs(destination[1] - enemy[1])
+                        > abs(worker.position[1] - enemy[1])
+                    )
+                    or (
+                        worker.position[1] == enemy[1] == destination[1]
+                        and abs(destination[0] - enemy[0])
+                        > abs(worker.position[0] - enemy[0])
+                    )
+                    for enemy in threats
+                )
+            )
             candidates.append(
                 (
                     nearest_enemy,
+                    direct_away,
+                    int(destination not in recent),
                     -manhattan(destination, core_position),
                     -order,
                     direction,
@@ -590,7 +608,7 @@ class AggressiveStrategy:
             )
 
         if candidates:
-            _, _, _, direction = max(candidates)
+            _, _, _, _, _, direction = max(candidates)
             return self._queue_move(
                 worker,
                 direction,
