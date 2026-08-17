@@ -400,6 +400,23 @@ class AggressiveStrategy:
                 reason="restore shield between engagements",
                 target=core.position,
             )
+            return
+
+        if (
+            not nearby_enemy
+            and context.turn.workers
+            and all(worker.cargo == 0 for worker in context.turn.workers)
+        ):
+            direction = self._core_migration_direction(context)
+            if direction is not None:
+                core.start_move(direction)
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="START_MOVE",
+                    reason="advance mobile base toward the resource-rich center",
+                    target=add(core.position, direction),
+                )
 
     def _pickup_beacon(self, unit: Unit, context: _TurnContext) -> bool:
         if (
@@ -613,6 +630,24 @@ class AggressiveStrategy:
             workers.pop(worker_id)
             resources.remove(resource)
         return assignments
+
+    def _core_migration_direction(self, context: _TurnContext) -> Direction | None:
+        """Choose one currently legal-looking Core step toward the origin."""
+
+        core = context.turn.core
+        if core is None or core.position == (0, 0):
+            return None
+        blocked = set(self.memory.obstacles)
+        blocked.update(context.turn.obstacle_cells)
+        blocked.update(context.turn.resource_cells)
+        blocked.update(context.occupied)
+        blocked.update(context.reserved)
+        return next_step(
+            core.position,
+            (0, 0),
+            blocked=blocked,
+            direction_offset=self._direction_offset(core.id),
+        )
 
     def _exploration_goal(self, worker: Worker, tick: int) -> Position:
         unit_id = str(worker.id)

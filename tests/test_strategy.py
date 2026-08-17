@@ -336,6 +336,38 @@ def test_moving_core_does_not_queue_illegal_action() -> None:
     assert report.decisions[0].reason == "Core migration is already progressing"
 
 
+def test_idle_core_migrates_toward_resource_rich_center() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(-10, 10)),
+            unit(2, "WORKER", position=(-12, 12)),
+            unit(3, "WORKER", position=(-13, 13)),
+        ]
+    )
+    report = decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction in {Direction.UP, Direction.RIGHT}
+    assert any(
+        item.reason == "advance mobile base toward the resource-rich center"
+        for item in report.decisions
+    )
+
+
+def test_core_stays_receptive_while_worker_returns_cargo() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(-10, 10)),
+            unit(2, "WORKER", position=(-12, 12), cargo=1),
+            unit(3, "WORKER", position=(-13, 13)),
+        ]
+    )
+    decide(turn)
+
+    assert turn.plan.core_action is None
+
+
 def test_population_cap_stops_production() -> None:
     units = [unit(number, "RANGER", position=(number, 2)) for number in range(2, 14)]
     turn = make_turn(resources=100, objects=[core(), *units])
