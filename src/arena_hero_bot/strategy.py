@@ -322,6 +322,7 @@ class AggressiveStrategy:
                 core.position,
                 context,
                 reason="retreat from visible enemy pressure",
+                allow_goal=True,
             )
             return
 
@@ -514,8 +515,15 @@ class AggressiveStrategy:
         context: _TurnContext,
         *,
         reason: str,
+        allow_goal: bool = False,
     ) -> None:
-        if not self._move(unit, goal, context, reason=reason):
+        if not self._move(
+            unit,
+            goal,
+            context,
+            reason=reason,
+            allow_goal=allow_goal,
+        ):
             self._record_wait(unit, context, f"no safe path for: {reason}")
 
     def _move(

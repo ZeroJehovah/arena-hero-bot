@@ -181,6 +181,22 @@ def test_worker_retreats_from_nearby_visible_enemy() -> None:
     )
 
 
+def test_worker_can_retreat_into_core_cell_when_threatened() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "WORKER", controlled=False, position=(2, 0)),
+        ]
+    )
+    decide(turn)
+
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+
+
 def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:
     turn = make_turn(
         objects=[
