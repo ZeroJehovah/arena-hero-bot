@@ -2,7 +2,7 @@
 
 from arena_hero import Direction, SpawnAction, UnitType
 
-from arena_hero_bot.memory import WorldMemory
+from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig
 
 from .factories import core, make_turn, object_id, unit
@@ -602,6 +602,38 @@ def test_exploration_goal_renews_after_progress_beyond_ttl() -> None:
     assert renewed.position == first_goal.position
     assert renewed.assigned_tick == progressed.tick
     assert renewed.last_progress_position == (99, 100)
+
+
+def test_legacy_exploration_goal_initializes_progress_baseline() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(objects=[core(), unit(2, "WORKER", position=(100, 100))])
+    strategy.decide(first)
+    initial = memory.goal_for(object_id(2))
+    assert initial is not None
+    memory.set_goal(
+        object_id(2),
+        UnitGoal(initial.position, initial.assigned_tick, initial.purpose),
+    )
+
+    baseline = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(99, 100))],
+    )
+    strategy.decide(baseline)
+    migrated = memory.goal_for(object_id(2))
+    assert migrated is not None
+    assert migrated.last_progress_position == (99, 100)
+
+    progressed = make_turn(
+        tick=baseline.tick + strategy.config.exploration_goal_ttl,
+        objects=[core(), unit(2, "WORKER", position=(98, 100))],
+    )
+    strategy.decide(progressed)
+    renewed = memory.goal_for(object_id(2))
+    assert renewed is not None
+    assert renewed.position == initial.position
+    assert renewed.assigned_tick == progressed.tick
 
 
 def test_exploration_goal_expires_after_worker_stalls() -> None:

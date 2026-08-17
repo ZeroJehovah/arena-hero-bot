@@ -817,6 +817,14 @@ class AggressiveStrategy:
             and current.purpose == EXPLORATION_PURPOSE
             and worker.position != current.position
         ):
+            if current.last_progress_position is None:
+                current = UnitGoal(
+                    position=current.position,
+                    assigned_tick=current.assigned_tick,
+                    purpose=current.purpose,
+                    last_progress_position=worker.position,
+                )
+                self.memory.set_goal(unit_id, current)
             age = tick - current.assigned_tick
             if age <= self.config.exploration_goal_ttl:
                 return current.position
