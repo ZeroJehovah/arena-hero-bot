@@ -144,6 +144,31 @@ def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:
     )
 
 
+def test_nearest_worker_is_assigned_visible_resource() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 5)),
+            unit(3, "WORKER", position=(9, 0)),
+        ],
+        resource_cells=[(10, 0)],
+    )
+    report = decide(turn)
+
+    near_worker = turn.workers[1]
+    action = turn.plan.unit_actions[near_worker.id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.RIGHT
+    claims = [
+        item
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned visible resource"
+    ]
+    assert [(item.actor_id, item.target) for item in claims] == [
+        (str(near_worker.id), (10, 0))
+    ]
+
+
 def test_worker_vacates_core_and_core_spawns_second_worker() -> None:
     turn = make_turn(
         resources=5,
@@ -321,14 +346,36 @@ def test_population_cap_stops_production() -> None:
 def test_exploration_goal_remains_stable_across_turns() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)
-    first = make_turn(objects=[core(), unit(2, "WORKER", position=(1, 0))])
+    first = make_turn(objects=[core(), unit(2, "WORKER", position=(100, 100))])
     strategy.decide(first)
     goal = memory.goal_for(object_id(2))
     assert goal is not None
 
     second = make_turn(
         tick=101,
-        objects=[core(), unit(2, "WORKER", position=(2, 0))],
+        objects=[core(), unit(2, "WORKER", position=(99, 100))],
     )
     strategy.decide(second)
     assert memory.goal_for(object_id(2)) == goal
+
+
+def test_reaching_exploration_goal_immediately_advances_toward_center() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(objects=[core(), unit(2, "WORKER", position=(100, 100))])
+    strategy.decide(first)
+    first_goal = memory.goal_for(object_id(2))
+    assert first_goal is not None
+
+    reached = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=first_goal.position)],
+    )
+    strategy.decide(reached)
+    next_goal = memory.goal_for(object_id(2))
+
+    assert next_goal is not None
+    assert next_goal.position != first_goal.position
+    assert abs(next_goal.position[0]) < abs(first_goal.position[0])
+    assert abs(next_goal.position[1]) < abs(first_goal.position[1])
+    assert reached.plan.unit_actions[reached.workers[0].id].type == "MOVE"

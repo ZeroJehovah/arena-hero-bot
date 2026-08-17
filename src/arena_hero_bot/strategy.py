@@ -33,6 +33,8 @@ from .geometry import (
 from .memory import EnemySighting, UnitGoal, WorldMemory
 from .models import DecisionReport
 
+EXPLORATION_PURPOSE = "explore-center-v2"
+
 
 @dataclass(frozen=True, slots=True)
 class StrategyConfig:
@@ -53,7 +55,7 @@ class _TurnContext:
     enemy_positions: set[Position]
     reserved: set[Position] = field(default_factory=set)
     departures: set[str] = field(default_factory=set)
-    assigned_resources: set[Position] = field(default_factory=set)
+    resource_assignments: dict[UUID, Position] = field(default_factory=dict)
     remaining_resources: int = 0
     remaining_resource_space: int = 0
     beacon_claimed: bool = False
@@ -92,6 +94,7 @@ class AggressiveStrategy:
             report=report,
             occupied=occupied,
             enemy_positions={enemy.position for enemy in turn.visible_enemies},
+            resource_assignments=self._assign_resources(turn),
             remaining_resources=turn.resources,
             remaining_resource_space=turn.resource_space,
         )
@@ -280,11 +283,8 @@ class AggressiveStrategy:
             self._record_wait(worker, context, "Core cell is not currently reachable")
             return
 
-        if (
-            worker.position in context.turn.resource_cells
-            and worker.position not in context.assigned_resources
-        ):
-            context.assigned_resources.add(worker.position)
+        assigned_resource = context.resource_assignments.get(worker.id)
+        if worker.position == assigned_resource:
             worker.harvest()
             self.memory.clear_goal(str(worker.id))
             context.report.add(
@@ -301,24 +301,16 @@ class AggressiveStrategy:
         if self._heal_if_critical(worker, maximum_hp=2, context=context):
             return
 
-        candidates = sorted(
-            context.turn.resource_cells
-            - context.assigned_resources
-            - context.enemy_positions,
-            key=lambda position: (manhattan(worker.position, position), position),
-        )
-        for resource in candidates:
-            if self._move(
-                worker,
-                resource,
-                context,
-                reason="claim nearest unassigned visible resource",
-            ):
-                context.assigned_resources.add(resource)
-                self.memory.clear_goal(str(worker.id))
-                return
+        if assigned_resource is not None and self._move(
+            worker,
+            assigned_resource,
+            context,
+            reason="claim nearest unassigned visible resource",
+        ):
+            self.memory.clear_goal(str(worker.id))
+            return
 
-        goal = self._exploration_goal(worker, core.position, context.turn.tick)
+        goal = self._exploration_goal(worker, context.turn.tick)
         self._move_or_wait(
             worker, goal, context, reason="scout for resources and enemies"
         )
@@ -599,39 +591,51 @@ class AggressiveStrategy:
             key=lambda position: (manhattan(ranger.position, position), position),
         )
 
-    def _exploration_goal(
-        self, worker: Worker, core_position: Position, tick: int
-    ) -> Position:
+    def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
+        """Assign every visible resource to the nearest empty Worker."""
+
+        workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
+        resources = set(turn.resource_cells) - {
+            enemy.position for enemy in turn.visible_enemies
+        }
+        assignments: dict[UUID, Position] = {}
+        while workers and resources:
+            _, worker_id, resource = min(
+                (
+                    manhattan(worker.position, resource),
+                    worker.id,
+                    resource,
+                )
+                for worker in workers.values()
+                for resource in resources
+            )
+            assignments[worker_id] = resource
+            workers.pop(worker_id)
+            resources.remove(resource)
+        return assignments
+
+    def _exploration_goal(self, worker: Worker, tick: int) -> Position:
         unit_id = str(worker.id)
         current = self.memory.goal_for(unit_id)
         if (
             current is not None
+            and current.purpose == EXPLORATION_PURPOSE
             and worker.position != current.position
             and tick - current.assigned_tick <= self.config.exploration_goal_ttl
         ):
             return current.position
 
-        vectors = (
-            (1, 0),
-            (1, 1),
-            (0, 1),
-            (-1, 1),
-            (-1, 0),
-            (-1, -1),
-            (0, -1),
-            (1, -1),
-        )
         phase = tick // self.config.exploration_goal_ttl
-        index = (worker.id.int + phase) % len(vectors)
-        dx, dy = vectors[index]
         radius = self.config.exploration_radius + (phase % 3) * 6
+        position = _inward_goal(worker.position, radius)
+        if position == worker.position:
+            vectors = ((1, 0), (0, 1), (-1, 0), (0, -1))
+            dx, dy = vectors[(worker.id.int + phase) % len(vectors)]
+            position = dx * radius, dy * radius
         goal = UnitGoal(
-            position=(
-                core_position[0] + dx * radius,
-                core_position[1] + dy * radius,
-            ),
+            position=position,
             assigned_tick=tick,
-            purpose="explore",
+            purpose=EXPLORATION_PURPOSE,
         )
         self.memory.set_goal(unit_id, goal)
         return goal.position
@@ -691,3 +695,14 @@ class AggressiveStrategy:
         if isinstance(enemy, CoreView):
             return f"Core @{enemy.owner_username}"
         return enemy.unit_type.value
+
+
+def _inward_goal(position: Position, distance: int) -> Position:
+    """Move each coordinate toward the resource-rich world origin."""
+
+    def inward(coordinate: int) -> int:
+        if coordinate > 0:
+            return max(0, coordinate - distance)
+        return min(0, coordinate + distance)
+
+    return inward(position[0]), inward(position[1])
