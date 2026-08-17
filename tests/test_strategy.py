@@ -268,6 +268,44 @@ def test_cargo_worker_retreats_from_visible_combat_enemy() -> None:
     )
 
 
+def test_worker_retreats_from_recently_seen_combat_enemy() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 1), cargo=1),
+            unit(3, "VANGUARD", controlled=False, position=(8, 1)),
+        ],
+    )
+    strategy.decide(first)
+
+    second = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(5, 1), cargo=1)],
+    )
+    report = strategy.decide(second)
+
+    action = second.plan.unit_actions[second.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is not Direction.RIGHT
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+    expired = make_turn(
+        tick=125,
+        objects=[core(), unit(2, "WORKER", position=(5, 1), cargo=1)],
+    )
+    expired_report = strategy.decide(expired)
+    assert not any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in expired_report.decisions
+    )
+
+
 def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:
     turn = make_turn(
         objects=[

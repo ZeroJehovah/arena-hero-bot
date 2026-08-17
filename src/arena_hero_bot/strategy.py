@@ -47,6 +47,7 @@ class StrategyConfig:
     exploration_goal_ttl: int = 80
     exploration_radius: int = 24
     worker_threat_radius: int = 6
+    worker_threat_memory_ttl: int = 24
 
 
 @dataclass(slots=True)
@@ -554,7 +555,7 @@ class AggressiveStrategy:
         worker: Worker,
         core_position: Position,
         context: _TurnContext,
-        threats: tuple[UnitView, ...],
+        threats: tuple[Position, ...],
     ) -> bool:
         """Choose a one-step retreat that never needlessly closes on an enemy."""
 
@@ -564,6 +565,7 @@ class AggressiveStrategy:
         blocked.update(context.reserved)
         blocked.discard(worker.position)
         blocked.discard(core_position)
+        threat_positions = set(threats)
         directions = (
             DIRECTIONS[self._direction_offset(worker.id) :]
             + DIRECTIONS[: self._direction_offset(worker.id)]
@@ -571,11 +573,13 @@ class AggressiveStrategy:
         candidates: list[tuple[int, int, int, Direction]] = []
         for order, direction in enumerate(directions):
             destination = add(worker.position, direction)
-            if destination in blocked or destination in context.enemy_positions:
+            if (
+                destination in blocked
+                or destination in context.enemy_positions
+                or destination in threat_positions
+            ):
                 continue
-            nearest_enemy = min(
-                manhattan(destination, enemy.position) for enemy in threats
-            )
+            nearest_enemy = min(manhattan(destination, enemy) for enemy in threats)
             candidates.append(
                 (
                     nearest_enemy,
@@ -606,15 +610,27 @@ class AggressiveStrategy:
         self,
         worker: Worker,
         context: _TurnContext,
-    ) -> tuple[UnitView, ...]:
-        return tuple(
-            enemy
+    ) -> tuple[Position, ...]:
+        visible = [
+            enemy.position
             for enemy in context.turn.visible_enemies
             if isinstance(enemy, UnitView)
             and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             and manhattan(worker.position, enemy.position)
             <= self.config.worker_threat_radius
-        )
+        ]
+        remembered = [
+            enemy.position
+            for enemy in self.memory.recent_enemies(
+                context.turn.tick,
+                self.config.worker_threat_memory_ttl,
+            )
+            if enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            and manhattan(worker.position, enemy.position)
+            <= self.config.worker_threat_radius
+        ]
+        return tuple(dict.fromkeys((*visible, *remembered)))
 
     def _move(
         self,
