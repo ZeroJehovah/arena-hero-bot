@@ -57,6 +57,7 @@ class UnitGoal:
     position: Position
     assigned_tick: int
     purpose: str
+    last_progress_position: Position | None = None
 
 
 @dataclass(slots=True)
@@ -186,6 +187,9 @@ class WorldMemory:
                     position=_position(value["position"]),
                     assigned_tick=int(value["assigned_tick"]),
                     purpose=str(value["purpose"]),
+                    last_progress_position=_optional_position(
+                        value.get("last_progress_position")
+                    ),
                 )
                 for key, value in raw.get("goals", {}).items()
             },
@@ -217,3 +221,9 @@ def _optional_integer(value: object) -> int | None:
     if type(value) is not int:
         raise ValueError(f"invalid stored integer: {value!r}")
     return value
+
+
+def _optional_position(value: object) -> Position | None:
+    if value is None:
+        return None
+    return _position(value)

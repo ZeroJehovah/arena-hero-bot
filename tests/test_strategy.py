@@ -583,6 +583,47 @@ def test_exploration_goal_remains_stable_across_turns() -> None:
     assert memory.goal_for(object_id(2)) == goal
 
 
+def test_exploration_goal_renews_after_progress_beyond_ttl() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(objects=[core(), unit(2, "WORKER", position=(100, 100))])
+    strategy.decide(first)
+    first_goal = memory.goal_for(object_id(2))
+    assert first_goal is not None
+
+    progressed = make_turn(
+        tick=first.tick + strategy.config.exploration_goal_ttl + 1,
+        objects=[core(), unit(2, "WORKER", position=(99, 100))],
+    )
+    strategy.decide(progressed)
+    renewed = memory.goal_for(object_id(2))
+
+    assert renewed is not None
+    assert renewed.position == first_goal.position
+    assert renewed.assigned_tick == progressed.tick
+    assert renewed.last_progress_position == (99, 100)
+
+
+def test_exploration_goal_expires_after_worker_stalls() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(objects=[core(), unit(2, "WORKER", position=(100, 100))])
+    strategy.decide(first)
+    first_goal = memory.goal_for(object_id(2))
+    assert first_goal is not None
+
+    stalled = make_turn(
+        tick=first.tick + strategy.config.exploration_goal_ttl + 1,
+        objects=[core(), unit(2, "WORKER", position=(100, 100))],
+    )
+    strategy.decide(stalled)
+    replacement = memory.goal_for(object_id(2))
+
+    assert replacement is not None
+    assert replacement.position != first_goal.position
+    assert replacement.assigned_tick == stalled.tick
+
+
 def test_exploration_goal_uses_aggressive_default_stride() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)

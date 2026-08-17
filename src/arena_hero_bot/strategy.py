@@ -816,9 +816,23 @@ class AggressiveStrategy:
             current is not None
             and current.purpose == EXPLORATION_PURPOSE
             and worker.position != current.position
-            and tick - current.assigned_tick <= self.config.exploration_goal_ttl
         ):
-            return current.position
+            age = tick - current.assigned_tick
+            if age <= self.config.exploration_goal_ttl:
+                return current.position
+
+            progress_reference = current.last_progress_position
+            if progress_reference is not None and manhattan(
+                worker.position, current.position
+            ) < manhattan(progress_reference, current.position):
+                renewed = UnitGoal(
+                    position=current.position,
+                    assigned_tick=tick,
+                    purpose=current.purpose,
+                    last_progress_position=worker.position,
+                )
+                self.memory.set_goal(unit_id, renewed)
+                return renewed.position
 
         phase = tick // self.config.exploration_goal_ttl
         radius = self.config.exploration_radius + (phase % 3) * 6
@@ -831,6 +845,7 @@ class AggressiveStrategy:
             position=position,
             assigned_tick=tick,
             purpose=EXPLORATION_PURPOSE,
+            last_progress_position=worker.position,
         )
         self.memory.set_goal(unit_id, goal)
         return goal.position
