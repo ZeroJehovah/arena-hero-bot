@@ -36,6 +36,15 @@ Run the tactic:
 uv run arena-hero-bot
 ```
 
+For a long-running local instance that restarts after an unexpected process exit:
+
+```bash
+./scripts/run-live.sh
+```
+
+The supervisor uses the live defaults `--target-workers 2 --max-population 20`
+when no arguments are supplied. Pass normal CLI arguments to override them.
+
 Runtime memory and JSONL telemetry are written under `var/` by default.
 
 ## Development
@@ -46,4 +55,3 @@ uv run ruff check .
 uv run ruff format --check .
 uv run ty check
 ```
-
