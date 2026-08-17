@@ -570,7 +570,8 @@ class AggressiveStrategy:
             DIRECTIONS[self._direction_offset(worker.id) :]
             + DIRECTIONS[: self._direction_offset(worker.id)]
         )
-        recent = set(self.memory.recent_positions(str(worker.id)))
+        recent_history = self.memory.recent_positions(str(worker.id))
+        recent = set(recent_history)
         candidates: list[tuple[int, int, int, int, int, Direction]] = []
         for order, direction in enumerate(directions):
             destination = add(worker.position, direction)
@@ -606,6 +607,16 @@ class AggressiveStrategy:
                     direction,
                 )
             )
+
+        if len(recent_history) >= 2 and recent_history[1] == worker.position:
+            previous = recent_history[0]
+            non_looping = [
+                candidate
+                for candidate in candidates
+                if add(worker.position, candidate[-1]) != previous
+            ]
+            if non_looping:
+                candidates = non_looping
 
         if candidates:
             _, _, _, _, _, direction = max(candidates)

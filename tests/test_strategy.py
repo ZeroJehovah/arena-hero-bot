@@ -278,6 +278,19 @@ def test_cargo_worker_does_not_oscillate_around_enemy() -> None:
         for item in report.decisions
     )
 
+    looping = make_turn(
+        tick=103,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 3), cargo=1),
+            unit(3, "RANGER", controlled=False, position=(-1, -3)),
+        ],
+    )
+    strategy.decide(looping)
+    loop_action = looping.plan.unit_actions[looping.workers[0].id]
+    assert loop_action.type == "MOVE"
+    assert loop_action.direction is not Direction.LEFT
+
 
 def test_worker_does_not_retreat_from_noncombat_enemy_worker() -> None:
     turn = make_turn(
