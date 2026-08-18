@@ -775,7 +775,7 @@ def test_resource_goal_retargets_distant_worker_to_local_patrol() -> None:
 
     goal = memory.goal_for(object_id(2))
     assert goal is not None
-    assert goal.purpose == "resource-patrol-v1"
+    assert goal.purpose == "resource-patrol-v2"
     assert manhattan(goal.position, (100, 100)) in {10, 20}
     assert turn.plan.unit_actions[turn.workers[0].id].type == "MOVE"
 
@@ -805,6 +805,32 @@ def test_resource_patrol_rotates_immediately_after_reaching_goal() -> None:
     assert next_goal is not None
     assert next_goal.position != first_goal.position
     assert arrived.plan.unit_actions[arrived.workers[0].id].type == "MOVE"
+
+
+def test_resource_patrol_assigns_distinct_initial_sectors() -> None:
+    memory = WorldMemory()
+    turn = make_turn(
+        tick=160,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "WORKER", position=(100, 100)),
+            unit(10, "WORKER", position=(101, 100)),
+            unit(18, "WORKER", position=(99, 100)),
+        ],
+    )
+
+    decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(resource_target=95, resource_patrol_radius=10),
+    )
+
+    goals = set()
+    for worker in turn.workers:
+        goal = memory.goal_for(str(worker.id))
+        assert goal is not None
+        goals.add(goal.position)
+    assert len(goals) == 3
 
 
 def test_exploration_goal_remains_stable_across_turns() -> None:

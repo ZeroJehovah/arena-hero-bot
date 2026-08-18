@@ -35,7 +35,7 @@ from .memory import EnemySighting, UnitGoal, WorldMemory
 from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
-RESOURCE_PATROL_PURPOSE = "resource-patrol-v1"
+RESOURCE_PATROL_PURPOSE = "resource-patrol-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -985,7 +985,11 @@ class AggressiveStrategy:
             (-radius, -radius),
             (radius, -radius),
         )
-        offset_index = (worker.id.int + phase) % len(offsets)
+        ordered_workers = sorted(turn.workers, key=lambda item: item.id.bytes)
+        worker_index = next(
+            index for index, item in enumerate(ordered_workers) if item.id == worker.id
+        )
+        offset_index = (worker_index + phase) % len(offsets)
         if current is not None and current.purpose == RESOURCE_PATROL_PURPOSE:
             current_offset = (
                 current.position[0] - core.position[0],
