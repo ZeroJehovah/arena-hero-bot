@@ -593,6 +593,47 @@ def test_idle_core_migrates_toward_resource_rich_center() -> None:
     )
 
 
+def test_core_migration_avoids_immediate_backtrack() -> None:
+    core_id = str(object_id(1))
+    memory = WorldMemory(
+        obstacles={
+            (-10, 518),
+            (-8, 514),
+            (-8, 517),
+            (-8, 521),
+            (-7, 521),
+            (-6, 485),
+            (-6, 519),
+            (-6, 521),
+            (-5, 484),
+            (-5, 517),
+            (-4, 488),
+            (-2, 471),
+            (-2, 485),
+            (-2, 486),
+            (-1, 469),
+            (1, 469),
+        },
+        position_history={core_id: [(-9, 518)]},
+    )
+    turn = make_turn(
+        tick=126628,
+        resources=9,
+        objects=[
+            core(position=(-8, 518)),
+            unit(2, "VANGUARD", position=(-5, 485)),
+            unit(3, "WORKER", position=(0, 468)),
+            unit(4, "WORKER", position=(-9, 514)),
+        ],
+        obstacles=[],
+    )
+    decide(turn, memory=memory)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction is Direction.RIGHT
+
+
 def test_core_stays_receptive_while_worker_returns_cargo() -> None:
     turn = make_turn(
         objects=[

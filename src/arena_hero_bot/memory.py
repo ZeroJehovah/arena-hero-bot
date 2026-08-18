@@ -79,11 +79,19 @@ class WorldMemory:
             self.enemies[str(enemy.id)] = EnemySighting.from_view(enemy, turn.tick)
 
         active_ids = {str(unit.id) for unit in turn.units}
+        if turn.core is not None:
+            active_ids.add(str(turn.core.id))
         for unit in turn.units:
             unit_id = str(unit.id)
             history = self.position_history.setdefault(unit_id, [])
             if not history or history[-1] != unit.position:
                 history.append(unit.position)
+                del history[:-POSITION_HISTORY_LIMIT]
+        if turn.core is not None:
+            core_id = str(turn.core.id)
+            history = self.position_history.setdefault(core_id, [])
+            if not history or history[-1] != turn.core.position:
+                history.append(turn.core.position)
                 del history[:-POSITION_HISTORY_LIMIT]
 
         for unit_id in set(self.position_history) - active_ids:

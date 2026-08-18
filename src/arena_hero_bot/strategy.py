@@ -851,6 +851,7 @@ class AggressiveStrategy:
             core.position,
             (0, 0),
             blocked=blocked,
+            recent=self.memory.recent_positions(str(core.id)),
             direction_offset=self._direction_offset(core.id),
         )
 

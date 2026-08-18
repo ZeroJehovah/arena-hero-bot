@@ -42,6 +42,8 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
     }
     assert loaded.goal_for("worker") == UnitGoal((9, 9), 50, "explore")
     assert loaded.recent_positions(str(turn.workers[0].id)) == ()
+    assert turn.core is not None
+    assert loaded.recent_positions(str(turn.core.id)) == ()
 
 
 def test_enemy_ttl_sorting_and_goal_lifecycle() -> None:
