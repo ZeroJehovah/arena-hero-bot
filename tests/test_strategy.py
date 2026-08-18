@@ -980,12 +980,16 @@ def test_resource_patrol_replaces_goal_near_remembered_enemy_core() -> None:
         UnitGoal((6, 0), observed.tick, "resource-patrol-v3"),
     )
 
-    hidden = make_turn(tick=125, objects=[core(), unit(2, "WORKER")])
+    hidden = make_turn(
+        tick=125,
+        objects=[core(), unit(2, "WORKER", position=(-12, -18))],
+    )
     strategy.decide(hidden)
 
     replacement = memory.goal_for(object_id(2))
     assert replacement is not None
     assert replacement.position != (6, 0)
+    assert replacement.position != hidden.workers[0].position
     assert manhattan(replacement.position, (6, 0)) > 2
 
 

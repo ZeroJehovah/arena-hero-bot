@@ -1020,7 +1020,10 @@ class AggressiveStrategy:
         for step in range(len(offsets)):
             dx, dy = offsets[(offset_index + step) % len(offsets)]
             candidate = core.position[0] + dx, core.position[1] + dy
-            if not self._near_remembered_enemy_core(candidate, turn):
+            if candidate != worker.position and not self._near_remembered_enemy_core(
+                candidate,
+                turn,
+            ):
                 patrol_position = candidate
                 break
         goal = UnitGoal(
