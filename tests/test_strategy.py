@@ -1052,11 +1052,13 @@ def test_worker_path_avoids_remembered_enemy_core_exclusion() -> None:
 
 
 def test_resource_patrol_route_covers_square_without_vision_gaps() -> None:
-    offsets = _resource_patrol_offsets(radius=18, spacing=6)
+    radius = StrategyConfig().resource_patrol_radius
+    offsets = _resource_patrol_offsets(radius=radius, spacing=6)
 
-    assert len(offsets) == 48
+    assert radius == 30
+    assert len(offsets) == 120
     assert len(set(offsets)) == len(offsets)
-    assert all(max(abs(x), abs(y)) <= 18 for x, y in offsets)
+    assert all(max(abs(x), abs(y)) <= radius for x, y in offsets)
     assert all(manhattan(left, right) <= 12 for left, right in pairwise(offsets))
 
 

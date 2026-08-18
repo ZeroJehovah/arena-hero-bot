@@ -46,7 +46,7 @@ class StrategyConfig:
     target_workers: int = 2
     max_population: int = 12
     resource_target: int = 0
-    resource_patrol_radius: int = 18
+    resource_patrol_radius: int = 30
     enemy_memory_ttl: int = 160
     exploration_goal_ttl: int = 80
     exploration_radius: int = 24
