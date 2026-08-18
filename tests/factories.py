@@ -68,6 +68,7 @@ def make_turn(
     resource_cells: Iterable[tuple[int, int]] = (),
     obstacles: Iterable[tuple[int, int]] = (),
     beacon: dict[str, Any] | None = None,
+    events: Iterable[dict[str, Any]] = (),
     status: str = "ACTIVE",
     respawn_at_tick: int | None = None,
 ) -> Turn:
@@ -87,7 +88,7 @@ def make_turn(
         "population": population,
         "champion_beacon": beacon or {"position": [100, 100]},
         "objects": object_list,
-        "events": [],
+        "events": list(events),
     }
     if respawn_at_tick is not None:
         payload["respawn_at_tick"] = respawn_at_tick

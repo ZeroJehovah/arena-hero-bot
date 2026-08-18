@@ -848,6 +848,53 @@ def test_resource_patrol_route_covers_square_without_vision_gaps() -> None:
     assert all(manhattan(left, right) <= 12 for left, right in pairwise(offsets))
 
 
+def test_strategy_avoids_recently_contested_resource_patrol_cell() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(resource_target=95, resource_patrol_radius=18)
+    strategy = AggressiveStrategy(memory, config)
+    first = make_turn(
+        tick=160,
+        objects=[core(position=(100, 100)), unit(2, "WORKER", position=(100, 100))],
+    )
+    strategy.decide(first)
+    first_action = first.plan.unit_actions[first.workers[0].id]
+    assert first_action.type == "MOVE"
+    contested = (
+        first.workers[0].position[0] + first_action.direction.delta[0],
+        first.workers[0].position[1] + first_action.direction.delta[1],
+    )
+    memory.contested_positions[contested] = first.tick
+
+    second = make_turn(
+        tick=161,
+        objects=[core(position=(100, 100)), unit(2, "WORKER", position=(100, 100))],
+    )
+    strategy.decide(second)
+    second_action = second.plan.unit_actions[second.workers[0].id]
+
+    assert second_action.type == "MOVE"
+    assert second_action.direction != first_action.direction
+
+
+def test_worker_retreats_from_recently_contested_area() -> None:
+    memory = WorldMemory(contested_positions={(6, 0): 160})
+    turn = make_turn(
+        tick=161,
+        objects=[core(position=(0, 0)), unit(2, "WORKER", position=(5, 0))],
+    )
+
+    report = decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(resource_target=95),
+    )
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert any("retreat" in item.reason for item in report.decisions)
+
+
 def test_exploration_goal_remains_stable_across_turns() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)

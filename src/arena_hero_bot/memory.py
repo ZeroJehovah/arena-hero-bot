@@ -11,6 +11,7 @@ from arena_hero import CoreView, Position, Turn, UnitView
 
 SCHEMA_VERSION = 1
 POSITION_HISTORY_LIMIT = 8
+CONTESTED_CELL_TTL = 80
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,8 @@ class WorldMemory:
     enemies: dict[str, EnemySighting] = field(default_factory=dict)
     position_history: dict[str, list[Position]] = field(default_factory=dict)
     goals: dict[str, UnitGoal] = field(default_factory=dict)
+    pending_move_targets: dict[str, Position] = field(default_factory=dict)
+    contested_positions: dict[Position, int] = field(default_factory=dict)
     last_tick: int = 0
 
     def observe(self, turn: Turn) -> None:
@@ -75,6 +78,22 @@ class WorldMemory:
 
         self.last_tick = turn.tick
         self.obstacles.update(turn.obstacle_cells)
+        for event in turn.events:
+            actor_id = str(event.actor_id) if event.actor_id is not None else None
+            if actor_id is None or event.event_type == "UNIT_MOVE_SUCCEEDED":
+                if actor_id is not None:
+                    self.pending_move_targets.pop(actor_id, None)
+                continue
+            if event.event_type != "UNIT_MOVE_FAILED":
+                continue
+            attempted = self.pending_move_targets.pop(actor_id, None)
+            if event.reason_code == "MOVE_CONTESTED" and attempted is not None:
+                self.contested_positions[attempted] = turn.tick
+        self.contested_positions = {
+            position: observed_tick
+            for position, observed_tick in self.contested_positions.items()
+            if turn.tick - observed_tick <= CONTESTED_CELL_TTL
+        }
         for enemy in turn.visible_enemies:
             self.enemies[str(enemy.id)] = EnemySighting.from_view(enemy, turn.tick)
 
@@ -97,6 +116,7 @@ class WorldMemory:
         for unit_id in set(self.position_history) - active_ids:
             self.position_history.pop(unit_id, None)
             self.goals.pop(unit_id, None)
+            self.pending_move_targets.pop(unit_id, None)
 
     def recent_positions(self, unit_id: str, limit: int = 4) -> tuple[Position, ...]:
         """Return recent cells with newest first, excluding the current cell."""
@@ -160,6 +180,14 @@ class WorldMemory:
                 for key, value in sorted(self.position_history.items())
             },
             "goals": {key: asdict(value) for key, value in sorted(self.goals.items())},
+            "pending_move_targets": {
+                key: list(position)
+                for key, position in sorted(self.pending_move_targets.items())
+            },
+            "contested_positions": [
+                {"position": list(position), "tick": observed_tick}
+                for position, observed_tick in sorted(self.contested_positions.items())
+            ],
         }
 
     @classmethod
@@ -200,6 +228,14 @@ class WorldMemory:
                     ),
                 )
                 for key, value in raw.get("goals", {}).items()
+            },
+            pending_move_targets={
+                key: _position(position)
+                for key, position in raw.get("pending_move_targets", {}).items()
+            },
+            contested_positions={
+                _position(value["position"]): int(value["tick"])
+                for value in raw.get("contested_positions", [])
             },
             last_tick=int(raw.get("last_tick", 0)),
         )

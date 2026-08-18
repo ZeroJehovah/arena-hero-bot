@@ -6,7 +6,7 @@ import pytest
 
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 
-from .factories import core, make_turn, unit
+from .factories import core, make_turn, object_id, unit
 
 
 def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
@@ -86,3 +86,29 @@ def test_old_friendly_histories_are_pruned() -> None:
     memory.observe(make_turn(tick=101, objects=[core()]))
     assert worker_id not in memory.position_history
     assert memory.goal_for(worker_id) is None
+
+
+def test_memory_marks_contested_move_target_and_expires_it() -> None:
+    memory = WorldMemory(pending_move_targets={object_id(2): (1, 0)})
+    turn = make_turn(
+        tick=100,
+        objects=[core(), unit(2, "WORKER")],
+        events=[
+            {
+                "event_id": object_id(99),
+                "tick": 100,
+                "event_type": "UNIT_MOVE_FAILED",
+                "reason_code": "MOVE_CONTESTED",
+                "actor_id": object_id(2),
+                "position": [0, 0],
+            }
+        ],
+    )
+
+    memory.observe(turn)
+
+    assert memory.contested_positions == {(1, 0): 100}
+    assert memory.pending_move_targets == {}
+
+    memory.observe(make_turn(tick=181, objects=[core(), unit(2, "WORKER")]))
+    assert memory.contested_positions == {}

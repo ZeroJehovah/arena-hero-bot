@@ -571,6 +571,7 @@ class AggressiveStrategy:
         """Choose a one-step retreat that never needlessly closes on an enemy."""
 
         blocked = set(self.memory.obstacles)
+        blocked.update(self.memory.contested_positions)
         blocked.update(context.turn.obstacle_cells)
         blocked.update(context.occupied)
         blocked.update(context.reserved)
@@ -670,7 +671,12 @@ class AggressiveStrategy:
             and manhattan(worker.position, enemy.position)
             <= self.config.worker_threat_radius
         ]
-        return tuple(dict.fromkeys((*visible, *remembered)))
+        contested = [
+            position
+            for position in self.memory.contested_positions
+            if manhattan(worker.position, position) <= self.config.worker_threat_radius
+        ]
+        return tuple(dict.fromkeys((*visible, *remembered, *contested)))
 
     def _move(
         self,
@@ -684,6 +690,7 @@ class AggressiveStrategy:
         if unit.position == goal:
             return False
         blocked = set(self.memory.obstacles)
+        blocked.update(self.memory.contested_positions)
         blocked.update(context.turn.obstacle_cells)
         blocked.update(context.occupied)
         blocked.update(context.reserved)
@@ -721,6 +728,7 @@ class AggressiveStrategy:
         if destination in context.reserved:
             return False
         unit.move(direction)
+        self.memory.pending_move_targets[str(unit.id)] = destination
         context.reserved.add(destination)
         if (
             context.turn.core is not None
