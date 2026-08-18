@@ -569,6 +569,26 @@ def test_critical_ranger_heals_at_stationary_core() -> None:
     assert turn.plan.unit_actions[turn.rangers[0].id].type == "HEAL"
 
 
+def test_critical_vanguard_returns_to_core_before_attacking() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(2, 0), hp=2),
+            unit(3, "RANGER", controlled=False, position=(3, 0)),
+        ],
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert any(
+        item.reason == "return critical unit to Core for healing"
+        for item in report.decisions
+    )
+
+
 def test_core_and_unit_pick_up_ground_beacon() -> None:
     unit_turn = make_turn(
         objects=[core(), unit(2, "VANGUARD", position=(1, 0))],

@@ -127,6 +127,8 @@ class AggressiveStrategy:
         context: _TurnContext,
         recent_enemies: tuple[EnemySighting, ...],
     ) -> None:
+        if self._recover_if_critical(ranger, maximum_hp=2, context=context):
+            return
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
         shootable = [
             enemy
@@ -152,9 +154,6 @@ class AggressiveStrategy:
 
         if self._pickup_beacon(ranger, context):
             return
-        if self._heal_if_critical(ranger, maximum_hp=2, context=context):
-            return
-
         visible_target = self._best_visible_target(ranger.position, context.turn)
         if visible_target is not None:
             goal = self._ranger_approach_goal(ranger, visible_target, context)
@@ -184,6 +183,8 @@ class AggressiveStrategy:
         context: _TurnContext,
         recent_enemies: tuple[EnemySighting, ...],
     ) -> None:
+        if self._recover_if_critical(vanguard, maximum_hp=4, context=context):
+            return
         adjacent_groups: dict[Direction, list[CoreView | UnitView]] = {}
         for enemy in context.turn.visible_enemies:
             direction = direction_between(vanguard.position, enemy.position)
@@ -209,9 +210,6 @@ class AggressiveStrategy:
 
         if self._pickup_beacon(vanguard, context):
             return
-        if self._heal_if_critical(vanguard, maximum_hp=4, context=context):
-            return
-
         visible_target = self._best_visible_target(vanguard.position, context.turn)
         if visible_target is not None:
             candidates = [
@@ -363,7 +361,7 @@ class AggressiveStrategy:
 
         if self._pickup_beacon(worker, context):
             return
-        if self._heal_if_critical(worker, maximum_hp=2, context=context):
+        if self._recover_if_critical(worker, maximum_hp=2, context=context):
             return
 
         if assigned_resource is not None and self._move(
@@ -542,6 +540,51 @@ class AggressiveStrategy:
             reason="recover critical combat asset before redeployment",
             target=unit.position,
         )
+        return True
+
+    def _recover_if_critical(
+        self,
+        unit: Unit,
+        *,
+        maximum_hp: int,
+        context: _TurnContext,
+    ) -> bool:
+        if unit.hp > maximum_hp // 2:
+            return False
+        if self._heal_if_critical(unit, maximum_hp=maximum_hp, context=context):
+            return True
+
+        core = context.turn.core
+        if core is None:
+            return False
+        reason = "return critical unit to Core for healing"
+        if unit.position == core.position:
+            self._record_wait(unit, context, "wait at Core for healing resources")
+            return True
+        if self._core_has_room_for(unit, context) and self._move(
+            unit,
+            core.position,
+            context,
+            reason=reason,
+            allow_goal=True,
+        ):
+            return True
+
+        staging_cells = [
+            position
+            for position in adjacent_positions(core.position)
+            if position not in self.memory.obstacles
+            and position not in context.turn.obstacle_cells
+            and position not in context.occupied | context.reserved
+        ]
+        if staging_cells:
+            goal = min(
+                staging_cells,
+                key=lambda position: (manhattan(unit.position, position), position),
+            )
+            if self._move(unit, goal, context, reason=reason):
+                return True
+        self._record_wait(unit, context, f"no safe path for: {reason}")
         return True
 
     def _move_or_wait(
@@ -1071,7 +1114,7 @@ class AggressiveStrategy:
             if abs(dx) + abs(dy) <= radius
         }
 
-    def _core_has_room_for(self, worker: Worker, context: _TurnContext) -> bool:
+    def _core_has_room_for(self, worker: Unit, context: _TurnContext) -> bool:
         core = context.turn.core
         if core is None:
             return False
