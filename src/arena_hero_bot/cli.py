@@ -8,6 +8,7 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 
+from arena_hero import core_resource_capacity
 from dotenv import load_dotenv
 
 from .runtime import RuntimeConfig, run_bot
@@ -61,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop producing Units at this population (default: 12)",
     )
     parser.add_argument(
+        "--resource-target",
+        type=_non_negative_integer,
+        default=0,
+        help="save this many Core resources after building storage capacity",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -71,7 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     """Load configuration and run until interrupted or ``--max-turns``."""
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    maximum_capacity = core_resource_capacity(args.max_population)
+    if args.resource_target > maximum_capacity:
+        parser.error(
+            f"--resource-target cannot exceed the maximum Core capacity "
+            f"of {maximum_capacity}"
+        )
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -94,6 +108,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     strategy = StrategyConfig(
         target_workers=args.target_workers,
         max_population=args.max_population,
+        resource_target=args.resource_target,
     )
     try:
         run_bot(runtime, strategy_config=strategy)

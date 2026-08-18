@@ -88,6 +88,42 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
     assert "api_key" not in json.dumps(record).lower()
 
 
+def test_runtime_tick_log_includes_resource_progress(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    turn = make_turn(
+        tick=100,
+        resources=7,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+    )
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def turns(self):
+            yield turn
+
+    monkeypatch.setattr(runtime, "ArenaHeroClient", FakeClient)
+    with caplog.at_level("INFO", logger="arena_hero_bot.runtime"):
+        runtime.run_bot(
+            RuntimeConfig(
+                api_key="test-key",
+                data_dir=tmp_path,
+                observe_only=True,
+                max_turns=1,
+            )
+        )
+
+    assert "resources=7/10 population=1" in caplog.text
+
+
 def test_run_bot_persists_memory_and_turn_telemetry(tmp_path, monkeypatch) -> None:
     turns = [
         make_turn(
@@ -153,6 +189,8 @@ def test_cli_requires_key_and_builds_runtime(monkeypatch, tmp_path) -> None:
             "1",
             "--max-population",
             "9",
+            "--resource-target",
+            "40",
             "--data-dir",
             str(tmp_path),
         ]
@@ -161,6 +199,7 @@ def test_cli_requires_key_and_builds_runtime(monkeypatch, tmp_path) -> None:
     assert captured["runtime"].observe_only is True
     assert captured["strategy"].target_workers == 1
     assert captured["strategy"].max_population == 9
+    assert captured["strategy"].resource_target == 40
 
 
 @pytest.mark.parametrize(
@@ -168,12 +207,20 @@ def test_cli_requires_key_and_builds_runtime(monkeypatch, tmp_path) -> None:
     [
         (["--max-turns", "0"], "must be greater than zero"),
         (["--target-workers", "-1"], "must be zero or greater"),
+        (["--resource-target", "-1"], "must be zero or greater"),
     ],
 )
 def test_cli_rejects_invalid_numbers(arguments, message, capsys) -> None:
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(arguments)
     assert message in capsys.readouterr().err
+
+
+def test_cli_rejects_unreachable_resource_target(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ARENA_HERO_API_KEY", "secret-value")
+    with pytest.raises(SystemExit):
+        cli.main(["--max-population", "18", "--resource-target", "95"])
+    assert "cannot exceed the maximum Core capacity of 90" in capsys.readouterr().err
 
 
 def _raise(error: Exception):

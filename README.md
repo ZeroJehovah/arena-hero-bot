@@ -36,6 +36,13 @@ Run the tactic:
 uv run arena-hero-bot
 ```
 
+Grow enough population for 100 storage capacity, then save 95 Core resources:
+
+```bash
+uv run arena-hero-bot --target-workers 8 --max-population 20 \
+  --resource-target 95
+```
+
 For a long-running local instance that restarts after an unexpected process exit:
 
 ```bash

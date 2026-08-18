@@ -2,6 +2,7 @@
 
 from arena_hero import Direction, SpawnAction, UnitType
 
+from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig
 
@@ -704,6 +705,79 @@ def test_population_cap_stops_production() -> None:
     turn = make_turn(resources=100, objects=[core(), *units])
     decide(turn, config=StrategyConfig(max_population=12))
     assert turn.plan.core_action is None
+
+
+def test_resource_goal_builds_one_capacity_unit_beyond_required_population() -> None:
+    units = [unit(number, "WORKER", position=(number, 2)) for number in range(2, 20)]
+    turn = make_turn(resources=5, objects=[core(), *units])
+
+    decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=20,
+            max_population=20,
+            resource_target=95,
+        ),
+    )
+
+    assert turn.state.population == 18
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
+def test_resource_goal_stops_production_at_buffered_capacity() -> None:
+    units = [unit(number, "WORKER", position=(number, 2)) for number in range(2, 22)]
+    turn = make_turn(resources=100, objects=[core(), *units])
+
+    decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=20,
+            max_population=20,
+            resource_target=95,
+        ),
+    )
+
+    assert turn.state.population == 20
+    assert turn.plan.core_action is None
+
+
+def test_resource_goal_keeps_core_stationary_and_preserves_stockpile() -> None:
+    turn = make_turn(
+        resources=95,
+        objects=[
+            core(position=(100, 100), shield=4),
+            unit(2, "WORKER", position=(101, 100)),
+        ],
+    )
+
+    decide(turn, config=StrategyConfig(resource_target=95, max_population=20))
+
+    assert turn.plan.core_action is None
+
+
+def test_resource_goal_retargets_distant_worker_to_local_patrol() -> None:
+    memory = WorldMemory()
+    turn = make_turn(
+        tick=160,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "WORKER", position=(0, 0)),
+        ],
+    )
+
+    decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(resource_target=95, resource_patrol_radius=10),
+    )
+
+    goal = memory.goal_for(object_id(2))
+    assert goal is not None
+    assert goal.purpose == "resource-patrol-v1"
+    assert manhattan(goal.position, (100, 100)) in {10, 20}
+    assert turn.plan.unit_actions[turn.workers[0].id].type == "MOVE"
 
 
 def test_exploration_goal_remains_stable_across_turns() -> None:

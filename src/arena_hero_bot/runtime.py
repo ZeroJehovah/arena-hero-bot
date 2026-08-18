@@ -83,8 +83,12 @@ def run_bot(
                 )
             )
             LOGGER.info(
-                "tick=%d enemies=%d actions=%d planning_ms=%.1f submit=%s",
+                "tick=%d resources=%d/%d population=%d enemies=%d actions=%d "
+                "planning_ms=%.1f submit=%s",
                 turn.tick,
+                turn.resources,
+                turn.resource_capacity,
+                turn.state.population,
                 len(turn.visible_enemies),
                 len(report.decisions),
                 planning_seconds * 1000,

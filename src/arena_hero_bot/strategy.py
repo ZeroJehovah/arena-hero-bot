@@ -35,6 +35,7 @@ from .memory import EnemySighting, UnitGoal, WorldMemory
 from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
+RESOURCE_PATROL_PURPOSE = "resource-patrol-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,8 @@ class StrategyConfig:
 
     target_workers: int = 2
     max_population: int = 12
+    resource_target: int = 0
+    resource_patrol_radius: int = 10
     enemy_memory_ttl: int = 160
     exploration_goal_ttl: int = 80
     exploration_radius: int = 24
@@ -83,6 +86,7 @@ class AggressiveStrategy:
         recent_enemies = self.memory.recent_enemies(
             turn.tick, self.config.enemy_memory_ttl
         )
+        tactical_enemies = self._tactical_enemies(turn, recent_enemies)
         report = DecisionReport(
             tick=turn.tick,
             visible_enemies=len(turn.visible_enemies),
@@ -103,9 +107,9 @@ class AggressiveStrategy:
         )
 
         for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
-            self._decide_ranger(ranger, context, recent_enemies)
+            self._decide_ranger(ranger, context, tactical_enemies)
         for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
-            self._decide_vanguard(vanguard, context, recent_enemies)
+            self._decide_vanguard(vanguard, context, tactical_enemies)
         core_position = turn.core.position if turn.core is not None else None
         for worker in sorted(
             turn.workers,
@@ -169,12 +173,8 @@ class AggressiveStrategy:
         ):
             return
 
-        self._move_or_wait(
-            ranger,
-            context.turn.beacon.position,
-            context,
-            reason="advance toward the public Beacon battle zone",
-        )
+        goal, reason = self._idle_combat_goal(ranger, context.turn)
+        self._move_or_wait(ranger, goal, context, reason=reason)
 
     def _decide_vanguard(
         self,
@@ -247,12 +247,8 @@ class AggressiveStrategy:
         ):
             return
 
-        self._move_or_wait(
-            vanguard,
-            context.turn.beacon.position,
-            context,
-            reason="advance toward the public Beacon battle zone",
-        )
+        goal, reason = self._idle_combat_goal(vanguard, context.turn)
+        self._move_or_wait(vanguard, goal, context, reason=reason)
 
     def _decide_worker(self, worker: Worker, context: _TurnContext) -> None:
         core = context.turn.core
@@ -377,9 +373,17 @@ class AggressiveStrategy:
             self.memory.clear_goal(str(worker.id))
             return
 
-        goal = self._exploration_goal(worker, context.turn.tick)
+        if self.config.resource_target > 0:
+            goal = self._resource_patrol_goal(worker, context.turn)
+            reason = "patrol near the stationary Core for resources"
+        else:
+            goal = self._exploration_goal(worker, context.turn.tick)
+            reason = "scout for resources and enemies"
         self._move_or_wait(
-            worker, goal, context, reason="scout for resources and enemies"
+            worker,
+            goal,
+            context,
+            reason=reason,
         )
 
     def _decide_core(self, context: _TurnContext) -> None:
@@ -443,12 +447,13 @@ class AggressiveStrategy:
                     actor_id=str(core.id),
                     actor_kind="CORE",
                     action="SPAWN",
-                    reason=f"expand aggressive {unit_type.value.lower()} roster",
+                    reason=self._spawn_reason(unit_type),
                     target=core.position,
                 )
                 return
 
-        if core.hp < 5 and context.remaining_resources > 0:
+        preserving_resources = self.config.resource_target > 0
+        if not preserving_resources and core.hp < 5 and context.remaining_resources > 0:
             core.heal()
             context.report.add(
                 actor_id=str(core.id),
@@ -458,7 +463,11 @@ class AggressiveStrategy:
                 target=core.position,
             )
             return
-        if core.shield < 5 and context.remaining_resources > 0:
+        if (
+            not preserving_resources
+            and core.shield < 5
+            and context.remaining_resources > 0
+        ):
             core.repair_shield()
             context.report.add(
                 actor_id=str(core.id),
@@ -470,7 +479,8 @@ class AggressiveStrategy:
             return
 
         if (
-            not nearby_enemy
+            not preserving_resources
+            and not nearby_enemy
             and context.turn.workers
             and all(worker.cargo == 0 for worker in context.turn.workers)
         ):
@@ -764,6 +774,45 @@ class AggressiveStrategy:
             ),
         )
 
+    def _tactical_enemies(
+        self,
+        turn: Turn,
+        enemies: tuple[EnemySighting, ...],
+    ) -> tuple[EnemySighting, ...]:
+        """Keep goal-oriented defenders near the Core instead of roaming away."""
+
+        if self.config.resource_target <= 0 or turn.core is None:
+            return enemies
+        return tuple(
+            enemy
+            for enemy in enemies
+            if manhattan(turn.core.position, enemy.position)
+            <= self.config.worker_threat_radius * 2
+        )
+
+    def _idle_combat_goal(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+    ) -> tuple[Position, str]:
+        if self.config.resource_target <= 0 or turn.core is None:
+            return turn.beacon.position, "advance toward the public Beacon battle zone"
+        offsets = (
+            (0, -2),
+            (2, 0),
+            (0, 2),
+            (-2, 0),
+            (1, -1),
+            (1, 1),
+            (-1, 1),
+            (-1, -1),
+        )
+        dx, dy = offsets[unit.id.int % len(offsets)]
+        return (
+            (turn.core.position[0] + dx, turn.core.position[1] + dy),
+            "hold a defensive perimeter around the resource Core",
+        )
+
     def _enemy_score(
         self,
         enemy: CoreView | UnitView,
@@ -905,6 +954,47 @@ class AggressiveStrategy:
         self.memory.set_goal(unit_id, goal)
         return goal.position
 
+    def _resource_patrol_goal(self, worker: Worker, turn: Turn) -> Position:
+        """Assign a stable patrol point close enough for efficient deposits."""
+
+        core = turn.core
+        if core is None:
+            return worker.position
+        unit_id = str(worker.id)
+        current = self.memory.goal_for(unit_id)
+        if (
+            current is not None
+            and current.purpose == RESOURCE_PATROL_PURPOSE
+            and worker.position != current.position
+            and current.position not in self.memory.obstacles
+            and manhattan(core.position, current.position)
+            <= self.config.resource_patrol_radius * 2
+            and turn.tick - current.assigned_tick <= self.config.exploration_goal_ttl
+        ):
+            return current.position
+
+        phase = turn.tick // self.config.exploration_goal_ttl
+        radius = self.config.resource_patrol_radius
+        offsets = (
+            (radius, 0),
+            (0, radius),
+            (-radius, 0),
+            (0, -radius),
+            (radius, radius),
+            (-radius, radius),
+            (-radius, -radius),
+            (radius, -radius),
+        )
+        dx, dy = offsets[(worker.id.int + phase) % len(offsets)]
+        goal = UnitGoal(
+            position=(core.position[0] + dx, core.position[1] + dy),
+            assigned_tick=turn.tick,
+            purpose=RESOURCE_PATROL_PURPOSE,
+            last_progress_position=worker.position,
+        )
+        self.memory.set_goal(unit_id, goal)
+        return goal.position
+
     def _core_has_room_for(self, worker: Worker, context: _TurnContext) -> bool:
         core = context.turn.core
         if core is None:
@@ -922,7 +1012,14 @@ class AggressiveStrategy:
 
     def _core_can_spawn(self, context: _TurnContext) -> bool:
         core = context.turn.core
-        if core is None or context.turn.state.population >= self.config.max_population:
+        if (
+            core is None
+            or context.turn.state.population >= self._growth_population_target()
+            or (
+                self.config.resource_target > 0
+                and context.remaining_resources >= self.config.resource_target
+            )
+        ):
             return False
         if core.position in context.reserved:
             return False
@@ -934,7 +1031,7 @@ class AggressiveStrategy:
         return not occupants
 
     def _choose_spawn(self, turn: Turn, resources: int) -> UnitType | None:
-        if turn.state.population >= self.config.max_population:
+        if turn.state.population >= self._growth_population_target():
             return None
         if len(turn.workers) < self.config.target_workers:
             candidates = (UnitType.WORKER,)
@@ -952,6 +1049,23 @@ class AggressiveStrategy:
             ),
             None,
         )
+
+    def _growth_population_target(self) -> int:
+        if self.config.resource_target <= 0:
+            return self.config.max_population
+        if self.config.resource_target <= 10:
+            return min(1, self.config.max_population)
+        required = (self.config.resource_target + 4) // 5
+        buffered = min(required + 1, self.config.max_population)
+        return buffered
+
+    def _spawn_reason(self, unit_type: UnitType) -> str:
+        if self.config.resource_target > 0:
+            return (
+                f"expand capacity toward {self.config.resource_target} Core resources "
+                f"with {unit_type.value.lower()}"
+            )
+        return f"expand aggressive {unit_type.value.lower()} roster"
 
     @staticmethod
     def _direction_offset(unit_id: UUID) -> int:
