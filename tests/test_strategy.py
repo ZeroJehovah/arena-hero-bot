@@ -315,6 +315,63 @@ def test_worker_does_not_retreat_from_noncombat_enemy_worker() -> None:
     )
 
 
+def test_worker_retreats_from_visible_enemy_core() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(5, 0)),
+            core(
+                3,
+                controlled=False,
+                owner_username="rival",
+                position=(6, 0),
+            ),
+        ]
+    )
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+
+def test_worker_retreats_from_recently_seen_enemy_core() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(5, 0)),
+            core(
+                3,
+                controlled=False,
+                owner_username="rival",
+                position=(8, 0),
+            ),
+        ],
+    )
+    strategy.decide(first)
+
+    second = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(5, 0))],
+    )
+    report = strategy.decide(second)
+
+    action = second.plan.unit_actions[second.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+
 def test_cargo_worker_retreats_from_visible_combat_enemy() -> None:
     turn = make_turn(
         objects=[
@@ -747,6 +804,58 @@ def test_resource_goal_stops_production_at_buffered_capacity() -> None:
 
     assert turn.state.population == 20
     assert turn.plan.core_action is None
+
+
+def test_resource_goal_reserves_for_one_guard_then_resumes_workers() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(
+            target_workers=20,
+            max_population=20,
+            resource_target=95,
+        ),
+    )
+    workers = [unit(number, "WORKER", position=(number, 2)) for number in range(2, 8)]
+    nearby_enemy = core(
+        20,
+        controlled=False,
+        owner_username="rival",
+        position=(20, 0),
+    )
+
+    saving = make_turn(
+        tick=100,
+        resources=5,
+        objects=[core(), *workers, nearby_enemy],
+    )
+    strategy.decide(saving)
+    assert saving.plan.core_action is None
+
+    guarded = make_turn(
+        tick=101,
+        resources=10,
+        objects=[core(), *workers, nearby_enemy],
+    )
+    strategy.decide(guarded)
+    assert guarded.plan.core_action is not None
+    assert guarded.plan.core_action.type == "SPAWN"
+    assert guarded.plan.core_action.unit_type is UnitType.VANGUARD
+
+    growing = make_turn(
+        tick=102,
+        resources=5,
+        objects=[
+            core(),
+            *workers,
+            unit(8, "VANGUARD", position=(2, 3)),
+            nearby_enemy,
+        ],
+    )
+    strategy.decide(growing)
+    assert growing.plan.core_action is not None
+    assert growing.plan.core_action.type == "SPAWN"
+    assert growing.plan.core_action.unit_type is UnitType.WORKER
 
 
 def test_resource_goal_keeps_core_stationary_and_preserves_stockpile() -> None:

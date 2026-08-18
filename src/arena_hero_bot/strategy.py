@@ -655,8 +655,13 @@ class AggressiveStrategy:
         visible = [
             enemy.position
             for enemy in context.turn.visible_enemies
-            if isinstance(enemy, UnitView)
-            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            if (
+                isinstance(enemy, CoreView)
+                or (
+                    isinstance(enemy, UnitView)
+                    and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                )
+            )
             and manhattan(worker.position, enemy.position)
             <= self.config.worker_threat_radius
         ]
@@ -666,8 +671,14 @@ class AggressiveStrategy:
                 context.turn.tick,
                 self.config.worker_threat_memory_ttl,
             )
-            if enemy.kind == "UNIT"
-            and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            if (
+                enemy.kind == "CORE"
+                or (
+                    enemy.kind == "UNIT"
+                    and enemy.unit_type
+                    in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                )
+            )
             and manhattan(worker.position, enemy.position)
             <= self.config.worker_threat_radius
         ]
@@ -1048,7 +1059,9 @@ class AggressiveStrategy:
     def _choose_spawn(self, turn: Turn, resources: int) -> UnitType | None:
         if turn.state.population >= self._growth_population_target():
             return None
-        if len(turn.workers) < self.config.target_workers:
+        if self._needs_resource_guard(turn):
+            candidates = (UnitType.VANGUARD,)
+        elif len(turn.workers) < self.config.target_workers:
             candidates = (UnitType.WORKER,)
         elif not turn.vanguards:
             candidates = (UnitType.VANGUARD, UnitType.RANGER)
@@ -1063,6 +1076,24 @@ class AggressiveStrategy:
                 if unit_cost(unit_type, turn.state.population) <= resources
             ),
             None,
+        )
+
+    def _needs_resource_guard(self, turn: Turn) -> bool:
+        if self.config.resource_target <= 0 or turn.core is None or turn.vanguards:
+            return False
+        local_radius = (
+            self.config.resource_patrol_radius + self.config.worker_threat_radius
+        )
+        return any(
+            (
+                enemy.kind == "CORE"
+                or enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            )
+            and manhattan(turn.core.position, enemy.position) <= local_radius
+            for enemy in self.memory.recent_enemies(
+                turn.tick,
+                self.config.enemy_memory_ttl,
+            )
         )
 
     def _growth_population_target(self) -> int:
