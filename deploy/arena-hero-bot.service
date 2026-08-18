@@ -1,0 +1,24 @@
+[Unit]
+Description=Arena Hero aggressive PvP bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/dev/projects/personal/arena-hero-bot/src
+EnvironmentFile=/opt/dev/projects/personal/arena-hero-bot/src/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/dev/projects/personal/arena-hero-bot/src/.venv/bin/arena-hero-bot --target-workers 2 --max-population 20 --log-level INFO
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arena-hero-bot
+
+[Install]
+WantedBy=multi-user.target

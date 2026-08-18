@@ -45,6 +45,21 @@ For a long-running local instance that restarts after an unexpected process exit
 The supervisor uses the live defaults `--target-workers 2 --max-population 20`
 when no arguments are supplied. Pass normal CLI arguments to override them.
 
+For a persistent systemd deployment, install the supplied service after creating
+the virtual environment and `.env` file:
+
+```bash
+sudo install -m 0644 deploy/arena-hero-bot.service \
+  /etc/systemd/system/arena-hero-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now arena-hero-bot.service
+sudo systemctl status arena-hero-bot.service
+journalctl -u arena-hero-bot.service -f
+```
+
+The supplied unit targets the canonical deployment path
+`/opt/dev/projects/personal/arena-hero-bot/src` and runs as the `ubuntu` user.
+
 Runtime memory and JSONL telemetry are written under `var/` by default.
 
 ## Development
