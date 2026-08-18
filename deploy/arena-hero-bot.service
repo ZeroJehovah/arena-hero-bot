@@ -10,7 +10,7 @@ Group=ubuntu
 WorkingDirectory=/opt/dev/projects/personal/arena-hero-bot/src
 EnvironmentFile=/opt/dev/projects/personal/arena-hero-bot/src/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/dev/projects/personal/arena-hero-bot/src/.venv/bin/arena-hero-bot --target-workers 8 --max-population 20 --resource-target 95 --log-level INFO
+ExecStart=/opt/dev/projects/personal/arena-hero-bot/src/.venv/bin/arena-hero-bot --target-workers 12 --max-population 20 --resource-target 95 --log-level INFO
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
