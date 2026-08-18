@@ -958,6 +958,31 @@ def test_resource_patrol_assigns_distinct_initial_sectors() -> None:
     assert len(goals) == 3
 
 
+def test_resource_patrol_splits_duplicate_existing_goals() -> None:
+    memory = WorldMemory()
+    shared_goal = UnitGoal((12, 12), 100, "resource-patrol-v3")
+    memory.set_goal(object_id(2), shared_goal)
+    memory.set_goal(object_id(3), shared_goal)
+    turn = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "WORKER", position=(-1, 0)),
+        ],
+    )
+
+    decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(resource_target=95, resource_patrol_radius=18),
+    )
+
+    goals = [memory.goal_for(object_id(number)) for number in (2, 3)]
+    assert all(goal is not None for goal in goals)
+    assert len({goal.position for goal in goals if goal is not None}) == 2
+
+
 def test_resource_patrol_replaces_goal_near_remembered_enemy_core() -> None:
     memory = WorldMemory()
     config = StrategyConfig(

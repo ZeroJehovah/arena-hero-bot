@@ -986,11 +986,19 @@ class AggressiveStrategy:
             return worker.position
         unit_id = str(worker.id)
         current = self.memory.goal_for(unit_id)
+        claimed_positions = {
+            goal.position
+            for other in turn.workers
+            if other.id != worker.id
+            if (goal := self.memory.goal_for(str(other.id))) is not None
+            and goal.purpose == RESOURCE_PATROL_PURPOSE
+        }
         if (
             current is not None
             and current.purpose == RESOURCE_PATROL_PURPOSE
             and worker.position != current.position
             and current.position not in self.memory.obstacles
+            and current.position not in claimed_positions
             and not self._near_remembered_enemy_core(current.position, turn)
             and manhattan(core.position, current.position)
             <= self.config.resource_patrol_radius * 2
@@ -1020,9 +1028,10 @@ class AggressiveStrategy:
         for step in range(len(offsets)):
             dx, dy = offsets[(offset_index + step) % len(offsets)]
             candidate = core.position[0] + dx, core.position[1] + dy
-            if candidate != worker.position and not self._near_remembered_enemy_core(
-                candidate,
-                turn,
+            if (
+                candidate != worker.position
+                and candidate not in claimed_positions
+                and not self._near_remembered_enemy_core(candidate, turn)
             ):
                 patrol_position = candidate
                 break
