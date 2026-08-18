@@ -669,7 +669,7 @@ class AggressiveStrategy:
             enemy.position
             for enemy in self.memory.recent_enemies(
                 context.turn.tick,
-                self.config.worker_threat_memory_ttl,
+                self.config.enemy_memory_ttl,
             )
             if (
                 enemy.kind == "CORE"
@@ -677,6 +677,8 @@ class AggressiveStrategy:
                     enemy.kind == "UNIT"
                     and enemy.unit_type
                     in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                    and context.turn.tick - enemy.tick
+                    <= self.config.worker_threat_memory_ttl
                 )
             )
             and manhattan(worker.position, enemy.position)
@@ -705,6 +707,8 @@ class AggressiveStrategy:
         blocked.update(context.turn.obstacle_cells)
         blocked.update(context.occupied)
         blocked.update(context.reserved)
+        if isinstance(unit, Worker):
+            blocked.update(self._worker_core_exclusion_cells(context.turn))
         direction = next_step(
             unit.position,
             goal,
@@ -987,6 +991,7 @@ class AggressiveStrategy:
             and current.purpose == RESOURCE_PATROL_PURPOSE
             and worker.position != current.position
             and current.position not in self.memory.obstacles
+            and not self._near_remembered_enemy_core(current.position, turn)
             and manhattan(core.position, current.position)
             <= self.config.resource_patrol_radius * 2
             and turn.tick - current.assigned_tick <= self.config.exploration_goal_ttl
@@ -1011,15 +1016,47 @@ class AggressiveStrategy:
             )
             if current_offset in offsets:
                 offset_index = (offsets.index(current_offset) + 1) % len(offsets)
-        dx, dy = offsets[offset_index]
+        patrol_position = core.position
+        for step in range(len(offsets)):
+            dx, dy = offsets[(offset_index + step) % len(offsets)]
+            candidate = core.position[0] + dx, core.position[1] + dy
+            if not self._near_remembered_enemy_core(candidate, turn):
+                patrol_position = candidate
+                break
         goal = UnitGoal(
-            position=(core.position[0] + dx, core.position[1] + dy),
+            position=patrol_position,
             assigned_tick=turn.tick,
             purpose=RESOURCE_PATROL_PURPOSE,
             last_progress_position=worker.position,
         )
         self.memory.set_goal(unit_id, goal)
         return goal.position
+
+    def _remembered_enemy_core_positions(self, turn: Turn) -> tuple[Position, ...]:
+        return tuple(
+            enemy.position
+            for enemy in self.memory.recent_enemies(
+                turn.tick,
+                self.config.enemy_memory_ttl,
+            )
+            if enemy.kind == "CORE"
+        )
+
+    def _near_remembered_enemy_core(self, position: Position, turn: Turn) -> bool:
+        return any(
+            manhattan(position, enemy) <= self.config.worker_threat_radius
+            for enemy in self._remembered_enemy_core_positions(turn)
+        )
+
+    def _worker_core_exclusion_cells(self, turn: Turn) -> set[Position]:
+        radius = self.config.worker_threat_radius
+        return {
+            (center[0] + dx, center[1] + dy)
+            for center in self._remembered_enemy_core_positions(turn)
+            for dx in range(-radius, radius + 1)
+            for dy in range(-radius, radius + 1)
+            if abs(dx) + abs(dy) <= radius
+        }
 
     def _core_has_room_for(self, worker: Worker, context: _TurnContext) -> bool:
         core = context.turn.core

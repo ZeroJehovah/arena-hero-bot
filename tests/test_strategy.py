@@ -371,6 +371,16 @@ def test_worker_retreats_from_recently_seen_enemy_core() -> None:
         for item in report.decisions
     )
 
+    still_remembered = make_turn(
+        tick=125,
+        objects=[core(), unit(2, "WORKER", position=(5, 0))],
+    )
+    remembered_report = strategy.decide(still_remembered)
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in remembered_report.decisions
+    )
+
 
 def test_cargo_worker_retreats_from_visible_combat_enemy() -> None:
     turn = make_turn(
@@ -946,6 +956,70 @@ def test_resource_patrol_assigns_distinct_initial_sectors() -> None:
         assert goal is not None
         goals.add(goal.position)
     assert len(goals) == 3
+
+
+def test_resource_patrol_replaces_goal_near_remembered_enemy_core() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(
+        resource_target=95,
+        resource_patrol_radius=18,
+        worker_threat_radius=2,
+    )
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER"),
+            core(3, controlled=False, owner_username="rival", position=(6, 0)),
+        ],
+    )
+    strategy.decide(observed)
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((6, 0), observed.tick, "resource-patrol-v3"),
+    )
+
+    hidden = make_turn(tick=125, objects=[core(), unit(2, "WORKER")])
+    strategy.decide(hidden)
+
+    replacement = memory.goal_for(object_id(2))
+    assert replacement is not None
+    assert replacement.position != (6, 0)
+    assert manhattan(replacement.position, (6, 0)) > 2
+
+
+def test_worker_path_avoids_remembered_enemy_core_exclusion() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(
+        resource_target=95,
+        resource_patrol_radius=18,
+        worker_threat_radius=2,
+    )
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(3, 0)),
+            core(3, controlled=False, owner_username="rival", position=(6, 0)),
+        ],
+    )
+    strategy.decide(observed)
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((10, 0), observed.tick, "resource-patrol-v3"),
+    )
+
+    hidden = make_turn(
+        tick=125,
+        objects=[core(), unit(2, "WORKER", position=(3, 0))],
+    )
+    strategy.decide(hidden)
+
+    action = hidden.plan.unit_actions[hidden.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is not Direction.RIGHT
 
 
 def test_resource_patrol_route_covers_square_without_vision_gaps() -> None:
