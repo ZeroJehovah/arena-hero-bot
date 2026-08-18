@@ -985,7 +985,15 @@ class AggressiveStrategy:
             (-radius, -radius),
             (radius, -radius),
         )
-        dx, dy = offsets[(worker.id.int + phase) % len(offsets)]
+        offset_index = (worker.id.int + phase) % len(offsets)
+        if current is not None and current.purpose == RESOURCE_PATROL_PURPOSE:
+            current_offset = (
+                current.position[0] - core.position[0],
+                current.position[1] - core.position[1],
+            )
+            if current_offset in offsets:
+                offset_index = (offsets.index(current_offset) + 1) % len(offsets)
+        dx, dy = offsets[offset_index]
         goal = UnitGoal(
             position=(core.position[0] + dx, core.position[1] + dy),
             assigned_tick=turn.tick,

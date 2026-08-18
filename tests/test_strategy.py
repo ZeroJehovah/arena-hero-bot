@@ -780,6 +780,33 @@ def test_resource_goal_retargets_distant_worker_to_local_patrol() -> None:
     assert turn.plan.unit_actions[turn.workers[0].id].type == "MOVE"
 
 
+def test_resource_patrol_rotates_immediately_after_reaching_goal() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(resource_target=95, resource_patrol_radius=10)
+    strategy = AggressiveStrategy(memory, config)
+    first = make_turn(
+        tick=160,
+        objects=[core(position=(100, 100)), unit(2, "WORKER", position=(90, 90))],
+    )
+    strategy.decide(first)
+    first_goal = memory.goal_for(object_id(2))
+    assert first_goal is not None
+
+    arrived = make_turn(
+        tick=161,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "WORKER", position=first_goal.position),
+        ],
+    )
+    strategy.decide(arrived)
+    next_goal = memory.goal_for(object_id(2))
+
+    assert next_goal is not None
+    assert next_goal.position != first_goal.position
+    assert arrived.plan.unit_actions[arrived.workers[0].id].type == "MOVE"
+
+
 def test_exploration_goal_remains_stable_across_turns() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)
