@@ -48,6 +48,7 @@ class StrategyConfig:
     resource_target: int = 0
     resource_patrol_radius: int = 30
     enemy_memory_ttl: int = 160
+    enemy_core_memory_ttl: int = 4096
     exploration_goal_ttl: int = 80
     exploration_radius: int = 24
     worker_threat_radius: int = 6
@@ -669,7 +670,7 @@ class AggressiveStrategy:
             enemy.position
             for enemy in self.memory.recent_enemies(
                 context.turn.tick,
-                self.config.enemy_memory_ttl,
+                self.config.enemy_core_memory_ttl,
             )
             if (
                 enemy.kind == "CORE"
@@ -1049,7 +1050,7 @@ class AggressiveStrategy:
             enemy.position
             for enemy in self.memory.recent_enemies(
                 turn.tick,
-                self.config.enemy_memory_ttl,
+                self.config.enemy_core_memory_ttl,
             )
             if enemy.kind == "CORE"
         )
@@ -1136,12 +1137,15 @@ class AggressiveStrategy:
         return any(
             (
                 enemy.kind == "CORE"
-                or enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                or (
+                    enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                    and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
+                )
             )
             and manhattan(turn.core.position, enemy.position) <= local_radius
             for enemy in self.memory.recent_enemies(
                 turn.tick,
-                self.config.enemy_memory_ttl,
+                self.config.enemy_core_memory_ttl,
             )
         )
 
