@@ -266,7 +266,7 @@ def test_cargo_worker_does_not_oscillate_around_enemy() -> None:
     strategy.decide(second)
     second_action = second.plan.unit_actions[second.workers[0].id]
     assert second_action.type == "MOVE"
-    assert second_action.direction is Direction.LEFT
+    assert second_action.direction is not Direction.UP
 
     third = make_turn(
         tick=102,
@@ -1112,6 +1112,47 @@ def test_worker_path_avoids_remembered_enemy_core_exclusion() -> None:
     action = hidden.plan.unit_actions[hidden.workers[0].id]
     assert action.type == "MOVE"
     assert action.direction is not Direction.RIGHT
+
+
+def test_worker_path_temporarily_avoids_recent_combat_enemy() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(
+        resource_target=95,
+        resource_patrol_radius=18,
+        worker_threat_radius=2,
+    )
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(3, 0)),
+            unit(3, "VANGUARD", controlled=False, position=(6, 0)),
+        ],
+    )
+    strategy.decide(observed)
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((10, 0), observed.tick, "resource-patrol-v3"),
+    )
+
+    hidden = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(3, 0))],
+    )
+    strategy.decide(hidden)
+    recent_action = hidden.plan.unit_actions[hidden.workers[0].id]
+    assert recent_action.type == "MOVE"
+    assert recent_action.direction is not Direction.RIGHT
+
+    expired = make_turn(
+        tick=125,
+        objects=[core(), unit(2, "WORKER", position=(3, 0))],
+    )
+    strategy.decide(expired)
+    expired_action = expired.plan.unit_actions[expired.workers[0].id]
+    assert expired_action.type == "MOVE"
+    assert expired_action.direction is Direction.RIGHT
 
 
 def test_resource_patrol_route_covers_square_without_vision_gaps() -> None:

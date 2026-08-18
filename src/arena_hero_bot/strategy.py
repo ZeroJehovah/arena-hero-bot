@@ -752,7 +752,7 @@ class AggressiveStrategy:
         blocked.update(context.occupied)
         blocked.update(context.reserved)
         if isinstance(unit, Worker):
-            blocked.update(self._worker_core_exclusion_cells(context.turn))
+            blocked.update(self._worker_threat_exclusion_cells(context.turn))
         direction = next_step(
             unit.position,
             goal,
@@ -1043,7 +1043,7 @@ class AggressiveStrategy:
             and worker.position != current.position
             and current.position not in self.memory.obstacles
             and current.position not in claimed_positions
-            and not self._near_remembered_enemy_core(current.position, turn)
+            and not self._near_remembered_worker_danger(current.position, turn)
             and manhattan(core.position, current.position)
             <= self.config.resource_patrol_radius * 2
             and turn.tick - current.assigned_tick <= self.config.exploration_goal_ttl
@@ -1075,7 +1075,7 @@ class AggressiveStrategy:
             if (
                 candidate != worker.position
                 and candidate not in claimed_positions
-                and not self._near_remembered_enemy_core(candidate, turn)
+                and not self._near_remembered_worker_danger(candidate, turn)
             ):
                 patrol_position = candidate
                 break
@@ -1088,7 +1088,10 @@ class AggressiveStrategy:
         self.memory.set_goal(unit_id, goal)
         return goal.position
 
-    def _remembered_enemy_core_positions(self, turn: Turn) -> tuple[Position, ...]:
+    def _remembered_worker_danger_positions(
+        self,
+        turn: Turn,
+    ) -> tuple[Position, ...]:
         return tuple(
             enemy.position
             for enemy in self.memory.recent_enemies(
@@ -1096,19 +1099,28 @@ class AggressiveStrategy:
                 self.config.enemy_core_memory_ttl,
             )
             if enemy.kind == "CORE"
+            or (
+                enemy.kind == "UNIT"
+                and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                and turn.tick - enemy.tick <= self.config.worker_threat_memory_ttl
+            )
         )
 
-    def _near_remembered_enemy_core(self, position: Position, turn: Turn) -> bool:
+    def _near_remembered_worker_danger(
+        self,
+        position: Position,
+        turn: Turn,
+    ) -> bool:
         return any(
             manhattan(position, enemy) <= self.config.worker_threat_radius
-            for enemy in self._remembered_enemy_core_positions(turn)
+            for enemy in self._remembered_worker_danger_positions(turn)
         )
 
-    def _worker_core_exclusion_cells(self, turn: Turn) -> set[Position]:
+    def _worker_threat_exclusion_cells(self, turn: Turn) -> set[Position]:
         radius = self.config.worker_threat_radius
         return {
             (center[0] + dx, center[1] + dy)
-            for center in self._remembered_enemy_core_positions(turn)
+            for center in self._remembered_worker_danger_positions(turn)
             for dx in range(-radius, radius + 1)
             for dy in range(-radius, radius + 1)
             if abs(dx) + abs(dy) <= radius
