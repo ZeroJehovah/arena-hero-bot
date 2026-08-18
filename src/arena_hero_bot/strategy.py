@@ -35,7 +35,8 @@ from .memory import EnemySighting, UnitGoal, WorldMemory
 from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
-RESOURCE_PATROL_PURPOSE = "resource-patrol-v2"
+RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
+RESOURCE_PATROL_SPACING = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +46,7 @@ class StrategyConfig:
     target_workers: int = 2
     max_population: int = 12
     resource_target: int = 0
-    resource_patrol_radius: int = 10
+    resource_patrol_radius: int = 18
     enemy_memory_ttl: int = 160
     exploration_goal_ttl: int = 80
     exploration_radius: int = 24
@@ -974,22 +975,16 @@ class AggressiveStrategy:
             return current.position
 
         phase = turn.tick // self.config.exploration_goal_ttl
-        radius = self.config.resource_patrol_radius
-        offsets = (
-            (radius, 0),
-            (0, radius),
-            (-radius, 0),
-            (0, -radius),
-            (radius, radius),
-            (-radius, radius),
-            (-radius, -radius),
-            (radius, -radius),
+        offsets = _resource_patrol_offsets(
+            self.config.resource_patrol_radius,
+            RESOURCE_PATROL_SPACING,
         )
         ordered_workers = sorted(turn.workers, key=lambda item: item.id.bytes)
         worker_index = next(
             index for index, item in enumerate(ordered_workers) if item.id == worker.id
         )
-        offset_index = (worker_index + phase) % len(offsets)
+        worker_spacing = max(1, len(offsets) // len(ordered_workers))
+        offset_index = (worker_index * worker_spacing + phase) % len(offsets)
         if current is not None and current.purpose == RESOURCE_PATROL_PURPOSE:
             current_offset = (
                 current.position[0] - core.position[0],
@@ -1106,3 +1101,16 @@ def _inward_goal(position: Position, distance: int) -> Position:
         return min(0, coordinate + distance)
 
     return inward(position[0]), inward(position[1])
+
+
+def _resource_patrol_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
+    """Return a deterministic sweep route with no gaps in Worker vision."""
+
+    coordinates = list(range(-radius, radius + 1, spacing))
+    if coordinates[-1] != radius:
+        coordinates.append(radius)
+    route: list[Position] = []
+    for row, dy in enumerate(coordinates):
+        columns = coordinates if row % 2 == 0 else reversed(coordinates)
+        route.extend((dx, dy) for dx in columns if (dx, dy) != (0, 0))
+    return tuple(route)

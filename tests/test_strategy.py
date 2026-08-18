@@ -1,10 +1,16 @@
 """Representative aggressive tactic scenarios."""
 
+from itertools import pairwise
+
 from arena_hero import Direction, SpawnAction, UnitType
 
 from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
-from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig
+from arena_hero_bot.strategy import (
+    AggressiveStrategy,
+    StrategyConfig,
+    _resource_patrol_offsets,
+)
 
 from .factories import core, make_turn, object_id, unit
 
@@ -775,8 +781,8 @@ def test_resource_goal_retargets_distant_worker_to_local_patrol() -> None:
 
     goal = memory.goal_for(object_id(2))
     assert goal is not None
-    assert goal.purpose == "resource-patrol-v2"
-    assert manhattan(goal.position, (100, 100)) in {10, 20}
+    assert goal.purpose == "resource-patrol-v3"
+    assert 0 < manhattan(goal.position, (100, 100)) <= 20
     assert turn.plan.unit_actions[turn.workers[0].id].type == "MOVE"
 
 
@@ -831,6 +837,15 @@ def test_resource_patrol_assigns_distinct_initial_sectors() -> None:
         assert goal is not None
         goals.add(goal.position)
     assert len(goals) == 3
+
+
+def test_resource_patrol_route_covers_square_without_vision_gaps() -> None:
+    offsets = _resource_patrol_offsets(radius=18, spacing=6)
+
+    assert len(offsets) == 48
+    assert len(set(offsets)) == len(offsets)
+    assert all(max(abs(x), abs(y)) <= 18 for x, y in offsets)
+    assert all(manhattan(left, right) <= 12 for left, right in pairwise(offsets))
 
 
 def test_exploration_goal_remains_stable_across_turns() -> None:
