@@ -898,6 +898,27 @@ def test_resource_goal_reserves_for_one_guard_then_resumes_workers() -> None:
     assert growing.plan.core_action.unit_type is UnitType.WORKER
 
 
+def test_resource_goal_builds_first_guard_before_full_worker_target() -> None:
+    workers = [unit(number, "WORKER", position=(number, 2)) for number in range(2, 8)]
+    turn = make_turn(
+        resources=10,
+        objects=[core(), *workers],
+    )
+
+    decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=12,
+            max_population=20,
+            resource_target=95,
+        ),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
 def test_resource_goal_remembers_nearby_enemy_core_for_guard_reserve() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(

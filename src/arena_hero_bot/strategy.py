@@ -53,6 +53,7 @@ class StrategyConfig:
     exploration_radius: int = 24
     worker_threat_radius: int = 6
     worker_threat_memory_ttl: int = 24
+    resource_guard_min_workers: int = 6
 
 
 @dataclass(slots=True)
@@ -1186,6 +1187,16 @@ class AggressiveStrategy:
     def _needs_resource_guard(self, turn: Turn) -> bool:
         if self.config.resource_target <= 0 or turn.core is None or turn.vanguards:
             return False
+        # Establish a first combat guard before the economy reaches its full
+        # worker target.  A resource Core can be rushed long before all
+        # workers are online; waiting for a remembered enemy leaves the Core
+        # undefended during that vulnerable growth window.
+        guard_threshold = min(
+            self.config.target_workers,
+            self.config.resource_guard_min_workers,
+        )
+        if len(turn.workers) == guard_threshold:
+            return True
         local_radius = (
             self.config.resource_patrol_radius + self.config.worker_threat_radius
         )
