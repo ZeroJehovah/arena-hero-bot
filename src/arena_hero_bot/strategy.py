@@ -372,6 +372,12 @@ class AggressiveStrategy:
             return
 
         worker_threats = self._worker_threats(worker, context)
+        if (
+            worker.hp <= 1
+            and worker_threats
+            and self._recover_if_critical(worker, maximum_hp=2, context=context)
+        ):
+            return
         if worker.cargo > 0 and worker_threats:
             retreat_goal = core.position
             if (

@@ -189,6 +189,23 @@ def test_worker_retreats_from_nearby_visible_enemy() -> None:
     )
 
 
+def test_critical_worker_returns_to_core_before_retreating_from_threat() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(1, 0)),
+            unit(2, "WORKER", position=(0, 0), hp=1),
+            unit(3, "VANGUARD", controlled=False, position=(0, 5)),
+        ]
+    )
+
+    report = decide(turn)
+
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == str(turn.workers[0].id)
+    )
+    assert worker_decision.reason == "return critical unit to Core for healing"
+
+
 def test_worker_can_retreat_into_core_cell_when_threatened() -> None:
     turn = make_turn(
         objects=[
