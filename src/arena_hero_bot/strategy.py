@@ -1048,12 +1048,12 @@ class AggressiveStrategy:
     def _offensive_patrol_enabled(self, turn: Turn) -> bool:
         """Keep a minority roaming while the Core itself remains safe.
 
-        Core stockpile tiers govern production, not whether combat units can
-        scout.  A stable two-thirds perimeter is still present, so a low
-        resource balance alone must not collapse the one-third patrol squad
-        into an all-``WAIT`` posture.  The patrol is suspended when the Core
-        is damaged or the combat roster is too small to leave a meaningful
-        guard.
+        Core stockpile tiers govern production and high-capacity patrol safety.
+        Small Cores still retain the original minority patrol while they are
+        in the fast-expansion tier, but a large Core below its reserve should
+        not leave combat units exposed far from the recovery point.  The
+        patrol is also suspended when the Core is damaged or the combat roster
+        is too small to leave a meaningful guard.
         """
 
         core = turn.core
@@ -1064,6 +1064,7 @@ class AggressiveStrategy:
             >= self.config.offensive_min_combat_units
             and core.hp >= 5
             and core.shield >= 5
+            and turn.resources >= self._stockpile_target(turn)
         )
 
     def _offensive_enemies(self, turn: Turn) -> tuple[EnemySighting, ...]:
