@@ -11,6 +11,7 @@ from arena_hero import CoreView, Position, Turn, UnitView
 
 SCHEMA_VERSION = 1
 POSITION_HISTORY_LIMIT = 8
+ENEMY_POSITION_HISTORY_LIMIT = 4
 CONTESTED_CELL_TTL = 80
 
 
@@ -67,6 +68,9 @@ class WorldMemory:
 
     obstacles: set[Position] = field(default_factory=set)
     enemies: dict[str, EnemySighting] = field(default_factory=dict)
+    enemy_position_history: dict[str, list[tuple[int, Position]]] = field(
+        default_factory=dict
+    )
     position_history: dict[str, list[Position]] = field(default_factory=dict)
     goals: dict[str, UnitGoal] = field(default_factory=dict)
     pending_move_targets: dict[str, Position] = field(default_factory=dict)
@@ -95,7 +99,12 @@ class WorldMemory:
             if turn.tick - observed_tick <= CONTESTED_CELL_TTL
         }
         for enemy in turn.visible_enemies:
-            self.enemies[str(enemy.id)] = EnemySighting.from_view(enemy, turn.tick)
+            enemy_id = str(enemy.id)
+            self.enemies[enemy_id] = EnemySighting.from_view(enemy, turn.tick)
+            history = self.enemy_position_history.setdefault(enemy_id, [])
+            if not history or history[-1][0] != turn.tick:
+                history.append((turn.tick, enemy.position))
+                del history[:-ENEMY_POSITION_HISTORY_LIMIT]
 
         active_ids = {str(unit.id) for unit in turn.units}
         if turn.core is not None:
@@ -139,6 +148,25 @@ class WorldMemory:
             )
         )
 
+    def predicted_enemy_position(
+        self,
+        enemy_id: str,
+        tick: int,
+    ) -> Position | None:
+        """Predict one cardinal step for an enemy with a stable track."""
+
+        history = self.enemy_position_history.get(enemy_id, [])
+        if len(history) < 2:
+            return None
+        previous_tick, previous = history[-2]
+        current_tick, current = history[-1]
+        if current_tick != tick or current_tick - previous_tick != 1:
+            return None
+        delta = current[0] - previous[0], current[1] - previous[1]
+        if abs(delta[0]) + abs(delta[1]) != 1:
+            return None
+        return current[0] + delta[0], current[1] + delta[1]
+
     def goal_for(self, unit_id: str) -> UnitGoal | None:
         """Return a Unit's current durable exploration goal."""
 
@@ -174,6 +202,13 @@ class WorldMemory:
             "obstacles": sorted([list(position) for position in self.obstacles]),
             "enemies": {
                 key: asdict(value) for key, value in sorted(self.enemies.items())
+            },
+            "enemy_position_history": {
+                key: [
+                    {"tick": tick, "position": list(position)}
+                    for tick, position in value
+                ]
+                for key, value in sorted(self.enemy_position_history.items())
             },
             "position_history": {
                 key: [list(position) for position in value]
@@ -213,6 +248,12 @@ class WorldMemory:
                     shield=_optional_integer(value.get("shield")),
                 )
                 for key, value in raw.get("enemies", {}).items()
+            },
+            enemy_position_history={
+                key: [
+                    (int(item["tick"]), _position(item["position"])) for item in value
+                ]
+                for key, value in raw.get("enemy_position_history", {}).items()
             },
             position_history={
                 key: [_position(position) for position in value]

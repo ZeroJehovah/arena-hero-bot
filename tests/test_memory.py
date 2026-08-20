@@ -68,6 +68,24 @@ def test_enemy_ttl_sorting_and_goal_lifecycle() -> None:
     assert memory.goal_for("unit") is None
 
 
+def test_enemy_track_predicts_one_cardinal_step() -> None:
+    memory = WorldMemory()
+    memory.observe(
+        make_turn(
+            tick=20,
+            objects=[core(), unit(6, "RANGER", controlled=False, position=(0, 4))],
+        )
+    )
+    memory.observe(
+        make_turn(
+            tick=21,
+            objects=[core(), unit(6, "RANGER", controlled=False, position=(0, 3))],
+        )
+    )
+
+    assert memory.predicted_enemy_position(object_id(6), 21) == (0, 2)
+
+
 def test_missing_file_and_unknown_schema(tmp_path) -> None:
     assert WorldMemory.load(tmp_path / "missing.json") == WorldMemory()
     path = tmp_path / "bad.json"

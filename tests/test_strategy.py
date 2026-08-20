@@ -64,6 +64,67 @@ def test_ranger_does_not_shoot_through_remembered_obstacle() -> None:
     assert turn.plan.unit_actions[turn.rangers[0].id].type == "MOVE"
 
 
+def test_ranger_tracks_target_and_leads_one_cell() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 2)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 6)),
+        ],
+    )
+    strategy.decide(first)
+
+    second = make_turn(
+        tick=101,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 2)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 5)),
+        ],
+    )
+    strategy.decide(second)
+
+    action = second.plan.unit_actions[second.rangers[0].id]
+    assert action.type == "SHOOT"
+    assert action.target_id == second.visible_enemies[0].id
+    assert action.expected_cell == (0, 4)
+
+
+def test_emergency_focuses_fire_and_bursts_combat_production() -> None:
+    turn = make_turn(
+        resources=90,
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, 1)),
+            unit(3, "RANGER", position=(0, 2)),
+            unit(4, "VANGUARD", position=(-2, 1)),
+            unit(5, "VANGUARD", position=(2, 1)),
+            unit(6, "VANGUARD", controlled=False, position=(0, 4), hp=1),
+            unit(7, "RANGER", controlled=False, position=(1, 4)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    ranger_actions = [
+        turn.plan.unit_actions[unit.id]
+        for unit in turn.rangers
+        if unit.id in turn.plan.unit_actions
+    ]
+    shoot_actions = [action for action in ranger_actions if action.type == "SHOOT"]
+    assert len(shoot_actions) == len(ranger_actions)
+    assert len({action.target_id for action in shoot_actions}) == 1
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert any(item.action == "SPAWN" for item in report.decisions)
+
+
 def test_vanguard_sweeps_every_adjacent_hostile() -> None:
     turn = make_turn(
         objects=[
