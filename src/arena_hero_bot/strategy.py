@@ -325,6 +325,21 @@ class AggressiveStrategy:
                         target=core.position,
                     )
                 else:
+                    if self._unbounded_growth():
+                        departure_goal = self._resource_patrol_goal(
+                            worker,
+                            context.turn,
+                        )
+                        if departure_goal != worker.position and self._move(
+                            worker,
+                            departure_goal,
+                            context,
+                            reason=(
+                                "clear the full Core cell for safe storage expansion"
+                            ),
+                            allow_goal=True,
+                        ):
+                            return
                     self._record_wait(worker, context, "Core storage is full")
                 return
             allow_core = self._core_has_room_for(worker, context)

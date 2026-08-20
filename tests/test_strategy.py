@@ -848,6 +848,29 @@ def test_unbounded_population_preserves_emergency_resource_reserve() -> None:
     assert turn.plan.core_action is None
 
 
+def test_unbounded_population_clears_full_core_cell_for_expansion() -> None:
+    units = [unit(number, "VANGUARD", position=(number, 2)) for number in range(3, 14)]
+    units.extend(
+        unit(number, "WORKER", position=(number, 3)) for number in range(14, 21)
+    )
+    units.append(unit(2, "WORKER", position=(0, 0), cargo=1))
+    turn = make_turn(resources=95, objects=[core(), *units])
+
+    decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=12,
+            max_population=None,
+            safety_reserve=10,
+        ),
+    )
+
+    worker = next(item for item in turn.workers if str(item.id) == object_id(2))
+    assert turn.plan.unit_actions[worker.id].type == "MOVE"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+
+
 def test_resource_goal_builds_one_capacity_unit_beyond_required_population() -> None:
     units = [unit(number, "WORKER", position=(number, 2)) for number in range(2, 20)]
     turn = make_turn(resources=5, objects=[core(), *units])
