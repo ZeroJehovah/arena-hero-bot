@@ -43,6 +43,7 @@ COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
 VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
+RANGER_STANDOFF_RANGE = 3
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
 CORE_CAPACITY_HIGH_RESERVE = 100
@@ -211,6 +212,24 @@ class AggressiveStrategy:
                     self._enemy_score(item[0], ranger.position, context.turn),
                 ),
             )
+            if isinstance(target, UnitView):
+                standoff = self._ranger_approach_goal(ranger, target, context)
+                if (
+                    standoff is not None
+                    and standoff != ranger.position
+                    and self._ranger_range(ranger.position, target.position)
+                    < RANGER_STANDOFF_RANGE
+                    and self._move(
+                        ranger,
+                        standoff,
+                        context,
+                        reason=(
+                            f"disengage to max-range firing line on "
+                            f"{self._enemy_label(target)}"
+                        ),
+                    )
+                ):
+                    return
             ranger.shoot(target, expected_cell=shot_cell)
             context.report.add(
                 actor_id=str(ranger.id),
@@ -1519,9 +1538,9 @@ class AggressiveStrategy:
             score = 600 + (5 - enemy.hp) * 45 + (5 - min(enemy.shield, 5)) * 10
         else:
             base = {
-                UnitType.WORKER: 220,
-                UnitType.RANGER: 200,
-                UnitType.VANGUARD: 170,
+                UnitType.WORKER: 120,
+                UnitType.RANGER: 260,
+                UnitType.VANGUARD: 190,
             }[enemy.unit_type]
             maximum_hp = {
                 UnitType.WORKER: 2,
@@ -1555,8 +1574,16 @@ class AggressiveStrategy:
             return None
         return min(
             candidates,
-            key=lambda position: (manhattan(ranger.position, position), position),
+            key=lambda position: (
+                -self._ranger_range(position, target.position),
+                manhattan(ranger.position, position),
+                position,
+            ),
         )
+
+    @staticmethod
+    def _ranger_range(origin: Position, target: Position) -> int:
+        return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
     def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
         """Assign every visible resource to the nearest empty Worker."""
