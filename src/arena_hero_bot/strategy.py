@@ -90,6 +90,17 @@ class _TurnContext:
     beacon_claimed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _DefensiveLayout:
+    """A defensive ring layout kept stable while the roster and Core stay put."""
+
+    core_id: UUID
+    core_position: Position
+    guard_ids: tuple[UUID, ...]
+    radius: int
+    assignments: dict[UUID, Position]
+
+
 class AggressiveStrategy:
     """Seek combat early while retaining a minimal resource engine."""
 
@@ -100,6 +111,11 @@ class AggressiveStrategy:
     ) -> None:
         self.memory = memory
         self.config = config or StrategyConfig()
+        # Defensive positions are intentionally strategy state rather than a
+        # per-Tick context value.  Recomputing them from newly observed
+        # obstacle/occupancy cells made guards oscillate between adjacent
+        # radii even when there was no enemy to react to.
+        self._defensive_layout: _DefensiveLayout | None = None
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
@@ -1047,10 +1063,12 @@ class AggressiveStrategy:
 
         The game uses Manhattan vision, so the most useful discrete circle is
         the set of cells at one Manhattan distance from the Core.  A ring at
-        radius ``r`` contains ``8r`` cells.  Each guard covers approximately
-        ``2 * vision`` consecutive ring cells; starting from the largest
-        radius supported by the roster and shrinking only when obstacles make
-        a gap un-coverable gives a stable, count-and-vision-derived perimeter.
+        radius ``r`` contains ``4r`` cells.  Obstacle cells are removed, but
+        the ring is not required to be connected to the Core: guards can walk
+        around an interior obstacle to reach a legal perimeter cell.  Each
+        guard covers approximately ``2 * vision`` consecutive ring cells;
+        shrinking only when visibility gaps cannot be covered gives a stable,
+        count-and-vision-derived perimeter.
         """
 
         core = context.turn.core
@@ -1068,16 +1086,28 @@ class AggressiveStrategy:
             )
         )
         if not guards:
+            self._defensive_layout = None
             return {}
 
         obstacles = set(self.memory.obstacles)
         obstacles.update(context.turn.obstacle_cells)
-        guard_ids = {unit.id for unit in guards}
-        unavailable = set(context.enemy_positions) | set(context.reserved)
+        ordered_guard_ids = tuple(unit.id for unit in guards)
+        cached = self._defensive_layout
+        if (
+            cached is not None
+            and cached.core_id == core.id
+            and cached.core_position == core_position
+            and cached.guard_ids == ordered_guard_ids
+            and not any(slot in obstacles for slot in cached.assignments.values())
+        ):
+            return dict(cached.assignments)
+
+        # Transient unit occupancy is deliberately not a layout constraint.
+        # Workers naturally pass through the perimeter and guards can wait
+        # for a slot to clear; treating those cells as unavailable would make
+        # the radius and cardinal anchors depend on traffic at one Tick.
+        unavailable = set(context.enemy_positions)
         unavailable.add(core.position)
-        unavailable.update(
-            unit.position for unit in context.turn.units if unit.id not in guard_ids
-        )
         visions = {unit.id: _combat_vision_radius(unit) for unit in guards}
         base_radius = max(
             DEFENSIVE_PERIMETER_MIN_RADIUS,
@@ -1089,11 +1119,6 @@ class AggressiveStrategy:
                 (core_position[0] + dx, core_position[1] + dy)
                 for dx, dy in _defensive_ring_offsets(radius)
                 if (core_position[0] + dx, core_position[1] + dy) not in obstacles
-                and _clear_manhattan_path(
-                    core_position,
-                    (core_position[0] + dx, core_position[1] + dy),
-                    obstacles,
-                )
             )
 
         # A Worker or a recently observed hostile can temporarily occupy a
@@ -1113,6 +1138,7 @@ class AggressiveStrategy:
             max_radius += 1
 
         best: dict[UUID, Position] = {}
+        best_radius = max_radius
         for radius in range(max_radius, DEFENSIVE_PERIMETER_MIN_RADIUS - 1, -1):
             coverage_cells = ring_for(radius)
             available = [
@@ -1120,17 +1146,62 @@ class AggressiveStrategy:
             ]
             if len(available) < len(guards):
                 continue
-            assignments = _assign_defensive_ring_slots(available, guards, visions)
+            # Keep the vertical axis covered whenever those cells are
+            # traversable.  Obstacles on a cardinal ring cell are omitted by
+            # ``ring_for`` and therefore do not create an artificial gap.
+            cardinal_positions = tuple(
+                position
+                for dx, dy in (
+                    (0, -radius),
+                    (0, radius),
+                    (radius, 0),
+                    (-radius, 0),
+                )
+                for position in ((core_position[0] + dx, core_position[1] + dy),)
+                if position in available
+            )
+            assignments = _assign_defensive_ring_slots(
+                available,
+                guards,
+                visions,
+                anchor_positions=cardinal_positions,
+            )
+            assignments = _repair_defensive_ring_slots(
+                coverage_cells,
+                available,
+                assignments,
+                visions,
+                obstacles,
+                set(cardinal_positions),
+            )
             if not best:
                 best = assignments
+                best_radius = radius
             if _ring_is_covered(
                 coverage_cells,
                 assignments,
                 visions,
                 obstacles,
             ):
-                return assignments
-        return best
+                self._defensive_layout = _DefensiveLayout(
+                    core_id=core.id,
+                    core_position=core_position,
+                    guard_ids=ordered_guard_ids,
+                    radius=radius,
+                    assignments=dict(assignments),
+                )
+                return dict(assignments)
+        if best:
+            self._defensive_layout = _DefensiveLayout(
+                core_id=core.id,
+                core_position=core_position,
+                guard_ids=ordered_guard_ids,
+                radius=best_radius,
+                assignments=dict(best),
+            )
+        else:
+            self._defensive_layout = None
+        return dict(best)
 
     def _combat_patrol_goal(
         self,
@@ -1709,8 +1780,16 @@ def _assign_defensive_ring_slots(
     cells: list[Position],
     guards: tuple[Ranger | Vanguard, ...],
     visions: dict[UUID, int],
+    *,
+    anchor_positions: tuple[Position, ...] = (),
 ) -> dict[UUID, Position]:
-    """Divide ring cells into vision-sized sectors and pick each sector's center."""
+    """Divide ring cells into vision-sized sectors and pick each sector's center.
+
+    The vertical cardinal cells are reserved first (when supplied by the
+    obstacle-aware ring builder).  This prevents a perfectly covered
+    Manhattan ring from looking open at its top or bottom simply because a
+    sector's mathematical center landed on a diagonal cell.
+    """
 
     ordered = tuple(
         sorted(
@@ -1718,8 +1797,46 @@ def _assign_defensive_ring_slots(
             key=lambda unit: (-visions[unit.id], unit.id.bytes),
         )
     )
-    total_capacity = sum(2 * visions[unit.id] for unit in ordered)
     assignments: dict[UUID, Position] = {}
+    available_anchors = tuple(
+        position for position in anchor_positions if position in cells
+    )
+    anchor_count = min(len(ordered), len(available_anchors))
+    if anchor_count:
+        # Start with evenly spaced ring indices, then replace the nearest
+        # non-anchor slots with the required cardinal cells.  This keeps the
+        # sectors balanced while making the vertical axis explicit.
+        ordered_cells = list(cells)
+        cell_index = {position: index for index, position in enumerate(ordered_cells)}
+        selected = {
+            ordered_cells[(index * len(ordered_cells)) // len(ordered)]
+            for index in range(len(ordered))
+        }
+        fixed = set(available_anchors[:anchor_count])
+        for anchor in available_anchors[:anchor_count]:
+            if anchor in selected:
+                continue
+            anchor_index = cell_index[anchor]
+            replacement = min(
+                (position for position in selected if position not in fixed),
+                key=lambda position: min(
+                    (cell_index[position] - anchor_index) % len(ordered_cells),
+                    (anchor_index - cell_index[position]) % len(ordered_cells),
+                ),
+            )
+            selected.remove(replacement)
+            selected.add(anchor)
+        slots = list(available_anchors[:anchor_count])
+        slots.extend(
+            position
+            for position in ordered_cells
+            if position in selected and position not in fixed
+        )
+        for unit, position in zip(ordered, slots, strict=True):
+            assignments[unit.id] = position
+        return assignments
+
+    total_capacity = sum(2 * visions[unit.id] for unit in ordered)
     cursor = 0
     cumulative_capacity = 0
     for index, unit in enumerate(ordered):
@@ -1733,6 +1850,60 @@ def _assign_defensive_ring_slots(
         center = cursor + (end - cursor - 1) // 2
         assignments[unit.id] = cells[center]
         cursor = end
+    return assignments
+
+
+def _repair_defensive_ring_slots(
+    cells: tuple[Position, ...],
+    available: list[Position],
+    assignments: dict[UUID, Position],
+    visions: dict[UUID, int],
+    obstacles: set[Position],
+    anchors: set[Position],
+) -> dict[UUID, Position]:
+    """Repair a cardinal layout when sector rounding leaves a small gap."""
+
+    if not assignments:
+        return assignments
+    visibility_cache: dict[tuple[Position, int], set[Position]] = {}
+
+    def visible_from(position: Position, vision: int) -> set[Position]:
+        key = position, vision
+        if key not in visibility_cache:
+            visibility_cache[key] = {
+                cell
+                for cell in cells
+                if manhattan(position, cell) <= vision
+                and _clear_manhattan_path(position, cell, obstacles)
+            }
+        return visibility_cache[key]
+
+    def coverage_count(layout: dict[UUID, Position]) -> int:
+        covered: set[Position] = set()
+        for unit_id, position in layout.items():
+            covered.update(visible_from(position, visions[unit_id]))
+        return len(covered)
+
+    current = coverage_count(assignments)
+    while current < len(cells):
+        used = set(assignments.values())
+        best: tuple[int, bytes, Position, UUID] | None = None
+        for unit_id, position in assignments.items():
+            if position in anchors:
+                continue
+            for candidate in available:
+                if candidate in used:
+                    continue
+                trial = dict(assignments)
+                trial[unit_id] = candidate
+                score = coverage_count(trial)
+                choice = (score, unit_id.bytes, candidate, unit_id)
+                if best is None or choice[:3] > best[:3]:
+                    best = choice
+        if best is None or best[0] <= current:
+            break
+        current, _, candidate, unit_id = best
+        assignments[unit_id] = candidate
     return assignments
 
 

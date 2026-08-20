@@ -49,7 +49,10 @@ respectively before paying the next dynamic unit price. It establishes an
 initial combat guard, while a stable minority of Rangers/Vanguards performs a
 bounded outward patrol once the combat roster is large enough. That roaming
 squad is recalled when the Core is damaged or resources approach the active
-stockpile tier.
+stockpile tier. The remaining combat units hold a single obstacle-aware
+Manhattan perimeter: its slots (including traversable upper and lower
+cardinal anchors) stay fixed across Turns, and a guard queues `WAIT` after
+reaching its slot until an enemy or a roster/Core change requires redeployment.
 
 For a long-running local instance that restarts after an unexpected process exit:
 

@@ -1076,6 +1076,83 @@ def test_defensive_guard_waits_explicitly_after_reaching_ring_slot() -> None:
     )
 
 
+def test_defensive_layout_stays_fixed_across_ticks_and_waits_after_arrival() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    first = make_turn(
+        tick=100,
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(10, 10)),
+            unit(3, "VANGUARD", position=(11, 10)),
+            unit(4, "VANGUARD", position=(12, 10)),
+            unit(5, "VANGUARD", position=(13, 10)),
+        ],
+    )
+    first_report = strategy.decide(first)
+    first_slots = {
+        item.actor_id: item.target
+        for item in first_report.decisions
+        if (
+            item.reason == "hold a defensive perimeter around the resource Core"
+            and item.target is not None
+        )
+    }
+
+    arrived = make_turn(
+        tick=101,
+        resources=0,
+        obstacles=[(30, 30)],
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=first_slots[str(object_id(number))])
+                for number in range(2, 6)
+            ],
+        ],
+    )
+    second_report = strategy.decide(arrived)
+    second_slots = {
+        item.actor_id: item.target
+        for item in second_report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    }
+
+    assert second_slots == first_slots
+    assert all(item.action == "WAIT" for item in second_report.decisions)
+    assert all(
+        arrived.plan.unit_actions[guard.id].type == "WAIT"
+        for guard in arrived.vanguards
+    )
+
+
+def test_defensive_layout_keeps_vertical_cardinal_anchors() -> None:
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=(number, 10))
+                for number in range(2, 7)
+            ],
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+    targets = {
+        item.target
+        for item in report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    }
+
+    assert (0, -5) in targets
+    assert (0, 5) in targets
+
+
 def test_defensive_ring_ignores_obstacle_cells_and_keeps_unique_slots() -> None:
     obstacle = (0, -4)
     turn = make_turn(
