@@ -646,13 +646,17 @@ class AggressiveStrategy:
                 target=core.position,
             )
             return
-        if nearby_enemy and core.shield <= 1 and context.remaining_resources > 0:
+        if (
+            (nearby_enemy or (self._unbounded_growth() and context.emergency))
+            and core.shield < 5
+            and context.remaining_resources > 0
+        ):
             core.repair_shield()
             context.report.add(
                 actor_id=str(core.id),
                 actor_kind="CORE",
                 action="REPAIR_SHIELD",
-                reason="repair critical shield under local pressure",
+                reason="repair damaged shield before the next enemy strike",
                 target=core.position,
             )
             return

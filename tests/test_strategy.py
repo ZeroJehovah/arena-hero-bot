@@ -638,6 +638,21 @@ def test_core_prioritizes_survival_under_pressure() -> None:
     assert shield_turn.plan.core_action is not None
     assert shield_turn.plan.core_action.type == "REPAIR_SHIELD"
 
+    early_shield_turn = make_turn(
+        resources=10,
+        objects=[
+            core(shield=4),
+            unit(2, "VANGUARD", controlled=False, position=(2, 0)),
+        ],
+    )
+    early_report = decide(early_shield_turn)
+    assert early_shield_turn.plan.core_action is not None
+    assert early_shield_turn.plan.core_action.type == "REPAIR_SHIELD"
+    assert any(
+        item.reason == "repair damaged shield before the next enemy strike"
+        for item in early_report.decisions
+    )
+
 
 def test_same_tick_deposit_can_fund_core_healing() -> None:
     turn = make_turn(
