@@ -854,7 +854,7 @@ def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
         for number in range(2, 10)
     ]
-    turn = make_turn(resources=15, objects=[core(), *combat_units])
+    turn = make_turn(resources=40, objects=[core(), *combat_units])
 
     report = decide(
         turn,
@@ -878,6 +878,23 @@ def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
     assert len(offensive) == 3
     assert len(defensive) == 5
     assert all(item.target != (0, 0) for item in offensive)
+
+
+def test_unbounded_growth_saves_two_emergency_combat_units_before_expanding() -> None:
+    combat_units = [
+        unit(number, "RANGER", position=(number, 2)) for number in range(2, 32)
+    ]
+    below_reserve = make_turn(resources=73, objects=[core(), *combat_units])
+    at_spawn_threshold = make_turn(resources=74, objects=[core(), *combat_units])
+    config = StrategyConfig(target_workers=0, max_population=None)
+
+    decide(below_reserve, config=config)
+    decide(at_spawn_threshold, config=config)
+
+    assert below_reserve.plan.core_action is None
+    assert at_spawn_threshold.plan.core_action is not None
+    assert at_spawn_threshold.plan.core_action.type == "SPAWN"
+    assert at_spawn_threshold.plan.core_action.unit_type is UnitType.VANGUARD
 
 
 def test_unbounded_growth_recalls_offensive_patrol_when_core_reserve_is_low() -> None:
