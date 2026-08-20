@@ -178,10 +178,15 @@ class AggressiveStrategy:
     ) -> None:
         if self._recover_if_critical(ranger, maximum_hp=2, context=context):
             return
+        visible_enemies = self._visible_combat_targets(
+            ranger,
+            context.turn,
+            offensive=offensive,
+        )
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
         shootable = [
             enemy
-            for enemy in context.turn.visible_enemies
+            for enemy in visible_enemies
             if line_of_fire(ranger.position, enemy.position, obstacles)
         ]
         if shootable:
@@ -203,7 +208,11 @@ class AggressiveStrategy:
 
         if self._pickup_beacon(ranger, context):
             return
-        visible_target = self._best_visible_target(ranger.position, context.turn)
+        visible_target = self._best_visible_target(
+            ranger.position,
+            context.turn,
+            visible_enemies,
+        )
         if visible_target is not None:
             goal = self._ranger_approach_goal(ranger, visible_target, context)
             if goal is not None and self._move(
@@ -217,6 +226,12 @@ class AggressiveStrategy:
         remembered_enemies = (
             self._offensive_enemies(context.turn) if offensive else recent_enemies
         )
+        if not offensive:
+            remembered_enemies = tuple(
+                enemy
+                for enemy in remembered_enemies
+                if self._combat_target_is_local(ranger, enemy.position)
+            )
         remembered = self._best_remembered_target(
             ranger.position,
             remembered_enemies,
@@ -253,8 +268,13 @@ class AggressiveStrategy:
     ) -> None:
         if self._recover_if_critical(vanguard, maximum_hp=4, context=context):
             return
+        visible_enemies = self._visible_combat_targets(
+            vanguard,
+            context.turn,
+            offensive=offensive,
+        )
         adjacent_groups: dict[Direction, list[CoreView | UnitView]] = {}
-        for enemy in context.turn.visible_enemies:
+        for enemy in visible_enemies:
             direction = direction_between(vanguard.position, enemy.position)
             if direction is not None:
                 adjacent_groups.setdefault(direction, []).append(enemy)
@@ -278,7 +298,11 @@ class AggressiveStrategy:
 
         if self._pickup_beacon(vanguard, context):
             return
-        visible_target = self._best_visible_target(vanguard.position, context.turn)
+        visible_target = self._best_visible_target(
+            vanguard.position,
+            context.turn,
+            visible_enemies,
+        )
         if visible_target is not None:
             candidates = [
                 position
@@ -309,6 +333,12 @@ class AggressiveStrategy:
         remembered_enemies = (
             self._offensive_enemies(context.turn) if offensive else recent_enemies
         )
+        if not offensive:
+            remembered_enemies = tuple(
+                enemy
+                for enemy in remembered_enemies
+                if self._combat_target_is_local(vanguard, enemy.position)
+            )
         remembered = self._best_remembered_target(
             vanguard.position,
             remembered_enemies,
@@ -929,9 +959,12 @@ class AggressiveStrategy:
         )
 
     def _best_visible_target(
-        self, origin: Position, turn: Turn
+        self,
+        origin: Position,
+        turn: Turn,
+        enemies: tuple[CoreView | UnitView, ...] | None = None,
     ) -> CoreView | UnitView | None:
-        enemies = turn.visible_enemies
+        enemies = turn.visible_enemies if enemies is None else enemies
         if not enemies:
             return None
         target = max(
@@ -941,6 +974,30 @@ class AggressiveStrategy:
         if target is None:
             return None
         return target
+
+    def _visible_combat_targets(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+        *,
+        offensive: bool,
+    ) -> tuple[CoreView | UnitView, ...]:
+        """Limit defensive reactions to enemies in that guard's local area."""
+
+        if offensive:
+            return turn.visible_enemies
+        return tuple(
+            enemy
+            for enemy in turn.visible_enemies
+            if self._combat_target_is_local(unit, enemy.position)
+        )
+
+    def _combat_target_is_local(
+        self,
+        unit: Ranger | Vanguard,
+        target: Position,
+    ) -> bool:
+        return manhattan(unit.position, target) <= _combat_vision_radius(unit)
 
     def _best_remembered_target(
         self,

@@ -949,6 +949,38 @@ def test_unbounded_growth_keeps_offensive_minority_when_core_reserve_is_low() ->
     )
 
 
+def test_defensive_guards_hold_when_patrol_group_sees_a_distant_enemy() -> None:
+    combat_units = [
+        unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
+        for number in range(2, 10)
+    ]
+    turn = make_turn(
+        resources=2,
+        objects=[
+            core(),
+            *combat_units,
+            unit(20, "WORKER", controlled=False, position=(30, 0)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=0,
+            max_population=None,
+            resource_target=0,
+        ),
+    )
+
+    defensive = [
+        item
+        for item in report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    ]
+    assert len(defensive) == 5
+    assert all(item.action == "MOVE" for item in defensive)
+
+
 def test_dense_core_guard_uses_unique_outer_slots_and_frees_worker_route() -> None:
     guard_positions = [
         (1, -1),
