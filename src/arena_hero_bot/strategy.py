@@ -1970,6 +1970,7 @@ class AggressiveStrategy:
                             unit_type,
                             turn.state.population,
                         ),
+                        available_resources=resources,
                     )
                     <= resources
                 )
@@ -2030,6 +2031,7 @@ class AggressiveStrategy:
         turn: Turn,
         *,
         production_cost: int | None = None,
+        available_resources: int | None = None,
     ) -> int:
         """Keep enough Core resources for a full emergency recovery cycle.
 
@@ -2059,12 +2061,21 @@ class AggressiveStrategy:
             # At an exact capacity-tier boundary, ``reserve + cost`` can be
             # larger than the entire Core.  Permit the smallest transition
             # spend needed to cross that boundary; otherwise a no-cap strategy
-            # would deadlock permanently at capacities 50, 95, or 100.
-            reserve = max(
-                self.config.safety_reserve,
-                missing_recovery,
-                min(reserve, turn.resource_capacity - production_cost),
+            # would deadlock permanently at capacities 50, 95, or 100.  A
+            # freshly respawned Core has capacity 10, where the base reserve
+            # itself would make the first 5-resource Worker impossible to
+            # produce.  Lower that reserve only when the Core can already
+            # afford its full recovery cycle; damaged Cores must still wait
+            # for recovery resources.
+            max_affordable_reserve = max(
+                0,
+                turn.resource_capacity - production_cost,
             )
+            if missing_recovery <= max_affordable_reserve and (
+                available_resources is None
+                or available_resources <= turn.resource_capacity
+            ):
+                reserve = min(reserve, max_affordable_reserve)
         return reserve
 
     def _stockpile_target(self, turn: Turn) -> int:

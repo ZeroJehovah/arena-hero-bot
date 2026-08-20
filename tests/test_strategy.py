@@ -1099,6 +1099,22 @@ def test_unbounded_growth_crosses_a_stockpile_boundary_without_deadlocking() -> 
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
+def test_unbounded_growth_recovers_from_minimum_respawn_capacity() -> None:
+    turn = make_turn(
+        resources=10,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+    )
+
+    decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
 def test_unbounded_growth_keeps_offensive_minority_when_core_reserve_is_low() -> None:
     combat_units = [
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
