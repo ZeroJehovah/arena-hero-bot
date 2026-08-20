@@ -905,6 +905,57 @@ def test_unbounded_growth_recalls_offensive_patrol_when_core_reserve_is_low() ->
     ) == len(combat_units)
 
 
+def test_dense_core_guard_uses_unique_outer_slots_and_frees_worker_route() -> None:
+    guard_positions = [
+        (1, -1),
+        (1, 0),
+        (1, 1),
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 2),
+        (2, 0),
+        (-2, 0),
+        (2, 2),
+    ]
+    guards = [
+        unit(number, "VANGUARD", position=position)
+        for number, position in enumerate(guard_positions, start=2)
+    ]
+    worker = unit(30, "WORKER", position=(0, 1))
+    turn = make_turn(resources=14, objects=[core(), *guards, worker])
+
+    report = decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=0,
+            max_population=None,
+            resource_target=0,
+        ),
+    )
+
+    defensive = [
+        item
+        for item in report.decisions
+        if item.actor_kind == "VANGUARD"
+        and item.reason == "hold a defensive perimeter around the resource Core"
+    ]
+    assert len(defensive) == len(guards)
+    assert len({item.target for item in defensive}) == len(defensive)
+    assert all(
+        max(abs(item.target[0]), abs(item.target[1])) >= 3
+        for item in defensive
+        if item.target is not None
+    )
+
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == str(turn.workers[0].id)
+    )
+    assert worker_decision.action == "MOVE"
+    assert worker_decision.reason == "patrol near the stationary Core for resources"
+
+
 def test_offensive_patrol_pursues_a_recently_seen_enemy_core() -> None:
     combat_units = [
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))

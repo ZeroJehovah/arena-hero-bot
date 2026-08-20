@@ -39,6 +39,8 @@ RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
+DEFENSIVE_PERIMETER_SPACING = 2
+DEFENSIVE_PERIMETER_MIN_RADIUS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,6 +853,14 @@ class AggressiveStrategy:
         unit.move(direction)
         self.memory.pending_move_targets[str(unit.id)] = destination
         context.reserved.add(destination)
+        # A queued move vacates the unit's current cell for the rest of this
+        # plan.  Keeping every origin in ``occupied`` made a dense defensive
+        # cluster behave like a solid wall: no guard could step through the
+        # cells that another guard was leaving, and nearby Workers could stay
+        # trapped indefinitely.  The Core itself remains occupied even when
+        # a unit departs from its cell.
+        if context.turn.core is None or unit.position != context.turn.core.position:
+            context.occupied.discard(unit.position)
         if (
             context.turn.core is not None
             and unit.position == context.turn.core.position
@@ -981,17 +991,34 @@ class AggressiveStrategy:
             return self._combat_patrol_goal(unit, turn)
         if not self._preserves_resources() or turn.core is None:
             return turn.beacon.position, "advance toward the public Beacon battle zone"
-        offsets = (
-            (0, -2),
-            (2, 0),
-            (0, 2),
-            (-2, 0),
-            (1, -1),
-            (1, 1),
-            (-1, 1),
-            (-1, -1),
+        guards = sorted(
+            (
+                item
+                for item in (*turn.rangers, *turn.vanguards)
+                if not self._is_offensive_combat_unit(item, turn)
+            ),
+            key=lambda item: item.id.bytes,
         )
-        dx, dy = offsets[unit.id.int % len(offsets)]
+        # Keep the guard ring outside the Core's immediate neighboring cells.
+        # The old eight-cell, radius-two ring was too small once the live
+        # roster grew: multiple Vanguards claimed the same cells and blocked
+        # Workers trying to leave or return to the Core.
+        radius = DEFENSIVE_PERIMETER_MIN_RADIUS
+        offsets = _defensive_perimeter_offsets(
+            radius,
+            DEFENSIVE_PERIMETER_SPACING,
+        )
+        while len(offsets) < len(guards):
+            radius += 1
+            offsets = _defensive_perimeter_offsets(
+                radius,
+                DEFENSIVE_PERIMETER_SPACING,
+            )
+        guard_index = next(
+            (index for index, item in enumerate(guards) if item.id == unit.id),
+            unit.id.int % len(offsets),
+        )
+        dx, dy = offsets[guard_index]
         return (
             (turn.core.position[0] + dx, turn.core.position[1] + dy),
             "hold a defensive perimeter around the resource Core",
@@ -1504,3 +1531,17 @@ def _resource_patrol_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
         columns = coordinates if row % 2 == 0 else reversed(coordinates)
         route.extend((dx, dy) for dx in columns if (dx, dy) != (0, 0))
     return tuple(route)
+
+
+def _defensive_perimeter_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
+    """Return unique cells on a sparse square ring around the Core."""
+
+    coordinates = list(range(-radius, radius + 1, spacing))
+    if coordinates[-1] != radius:
+        coordinates.append(radius)
+    return tuple(
+        (dx, dy)
+        for dy in coordinates
+        for dx in coordinates
+        if max(abs(dx), abs(dy)) == radius
+    )
