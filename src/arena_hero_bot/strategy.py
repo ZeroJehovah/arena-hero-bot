@@ -43,6 +43,9 @@ COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
 VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
+CORE_CAPACITY_FAST_EXPANSION = 50
+CORE_CAPACITY_MEDIUM_RESERVE = 95
+CORE_CAPACITY_HIGH_RESERVE = 150
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +61,6 @@ class StrategyConfig:
     max_population: int | None = 12
     resource_target: int = 0
     safety_reserve: int = 10
-    emergency_combat_reserve_units: int = 2
     resource_patrol_radius: int = 30
     offensive_patrol_radius: int = 60
     offensive_patrol_goal_ttl: int = 160
@@ -1566,12 +1568,12 @@ class AggressiveStrategy:
     def _spawn_safety_reserve(self, turn: Turn) -> int:
         """Keep enough Core resources for a full emergency recovery cycle.
 
-        The reserve is only added by the unbounded live mode.  Explicit legacy
+        The reserve is only added by the unbounded live mode. Explicit legacy
         resource-target configurations retain their historical exact-cost
-        behavior so callers can reproduce prior experiments.  In the live
-        mode, the reserve also covers two of the most expensive combat units at
-        the current population, so expansion cannot consume the stockpile that
-        would be needed to answer a sudden attack.
+        behavior so callers can reproduce prior experiments. In the live mode,
+        the stockpile follows the Core capacity tiers used by the shop: small
+        Cores expand quickly, then preserve 50, 95, or 150 resources as storage
+        grows. The base reserve and any missing recovery resources always win.
         """
 
         if not self._unbounded_growth():
@@ -1580,19 +1582,24 @@ class AggressiveStrategy:
         if core is None:
             return max(0, self.config.safety_reserve)
         missing_recovery = max(0, 5 - core.hp) + max(0, 5 - core.shield)
-        combat_unit_cost = max(
-            unit_cost(UnitType.VANGUARD, turn.state.population),
-            unit_cost(UnitType.RANGER, turn.state.population),
-        )
-        combat_reserve = max(0, self.config.emergency_combat_reserve_units) * (
-            combat_unit_cost
-        )
         return max(
             0,
             self.config.safety_reserve,
             missing_recovery,
-            combat_reserve,
+            self._stockpile_target(turn),
         )
+
+    def _stockpile_target(self, turn: Turn) -> int:
+        """Return the shop-aligned live stockpile target for Core capacity."""
+
+        capacity = turn.resource_capacity
+        if capacity < CORE_CAPACITY_FAST_EXPANSION:
+            return 0
+        if capacity < CORE_CAPACITY_MEDIUM_RESERVE:
+            return 50
+        if capacity < CORE_CAPACITY_HIGH_RESERVE:
+            return 95
+        return 150
 
     def _unbounded_growth(self) -> bool:
         """Return whether the live strategy has no fixed population/stockpile goal."""

@@ -813,7 +813,7 @@ def test_population_cap_stops_production() -> None:
 
 def test_unbounded_population_keeps_expanding_past_legacy_cap() -> None:
     units = [unit(number, "RANGER", position=(number, 2)) for number in range(2, 22)]
-    turn = make_turn(resources=100, objects=[core(), *units])
+    turn = make_turn(resources=120, objects=[core(), *units])
 
     decide(
         turn,
@@ -854,7 +854,7 @@ def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
         for number in range(2, 10)
     ]
-    turn = make_turn(resources=40, objects=[core(), *combat_units])
+    turn = make_turn(resources=15, objects=[core(), *combat_units])
 
     report = decide(
         turn,
@@ -880,21 +880,27 @@ def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
     assert all(item.target != (0, 0) for item in offensive)
 
 
-def test_unbounded_growth_saves_two_emergency_combat_units_before_expanding() -> None:
-    combat_units = [
-        unit(number, "RANGER", position=(number, 2)) for number in range(2, 32)
-    ]
-    below_reserve = make_turn(resources=73, objects=[core(), *combat_units])
-    at_spawn_threshold = make_turn(resources=74, objects=[core(), *combat_units])
-    config = StrategyConfig(target_workers=0, max_population=None)
+def test_unbounded_growth_uses_shop_aligned_capacity_stockpile_tiers() -> None:
+    strategy = AggressiveStrategy(
+        WorldMemory(),
+        StrategyConfig(target_workers=0, max_population=None),
+    )
 
-    decide(below_reserve, config=config)
-    decide(at_spawn_threshold, config=config)
+    def reserve_for_population(population: int) -> int:
+        units = [
+            unit(number, "WORKER", position=(number, 2))
+            for number in range(2, population + 2)
+        ]
+        turn = make_turn(objects=[core(), *units])
+        return strategy._spawn_safety_reserve(turn)
 
-    assert below_reserve.plan.core_action is None
-    assert at_spawn_threshold.plan.core_action is not None
-    assert at_spawn_threshold.plan.core_action.type == "SPAWN"
-    assert at_spawn_threshold.plan.core_action.unit_type is UnitType.VANGUARD
+    assert reserve_for_population(8) == 10  # capacity 40: fast expansion
+    assert reserve_for_population(10) == 50  # capacity 50
+    assert reserve_for_population(18) == 50  # capacity 90
+    assert reserve_for_population(19) == 95  # capacity 95
+    assert reserve_for_population(29) == 95  # capacity 145
+    assert reserve_for_population(30) == 150  # capacity 150
+    assert reserve_for_population(31) == 150  # capacity 155
 
 
 def test_unbounded_growth_recalls_offensive_patrol_when_core_reserve_is_low() -> None:
@@ -1127,7 +1133,7 @@ def test_unbounded_population_clears_full_core_cell_for_expansion() -> None:
         unit(number, "WORKER", position=(number, 3)) for number in range(14, 21)
     )
     units.append(unit(2, "WORKER", position=(0, 0), cargo=1))
-    turn = make_turn(resources=95, objects=[core(), *units])
+    turn = make_turn(resources=130, objects=[core(), *units])
 
     decide(
         turn,

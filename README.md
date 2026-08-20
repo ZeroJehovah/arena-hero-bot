@@ -42,14 +42,14 @@ Run safety-first growth without a fixed population cap or Core resource target:
 uv run arena-hero-bot --target-workers 12 --no-max-population
 ```
 
-The unbounded live posture keeps a dynamic emergency reserve: at least the
-configured base reserve and enough for two of the most expensive combat units
-at the current population. It establishes an initial combat guard and only
-expands when the dynamic unit price can be paid without spending that reserve.
-Workers patrol the local resource grid; once the combat roster is large enough,
-a stable minority of Rangers/Vanguards performs a bounded outward patrol and
-pursues recently seen enemy units or Cores. That roaming squad is recalled when
-the Core is damaged or resources approach the reserve.
+The unbounded live posture uses shop-aligned stockpile tiers. With Core
+capacity below 50 it expands quickly while keeping the base emergency reserve;
+at capacities 50–94, 95–149, and 150+ it preserves 50, 95, and 150 resources
+respectively before paying the next dynamic unit price. It establishes an
+initial combat guard, while a stable minority of Rangers/Vanguards performs a
+bounded outward patrol once the combat roster is large enough. That roaming
+squad is recalled when the Core is damaged or resources approach the active
+stockpile tier.
 
 For a long-running local instance that restarts after an unexpected process exit:
 
