@@ -44,6 +44,7 @@ DEFENSIVE_PERIMETER_MIN_RADIUS = 2
 VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
 RANGER_STANDOFF_RANGE = 3
+CORE_ESCAPE_MIN_ENEMIES = 4
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
 CORE_CAPACITY_HIGH_RESERVE = 100
@@ -361,6 +362,21 @@ class AggressiveStrategy:
                 visible_enemies,
             )
         if visible_target is not None:
+            if (
+                context.focus_target is not None
+                and visible_target.id == context.focus_target.id
+            ):
+                goal = self._vanguard_block_goal(vanguard, visible_target, context)
+                if goal is not None and self._move(
+                    vanguard,
+                    goal,
+                    context,
+                    reason=(
+                        f"close escape routes around "
+                        f"{self._enemy_label(visible_target)}"
+                    ),
+                ):
+                    return
             candidates = [
                 position
                 for position in adjacent_positions(visible_target.position)
@@ -420,6 +436,45 @@ class AggressiveStrategy:
             context,
             reason=reason,
             wait_at_goal=not offensive and self._preserves_resources(),
+        )
+
+    def _vanguard_block_goal(
+        self,
+        vanguard: Vanguard,
+        target: CoreView | UnitView,
+        context: _TurnContext,
+    ) -> Position | None:
+        """Assign the focus target's adjacent escape cells across Vanguards."""
+
+        slots = [
+            position
+            for position in adjacent_positions(target.position)
+            if position not in self.memory.obstacles
+            and position not in context.turn.obstacle_cells
+            and position not in context.enemy_positions
+            and position not in context.occupied | context.reserved
+        ]
+        if not slots:
+            return None
+        ordered_vanguards = sorted(
+            context.turn.vanguards,
+            key=lambda unit: unit.id.bytes,
+        )
+        index = next(
+            index
+            for index, unit in enumerate(ordered_vanguards)
+            if unit.id == vanguard.id
+        )
+        preferred = adjacent_positions(target.position)
+        rotation = index % len(preferred)
+        rotated = preferred[rotation:] + preferred[:rotation]
+        return min(
+            slots,
+            key=lambda position: (
+                next(slot for slot, cell in enumerate(rotated) if cell == position),
+                manhattan(vanguard.position, position),
+                position,
+            ),
         )
 
     def _decide_worker(self, worker: Worker, context: _TurnContext) -> None:
@@ -636,6 +691,32 @@ class AggressiveStrategy:
             manhattan(core.position, enemy.position) <= 4
             for enemy in context.turn.visible_enemies
         )
+        nearby_combat_enemies = tuple(
+            enemy
+            for enemy in context.turn.visible_enemies
+            if isinstance(enemy, CoreView)
+            or (
+                enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and manhattan(core.position, enemy.position) <= 4
+            )
+        )
+        combat_units = len(context.turn.rangers) + len(context.turn.vanguards)
+        overwhelmed = nearby_enemy and (
+            len(nearby_combat_enemies) >= max(CORE_ESCAPE_MIN_ENEMIES, combat_units + 1)
+            or (core.shield <= 2 and len(nearby_combat_enemies) >= 2)
+        )
+        if overwhelmed:
+            direction = self._core_escape_direction(context, nearby_combat_enemies)
+            if direction is not None:
+                core.start_move(direction)
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="START_MOVE",
+                    reason="evacuate Core from overwhelming enemy assault",
+                    target=add(core.position, direction),
+                )
+                return
         if core.hp <= 2 and context.remaining_resources > 0:
             core.heal()
             context.report.add(
@@ -1630,6 +1711,39 @@ class AggressiveStrategy:
             recent=self.memory.recent_positions(str(core.id)),
             direction_offset=self._direction_offset(core.id),
         )
+
+    def _core_escape_direction(
+        self,
+        context: _TurnContext,
+        enemies: tuple[CoreView | UnitView, ...],
+    ) -> Direction | None:
+        core = context.turn.core
+        if core is None:
+            return None
+        blocked = (
+            self.memory.obstacles
+            | set(context.turn.obstacle_cells)
+            | set(context.turn.resource_cells)
+            | context.occupied
+            | context.reserved
+        )
+        enemy_positions = {enemy.position for enemy in enemies}
+        candidates = [
+            (direction, add(core.position, direction))
+            for direction in DIRECTIONS
+            if add(core.position, direction) not in blocked
+            and add(core.position, direction) not in enemy_positions
+        ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: (
+                min(manhattan(item[1], enemy.position) for enemy in enemies),
+                sum(manhattan(item[1], enemy.position) for enemy in enemies),
+                item[1],
+            ),
+        )[0]
 
     def _exploration_goal(self, worker: Worker, tick: int) -> Position:
         unit_id = str(worker.id)

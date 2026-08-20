@@ -151,6 +151,51 @@ def test_vanguard_sweeps_every_adjacent_hostile() -> None:
     assert action.direction is Direction.RIGHT
 
 
+def test_vanguards_spread_across_focus_target_escape_routes() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "VANGUARD", position=(-3, 0)),
+            unit(3, "VANGUARD", position=(3, 0)),
+            unit(4, "VANGUARD", position=(0, -3)),
+            unit(5, "VANGUARD", position=(0, 3)),
+            unit(6, "RANGER", controlled=False, position=(0, 0)),
+            unit(7, "VANGUARD", controlled=False, position=(0, 5)),
+        ],
+    )
+
+    decide(turn)
+
+    goals = []
+    for vanguard in turn.vanguards:
+        action = turn.plan.unit_actions[vanguard.id]
+        if action.type == "MOVE":
+            dx, dy = action.direction.delta
+            goals.append((vanguard.position[0] + dx, vanguard.position[1] + dy))
+    assert len(goals) == len(set(goals))
+
+
+def test_core_evacuates_when_combat_group_is_overwhelmed() -> None:
+    turn = make_turn(
+        resources=10,
+        objects=[
+            core(position=(0, 0), shield=4),
+            unit(2, "VANGUARD", position=(0, 5)),
+            unit(3, "RANGER", controlled=False, position=(0, 1)),
+            unit(4, "RANGER", controlled=False, position=(1, 1)),
+            unit(5, "RANGER", controlled=False, position=(-1, 1)),
+            unit(6, "VANGUARD", controlled=False, position=(1, 0)),
+            unit(7, "VANGUARD", controlled=False, position=(-1, 0)),
+        ],
+    )
+
+    report = decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert any("overwhelming enemy assault" in item.reason for item in report.decisions)
+
+
 def test_worker_harvests_then_returns_cargo() -> None:
     harvesting = make_turn(
         objects=[core(), unit(2, "WORKER", position=(1, 0))],
