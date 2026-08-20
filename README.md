@@ -43,8 +43,12 @@ uv run arena-hero-bot --target-workers 12 --no-max-population
 ```
 
 The unbounded live posture keeps a 10-resource emergency reserve, establishes
-an initial combat guard, patrols near the Core, and keeps expanding whenever
-the current dynamic unit price can be paid without spending that reserve.
+an initial combat guard, and keeps expanding whenever the current dynamic unit
+price can be paid without spending that reserve. Workers patrol the local
+resource grid; once the combat roster is large enough, a stable minority of
+Rangers/Vanguards performs a bounded outward patrol and pursues recently seen
+enemy units or Cores. That roaming squad is recalled when the Core is damaged
+or resources approach the reserve.
 
 For a long-running local instance that restarts after an unexpected process exit:
 

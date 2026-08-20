@@ -36,7 +36,9 @@ from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
+COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_PATROL_SPACING = 6
+COMBAT_PATROL_SPACING = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +55,10 @@ class StrategyConfig:
     resource_target: int = 0
     safety_reserve: int = 10
     resource_patrol_radius: int = 30
+    offensive_patrol_radius: int = 60
+    offensive_patrol_goal_ttl: int = 160
+    offensive_core_memory_ttl: int = 512
+    offensive_min_combat_units: int = 8
     enemy_memory_ttl: int = 160
     enemy_core_memory_ttl: int = 4096
     exploration_goal_ttl: int = 80
@@ -116,9 +122,19 @@ class AggressiveStrategy:
         )
 
         for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
-            self._decide_ranger(ranger, context, tactical_enemies)
+            self._decide_ranger(
+                ranger,
+                context,
+                tactical_enemies,
+                offensive=self._is_offensive_combat_unit(ranger, turn),
+            )
         for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
-            self._decide_vanguard(vanguard, context, tactical_enemies)
+            self._decide_vanguard(
+                vanguard,
+                context,
+                tactical_enemies,
+                offensive=self._is_offensive_combat_unit(vanguard, turn),
+            )
         core_position = turn.core.position if turn.core is not None else None
         for worker in sorted(
             turn.workers,
@@ -133,6 +149,8 @@ class AggressiveStrategy:
         ranger: Ranger,
         context: _TurnContext,
         recent_enemies: tuple[EnemySighting, ...],
+        *,
+        offensive: bool = False,
     ) -> None:
         if self._recover_if_critical(ranger, maximum_hp=2, context=context):
             return
@@ -172,7 +190,13 @@ class AggressiveStrategy:
             ):
                 return
 
-        remembered = self._best_remembered_target(ranger.position, recent_enemies)
+        remembered_enemies = (
+            self._offensive_enemies(context.turn) if offensive else recent_enemies
+        )
+        remembered = self._best_remembered_target(
+            ranger.position,
+            remembered_enemies,
+        )
         if remembered is not None and self._move(
             ranger,
             remembered.position,
@@ -181,7 +205,11 @@ class AggressiveStrategy:
         ):
             return
 
-        goal, reason = self._idle_combat_goal(ranger, context.turn)
+        goal, reason = self._idle_combat_goal(
+            ranger,
+            context.turn,
+            offensive=offensive,
+        )
         self._move_or_wait(ranger, goal, context, reason=reason)
 
     def _decide_vanguard(
@@ -189,6 +217,8 @@ class AggressiveStrategy:
         vanguard: Vanguard,
         context: _TurnContext,
         recent_enemies: tuple[EnemySighting, ...],
+        *,
+        offensive: bool = False,
     ) -> None:
         if self._recover_if_critical(vanguard, maximum_hp=4, context=context):
             return
@@ -245,7 +275,13 @@ class AggressiveStrategy:
                 ):
                     return
 
-        remembered = self._best_remembered_target(vanguard.position, recent_enemies)
+        remembered_enemies = (
+            self._offensive_enemies(context.turn) if offensive else recent_enemies
+        )
+        remembered = self._best_remembered_target(
+            vanguard.position,
+            remembered_enemies,
+        )
         if remembered is not None and self._move(
             vanguard,
             remembered.position,
@@ -254,7 +290,11 @@ class AggressiveStrategy:
         ):
             return
 
-        goal, reason = self._idle_combat_goal(vanguard, context.turn)
+        goal, reason = self._idle_combat_goal(
+            vanguard,
+            context.turn,
+            offensive=offensive,
+        )
         self._move_or_wait(vanguard, goal, context, reason=reason)
 
     def _decide_worker(self, worker: Worker, context: _TurnContext) -> None:
@@ -880,11 +920,65 @@ class AggressiveStrategy:
             <= self.config.worker_threat_radius * 2
         )
 
+    def _is_offensive_combat_unit(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+    ) -> bool:
+        """Assign a stable minority of combat units to the roaming squad."""
+
+        if not self._offensive_patrol_enabled(turn):
+            return False
+        # UUID assignment keeps roles stable across ticks without adding
+        # private state.  With the live roster this sends roughly one third
+        # of Rangers/Vanguards away while leaving a substantial Core guard.
+        return unit.id.int % 3 == 0
+
+    def _offensive_patrol_enabled(self, turn: Turn) -> bool:
+        """Allow roaming combat only while the economy can absorb the risk."""
+
+        core = turn.core
+        return (
+            self._unbounded_growth()
+            and core is not None
+            and len(turn.vanguards) + len(turn.rangers)
+            >= self.config.offensive_min_combat_units
+            and turn.resources >= self.config.safety_reserve + 5
+            and core.hp >= 5
+            and core.shield >= 5
+        )
+
+    def _offensive_enemies(self, turn: Turn) -> tuple[EnemySighting, ...]:
+        """Return recent targets suitable for a roaming squad to pursue."""
+
+        if not self._offensive_patrol_enabled(turn):
+            return ()
+        enemies = self.memory.recent_enemies(
+            turn.tick,
+            self.config.enemy_core_memory_ttl,
+        )
+        return tuple(
+            enemy
+            for enemy in enemies
+            if (
+                enemy.kind == "CORE"
+                and turn.tick - enemy.tick <= self.config.offensive_core_memory_ttl
+            )
+            or (
+                enemy.kind == "UNIT"
+                and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
+            )
+        )
+
     def _idle_combat_goal(
         self,
         unit: Ranger | Vanguard,
         turn: Turn,
+        *,
+        offensive: bool = False,
     ) -> tuple[Position, str]:
+        if offensive and self._offensive_patrol_enabled(turn):
+            return self._combat_patrol_goal(unit, turn)
         if not self._preserves_resources() or turn.core is None:
             return turn.beacon.position, "advance toward the public Beacon battle zone"
         offsets = (
@@ -902,6 +996,82 @@ class AggressiveStrategy:
             (turn.core.position[0] + dx, turn.core.position[1] + dy),
             "hold a defensive perimeter around the resource Core",
         )
+
+    def _combat_patrol_goal(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+    ) -> tuple[Position, str]:
+        """Choose a stable outward search point for one roaming combat unit."""
+
+        core = turn.core
+        if core is None:
+            return unit.position, "no Core available for offensive patrol"
+        unit_id = str(unit.id)
+        current = self.memory.goal_for(unit_id)
+        claimed_positions = {
+            goal.position
+            for other in (*turn.rangers, *turn.vanguards)
+            if other.id != unit.id
+            if (goal := self.memory.goal_for(str(other.id))) is not None
+            and goal.purpose == COMBAT_PATROL_PURPOSE
+        }
+        if (
+            current is not None
+            and current.purpose == COMBAT_PATROL_PURPOSE
+            and unit.position != current.position
+            and current.position not in self.memory.obstacles
+            and current.position not in claimed_positions
+            and manhattan(core.position, current.position)
+            <= self.config.offensive_patrol_radius * 2
+            and turn.tick - current.assigned_tick
+            <= self.config.offensive_patrol_goal_ttl
+        ):
+            return current.position, "search outward for enemy units and Cores"
+
+        offsets = _resource_patrol_offsets(
+            self.config.offensive_patrol_radius,
+            COMBAT_PATROL_SPACING,
+        )
+        combat_units = sorted(
+            (*turn.rangers, *turn.vanguards),
+            key=lambda item: item.id.bytes,
+        )
+        unit_index = next(
+            index for index, item in enumerate(combat_units) if item.id == unit.id
+        )
+        phase = turn.tick // self.config.offensive_patrol_goal_ttl
+        unit_spacing = max(1, len(offsets) // len(combat_units))
+        offset_index = (unit_index * unit_spacing + phase) % len(offsets)
+        if current is not None and current.purpose == COMBAT_PATROL_PURPOSE:
+            current_offset = (
+                current.position[0] - core.position[0],
+                current.position[1] - core.position[1],
+            )
+            if current_offset in offsets:
+                offset_index = (offsets.index(current_offset) + unit_spacing) % len(
+                    offsets
+                )
+
+        patrol_position = core.position
+        for step in range(len(offsets)):
+            dx, dy = offsets[(offset_index + step) % len(offsets)]
+            candidate = core.position[0] + dx, core.position[1] + dy
+            if (
+                candidate != unit.position
+                and candidate not in self.memory.obstacles
+                and candidate not in claimed_positions
+            ):
+                patrol_position = candidate
+                break
+        goal = UnitGoal(
+            position=patrol_position,
+            assigned_tick=turn.tick,
+            purpose=COMBAT_PATROL_PURPOSE,
+            last_progress_position=unit.position,
+        )
+        self.memory.set_goal(unit_id, goal)
+        return patrol_position, "search outward for enemy units and Cores"
 
     def _enemy_score(
         self,

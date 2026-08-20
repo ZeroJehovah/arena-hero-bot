@@ -848,6 +848,94 @@ def test_unbounded_population_preserves_emergency_resource_reserve() -> None:
     assert turn.plan.core_action is None
 
 
+def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
+    combat_units = [
+        unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
+        for number in range(2, 10)
+    ]
+    turn = make_turn(resources=15, objects=[core(), *combat_units])
+
+    report = decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=0,
+            max_population=None,
+            resource_target=0,
+        ),
+    )
+
+    offensive = [
+        item
+        for item in report.decisions
+        if item.reason == "search outward for enemy units and Cores"
+    ]
+    defensive = [
+        item
+        for item in report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    ]
+    assert len(offensive) == 3
+    assert len(defensive) == 5
+    assert all(item.target != (0, 0) for item in offensive)
+
+
+def test_unbounded_growth_recalls_offensive_patrol_when_core_reserve_is_low() -> None:
+    combat_units = [
+        unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
+        for number in range(2, 10)
+    ]
+    turn = make_turn(resources=14, objects=[core(), *combat_units])
+
+    report = decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=0,
+            max_population=None,
+            resource_target=0,
+        ),
+    )
+
+    assert not any(
+        item.reason == "search outward for enemy units and Cores"
+        for item in report.decisions
+    )
+    assert sum(
+        item.reason == "hold a defensive perimeter around the resource Core"
+        for item in report.decisions
+    ) == len(combat_units)
+
+
+def test_offensive_patrol_pursues_a_recently_seen_enemy_core() -> None:
+    combat_units = [
+        unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
+        for number in range(2, 10)
+    ]
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=0, max_population=None, resource_target=0),
+    )
+    observed = make_turn(
+        tick=100,
+        resources=15,
+        objects=[
+            core(),
+            *combat_units,
+            core(20, controlled=False, owner_username="rival", position=(10, 0)),
+        ],
+    )
+    strategy.decide(observed)
+
+    hidden = make_turn(
+        tick=101,
+        resources=15,
+        objects=[core(), *combat_units],
+    )
+    report = strategy.decide(hidden)
+
+    assert any(item.reason == "hunt last seen core" for item in report.decisions)
+
+
 def test_unbounded_population_clears_full_core_cell_for_expansion() -> None:
     units = [unit(number, "VANGUARD", position=(number, 2)) for number in range(3, 14)]
     units.extend(
