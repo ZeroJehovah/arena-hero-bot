@@ -1069,6 +1069,7 @@ def test_defensive_guard_waits_explicitly_after_reaching_ring_slot() -> None:
         arrived.plan.unit_actions[guard.id].type == "WAIT"
         for guard in arrived.vanguards
     )
+
     assert all(
         item.action == "WAIT"
         and item.reason == "hold a defensive perimeter around the resource Core"
@@ -1125,6 +1126,26 @@ def test_defensive_layout_stays_fixed_across_ticks_and_waits_after_arrival() -> 
         arrived.plan.unit_actions[guard.id].type == "WAIT"
         for guard in arrived.vanguards
     )
+
+    settled = make_turn(
+        tick=102,
+        resources=0,
+        obstacles=[(31, 31)],
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=first_slots[str(object_id(number))])
+                for number in range(2, 6)
+            ],
+        ],
+    )
+    settled_report = strategy.decide(settled)
+    assert all(item.action == "WAIT" for item in settled_report.decisions)
+    assert {
+        item.actor_id: item.target
+        for item in settled_report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    } == first_slots
 
 
 def test_defensive_layout_keeps_vertical_cardinal_anchors() -> None:
