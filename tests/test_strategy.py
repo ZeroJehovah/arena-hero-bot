@@ -810,6 +810,44 @@ def test_population_cap_stops_production() -> None:
     assert turn.plan.core_action is None
 
 
+def test_unbounded_population_keeps_expanding_past_legacy_cap() -> None:
+    units = [unit(number, "RANGER", position=(number, 2)) for number in range(2, 22)]
+    turn = make_turn(resources=100, objects=[core(), *units])
+
+    decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=0,
+            max_population=None,
+            safety_reserve=10,
+        ),
+    )
+
+    assert turn.state.population == 20
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_unbounded_population_preserves_emergency_resource_reserve() -> None:
+    workers = [
+        unit(2, "WORKER", position=(1, 0)),
+        unit(3, "WORKER", position=(2, 0)),
+    ]
+    turn = make_turn(resources=14, objects=[core(), *workers])
+
+    decide(
+        turn,
+        config=StrategyConfig(
+            target_workers=12,
+            max_population=None,
+            safety_reserve=10,
+        ),
+    )
+
+    assert turn.plan.core_action is None
+
+
 def test_resource_goal_builds_one_capacity_unit_beyond_required_population() -> None:
     units = [unit(number, "WORKER", position=(number, 2)) for number in range(2, 20)]
     turn = make_turn(resources=5, objects=[core(), *units])

@@ -36,12 +36,15 @@ Run the tactic:
 uv run arena-hero-bot
 ```
 
-Grow enough population for 100 storage capacity, then save 95 Core resources:
+Run safety-first growth without a fixed population cap or Core resource target:
 
 ```bash
-uv run arena-hero-bot --target-workers 12 --max-population 20 \
-  --resource-target 95
+uv run arena-hero-bot --target-workers 12 --no-max-population
 ```
+
+The unbounded live posture keeps a 10-resource emergency reserve, establishes
+an initial combat guard, patrols near the Core, and keeps expanding whenever
+the current dynamic unit price can be paid without spending that reserve.
 
 For a long-running local instance that restarts after an unexpected process exit:
 
@@ -49,7 +52,7 @@ For a long-running local instance that restarts after an unexpected process exit
 ./scripts/run-live.sh
 ```
 
-The supervisor uses the live defaults `--target-workers 2 --max-population 20`
+The supervisor uses the live defaults `--target-workers 12 --no-max-population`
 when no arguments are supplied. Pass normal CLI arguments to override them.
 
 For a persistent systemd deployment, install the supplied service after creating

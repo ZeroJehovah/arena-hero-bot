@@ -41,11 +41,17 @@ RESOURCE_PATROL_SPACING = 6
 
 @dataclass(frozen=True, slots=True)
 class StrategyConfig:
-    """Parameters that define the aggressive v1 posture."""
+    """Parameters that define the tactic posture.
+
+    ``max_population=None`` enables the live, safety-first growth mode.  A
+    positive value keeps the older explicit population cap available for
+    experiments and backwards-compatible callers.
+    """
 
     target_workers: int = 2
-    max_population: int = 12
+    max_population: int | None = 12
     resource_target: int = 0
+    safety_reserve: int = 10
     resource_patrol_radius: int = 30
     enemy_memory_ttl: int = 160
     enemy_core_memory_ttl: int = 4096
@@ -374,7 +380,7 @@ class AggressiveStrategy:
             self.memory.clear_goal(str(worker.id))
             return
 
-        if self.config.resource_target > 0:
+        if self._preserves_resources():
             goal = self._resource_patrol_goal(worker, context.turn)
             reason = "patrol near the stationary Core for resources"
         else:
@@ -453,7 +459,7 @@ class AggressiveStrategy:
                 )
                 return
 
-        preserving_resources = self.config.resource_target > 0
+        preserving_resources = self._preserves_resources()
         if not preserving_resources and core.hp < 5 and context.remaining_resources > 0:
             core.heal()
             context.report.add(
@@ -850,7 +856,7 @@ class AggressiveStrategy:
     ) -> tuple[EnemySighting, ...]:
         """Keep goal-oriented defenders near the Core instead of roaming away."""
 
-        if self.config.resource_target <= 0 or turn.core is None:
+        if not self._preserves_resources() or turn.core is None:
             return enemies
         return tuple(
             enemy
@@ -864,7 +870,7 @@ class AggressiveStrategy:
         unit: Ranger | Vanguard,
         turn: Turn,
     ) -> tuple[Position, str]:
-        if self.config.resource_target <= 0 or turn.core is None:
+        if not self._preserves_resources() or turn.core is None:
             return turn.beacon.position, "advance toward the public Beacon battle zone"
         offsets = (
             (0, -2),
@@ -1144,9 +1150,13 @@ class AggressiveStrategy:
 
     def _core_can_spawn(self, context: _TurnContext) -> bool:
         core = context.turn.core
+        growth_target = self._growth_population_target()
         if (
             core is None
-            or context.turn.state.population >= self._growth_population_target()
+            or (
+                growth_target is not None
+                and context.turn.state.population >= growth_target
+            )
             or (
                 self.config.resource_target > 0
                 and context.remaining_resources >= self.config.resource_target
@@ -1163,7 +1173,8 @@ class AggressiveStrategy:
         return not occupants
 
     def _choose_spawn(self, turn: Turn, resources: int) -> UnitType | None:
-        if turn.state.population >= self._growth_population_target():
+        growth_target = self._growth_population_target()
+        if growth_target is not None and turn.state.population >= growth_target:
             return None
         if self._needs_resource_guard(turn):
             candidates = (UnitType.VANGUARD,)
@@ -1179,13 +1190,15 @@ class AggressiveStrategy:
             (
                 unit_type
                 for unit_type in candidates
-                if unit_cost(unit_type, turn.state.population) <= resources
+                if unit_cost(unit_type, turn.state.population)
+                + self._spawn_safety_reserve(turn)
+                <= resources
             ),
             None,
         )
 
     def _needs_resource_guard(self, turn: Turn) -> bool:
-        if self.config.resource_target <= 0 or turn.core is None or turn.vanguards:
+        if not self._preserves_resources() or turn.core is None or turn.vanguards:
             return False
         # Establish a first combat guard before the economy reaches its full
         # worker target.  A resource Core can be rushed long before all
@@ -1215,16 +1228,50 @@ class AggressiveStrategy:
             )
         )
 
-    def _growth_population_target(self) -> int:
+    def _growth_population_target(self) -> int | None:
         if self.config.resource_target <= 0:
             return self.config.max_population
         if self.config.resource_target <= 10:
+            if self.config.max_population is None:
+                return 1
             return min(1, self.config.max_population)
         required = (self.config.resource_target + 4) // 5
-        buffered = min(required + 1, self.config.max_population)
-        return buffered
+        if self.config.max_population is None:
+            return required + 1
+        return min(required + 1, self.config.max_population)
+
+    def _preserves_resources(self) -> bool:
+        """Return whether this tactic should prioritize a safe Core reserve."""
+
+        return self.config.resource_target > 0 or self.config.max_population is None
+
+    def _spawn_safety_reserve(self, turn: Turn) -> int:
+        """Keep enough Core resources for a full emergency recovery cycle.
+
+        The reserve is only added by the unbounded live mode.  Explicit legacy
+        resource-target configurations retain their historical exact-cost
+        behavior so callers can reproduce prior experiments.
+        """
+
+        if not self._unbounded_growth():
+            return 0
+        core = turn.core
+        if core is None:
+            return max(0, self.config.safety_reserve)
+        missing_recovery = max(0, 5 - core.hp) + max(0, 5 - core.shield)
+        return max(0, self.config.safety_reserve, missing_recovery)
+
+    def _unbounded_growth(self) -> bool:
+        """Return whether the live strategy has no fixed population/stockpile goal."""
+
+        return self.config.max_population is None and self.config.resource_target <= 0
 
     def _spawn_reason(self, unit_type: UnitType) -> str:
+        if self._unbounded_growth():
+            return (
+                "expand storage while preserving the Core safety reserve "
+                f"with {unit_type.value.lower()}"
+            )
         if self.config.resource_target > 0:
             return (
                 f"expand capacity toward {self.config.resource_target} Core resources "

@@ -201,6 +201,19 @@ def test_cli_requires_key_and_builds_runtime(monkeypatch, tmp_path) -> None:
     assert captured["strategy"].max_population == 9
     assert captured["strategy"].resource_target == 40
 
+    cli.main(
+        [
+            "--observe-only",
+            "--no-max-population",
+            "--max-turns",
+            "1",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert captured["strategy"].max_population is None
+    assert captured["strategy"].resource_target == 0
+
 
 @pytest.mark.parametrize(
     ("arguments", "message"),

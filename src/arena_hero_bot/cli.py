@@ -55,17 +55,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="minimum Worker economy before combat production (default: 2)",
     )
-    parser.add_argument(
+    population_group = parser.add_mutually_exclusive_group()
+    population_group.add_argument(
         "--max-population",
         type=_positive_integer,
         default=12,
         help="stop producing Units at this population (default: 12)",
     )
+    population_group.add_argument(
+        "--no-max-population",
+        action="store_true",
+        help="remove the explicit population cap for safety-first growth",
+    )
     parser.add_argument(
         "--resource-target",
         type=_non_negative_integer,
         default=0,
-        help="save this many Core resources after building storage capacity",
+        help=(
+            "legacy fixed Core reserve target "
+            "(0 disables it; live mode leaves it unset)"
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -80,8 +89,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    maximum_capacity = core_resource_capacity(args.max_population)
-    if args.resource_target > maximum_capacity:
+    max_population = None if args.no_max_population else args.max_population
+    maximum_capacity = (
+        core_resource_capacity(max_population) if max_population is not None else None
+    )
+    if maximum_capacity is not None and args.resource_target > maximum_capacity:
         parser.error(
             f"--resource-target cannot exceed the maximum Core capacity "
             f"of {maximum_capacity}"
@@ -107,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     strategy = StrategyConfig(
         target_workers=args.target_workers,
-        max_population=args.max_population,
+        max_population=max_population,
         resource_target=args.resource_target,
     )
     try:

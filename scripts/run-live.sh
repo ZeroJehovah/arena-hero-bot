@@ -7,7 +7,7 @@ cd "$project_dir"
 mkdir -p var
 
 if (($# == 0)); then
-    set -- --target-workers 2 --max-population 20 --log-level INFO
+    set -- --target-workers 12 --no-max-population --log-level INFO
 fi
 
 while true; do
