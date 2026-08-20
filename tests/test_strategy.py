@@ -880,7 +880,7 @@ def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
     assert all(item.target != (0, 0) for item in offensive)
 
 
-def test_unbounded_growth_uses_shop_aligned_capacity_stockpile_tiers() -> None:
+def test_unbounded_growth_uses_capacity_stockpile_tiers() -> None:
     strategy = AggressiveStrategy(
         WorldMemory(),
         StrategyConfig(target_workers=0, max_population=None),
@@ -898,9 +898,11 @@ def test_unbounded_growth_uses_shop_aligned_capacity_stockpile_tiers() -> None:
     assert reserve_for_population(10) == 50  # capacity 50
     assert reserve_for_population(18) == 50  # capacity 90
     assert reserve_for_population(19) == 95  # capacity 95
-    assert reserve_for_population(29) == 95  # capacity 145
-    assert reserve_for_population(30) == 150  # capacity 150
-    assert reserve_for_population(31) == 150  # capacity 155
+    assert reserve_for_population(20) == 95  # capacity 100: previous tier
+    assert reserve_for_population(21) == 100  # capacity 105: high tier
+    assert reserve_for_population(29) == 100  # capacity 145
+    assert reserve_for_population(30) == 100  # capacity 150
+    assert reserve_for_population(31) == 100  # capacity 155
 
 
 def test_unbounded_growth_crosses_a_stockpile_boundary_without_deadlocking() -> None:

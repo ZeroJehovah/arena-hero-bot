@@ -45,7 +45,7 @@ VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
-CORE_CAPACITY_HIGH_RESERVE = 150
+CORE_CAPACITY_HIGH_RESERVE = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -1719,9 +1719,9 @@ class AggressiveStrategy:
         The reserve is only added by the unbounded live mode. Explicit legacy
         resource-target configurations retain their historical exact-cost
         behavior so callers can reproduce prior experiments. In the live mode,
-        the stockpile follows the Core capacity tiers used by the shop: small
-        Cores expand quickly, then preserve 50, 95, or 150 resources as storage
-        grows. The base reserve and any missing recovery resources always win.
+        the stockpile follows the live Core capacity tiers: small Cores expand
+        quickly, then preserve 50, 95, or 100 resources as storage grows. The
+        base reserve and any missing recovery resources always win.
         """
 
         if not self._unbounded_growth():
@@ -1737,10 +1737,10 @@ class AggressiveStrategy:
             self._stockpile_target(turn),
         )
         if production_cost is not None:
-            # At an exact shop-capacity boundary, ``reserve + cost`` can be
+            # At an exact capacity-tier boundary, ``reserve + cost`` can be
             # larger than the entire Core.  Permit the smallest transition
             # spend needed to cross that boundary; otherwise a no-cap strategy
-            # would deadlock permanently at capacities 50, 95, or 150.
+            # would deadlock permanently at capacities 50, 95, or 100.
             reserve = max(
                 self.config.safety_reserve,
                 missing_recovery,
@@ -1756,9 +1756,9 @@ class AggressiveStrategy:
             return 0
         if capacity < CORE_CAPACITY_MEDIUM_RESERVE:
             return 50
-        if capacity < CORE_CAPACITY_HIGH_RESERVE:
+        if capacity <= CORE_CAPACITY_HIGH_RESERVE:
             return 95
-        return 150
+        return CORE_CAPACITY_HIGH_RESERVE
 
     def _unbounded_growth(self) -> bool:
         """Return whether the live strategy has no fixed population/stockpile goal."""
