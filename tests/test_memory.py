@@ -82,8 +82,14 @@ def test_enemy_track_predicts_one_cardinal_step() -> None:
             objects=[core(), unit(6, "RANGER", controlled=False, position=(0, 3))],
         )
     )
+    memory.observe(
+        make_turn(
+            tick=22,
+            objects=[core(), unit(6, "RANGER", controlled=False, position=(0, 2))],
+        )
+    )
 
-    assert memory.predicted_enemy_position(object_id(6), 21) == (0, 2)
+    assert memory.predicted_enemy_position(object_id(6), 22) == (0, 1)
 
 
 def test_missing_file_and_unknown_schema(tmp_path) -> None:

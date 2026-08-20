@@ -181,8 +181,6 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
-        if self._recover_if_critical(ranger, maximum_hp=2, context=context):
-            return
         visible_enemies = self._visible_combat_targets(
             ranger,
             context.turn,
@@ -224,6 +222,12 @@ class AggressiveStrategy:
                 ),
                 target=shot_cell,
             )
+            return
+
+        # A Ranger at one HP is still a live firing platform.  Let it take a
+        # legal shot before withdrawing; otherwise a whole damaged fireteam
+        # can collapse into the Core while an enemy remains in range.
+        if self._recover_if_critical(ranger, maximum_hp=2, context=context):
             return
 
         if self._pickup_beacon(ranger, context):

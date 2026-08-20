@@ -153,19 +153,28 @@ class WorldMemory:
         enemy_id: str,
         tick: int,
     ) -> Position | None:
-        """Predict one cardinal step for an enemy with a stable track."""
+        """Predict one cardinal step after two consecutive matching moves."""
 
         history = self.enemy_position_history.get(enemy_id, [])
-        if len(history) < 2:
+        if len(history) < 3:
             return None
+        older_tick, older = history[-3]
         previous_tick, previous = history[-2]
         current_tick, current = history[-1]
-        if current_tick != tick or current_tick - previous_tick != 1:
+        if (
+            current_tick != tick
+            or previous_tick - older_tick != 1
+            or current_tick - previous_tick != 1
+        ):
             return None
-        delta = current[0] - previous[0], current[1] - previous[1]
-        if abs(delta[0]) + abs(delta[1]) != 1:
+        previous_delta = previous[0] - older[0], previous[1] - older[1]
+        current_delta = current[0] - previous[0], current[1] - previous[1]
+        if (
+            previous_delta != current_delta
+            or abs(current_delta[0]) + abs(current_delta[1]) != 1
+        ):
             return None
-        return current[0] + delta[0], current[1] + delta[1]
+        return current[0] + current_delta[0], current[1] + current_delta[1]
 
     def goal_for(self, unit_id: str) -> UnitGoal | None:
         """Return a Unit's current durable exploration goal."""

@@ -87,10 +87,20 @@ def test_ranger_tracks_target_and_leads_one_cell() -> None:
     )
     strategy.decide(second)
 
-    action = second.plan.unit_actions[second.rangers[0].id]
+    third = make_turn(
+        tick=102,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 2)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 4)),
+        ],
+    )
+    strategy.decide(third)
+
+    action = third.plan.unit_actions[third.rangers[0].id]
     assert action.type == "SHOOT"
-    assert action.target_id == second.visible_enemies[0].id
-    assert action.expected_cell == (0, 4)
+    assert action.target_id == third.visible_enemies[0].id
+    assert action.expected_cell == (0, 3)
 
 
 def test_emergency_focuses_fire_and_bursts_combat_production() -> None:
@@ -646,6 +656,21 @@ def test_critical_ranger_heals_at_stationary_core() -> None:
     )
     decide(turn)
     assert turn.plan.unit_actions[turn.rangers[0].id].type == "HEAL"
+
+
+def test_critical_ranger_takes_legal_shot_before_withdrawing() -> None:
+    turn = make_turn(
+        resources=4,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 1), hp=1),
+            unit(3, "VANGUARD", controlled=False, position=(0, 3)),
+        ],
+    )
+
+    decide(turn)
+
+    assert turn.plan.unit_actions[turn.rangers[0].id].type == "SHOOT"
 
 
 def test_critical_vanguard_returns_to_core_before_attacking() -> None:
