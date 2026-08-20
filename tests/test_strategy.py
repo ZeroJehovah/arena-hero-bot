@@ -917,12 +917,12 @@ def test_unbounded_growth_crosses_a_stockpile_boundary_without_deadlocking() -> 
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_unbounded_growth_recalls_offensive_patrol_when_core_reserve_is_low() -> None:
+def test_unbounded_growth_keeps_offensive_minority_when_core_reserve_is_low() -> None:
     combat_units = [
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
         for number in range(2, 10)
     ]
-    turn = make_turn(resources=14, objects=[core(), *combat_units])
+    turn = make_turn(resources=2, objects=[core(), *combat_units])
 
     report = decide(
         turn,
@@ -933,14 +933,20 @@ def test_unbounded_growth_recalls_offensive_patrol_when_core_reserve_is_low() ->
         ),
     )
 
-    assert not any(
-        item.reason == "search outward for enemy units and Cores"
-        for item in report.decisions
+    assert (
+        sum(
+            item.reason == "search outward for enemy units and Cores"
+            for item in report.decisions
+        )
+        == 3
     )
-    assert sum(
-        item.reason == "hold a defensive perimeter around the resource Core"
-        for item in report.decisions
-    ) == len(combat_units)
+    assert (
+        sum(
+            item.reason == "hold a defensive perimeter around the resource Core"
+            for item in report.decisions
+        )
+        == 5
+    )
 
 
 def test_dense_core_guard_uses_unique_outer_slots_and_frees_worker_route() -> None:
@@ -970,6 +976,7 @@ def test_dense_core_guard_uses_unique_outer_slots_and_frees_worker_route() -> No
             target_workers=0,
             max_population=None,
             resource_target=0,
+            offensive_min_combat_units=12,
         ),
     )
 

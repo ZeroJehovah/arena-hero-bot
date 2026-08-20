@@ -989,7 +989,15 @@ class AggressiveStrategy:
         return unit.id.int % 3 == 0
 
     def _offensive_patrol_enabled(self, turn: Turn) -> bool:
-        """Allow roaming combat only while the economy can absorb the risk."""
+        """Keep a minority roaming while the Core itself remains safe.
+
+        Core stockpile tiers govern production, not whether combat units can
+        scout.  A stable two-thirds perimeter is still present, so a low
+        resource balance alone must not collapse the one-third patrol squad
+        into an all-``WAIT`` posture.  The patrol is suspended when the Core
+        is damaged or the combat roster is too small to leave a meaningful
+        guard.
+        """
 
         core = turn.core
         return (
@@ -997,7 +1005,6 @@ class AggressiveStrategy:
             and core is not None
             and len(turn.vanguards) + len(turn.rangers)
             >= self.config.offensive_min_combat_units
-            and turn.resources >= self._spawn_safety_reserve(turn) + 5
             and core.hp >= 5
             and core.shield >= 5
         )

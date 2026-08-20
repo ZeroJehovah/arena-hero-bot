@@ -48,8 +48,9 @@ at capacities 50–94, 95–149, and 150+ it preserves 50, 95, and 150 resources
 respectively before paying the next dynamic unit price. It establishes an
 initial combat guard, while a stable minority of Rangers/Vanguards performs a
 bounded outward patrol once the combat roster is large enough. That roaming
-squad is recalled when the Core is damaged or resources approach the active
-stockpile tier. The remaining combat units hold a single obstacle-aware
+squad is suspended when the Core is damaged or the roster is too small; Core
+stockpile level controls production and does not turn the patrol off. The
+remaining combat units hold a single obstacle-aware
 Manhattan perimeter: its slots (including traversable upper and lower
 cardinal anchors) stay fixed across Turns, and a guard queues `WAIT` after
 reaching its slot until an enemy or a roster/Core change requires redeployment.
