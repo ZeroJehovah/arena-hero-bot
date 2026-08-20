@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import atan2
 from uuid import UUID
 
 from arena_hero import (
@@ -39,8 +40,9 @@ RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
-DEFENSIVE_PERIMETER_SPACING = 2
-DEFENSIVE_PERIMETER_MIN_RADIUS = 3
+DEFENSIVE_PERIMETER_MIN_RADIUS = 2
+VANGUARD_VISION_RADIUS = 4
+RANGER_VISION_RADIUS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,7 @@ class _TurnContext:
     reserved: set[Position] = field(default_factory=set)
     departures: set[str] = field(default_factory=set)
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
+    defensive_assignments: dict[UUID, Position] | None = None
     remaining_resources: int = 0
     remaining_resource_space: int = 0
     beacon_claimed: bool = False
@@ -211,8 +214,15 @@ class AggressiveStrategy:
             ranger,
             context.turn,
             offensive=offensive,
+            context=context,
         )
-        self._move_or_wait(ranger, goal, context, reason=reason)
+        self._move_or_wait(
+            ranger,
+            goal,
+            context,
+            reason=reason,
+            wait_at_goal=not offensive and self._preserves_resources(),
+        )
 
     def _decide_vanguard(
         self,
@@ -296,8 +306,15 @@ class AggressiveStrategy:
             vanguard,
             context.turn,
             offensive=offensive,
+            context=context,
         )
-        self._move_or_wait(vanguard, goal, context, reason=reason)
+        self._move_or_wait(
+            vanguard,
+            goal,
+            context,
+            reason=reason,
+            wait_at_goal=not offensive and self._preserves_resources(),
+        )
 
     def _decide_worker(self, worker: Worker, context: _TurnContext) -> None:
         core = context.turn.core
@@ -659,7 +676,13 @@ class AggressiveStrategy:
         *,
         reason: str,
         allow_goal: bool = False,
+        wait_at_goal: bool = False,
     ) -> None:
+        if unit.position == goal:
+            self._record_wait(unit, context, reason)
+            if wait_at_goal:
+                unit.wait()
+            return
         if not self._move(
             unit,
             goal,
@@ -668,6 +691,8 @@ class AggressiveStrategy:
             allow_goal=allow_goal,
         ):
             self._record_wait(unit, context, f"no safe path for: {reason}")
+            if wait_at_goal and unit.position == goal:
+                unit.wait()
 
     def _retreat_worker(
         self,
@@ -986,43 +1011,123 @@ class AggressiveStrategy:
         turn: Turn,
         *,
         offensive: bool = False,
+        context: _TurnContext | None = None,
     ) -> tuple[Position, str]:
         if offensive and self._offensive_patrol_enabled(turn):
             return self._combat_patrol_goal(unit, turn)
         if not self._preserves_resources() or turn.core is None:
             return turn.beacon.position, "advance toward the public Beacon battle zone"
-        guards = sorted(
-            (
-                item
-                for item in (*turn.rangers, *turn.vanguards)
-                if not self._is_offensive_combat_unit(item, turn)
-            ),
-            key=lambda item: item.id.bytes,
-        )
-        # Keep the guard ring outside the Core's immediate neighboring cells.
-        # The old eight-cell, radius-two ring was too small once the live
-        # roster grew: multiple Vanguards claimed the same cells and blocked
-        # Workers trying to leave or return to the Core.
-        radius = DEFENSIVE_PERIMETER_MIN_RADIUS
-        offsets = _defensive_perimeter_offsets(
-            radius,
-            DEFENSIVE_PERIMETER_SPACING,
-        )
-        while len(offsets) < len(guards):
-            radius += 1
-            offsets = _defensive_perimeter_offsets(
-                radius,
-                DEFENSIVE_PERIMETER_SPACING,
+        if context is None:
+            # Keep this helper useful for callers that only have a Turn.  The
+            # normal decision path passes the context so assignments are
+            # calculated once and can account for same-Tick reservations.
+            context = _TurnContext(
+                turn=turn,
+                report=DecisionReport(tick=turn.tick),
+                occupied={item.position for item in turn.units},
+                enemy_positions={item.position for item in turn.visible_enemies},
             )
-        guard_index = next(
-            (index for index, item in enumerate(guards) if item.id == unit.id),
-            unit.id.int % len(offsets),
-        )
-        dx, dy = offsets[guard_index]
+        if context.defensive_assignments is None:
+            context.defensive_assignments = self._defensive_perimeter_assignments(
+                context
+            )
         return (
-            (turn.core.position[0] + dx, turn.core.position[1] + dy),
+            context.defensive_assignments.get(unit.id, unit.position),
             "hold a defensive perimeter around the resource Core",
         )
+
+    def _defensive_perimeter_assignments(
+        self,
+        context: _TurnContext,
+    ) -> dict[UUID, Position]:
+        """Place non-roaming combat units on one obstacle-aware vision ring.
+
+        The game uses Manhattan vision, so the most useful discrete circle is
+        the set of cells at one Manhattan distance from the Core.  A ring at
+        radius ``r`` contains ``8r`` cells.  Each guard covers approximately
+        ``2 * vision`` consecutive ring cells; starting from the largest
+        radius supported by the roster and shrinking only when obstacles make
+        a gap un-coverable gives a stable, count-and-vision-derived perimeter.
+        """
+
+        core = context.turn.core
+        if core is None:
+            return {}
+        core_position = core.position
+        guards = tuple(
+            sorted(
+                (
+                    unit
+                    for unit in (*context.turn.rangers, *context.turn.vanguards)
+                    if not self._is_offensive_combat_unit(unit, context.turn)
+                ),
+                key=lambda unit: unit.id.bytes,
+            )
+        )
+        if not guards:
+            return {}
+
+        obstacles = set(self.memory.obstacles)
+        obstacles.update(context.turn.obstacle_cells)
+        guard_ids = {unit.id for unit in guards}
+        unavailable = set(context.enemy_positions) | set(context.reserved)
+        unavailable.add(core.position)
+        unavailable.update(
+            unit.position for unit in context.turn.units if unit.id not in guard_ids
+        )
+        visions = {unit.id: _combat_vision_radius(unit) for unit in guards}
+        base_radius = max(
+            DEFENSIVE_PERIMETER_MIN_RADIUS,
+            sum(visions.values()) // 4,
+        )
+
+        def ring_for(radius: int) -> tuple[Position, ...]:
+            return tuple(
+                (core_position[0] + dx, core_position[1] + dy)
+                for dx, dy in _defensive_ring_offsets(radius)
+                if (core_position[0] + dx, core_position[1] + dy) not in obstacles
+                and _clear_manhattan_path(
+                    core_position,
+                    (core_position[0] + dx, core_position[1] + dy),
+                    obstacles,
+                )
+            )
+
+        # A Worker or a recently observed hostile can temporarily occupy a
+        # ring cell.  Expand the ring until every guard still has a unique
+        # legal slot, while keeping the count/vision radius as the primary
+        # choice.
+        max_radius = base_radius
+        search_limit = base_radius + max(8, len(guards) * 2)
+        while max_radius < search_limit:
+            available = [
+                position
+                for position in ring_for(max_radius)
+                if position not in unavailable
+            ]
+            if len(available) >= len(guards):
+                break
+            max_radius += 1
+
+        best: dict[UUID, Position] = {}
+        for radius in range(max_radius, DEFENSIVE_PERIMETER_MIN_RADIUS - 1, -1):
+            coverage_cells = ring_for(radius)
+            available = [
+                position for position in coverage_cells if position not in unavailable
+            ]
+            if len(available) < len(guards):
+                continue
+            assignments = _assign_defensive_ring_slots(available, guards, visions)
+            if not best:
+                best = assignments
+            if _ring_is_covered(
+                coverage_cells,
+                assignments,
+                visions,
+                obstacles,
+            ):
+                return assignments
+        return best
 
     def _combat_patrol_goal(
         self,
@@ -1533,15 +1638,112 @@ def _resource_patrol_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
     return tuple(route)
 
 
-def _defensive_perimeter_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
-    """Return unique cells on a sparse square ring around the Core."""
+def _combat_vision_radius(unit: Ranger | Vanguard) -> int:
+    """Return the authoritative Manhattan vision radius for a combat unit."""
 
-    coordinates = list(range(-radius, radius + 1, spacing))
-    if coordinates[-1] != radius:
-        coordinates.append(radius)
-    return tuple(
+    if isinstance(unit, Ranger):
+        return RANGER_VISION_RADIUS
+    return VANGUARD_VISION_RADIUS
+
+
+def _defensive_ring_offsets(radius: int) -> tuple[Position, ...]:
+    """Return a deterministic Manhattan-distance ring in angular order."""
+
+    offsets = [
         (dx, dy)
-        for dy in coordinates
-        for dx in coordinates
-        if max(abs(dx), abs(dy)) == radius
+        for dx in range(-radius, radius + 1)
+        for dy in range(-radius, radius + 1)
+        if abs(dx) + abs(dy) == radius
+    ]
+    return tuple(sorted(offsets, key=lambda position: atan2(position[1], position[0])))
+
+
+def _assign_defensive_ring_slots(
+    cells: list[Position],
+    guards: tuple[Ranger | Vanguard, ...],
+    visions: dict[UUID, int],
+) -> dict[UUID, Position]:
+    """Divide ring cells into vision-sized sectors and pick each sector's center."""
+
+    ordered = tuple(
+        sorted(
+            guards,
+            key=lambda unit: (-visions[unit.id], unit.id.bytes),
+        )
     )
+    total_capacity = sum(2 * visions[unit.id] for unit in ordered)
+    assignments: dict[UUID, Position] = {}
+    cursor = 0
+    cumulative_capacity = 0
+    for index, unit in enumerate(ordered):
+        cumulative_capacity += 2 * visions[unit.id]
+        remaining_units = len(ordered) - index - 1
+        target_end = (
+            len(cells) * cumulative_capacity + total_capacity // 2
+        ) // total_capacity
+        end = max(cursor + 1, target_end)
+        end = min(end, len(cells) - remaining_units)
+        center = cursor + (end - cursor - 1) // 2
+        assignments[unit.id] = cells[center]
+        cursor = end
+    return assignments
+
+
+def _ring_is_covered(
+    cells: tuple[Position, ...],
+    assignments: dict[UUID, Position],
+    visions: dict[UUID, int],
+    obstacles: set[Position],
+) -> bool:
+    """Return whether every traversable ring cell is visible from a guard."""
+
+    return all(
+        any(
+            manhattan(position, slot) <= visions[unit_id]
+            and _clear_manhattan_path(slot, position, obstacles)
+            for unit_id, slot in assignments.items()
+        )
+        for position in cells
+    )
+
+
+def _clear_manhattan_path(
+    origin: Position,
+    target: Position,
+    obstacles: set[Position] | frozenset[Position],
+) -> bool:
+    """Return whether a shortest Manhattan path avoids known obstacles.
+
+    Visibility is evaluated over shortest cardinal paths.  If one such path
+    remains open, an obstacle does not hide the target; if every shortest path
+    is cut, the target is treated as being behind the obstacle.  This mirrors
+    the map rule that an obstacle cell is visible but cells behind it are not,
+    while allowing paths around a single isolated obstacle.
+    """
+
+    if origin == target:
+        return True
+    if target in obstacles:
+        return False
+    frontier = {origin}
+    dx = target[0] - origin[0]
+    dy = target[1] - origin[1]
+    step_x = 0 if dx == 0 else (1 if dx > 0 else -1)
+    step_y = 0 if dy == 0 else (1 if dy > 0 else -1)
+    for _ in range(abs(dx) + abs(dy)):
+        next_frontier: set[Position] = set()
+        for position in frontier:
+            if position[0] != target[0]:
+                candidate = (position[0] + step_x, position[1])
+                if candidate not in obstacles:
+                    next_frontier.add(candidate)
+            if position[1] != target[1]:
+                candidate = (position[0], position[1] + step_y)
+                if candidate not in obstacles:
+                    next_frontier.add(candidate)
+        frontier = next_frontier
+        if not frontier:
+            return False
+        if target in frontier:
+            return True
+    return target in frontier

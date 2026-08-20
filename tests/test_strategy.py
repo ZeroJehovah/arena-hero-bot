@@ -9,6 +9,7 @@ from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
     AggressiveStrategy,
     StrategyConfig,
+    _clear_manhattan_path,
     _resource_patrol_offsets,
 )
 
@@ -954,6 +955,122 @@ def test_dense_core_guard_uses_unique_outer_slots_and_frees_worker_route() -> No
     )
     assert worker_decision.action == "MOVE"
     assert worker_decision.reason == "patrol near the stationary Core for resources"
+
+
+def test_defensive_ring_radius_scales_with_guard_count_and_vision() -> None:
+    small = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(10, 10)),
+            unit(3, "VANGUARD", position=(11, 10)),
+        ],
+    )
+    small_report = decide(
+        small,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+    small_targets = [
+        item.target
+        for item in small_report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    ]
+
+    large = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=(number, 10))
+                for number in range(2, 7)
+            ],
+        ],
+    )
+    large_report = decide(
+        large,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+    large_targets = [
+        item.target
+        for item in large_report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    ]
+
+    assert max(manhattan((0, 0), target) for target in small_targets) == 2
+    assert max(manhattan((0, 0), target) for target in large_targets) == 5
+    assert len(set(large_targets)) == len(large_targets)
+
+
+def test_defensive_guard_waits_explicitly_after_reaching_ring_slot() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    initial = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(10, 10)),
+            unit(3, "VANGUARD", position=(11, 10)),
+        ],
+    )
+    initial_report = decide(initial, config=config)
+    slots = {
+        item.actor_id: item.target
+        for item in initial_report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    }
+    arrived = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=slots[str(object_id(2))]),
+            unit(3, "VANGUARD", position=slots[str(object_id(3))]),
+        ],
+    )
+
+    report = decide(arrived, config=config)
+
+    assert all(
+        arrived.plan.unit_actions[guard.id].type == "WAIT"
+        for guard in arrived.vanguards
+    )
+    assert all(
+        item.action == "WAIT"
+        and item.reason == "hold a defensive perimeter around the resource Core"
+        for item in report.decisions
+    )
+
+
+def test_defensive_ring_ignores_obstacle_cells_and_keeps_unique_slots() -> None:
+    obstacle = (0, -4)
+    turn = make_turn(
+        resources=0,
+        obstacles=[obstacle],
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=(number, 10))
+                for number in range(2, 6)
+            ],
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+    targets = [
+        item.target
+        for item in report.decisions
+        if item.reason == "hold a defensive perimeter around the resource Core"
+    ]
+
+    assert obstacle not in targets
+    assert len(set(targets)) == len(targets)
+    assert all(manhattan((0, 0), target) == 4 for target in targets)
+
+
+def test_clear_manhattan_path_allows_detour_but_rejects_complete_wall() -> None:
+    assert _clear_manhattan_path((0, 0), (2, 1), {(1, 0)})
+    assert not _clear_manhattan_path((0, 0), (2, 0), {(1, -1), (1, 0), (1, 1)})
 
 
 def test_offensive_patrol_pursues_a_recently_seen_enemy_core() -> None:
