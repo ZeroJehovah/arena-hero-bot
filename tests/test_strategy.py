@@ -903,6 +903,20 @@ def test_unbounded_growth_uses_shop_aligned_capacity_stockpile_tiers() -> None:
     assert reserve_for_population(31) == 150  # capacity 155
 
 
+def test_unbounded_growth_crosses_a_stockpile_boundary_without_deadlocking() -> None:
+    workers = [unit(number, "WORKER", position=(number, 2)) for number in range(2, 12)]
+    turn = make_turn(resources=50, objects=[core(), *workers])
+
+    decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
 def test_unbounded_growth_recalls_offensive_patrol_when_core_reserve_is_low() -> None:
     combat_units = [
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))

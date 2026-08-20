@@ -1510,9 +1510,17 @@ class AggressiveStrategy:
             (
                 unit_type
                 for unit_type in candidates
-                if unit_cost(unit_type, turn.state.population)
-                + self._spawn_safety_reserve(turn)
-                <= resources
+                if (
+                    unit_cost(unit_type, turn.state.population)
+                    + self._spawn_safety_reserve(
+                        turn,
+                        production_cost=unit_cost(
+                            unit_type,
+                            turn.state.population,
+                        ),
+                    )
+                    <= resources
+                )
             ),
             None,
         )
@@ -1565,7 +1573,12 @@ class AggressiveStrategy:
 
         return self.config.resource_target > 0 or self.config.max_population is None
 
-    def _spawn_safety_reserve(self, turn: Turn) -> int:
+    def _spawn_safety_reserve(
+        self,
+        turn: Turn,
+        *,
+        production_cost: int | None = None,
+    ) -> int:
         """Keep enough Core resources for a full emergency recovery cycle.
 
         The reserve is only added by the unbounded live mode. Explicit legacy
@@ -1582,12 +1595,23 @@ class AggressiveStrategy:
         if core is None:
             return max(0, self.config.safety_reserve)
         missing_recovery = max(0, 5 - core.hp) + max(0, 5 - core.shield)
-        return max(
+        reserve = max(
             0,
             self.config.safety_reserve,
             missing_recovery,
             self._stockpile_target(turn),
         )
+        if production_cost is not None:
+            # At an exact shop-capacity boundary, ``reserve + cost`` can be
+            # larger than the entire Core.  Permit the smallest transition
+            # spend needed to cross that boundary; otherwise a no-cap strategy
+            # would deadlock permanently at capacities 50, 95, or 150.
+            reserve = max(
+                self.config.safety_reserve,
+                missing_recovery,
+                min(reserve, turn.resource_capacity - production_cost),
+            )
+        return reserve
 
     def _stockpile_target(self, turn: Turn) -> int:
         """Return the shop-aligned live stockpile target for Core capacity."""
