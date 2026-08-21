@@ -43,10 +43,11 @@ uv run arena-hero-bot --target-workers 12 --no-max-population
 ```
 
 The unbounded live posture uses capacity-based stockpile tiers. With Core
-capacity below 50 it expands quickly while keeping the base emergency reserve;
-at capacities 50–94 and 95–100 it preserves 50 and 95 resources, while
-capacities above 100 preserve 100 resources before paying the next dynamic
-unit price. It establishes an
+capacity below 50 it spends healthy surplus resources immediately to expand;
+it retains resources needed to repair a damaged Core and enters the normal
+emergency reserve during active combat. At capacities 50–94 and 95–100 it
+preserves 50 and 95 resources, while capacities above 100 preserve 100
+resources before paying the next dynamic unit price. It establishes an
 initial combat guard, while a stable minority of Rangers/Vanguards performs a
 bounded outward patrol once the combat roster is large enough. That roaming
 squad is suspended when the Core is damaged or the roster is too small; Core

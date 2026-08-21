@@ -2580,6 +2580,19 @@ class AggressiveStrategy:
             self._stockpile_target(turn),
         )
         if production_cost is not None:
+            # In the low-capacity growth tier, a healthy Core should spend
+            # every surplus resource on the next Unit.  Keeping the generic
+            # ten-resource reserve here strands a 15-capacity Core at
+            # 13/15 or 14/15: it has enough for a Worker, but the reserve
+            # makes the production check fail.  Emergency combat mode already
+            # returned above, so a damaged or actively threatened Core keeps
+            # its recovery reserve.
+            if (
+                turn.resource_capacity < CORE_CAPACITY_FAST_EXPANSION
+                and available_resources is not None
+                and available_resources <= turn.resource_capacity
+            ):
+                return max(missing_recovery, self._stockpile_target(turn))
             # At an exact capacity-tier boundary, ``reserve + cost`` can be
             # larger than the entire Core.  Permit the smallest transition
             # spend needed to cross that boundary; otherwise a no-cap strategy
@@ -2620,8 +2633,8 @@ class AggressiveStrategy:
     def _spawn_reason(self, unit_type: UnitType) -> str:
         if self._unbounded_growth():
             return (
-                "expand storage while preserving the Core safety reserve "
-                f"with {unit_type.value.lower()}"
+                "expand storage with the next available Core resources "
+                f"using {unit_type.value.lower()}"
             )
         if self.config.resource_target > 0:
             return (

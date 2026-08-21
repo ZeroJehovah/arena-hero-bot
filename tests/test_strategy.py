@@ -1168,6 +1168,47 @@ def test_unbounded_population_preserves_emergency_resource_reserve() -> None:
     assert turn.plan.core_action is None
 
 
+def test_unbounded_growth_spends_healthy_low_capacity_surplus() -> None:
+    turn = make_turn(
+        resources=13,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "WORKER", position=(2, 0)),
+            unit(4, "VANGUARD", position=(3, 0)),
+        ],
+    )
+
+    decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.resource_capacity == 15
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
+def test_unbounded_growth_keeps_reserve_for_damaged_low_capacity_core() -> None:
+    turn = make_turn(
+        resources=13,
+        objects=[
+            core(hp=4),
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "WORKER", position=(2, 0)),
+            unit(4, "VANGUARD", position=(3, 0)),
+        ],
+    )
+
+    decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.plan.core_action is None
+
+
 def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
     combat_units = [
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
