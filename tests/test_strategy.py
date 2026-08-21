@@ -128,9 +128,8 @@ def test_emergency_focuses_fire_and_bursts_combat_production() -> None:
         if unit.id in turn.plan.unit_actions
     ]
     shoot_actions = [action for action in ranger_actions if action.type == "SHOOT"]
-    assert len(shoot_actions) >= 1
+    assert len(shoot_actions) == len(turn.rangers)
     assert len({action.target_id for action in shoot_actions}) == 1
-    assert any(action.type == "MOVE" for action in ranger_actions)
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "SPAWN"
     assert any(item.action == "SPAWN" for item in report.decisions)
@@ -194,6 +193,146 @@ def test_core_evacuates_when_combat_group_is_overwhelmed() -> None:
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "START_MOVE"
     assert any("overwhelming enemy assault" in item.reason for item in report.decisions)
+
+
+def test_core_escape_lane_is_reserved_before_combat_moves() -> None:
+    turn = make_turn(
+        resources=20,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(0, 4)),
+            unit(3, "VANGUARD", position=(4, 0)),
+            unit(4, "VANGUARD", position=(-4, 0)),
+            unit(5, "WORKER", position=(0, 6)),
+            unit(6, "VANGUARD", controlled=False, position=(0, 2)),
+            unit(7, "RANGER", controlled=False, position=(1, 2)),
+            unit(8, "VANGUARD", controlled=False, position=(-1, 1)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.core is not None
+    escape_cell = (
+        turn.core.position[0] + turn.plan.core_action.direction.delta[0],
+        turn.core.position[1] + turn.plan.core_action.direction.delta[1],
+    )
+    unit_destinations = {
+        (
+            unit_view.position[0] + action.direction.delta[0],
+            unit_view.position[1] + action.direction.delta[1],
+        )
+        for unit_view in turn.units
+        if (action := turn.plan.unit_actions.get(unit_view.id)) is not None
+        and action.type == "MOVE"
+    }
+    assert escape_cell not in unit_destinations
+    assert any("before the screen breaks" in item.reason for item in report.decisions)
+
+
+def test_assault_limits_vanguard_strike_team_and_assigns_unique_screen_slots() -> None:
+    turn = make_turn(
+        resources=20,
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=(10, number))
+                for number in range(2, 8)
+            ],
+            unit(20, "RANGER", controlled=False, position=(0, 5)),
+            unit(21, "RANGER", controlled=False, position=(1, 5)),
+            unit(22, "VANGUARD", controlled=False, position=(-1, 5)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    screen = [
+        item
+        for item in report.decisions
+        if item.reason == "hold the Core screen while the strike team attacks"
+    ]
+    assert len(screen) == 3
+    assert len({item.target for item in screen}) == len(screen)
+
+
+def test_ranger_fires_at_close_focus_target_during_core_assault() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, 0)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 2)),
+            unit(4, "RANGER", controlled=False, position=(0, 2)),
+            unit(5, "VANGUARD", controlled=False, position=(1, 2)),
+        ],
+    )
+
+    decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "SHOOT"
+    assert action.expected_cell == (0, 2)
+
+
+def test_ranger_uses_supporting_fire_when_focus_lane_is_not_legal() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 0)),
+            unit(3, "RANGER", position=(2, 0)),
+            unit(4, "RANGER", controlled=False, position=(0, 3)),
+            unit(5, "VANGUARD", controlled=False, position=(2, 3)),
+        ],
+    )
+
+    report = decide(turn)
+
+    first = turn.plan.unit_actions[turn.rangers[0].id]
+    second = turn.plan.unit_actions[turn.rangers[1].id]
+    assert first.type == "SHOOT"
+    assert second.type == "SHOOT"
+    assert first.target_id != second.target_id
+    assert any("supporting fire" in item.reason for item in report.decisions)
+
+
+def test_high_pressure_forms_a_screen_before_core_escape_is_needed() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=(8, number - 2))
+                for number in range(2, 8)
+            ],
+            *[
+                unit(number, "VANGUARD", controlled=False, position=position)
+                for number, position in enumerate(
+                    ((-2, 10), (-1, 10), (0, 10), (1, 10), (2, 10), (3, 10)),
+                    start=20,
+                )
+            ],
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    screen = [
+        item
+        for item in report.decisions
+        if item.reason == "hold the Core screen while the strike team attacks"
+    ]
+    assert len(screen) == 3
+    assert turn.plan.core_action is None
 
 
 def test_worker_harvests_then_returns_cargo() -> None:
