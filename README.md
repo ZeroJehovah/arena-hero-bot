@@ -48,7 +48,9 @@ it retains resources needed to repair a damaged Core and enters the normal
 emergency reserve during active combat. At capacities 50–94 and 95–100 it
 preserves 50 and 95 resources, while capacities above 100 preserve 100
 resources before paying the next dynamic unit price. It establishes an
-initial combat guard, while a stable minority of Rangers/Vanguards performs a
+initial combat guard and, once four Workers are online, adds a second combat
+unit (preferring a Ranger) before resuming unrestricted Worker growth. A
+stable minority of Rangers/Vanguards performs a
 bounded outward patrol once the combat roster is large enough. That roaming
 squad is suspended when the Core is damaged or the roster is too small; Core
 stockpile level controls production and does not turn the patrol off. The
