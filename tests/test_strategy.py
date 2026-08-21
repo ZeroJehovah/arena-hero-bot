@@ -1668,6 +1668,66 @@ def test_resource_goal_remembers_nearby_enemy_core_for_guard_reserve() -> None:
     assert hidden.plan.core_action is None
 
 
+def test_resource_guard_ignores_stale_enemy_core_after_respawn() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(
+        target_workers=12,
+        max_population=None,
+        enemy_memory_ttl=160,
+    )
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            core(20, controlled=False, owner_username="rival", position=(20, 0)),
+        ],
+    )
+    strategy.decide(observed)
+
+    recovered = make_turn(
+        tick=261,
+        resources=10,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+    )
+    strategy.decide(recovered)
+
+    assert recovered.plan.core_action is not None
+    assert recovered.plan.core_action.type == "SPAWN"
+    assert recovered.plan.core_action.unit_type is UnitType.WORKER
+
+
+def test_resource_guard_keeps_recent_enemy_core_priority() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(
+        target_workers=12,
+        max_population=None,
+        enemy_memory_ttl=160,
+    )
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            core(20, controlled=False, owner_username="rival", position=(20, 0)),
+        ],
+    )
+    strategy.decide(observed)
+
+    guarded = make_turn(
+        tick=101,
+        resources=10,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+    )
+    strategy.decide(guarded)
+
+    assert guarded.plan.core_action is not None
+    assert guarded.plan.core_action.type == "SPAWN"
+    assert guarded.plan.core_action.unit_type is UnitType.VANGUARD
+
+
 def test_resource_goal_keeps_core_stationary_and_preserves_stockpile() -> None:
     turn = make_turn(
         resources=95,

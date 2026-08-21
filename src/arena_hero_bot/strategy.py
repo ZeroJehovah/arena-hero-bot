@@ -1996,7 +1996,10 @@ class AggressiveStrategy:
         )
         return any(
             (
-                enemy.kind == "CORE"
+                (
+                    enemy.kind == "CORE"
+                    and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
+                )
                 or (
                     enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
                     and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
