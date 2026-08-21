@@ -219,6 +219,27 @@ def test_guardless_low_capacity_core_evacuates_before_first_hit() -> None:
     )
 
 
+def test_unprotected_core_evacuates_on_nearby_pre_evade_enemy() -> None:
+    turn = make_turn(
+        resources=5,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(2, 0)),
+            unit(3, "VANGUARD", position=(20, 0)),
+            unit(4, "RANGER", controlled=False, position=(0, 9)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert report.threat_level == "PRE_EVADE"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+
+
 def test_core_escape_lane_is_reserved_before_combat_moves() -> None:
     turn = make_turn(
         resources=20,

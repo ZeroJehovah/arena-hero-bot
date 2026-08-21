@@ -194,7 +194,11 @@ class AggressiveStrategy:
             emergency=emergency,
         )
         assault_enemies = self._core_assault_enemies(turn)
-        if threat.requires_coordination:
+        if threat.requires_coordination or self._needs_preemptive_ranger_evasion(
+            turn,
+            self._visible_combat_enemies(turn),
+            threat,
+        ):
             assault_enemies = self._visible_combat_enemies(turn)
         context.assault_enemies = assault_enemies
         context.combat_assault = self._combat_defense_required(
@@ -1596,6 +1600,11 @@ class AggressiveStrategy:
             # assault ring, moving immediately is safer than waiting for the
             # first shot while the economy is still undefended.
             return True
+        if self._needs_preemptive_ranger_evasion(turn, enemies, threat):
+            # A distant combat unit cannot protect the Core during its
+            # four-Tick migration. Evacuate an outer-ring Ranger approach
+            # instead of waiting for pursuit memory or the first hit.
+            return True
         if threat is not None and threat.should_evacuate_core:
             return True
         # A group already inside the pre-evade ring is dangerous even when it
@@ -1627,6 +1636,8 @@ class AggressiveStrategy:
             return False
         if self._guardless_low_capacity_assault(turn, assault_enemies):
             return True
+        if self._needs_preemptive_ranger_evasion(turn, assault_enemies, threat):
+            return True
         if threat is not None and threat.requires_coordination:
             return True
         if len(assault_enemies) >= 2:
@@ -1656,6 +1667,41 @@ class AggressiveStrategy:
             and not turn.vanguards
             and not turn.rangers
             and bool(enemies)
+        )
+
+    def _has_local_combat_guard(self, turn: Turn) -> bool:
+        """Return whether a combat unit is close enough to screen the Core."""
+
+        core = turn.core
+        return core is not None and any(
+            manhattan(core.position, unit.position) <= COMBAT_SCREEN_RADIUS
+            for unit in (*turn.vanguards, *turn.rangers)
+        )
+
+    def _needs_preemptive_ranger_evasion(
+        self,
+        turn: Turn,
+        enemies: tuple[CoreView | UnitView, ...],
+        threat: ThreatAssessment | None,
+    ) -> bool:
+        """Detect an outer-ring Ranger approach without a local Core screen."""
+
+        core = turn.core
+        if (
+            core is None
+            or threat is None
+            or threat.level is not ThreatLevel.PRE_EVADE
+            or not threat.near_core_enemy_ids
+            or self._has_local_combat_guard(turn)
+        ):
+            return False
+        return any(
+            isinstance(enemy, UnitView)
+            and enemy.unit_type is UnitType.RANGER
+            and self.config.core_assault_radius
+            < manhattan(core.position, enemy.position)
+            <= self.config.core_assault_radius + 4
+            for enemy in enemies
         )
 
     def _emergency_combat_mode(
