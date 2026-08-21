@@ -22,6 +22,12 @@ from arena_hero import (
     unit_cost,
 )
 
+from .combat_policy import (
+    CombatPolicy,
+    CombatTargetLedger,
+    ThreatAssessment,
+    ThreatLevel,
+)
 from .geometry import (
     DIRECTIONS,
     add,
@@ -101,6 +107,9 @@ class _TurnContext:
     screen_assignments: dict[UUID, Position] = field(default_factory=dict)
     core_escape_direction: Direction | None = None
     combat_assault: bool = False
+    threat: ThreatAssessment = field(default_factory=ThreatAssessment)
+    damage_ledger: CombatTargetLedger = field(default_factory=CombatTargetLedger)
+    squad_return_ids: frozenset[UUID] = field(default_factory=frozenset)
     emergency: bool = False
 
 
@@ -131,27 +140,39 @@ class AggressiveStrategy:
         # radii even when there was no enemy to react to.
         self._defensive_layout: _DefensiveLayout | None = None
         self._combat_focus_id: str | None = None
+        self._combat_policy = CombatPolicy()
+        self._squad_return_until: dict[UUID, int] = {}
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
 
         turn.clear()
         self.memory.observe(turn)
+        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        threat = self._combat_policy.assess(turn, obstacles)
         recent_enemies = self.memory.recent_enemies(
             turn.tick, self.config.enemy_memory_ttl
         )
         tactical_enemies = self._tactical_enemies(turn, recent_enemies)
-        emergency = self._emergency_combat_mode(turn, recent_enemies)
+        emergency = (
+            self._emergency_combat_mode(turn, recent_enemies)
+            or threat.requires_coordination
+        )
         report = DecisionReport(
             tick=turn.tick,
             visible_enemies=len(turn.visible_enemies),
             remembered_enemies=len(recent_enemies),
+            threat_level=threat.level.value,
+            threat_reason=threat.reason,
+            minimum_ticks_to_range=threat.minimum_ticks_to_range,
+            projected_core_damage=threat.projected_core_damage,
         )
         occupied = {unit.position for unit in turn.units}
         occupied.update(enemy.position for enemy in turn.visible_enemies)
         if turn.core is not None:
             occupied.add(turn.core.position)
         focus_target = self._focus_target(turn)
+        squad_return_ids = self._update_squad_returns(turn, threat)
         context = _TurnContext(
             turn=turn,
             report=report,
@@ -161,6 +182,8 @@ class AggressiveStrategy:
             remaining_resources=turn.resources,
             remaining_resource_space=turn.resource_space,
             focus_target=focus_target,
+            threat=threat,
+            squad_return_ids=squad_return_ids,
             vanguard_attack_ids=self._vanguard_attack_ids(
                 turn,
                 focus_target,
@@ -169,14 +192,18 @@ class AggressiveStrategy:
             emergency=emergency,
         )
         assault_enemies = self._core_assault_enemies(turn)
+        if threat.requires_coordination:
+            assault_enemies = self._visible_combat_enemies(turn)
         context.assault_enemies = assault_enemies
         context.combat_assault = self._combat_defense_required(
             turn,
             assault_enemies,
+            threat,
         )
         if context.combat_assault and self._should_evacuate_core(
             turn,
             assault_enemies,
+            threat,
         ):
             context.core_escape_direction = self._core_escape_direction(
                 context,
@@ -190,20 +217,21 @@ class AggressiveStrategy:
                     add(turn.core.position, context.core_escape_direction)
                 )
             context.screen_assignments = self._combat_screen_assignments(context)
+            self._clear_core_escape_lane(context)
 
         for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
             self._decide_ranger(
                 ranger,
                 context,
                 tactical_enemies,
-                offensive=self._is_offensive_combat_unit(ranger, turn),
+                offensive=self._is_offensive_combat_unit(ranger, turn, threat),
             )
         for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
             self._decide_vanguard(
                 vanguard,
                 context,
                 tactical_enemies,
-                offensive=self._is_offensive_combat_unit(vanguard, turn),
+                offensive=self._is_offensive_combat_unit(vanguard, turn, threat),
             )
         core_position = turn.core.position if turn.core is not None else None
         for worker in sorted(
@@ -212,6 +240,7 @@ class AggressiveStrategy:
         ):
             self._decide_worker(worker, context)
         self._decide_core(context)
+        report.planned_damage = dict(context.damage_ledger.planned_damage)
         return report
 
     def _decide_ranger(
@@ -243,29 +272,20 @@ class AggressiveStrategy:
         ]
         if shootable:
             focused = self._preferred_target(context.focus_target, visible_enemies)
-            focused_shot = next(
+            target = context.damage_ledger.select(
+                tuple(item[0] for item in shootable),
+                focused,
+                ranger.position,
+                context.turn.core.position if context.turn.core is not None else None,
+            )
+            shot_cell = next(
                 (
-                    item
-                    for item in shootable
-                    if focused is not None and item[0].id == focused.id
+                    cell
+                    for candidate, cell in shootable
+                    if target is not None and candidate.id == target.id
                 ),
                 None,
             )
-            if focused_shot is not None:
-                target, shot_cell = focused_shot
-            elif shootable:
-                # Keep the shared focus whenever geometry permits it, but do
-                # not throw away a legal shot just because this Ranger has a
-                # different firing lane.  A large battle needs both focus
-                # fire and full legal firepower.
-                target, shot_cell = max(
-                    shootable,
-                    key=lambda item: self._enemy_score(
-                        item[0], ranger.position, context.turn
-                    ),
-                )
-            else:
-                target, shot_cell = None, None
             if target is None or shot_cell is None:
                 shootable = []
             else:
@@ -289,6 +309,7 @@ class AggressiveStrategy:
                     ):
                         return
                 ranger.shoot(target, expected_cell=shot_cell)
+                context.damage_ledger.record(target)
                 context.report.add(
                     actor_id=str(ranger.id),
                     actor_kind="RANGER",
@@ -304,6 +325,11 @@ class AggressiveStrategy:
                             if shot_cell != target.position
                             else ""
                         )
+                        + (
+                            " via damage ledger"
+                            if focused is not None and target.id != focused.id
+                            else ""
+                        )
                     ),
                     target=shot_cell,
                 )
@@ -313,6 +339,19 @@ class AggressiveStrategy:
         # legal shot before withdrawing; otherwise a whole damaged fireteam
         # can collapse into the Core while an enemy remains in range.
         if self._recover_if_critical(ranger, maximum_hp=2, context=context):
+            return
+
+        if (
+            ranger.id in context.squad_return_ids
+            and context.turn.core is not None
+            and self._move(
+                ranger,
+                context.turn.core.position,
+                context,
+                reason="return intercepted expedition Ranger to Core",
+                allow_goal=True,
+            )
+        ):
             return
 
         if self._pickup_beacon(ranger, context):
@@ -407,10 +446,13 @@ class AggressiveStrategy:
                 adjacent_groups.items(),
                 key=lambda item: sum(
                     self._enemy_score(enemy, vanguard.position, context.turn)
+                    + (100 if context.damage_ledger.remaining(enemy) > 0 else -100)
                     for enemy in item[1]
                 ),
             )
             vanguard.sweep(direction)
+            for target in targets:
+                context.damage_ledger.record(target)
             context.report.add(
                 actor_id=str(vanguard.id),
                 actor_kind="VANGUARD",
@@ -418,6 +460,19 @@ class AggressiveStrategy:
                 reason=f"hit {len(targets)} adjacent hostile object(s)",
                 target=add(vanguard.position, direction),
             )
+            return
+
+        if (
+            vanguard.id in context.squad_return_ids
+            and context.turn.core is not None
+            and self._move(
+                vanguard,
+                context.turn.core.position,
+                context,
+                reason="return intercepted expedition Vanguard to Core",
+                allow_goal=True,
+            )
+        ):
             return
 
         if self._pickup_beacon(vanguard, context):
@@ -668,13 +723,27 @@ class AggressiveStrategy:
                     context,
                     "hold outside the Core assault zone",
                 )
+            elif self._move(
+                worker,
+                goal,
+                context,
+                reason="clear the Core assault zone with economy unit",
+                allow_goal=True,
+            ):
+                return
             else:
-                self._move(
+                worker_threats = self._worker_threats(worker, context)
+                if worker_threats and self._retreat_worker(
                     worker,
-                    goal,
+                    core.position,
                     context,
-                    reason="clear the Core assault zone with economy unit",
-                    allow_goal=True,
+                    worker_threats,
+                ):
+                    return
+                self._record_wait(
+                    worker,
+                    context,
+                    "no safe path for: clear the Core assault zone",
                 )
             return
 
@@ -1503,10 +1572,13 @@ class AggressiveStrategy:
         self,
         turn: Turn,
         enemies: tuple[CoreView | UnitView, ...],
+        threat: ThreatAssessment | None = None,
     ) -> bool:
         core = turn.core
         if core is None or core.view.state is CoreState.MOVING or not enemies:
             return False
+        if threat is not None and threat.should_evacuate_core:
+            return True
         if len(enemies) >= self.config.core_escape_enemy_count:
             return True
         if core.shield <= 3 and len(enemies) >= 2:
@@ -1517,12 +1589,15 @@ class AggressiveStrategy:
         self,
         turn: Turn,
         assault_enemies: tuple[CoreView | UnitView, ...],
+        threat: ThreatAssessment | None = None,
     ) -> bool:
         """Raise the coordinated defense posture before the Core is hit."""
 
         core = turn.core
         if core is None or core.view.state is CoreState.MOVING:
             return False
+        if threat is not None and threat.requires_coordination:
+            return True
         if len(assault_enemies) >= 2:
             return True
         nearby = tuple(
@@ -1644,11 +1719,14 @@ class AggressiveStrategy:
         self,
         unit: Ranger | Vanguard,
         turn: Turn,
+        threat: ThreatAssessment | None = None,
     ) -> bool:
         """Assign a stable minority of combat units to the roaming squad."""
 
-        if self._emergency_combat_mode(turn) or not self._offensive_patrol_enabled(
-            turn
+        if (
+            self._emergency_combat_mode(turn)
+            or not self._offensive_patrol_enabled(turn)
+            or (threat is not None and threat.level is not ThreatLevel.NORMAL)
         ):
             return False
         # UUID assignment keeps roles stable across ticks without adding
@@ -2063,29 +2141,128 @@ class AggressiveStrategy:
         if core is None:
             return None
         blocked = (
-            self.memory.obstacles
+            set(self.memory.obstacles)
             | set(context.turn.obstacle_cells)
             | set(context.turn.resource_cells)
-            | context.occupied
             | context.reserved
         )
-        enemy_positions = {enemy.position for enemy in enemies}
-        candidates = [
-            (direction, add(core.position, direction))
-            for direction in DIRECTIONS
-            if add(core.position, direction) not in blocked
-            and add(core.position, direction) not in enemy_positions
-        ]
-        if not candidates:
-            return None
-        return max(
-            candidates,
-            key=lambda item: (
-                min(manhattan(item[1], enemy.position) for enemy in enemies),
-                sum(manhattan(item[1], enemy.position) for enemy in enemies),
-                item[1],
-            ),
-        )[0]
+        # A friendly unit may vacate the lane in this same plan.  The lane is
+        # cleared before the normal unit passes, so treating all transient
+        # occupancy as hard terrain would recreate the old boxed-Core failure.
+        for enemy in context.turn.visible_enemies:
+            blocked.add(enemy.position)
+        return self._combat_policy.escape_direction(
+            core.position,
+            enemies,
+            self.memory.obstacles | set(context.turn.obstacle_cells),
+            blocked,
+            beacon_position=context.turn.beacon.position,
+            previous_direction=None,
+        )
+
+    def _visible_combat_enemies(
+        self,
+        turn: Turn,
+    ) -> tuple[CoreView | UnitView, ...]:
+        """Return visible hostile combat objects relevant to Core survival."""
+
+        return tuple(
+            enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, CoreView)
+            or (
+                isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            )
+        )
+
+    def _clear_core_escape_lane(self, context: _TurnContext) -> None:
+        """Evacuate friendly occupants from the reserved Core escape cell."""
+
+        core = context.turn.core
+        direction = context.core_escape_direction
+        if core is None or direction is None:
+            return
+        escape_cell = add(core.position, direction)
+        occupants = sorted(
+            (unit for unit in context.turn.units if unit.position == escape_cell),
+            key=lambda unit: unit.id.bytes,
+        )
+        if not occupants:
+            return
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        enemy_positions = {enemy.position for enemy in context.turn.visible_enemies}
+        for unit in occupants:
+            for move_direction in DIRECTIONS:
+                destination = add(unit.position, move_direction)
+                if (
+                    destination == core.position
+                    or destination in obstacles
+                    or destination in enemy_positions
+                    or destination in context.reserved
+                    or destination in context.occupied
+                ):
+                    continue
+                if self._queue_move(
+                    unit,
+                    move_direction,
+                    context,
+                    reason="clear the reserved Core escape lane",
+                    target=destination,
+                ):
+                    break
+
+    def _update_squad_returns(
+        self,
+        turn: Turn,
+        threat: ThreatAssessment,
+    ) -> frozenset[UUID]:
+        """Recall an intercepted roaming pair for a bounded return window."""
+
+        live_ids = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
+        self._squad_return_until = {
+            unit_id: until
+            for unit_id, until in self._squad_return_until.items()
+            if unit_id in live_ids and until >= turn.tick
+        }
+        if turn.core is None:
+            self._squad_return_until.clear()
+            return frozenset()
+
+        visible_combat = tuple(
+            enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+        )
+        if threat.level is not ThreatLevel.NORMAL:
+            for unit in (*turn.vanguards, *turn.rangers):
+                # Keep the deterministic one-third expedition identity used by
+                # the existing patrol, but recall it as soon as it is locally
+                # intercepted instead of chasing through the contact.
+                if unit.id.int % 3 != 0:
+                    continue
+                if any(
+                    manhattan(unit.position, enemy.position) <= 5
+                    for enemy in visible_combat
+                ):
+                    self._squad_return_until[unit.id] = max(
+                        self._squad_return_until.get(unit.id, 0),
+                        turn.tick + 8,
+                    )
+
+        for unit_id in tuple(self._squad_return_until):
+            unit = next(
+                (
+                    candidate
+                    for candidate in (*turn.vanguards, *turn.rangers)
+                    if candidate.id == unit_id
+                ),
+                None,
+            )
+            if unit is not None and manhattan(unit.position, turn.core.position) <= 3:
+                self._squad_return_until.pop(unit_id, None)
+        return frozenset(self._squad_return_until)
 
     def _exploration_goal(self, worker: Worker, tick: int) -> Position:
         unit_id = str(worker.id)

@@ -32,6 +32,11 @@ class DecisionReport:
     decisions: list[Decision] = field(default_factory=list)
     visible_enemies: int = 0
     remembered_enemies: int = 0
+    threat_level: str = "NORMAL"
+    threat_reason: str = "NONE"
+    minimum_ticks_to_range: int | None = None
+    projected_core_damage: int = 0
+    planned_damage: dict[str, int] = field(default_factory=dict)
 
     def add(
         self,
@@ -61,5 +66,10 @@ class DecisionReport:
             "tick": self.tick,
             "visible_enemies": self.visible_enemies,
             "remembered_enemies": self.remembered_enemies,
+            "threat_level": self.threat_level,
+            "threat_reason": self.threat_reason,
+            "minimum_ticks_to_range": self.minimum_ticks_to_range,
+            "projected_core_damage": self.projected_core_damage,
+            "planned_damage": dict(sorted(self.planned_damage.items())),
             "decisions": [decision.to_dict() for decision in self.decisions],
         }
