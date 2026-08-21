@@ -195,6 +195,30 @@ def test_core_evacuates_when_combat_group_is_overwhelmed() -> None:
     assert any("overwhelming enemy assault" in item.reason for item in report.decisions)
 
 
+def test_guardless_low_capacity_core_evacuates_before_first_hit() -> None:
+    turn = make_turn(
+        resources=5,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(2, 0)),
+            unit(3, "RANGER", controlled=False, position=(5, 0)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert any(
+        "evacuate Core from overwhelming enemy assault" in item.reason
+        or "before the screen breaks" in item.reason
+        for item in report.decisions
+    )
+
+
 def test_core_escape_lane_is_reserved_before_combat_moves() -> None:
     turn = make_turn(
         resources=20,

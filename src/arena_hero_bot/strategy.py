@@ -1590,6 +1590,12 @@ class AggressiveStrategy:
         core = turn.core
         if core is None or core.view.state is CoreState.MOVING or not enemies:
             return False
+        if self._guardless_low_capacity_assault(turn, enemies):
+            # A freshly respawned Core can spend several minutes below the
+            # first Vanguard threshold.  Once a combat enemy enters the local
+            # assault ring, moving immediately is safer than waiting for the
+            # first shot while the economy is still undefended.
+            return True
         if threat is not None and threat.should_evacuate_core:
             return True
         # A group already inside the pre-evade ring is dangerous even when it
@@ -1619,6 +1625,8 @@ class AggressiveStrategy:
         core = turn.core
         if core is None or core.view.state is CoreState.MOVING:
             return False
+        if self._guardless_low_capacity_assault(turn, assault_enemies):
+            return True
         if threat is not None and threat.requires_coordination:
             return True
         if len(assault_enemies) >= 2:
@@ -1634,6 +1642,21 @@ class AggressiveStrategy:
             <= self.config.combat_alert_radius
         )
         return len(nearby) >= max(4, self.config.core_escape_enemy_count * 2)
+
+    def _guardless_low_capacity_assault(
+        self,
+        turn: Turn,
+        enemies: tuple[CoreView | UnitView, ...],
+    ) -> bool:
+        """Evacuate an undefended low-capacity Core before its first hit."""
+
+        return (
+            self._unbounded_growth()
+            and turn.resource_capacity < CORE_CAPACITY_FAST_EXPANSION
+            and not turn.vanguards
+            and not turn.rangers
+            and bool(enemies)
+        )
 
     def _emergency_combat_mode(
         self,
