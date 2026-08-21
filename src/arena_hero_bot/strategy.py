@@ -56,6 +56,8 @@ MAX_VANGUARD_ATTACKERS = 4
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
 CORE_CAPACITY_HIGH_RESERVE = 100
+EARLY_COMBAT_MIN_UNITS = 2
+EARLY_COMBAT_GUARD_WORKERS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,7 +418,11 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
-        if self._recover_if_critical(vanguard, maximum_hp=4, context=context):
+        if not context.combat_assault and self._recover_if_critical(
+            vanguard,
+            maximum_hp=4,
+            context=context,
+        ):
             return
         visible_enemies = self._visible_combat_targets(
             vanguard,
@@ -525,6 +531,13 @@ class AggressiveStrategy:
                     reason=f"rush {self._enemy_label(visible_target)}",
                 ):
                     return
+
+        if context.combat_assault and self._recover_if_critical(
+            vanguard,
+            maximum_hp=4,
+            context=context,
+        ):
+            return
 
         remembered_enemies = (
             self._offensive_enemies(context.turn) if offensive else recent_enemies
@@ -1579,6 +1592,16 @@ class AggressiveStrategy:
             return False
         if threat is not None and threat.should_evacuate_core:
             return True
+        # A group already inside the pre-evade ring is dangerous even when it
+        # has not crossed attack range yet. Waiting for the first hit leaves a
+        # four-Tick Core migration too late against a melee group.
+        if (
+            threat is not None
+            and threat.level is ThreatLevel.PRE_EVADE
+            and len(enemies) >= 2
+            and min(manhattan(core.position, enemy.position) for enemy in enemies) <= 3
+        ):
+            return True
         if len(enemies) >= self.config.core_escape_enemy_count:
             return True
         if core.shield <= 3 and len(enemies) >= 2:
@@ -2468,7 +2491,16 @@ class AggressiveStrategy:
                 else (UnitType.VANGUARD, UnitType.RANGER)
             )
         elif self._needs_resource_guard(turn):
-            candidates = (UnitType.VANGUARD,)
+            if not turn.vanguards:
+                candidates = (UnitType.VANGUARD,)
+            elif not turn.rangers:
+                # Once the first melee guard exists, add ranged damage before
+                # spending the rest of the low-capacity economy on Workers.
+                # Fall back to a second Vanguard when the cheaper candidate
+                # is the only affordable combat option.
+                candidates = (UnitType.RANGER, UnitType.VANGUARD)
+            else:
+                candidates = (UnitType.VANGUARD, UnitType.RANGER)
         elif len(turn.workers) < self.config.target_workers:
             candidates = (UnitType.WORKER,)
         elif not turn.vanguards:
@@ -2498,7 +2530,23 @@ class AggressiveStrategy:
         )
 
     def _needs_resource_guard(self, turn: Turn) -> bool:
-        if not self._preserves_resources() or turn.core is None or turn.vanguards:
+        if not self._preserves_resources() or turn.core is None:
+            return False
+        combat_units = len(turn.vanguards) + len(turn.rangers)
+        if (
+            self._unbounded_growth()
+            and turn.resource_capacity < CORE_CAPACITY_FAST_EXPANSION
+            and 0 < combat_units < EARLY_COMBAT_MIN_UNITS
+            and self.config.target_workers > 0
+            and len(turn.workers)
+            >= min(
+                self.config.target_workers,
+                self.config.resource_guard_min_workers,
+                EARLY_COMBAT_GUARD_WORKERS,
+            )
+        ):
+            return True
+        if turn.vanguards:
             return False
         # Establish a first combat guard before the economy reaches its full
         # worker target.  A resource Core can be rushed long before all

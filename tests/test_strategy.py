@@ -889,7 +889,7 @@ def test_ranger_disengages_to_max_range_against_enemy_unit() -> None:
     assert any("max-range firing line" in item.reason for item in report.decisions)
 
 
-def test_critical_vanguard_returns_to_core_before_attacking() -> None:
+def test_critical_vanguard_fights_before_withdrawing_during_core_assault() -> None:
     turn = make_turn(
         objects=[
             core(),
@@ -901,10 +901,9 @@ def test_critical_vanguard_returns_to_core_before_attacking() -> None:
     report = decide(turn)
 
     action = turn.plan.unit_actions[turn.vanguards[0].id]
-    assert action.type == "MOVE"
-    assert action.direction is Direction.LEFT
+    assert action.type == "SWEEP"
     assert any(
-        item.reason == "return critical unit to Core for healing"
+        item.action == "SWEEP" and "adjacent hostile" in item.reason
         for item in report.decisions
     )
 
@@ -1190,6 +1189,29 @@ def test_unbounded_growth_spends_healthy_low_capacity_surplus() -> None:
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
+def test_unbounded_growth_builds_ranged_guard_before_more_workers() -> None:
+    turn = make_turn(
+        resources=12,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "WORKER", position=(2, 0)),
+            unit(4, "WORKER", position=(3, 0)),
+            unit(5, "WORKER", position=(4, 0)),
+            unit(6, "VANGUARD", position=(5, 0)),
+        ],
+    )
+
+    decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
 def test_unbounded_growth_keeps_reserve_for_damaged_low_capacity_core() -> None:
     turn = make_turn(
         resources=13,
@@ -1207,6 +1229,26 @@ def test_unbounded_growth_keeps_reserve_for_damaged_low_capacity_core() -> None:
     )
 
     assert turn.plan.core_action is None
+
+
+def test_pre_evade_moves_core_before_a_melee_group_reaches_attack_range() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(5, 5)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 3)),
+            unit(4, "VANGUARD", controlled=False, position=(1, 2)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    assert report.threat_level == "PRE_EVADE"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
 
 
 def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
