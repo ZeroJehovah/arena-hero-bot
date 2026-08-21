@@ -2536,6 +2536,17 @@ class AggressiveStrategy:
         if (
             self._unbounded_growth()
             and turn.resource_capacity < CORE_CAPACITY_FAST_EXPANSION
+            and not combat_units
+            and turn.workers
+        ):
+            # After a Core respawn, spending the first five resources on a
+            # second Worker leaves the base with no combat answer while it
+            # waits for the next ten-resource Vanguard.  Establish the first
+            # guard before widening the economy beyond its first Worker.
+            return True
+        if (
+            self._unbounded_growth()
+            and turn.resource_capacity < CORE_CAPACITY_FAST_EXPANSION
             and 0 < combat_units < EARLY_COMBAT_MIN_UNITS
             and self.config.target_workers > 0
             and len(turn.workers)

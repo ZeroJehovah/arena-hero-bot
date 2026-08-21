@@ -1321,7 +1321,7 @@ def test_unbounded_growth_crosses_a_stockpile_boundary_without_deadlocking() -> 
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_unbounded_growth_recovers_from_minimum_respawn_capacity() -> None:
+def test_unbounded_growth_builds_first_guard_at_minimum_respawn_capacity() -> None:
     turn = make_turn(
         resources=10,
         objects=[core(), unit(2, "WORKER", position=(1, 0))],
@@ -1334,7 +1334,35 @@ def test_unbounded_growth_recovers_from_minimum_respawn_capacity() -> None:
 
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "SPAWN"
-    assert turn.plan.core_action.unit_type is UnitType.WORKER
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_unbounded_growth_establishes_guard_before_second_worker() -> None:
+    waiting = make_turn(
+        resources=5,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+    )
+
+    decide(
+        waiting,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert waiting.plan.core_action is None
+
+    guarded = make_turn(
+        resources=10,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+    )
+
+    decide(
+        guarded,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert guarded.plan.core_action is not None
+    assert guarded.plan.core_action.type == "SPAWN"
+    assert guarded.plan.core_action.unit_type is UnitType.VANGUARD
 
 
 def test_unbounded_growth_keeps_offensive_minority_when_core_reserve_is_low() -> None:
@@ -1917,7 +1945,7 @@ def test_resource_guard_ignores_stale_enemy_core_after_respawn() -> None:
 
     assert recovered.plan.core_action is not None
     assert recovered.plan.core_action.type == "SPAWN"
-    assert recovered.plan.core_action.unit_type is UnitType.WORKER
+    assert recovered.plan.core_action.unit_type is UnitType.VANGUARD
 
 
 def test_resource_guard_keeps_recent_enemy_core_priority() -> None:
