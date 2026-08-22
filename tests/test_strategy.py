@@ -398,6 +398,40 @@ def test_worker_harvests_then_returns_cargo() -> None:
     assert action.direction is Direction.LEFT
 
 
+def test_worker_keeps_recent_resource_goal_across_missing_observation() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+
+    first = make_turn(
+        tick=100,
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 0))],
+        resource_cells=[(0, 2)],
+    )
+    strategy.decide(first)
+    assert first.plan.unit_actions[first.workers[0].id].type == "MOVE"
+
+    second = make_turn(
+        tick=101,
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 1))],
+    )
+    report = strategy.decide(second)
+    action = second.plan.unit_actions[second.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.DOWN
+    assert any(
+        item.reason == "continue toward recently seen resource"
+        for item in report.decisions
+    )
+
+    third = make_turn(
+        tick=102,
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 2))],
+        resource_cells=[(0, 2)],
+    )
+    strategy.decide(third)
+    assert third.plan.unit_actions[third.workers[0].id].type == "HARVEST"
+
+
 def test_worker_deposits_at_core_and_waits_when_storage_full() -> None:
     deposit = make_turn(
         resources=5,

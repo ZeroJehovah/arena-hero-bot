@@ -42,8 +42,10 @@ from .memory import EnemySighting, UnitGoal, WorldMemory
 from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
+RESOURCE_CLAIM_PURPOSE = "resource-claim-v1"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
+RESOURCE_CLAIM_TTL = 4
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -901,8 +903,43 @@ class AggressiveStrategy:
             context,
             reason="claim nearest unassigned visible resource",
         ):
-            self.memory.clear_goal(str(worker.id))
+            self.memory.set_goal(
+                str(worker.id),
+                UnitGoal(
+                    position=assigned_resource,
+                    assigned_tick=context.turn.tick,
+                    purpose=RESOURCE_CLAIM_PURPOSE,
+                    last_progress_position=worker.position,
+                ),
+            )
             return
+
+        resource_goal = self.memory.goal_for(str(worker.id))
+        if (
+            assigned_resource is None
+            and resource_goal is not None
+            and resource_goal.purpose == RESOURCE_CLAIM_PURPOSE
+        ):
+            if resource_goal.position in context.turn.resource_cells:
+                self.memory.clear_goal(str(worker.id))
+            elif context.turn.tick - resource_goal.assigned_tick <= RESOURCE_CLAIM_TTL:
+                if worker.position == resource_goal.position:
+                    self._record_wait(
+                        worker,
+                        context,
+                        "wait for recently seen resource to reappear",
+                    )
+                    return
+                if self._move(
+                    worker,
+                    resource_goal.position,
+                    context,
+                    reason="continue toward recently seen resource",
+                ):
+                    return
+                self.memory.clear_goal(str(worker.id))
+            else:
+                self.memory.clear_goal(str(worker.id))
 
         if self._preserves_resources():
             goal = self._resource_patrol_goal(worker, context.turn)
