@@ -386,7 +386,8 @@ class AggressiveStrategy:
             remembered_enemies = tuple(
                 enemy
                 for enemy in remembered_enemies
-                if self._combat_target_is_local(ranger, enemy.position)
+                if self._is_combat_memory_target(enemy)
+                and self._combat_target_is_local(ranger, enemy.position)
             )
         remembered = self._best_remembered_target(
             ranger.position,
@@ -550,7 +551,8 @@ class AggressiveStrategy:
             remembered_enemies = tuple(
                 enemy
                 for enemy in remembered_enemies
-                if self._combat_target_is_local(vanguard, enemy.position)
+                if self._is_combat_memory_target(enemy)
+                and self._combat_target_is_local(vanguard, enemy.position)
             )
         remembered = self._best_remembered_target(
             vanguard.position,
@@ -1774,6 +1776,15 @@ class AggressiveStrategy:
         target: Position,
     ) -> bool:
         return manhattan(unit.position, target) <= _combat_vision_radius(unit)
+
+    @staticmethod
+    def _is_combat_memory_target(enemy: EnemySighting) -> bool:
+        """Keep defensive guards from chasing remembered enemy Workers."""
+
+        return enemy.kind == "CORE" or enemy.unit_type in {
+            UnitType.RANGER.value,
+            UnitType.VANGUARD.value,
+        }
 
     def _best_remembered_target(
         self,

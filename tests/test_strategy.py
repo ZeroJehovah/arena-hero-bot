@@ -1011,6 +1011,46 @@ def test_combat_unit_hunts_recent_enemy_after_losing_vision() -> None:
     assert any("last seen core" in item.reason for item in report.decisions)
 
 
+def test_defensive_vanguard_does_not_hunt_remembered_worker_over_resource() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=0, max_population=None),
+    )
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(0, 1)),
+            unit(20, "WORKER", controlled=False, position=(1, 1)),
+        ],
+        resource_cells=[(1, 1)],
+    )
+    strategy.decide(observed)
+
+    recovered = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(0, 1)),
+            unit(3, "WORKER", position=(0, 3)),
+        ],
+        resource_cells=[(1, 1)],
+    )
+    report = strategy.decide(recovered)
+
+    vanguard_decision = next(
+        item
+        for item in report.decisions
+        if item.actor_id == str(recovered.vanguards[0].id)
+    )
+    assert (
+        vanguard_decision.reason
+        == "hold a defensive perimeter around the resource Core"
+    )
+    assert not any("hunt last seen unit" in item.reason for item in report.decisions)
+
+
 def test_respawning_state_submits_no_invented_actions() -> None:
     turn = make_turn(
         status="RESPAWNING",
