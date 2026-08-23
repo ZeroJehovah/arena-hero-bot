@@ -80,6 +80,7 @@ class StrategyConfig:
     offensive_patrol_radius: int = 60
     offensive_patrol_goal_ttl: int = 160
     offensive_core_memory_ttl: int = 512
+    offensive_unit_memory_ttl: int = 32
     offensive_min_combat_units: int = 8
     enemy_memory_ttl: int = 160
     enemy_core_memory_ttl: int = 4096
@@ -1956,7 +1957,7 @@ class AggressiveStrategy:
             )
             or (
                 enemy.kind == "UNIT"
-                and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
+                and turn.tick - enemy.tick <= self.config.offensive_unit_memory_ttl
             )
         )
 

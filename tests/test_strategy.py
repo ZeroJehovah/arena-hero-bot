@@ -172,8 +172,7 @@ def test_vanguards_intercept_worker_near_core_on_distinct_escape_cells() -> None
         destinations.append(decision.target)
     assert len(destinations) == len(set(destinations))
     assert all(
-        destination in {(0, 0), (2, 0), (1, -1), (1, 1)}
-        for destination in destinations
+        destination in {(0, 0), (2, 0), (1, -1), (1, 1)} for destination in destinations
     )
 
 
@@ -1961,6 +1960,41 @@ def test_offensive_patrol_pursues_a_recently_seen_enemy_core() -> None:
     report = strategy.decide(hidden)
 
     assert any(item.reason == "hunt last seen core" for item in report.decisions)
+
+
+def test_offensive_patrol_drops_stale_enemy_unit_memory() -> None:
+    combat_units = [
+        unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
+        for number in range(2, 10)
+    ]
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=0, max_population=None, resource_target=0),
+    )
+    observed = make_turn(
+        tick=100,
+        resources=15,
+        objects=[
+            core(),
+            *combat_units,
+            unit(20, "WORKER", controlled=False, position=(10, 0)),
+        ],
+    )
+    strategy.decide(observed)
+
+    hidden = make_turn(
+        tick=133,
+        resources=15,
+        objects=[core(), *combat_units],
+    )
+    report = strategy.decide(hidden)
+
+    assert not any(item.reason == "hunt last seen unit" for item in report.decisions)
+    assert any(
+        item.reason == "search outward for enemy units and Cores"
+        for item in report.decisions
+    )
 
 
 def test_unbounded_population_clears_full_core_cell_for_expansion() -> None:

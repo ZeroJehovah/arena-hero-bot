@@ -86,7 +86,8 @@ class WorldMemory:
             str(event.target_id)
             for event in turn.events
             if event.target_id is not None
-            and event.event_type in {
+            and event.event_type
+            in {
                 "DESTRUCTION_PARTICIPATION",
                 "UNIT_DESTROYED",
                 "CORE_DESTROYED",
