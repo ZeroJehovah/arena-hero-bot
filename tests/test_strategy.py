@@ -150,6 +150,33 @@ def test_vanguard_sweeps_every_adjacent_hostile() -> None:
     assert action.direction is Direction.RIGHT
 
 
+def test_vanguards_intercept_worker_near_core_on_distinct_escape_cells() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "VANGUARD", position=(-3, 0)),
+            unit(3, "VANGUARD", position=(3, 0)),
+            unit(4, "WORKER", controlled=False, position=(1, 0)),
+        ]
+    )
+
+    report = decide(turn)
+
+    destinations = []
+    for vanguard in turn.vanguards:
+        action = turn.plan.unit_actions[vanguard.id]
+        assert action.type == "MOVE"
+        decision = next(
+            item for item in report.decisions if item.actor_id == str(vanguard.id)
+        )
+        destinations.append(decision.target)
+    assert len(destinations) == len(set(destinations))
+    assert all(
+        destination in {(0, 0), (2, 0), (1, -1), (1, 1)}
+        for destination in destinations
+    )
+
+
 def test_vanguards_spread_across_focus_target_escape_routes() -> None:
     turn = make_turn(
         objects=[
@@ -825,6 +852,46 @@ def test_worker_retreats_from_recently_seen_combat_enemy() -> None:
         item.reason == "retreat from visible enemy pressure"
         for item in expired_report.decisions
     )
+
+
+def test_worker_harvests_immediately_after_enemy_destruction_event() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "VANGUARD", controlled=False, position=(2, 0)),
+        ],
+        resource_cells=[(1, 0)],
+    )
+    first_report = strategy.decide(first)
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in first_report.decisions
+    )
+
+    second = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+        resource_cells=[(1, 0)],
+        events=[
+            {
+                "event_id": object_id(99),
+                "tick": 101,
+                "event_type": "DESTRUCTION_PARTICIPATION",
+                "reason_code": "UNIT",
+                "target_id": object_id(3),
+                "position": [2, 0],
+            }
+        ],
+    )
+
+    report = strategy.decide(second)
+
+    assert second.plan.unit_actions[second.workers[0].id].type == "HARVEST"
+    assert any(item.action == "HARVEST" for item in report.decisions)
 
 
 def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:

@@ -136,3 +136,43 @@ def test_memory_marks_contested_move_target_and_expires_it() -> None:
 
     memory.observe(make_turn(tick=181, objects=[core(), unit(2, "WORKER")]))
     assert memory.contested_positions == {}
+
+
+def test_destruction_event_forgets_enemy_and_motion_history() -> None:
+    memory = WorldMemory()
+    enemy_id = object_id(6)
+    memory.observe(
+        make_turn(
+            tick=20,
+            objects=[core(), unit(6, "WORKER", controlled=False, position=(1, 0))],
+        )
+    )
+    memory.observe(
+        make_turn(
+            tick=21,
+            objects=[core(), unit(6, "WORKER", controlled=False, position=(0, 1))],
+        )
+    )
+    assert enemy_id in memory.enemies
+    assert enemy_id in memory.enemy_position_history
+
+    memory.observe(
+        make_turn(
+            tick=22,
+            objects=[core()],
+            events=[
+                {
+                    "event_id": object_id(99),
+                    "tick": 22,
+                    "event_type": "DESTRUCTION_PARTICIPATION",
+                    "reason_code": "UNIT",
+                    "target_id": enemy_id,
+                    "position": [0, 1],
+                }
+            ],
+        )
+    )
+
+    assert enemy_id not in memory.enemies
+    assert enemy_id not in memory.enemy_position_history
+    assert memory.recent_enemies(22, ttl=100) == ()

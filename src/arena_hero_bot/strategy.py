@@ -55,6 +55,7 @@ RANGER_STANDOFF_RANGE = 3
 COMBAT_SCREEN_RADIUS = 3
 CORE_ESCAPE_MIN_ENEMIES = 3
 MAX_VANGUARD_ATTACKERS = 4
+CORE_WORKER_INTERCEPT_RADIUS = 4
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
 CORE_CAPACITY_HIGH_RESERVE = 100
@@ -1523,6 +1524,14 @@ class AggressiveStrategy:
             enemy
             for enemy in turn.visible_enemies
             if self._combat_target_is_local(unit, enemy.position)
+            or (
+                isinstance(unit, Vanguard)
+                and isinstance(enemy, UnitView)
+                and enemy.unit_type is UnitType.WORKER
+                and turn.core is not None
+                and manhattan(turn.core.position, enemy.position)
+                <= CORE_WORKER_INTERCEPT_RADIUS
+            )
         )
 
     def _focus_target(self, turn: Turn) -> CoreView | UnitView | None:
@@ -1536,8 +1545,32 @@ class AggressiveStrategy:
             )
         ]
         if not enemies:
-            self._combat_focus_id = None
-            return None
+            nearby_workers = tuple(
+                enemy
+                for enemy in turn.visible_enemies
+                if (
+                    isinstance(enemy, UnitView)
+                    and enemy.unit_type is UnitType.WORKER
+                    and turn.core is not None
+                    and turn.vanguards
+                    and manhattan(turn.core.position, enemy.position)
+                    <= CORE_WORKER_INTERCEPT_RADIUS
+                )
+            )
+            if not nearby_workers:
+                self._combat_focus_id = None
+                return None
+            target = min(
+                nearby_workers,
+                key=lambda enemy: (
+                    manhattan(turn.core.position, enemy.position)
+                    if turn.core is not None
+                    else 0,
+                    str(enemy.id),
+                ),
+            )
+            self._combat_focus_id = str(target.id)
+            return target
         obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         shootable = tuple(
             enemy

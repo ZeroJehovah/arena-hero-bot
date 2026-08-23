@@ -82,6 +82,19 @@ class WorldMemory:
 
         self.last_tick = turn.tick
         self.obstacles.update(turn.obstacle_cells)
+        destroyed_enemy_ids = {
+            str(event.target_id)
+            for event in turn.events
+            if event.target_id is not None
+            and event.event_type in {
+                "DESTRUCTION_PARTICIPATION",
+                "UNIT_DESTROYED",
+                "CORE_DESTROYED",
+            }
+        }
+        for enemy_id in destroyed_enemy_ids:
+            self.enemies.pop(enemy_id, None)
+            self.enemy_position_history.pop(enemy_id, None)
         for event in turn.events:
             actor_id = str(event.actor_id) if event.actor_id is not None else None
             if actor_id is None or event.event_type == "UNIT_MOVE_SUCCEEDED":
