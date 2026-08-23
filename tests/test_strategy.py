@@ -765,6 +765,30 @@ def test_cargo_worker_retreats_from_visible_combat_enemy() -> None:
     )
 
 
+def test_cargo_worker_returns_through_contested_noncombat_area() -> None:
+    memory = WorldMemory(contested_positions={(1, 0): 100})
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+            unit(3, "WORKER", controlled=False, position=(1, 0)),
+        ]
+    )
+
+    report = decide(turn, memory=memory)
+
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    assert any(
+        item.reason == "return carried resources to Core" for item in report.decisions
+    )
+    assert not any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+
 def test_worker_retreats_from_recently_seen_combat_enemy() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)

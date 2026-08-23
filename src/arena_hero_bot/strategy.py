@@ -769,13 +769,14 @@ class AggressiveStrategy:
             return
 
         worker_threats = self._worker_threats(worker, context)
+        combat_threats = self._worker_combat_threats(worker, context)
         if (
             worker.hp <= 1
             and worker_threats
             and self._recover_if_critical(worker, maximum_hp=2, context=context)
         ):
             return
-        if worker.cargo > 0 and worker_threats:
+        if worker.cargo > 0 and combat_threats:
             retreat_goal = core.position
             if (
                 core.view.state is CoreState.MOVING
@@ -786,7 +787,7 @@ class AggressiveStrategy:
                 worker,
                 retreat_goal,
                 context,
-                worker_threats,
+                combat_threats,
             ):
                 return
             self._record_wait(
@@ -1354,6 +1355,19 @@ class AggressiveStrategy:
         worker: Worker,
         context: _TurnContext,
     ) -> tuple[Position, ...]:
+        combat_threats = self._worker_combat_threats(worker, context)
+        contested = [
+            position
+            for position in self.memory.contested_positions
+            if manhattan(worker.position, position) <= self.config.worker_threat_radius
+        ]
+        return tuple(dict.fromkeys((*combat_threats, *contested)))
+
+    def _worker_combat_threats(
+        self,
+        worker: Worker,
+        context: _TurnContext,
+    ) -> tuple[Position, ...]:
         visible = [
             enemy.position
             for enemy in context.turn.visible_enemies
@@ -1386,12 +1400,7 @@ class AggressiveStrategy:
             and manhattan(worker.position, enemy.position)
             <= self.config.worker_threat_radius
         ]
-        contested = [
-            position
-            for position in self.memory.contested_positions
-            if manhattan(worker.position, position) <= self.config.worker_threat_radius
-        ]
-        return tuple(dict.fromkeys((*visible, *remembered, *contested)))
+        return tuple(dict.fromkeys((*visible, *remembered)))
 
     def _move(
         self,
