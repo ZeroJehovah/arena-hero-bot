@@ -1886,7 +1886,9 @@ def test_unbounded_growth_uses_capacity_stockpile_tiers() -> None:
     assert reserve_for_population(29) == 101  # capacity 145: 70%
     assert reserve_for_population(30) == 105  # capacity 150: 70%
     assert reserve_for_population(31) == 108  # capacity 155: 70%
-    assert reserve_for_population(39) == 136  # capacity 195: 70%
+    # Start banking one Unit before the slowdown threshold so the final
+    # expensive production step cannot reset the newly larger Core's reserve.
+    assert reserve_for_population(39) == 175  # capacity 195: 90%
     # At the growth slowdown threshold the target jumps to the banking tier so
     # income fills the emergency reserve instead of an ever pricier roster.
     assert reserve_for_population(40) == 180  # capacity 200: 90%
@@ -3095,6 +3097,20 @@ def test_growth_slowdown_banks_income_instead_of_buying_a_pricier_roster() -> No
     strategy.decide(banked)
     assert banked.plan.core_action is not None
     assert banked.plan.core_action.type == "SPAWN"
+
+
+def test_growth_slowdown_banks_before_crossing_the_threshold() -> None:
+    roster = [
+        unit(number, "VANGUARD", position=(number % 9, number // 9))
+        for number in range(2, 41)
+    ]
+    turn = make_turn(resources=174, objects=[core(), *roster])
+
+    decide(turn, config=StrategyConfig(target_workers=0, max_population=None))
+
+    assert turn.state.population == 39
+    assert turn.resource_capacity == 195
+    assert turn.plan.core_action is None
 
 
 def test_growth_slowdown_lifts_under_real_enemy_pressure() -> None:

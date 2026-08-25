@@ -3900,15 +3900,19 @@ class AggressiveStrategy:
         Unit prices rise 1.3x per five population while each Unit only adds
         five storage, so past the soft threshold every additional guard costs
         much more and adds very little to a Core that already holds a full
-        defensive ring.  Real enemy pressure lifts the slowdown so the bank
-        can be spent on defenders at once.
+        defensive ring.  Enter the banking tier one Unit early: the next
+        production action would otherwise cross the threshold, pay its old
+        lower reserve, and leave the newly larger Core below its reserve for
+        a long time.  Real enemy pressure lifts the slowdown so the bank can
+        be spent on defenders at once.
         """
 
         threshold = self.config.growth_slowdown_population
+        banking_threshold = max(1, threshold - 1) if threshold is not None else None
         return (
-            threshold is not None
+            banking_threshold is not None
             and self._unbounded_growth()
-            and turn.state.population >= threshold
+            and turn.state.population >= banking_threshold
             and not self._emergency_combat_mode(turn)
         )
 
