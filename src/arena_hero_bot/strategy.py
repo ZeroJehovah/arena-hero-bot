@@ -88,6 +88,7 @@ class StrategyConfig:
     growth_slowdown_population: int | None = 40
     safety_reserve: int = 10
     resource_patrol_radius: int = 14
+    resource_outreach_radius: int = 48
     offensive_patrol_radius: int = 60
     offensive_patrol_goal_ttl: int = 160
     offensive_core_memory_ttl: int = 512
@@ -1104,14 +1105,14 @@ class AggressiveStrategy:
             and resource_goal is not None
             and resource_goal.purpose == RESOURCE_CLAIM_PURPOSE
         ):
-            local_radius = self.config.resource_patrol_radius * 2
+            reach = self.config.resource_outreach_radius
             if (
                 self._preserves_resources()
                 and not self._is_resource_scout(worker, context.turn)
-                and manhattan(core.position, resource_goal.position) > local_radius
+                and manhattan(core.position, resource_goal.position) > reach
             ):
                 # A previously persisted claim may have been made before the
-                # live local-radius filter.  Drop it on the first Tick after
+                # live radius filter.  Drop it on the first Tick after
                 # deployment instead of renewing an already remote route.
                 self.memory.clear_goal(str(worker.id))
             elif resource_goal.position in context.turn.resource_cells:
@@ -2747,12 +2748,40 @@ class AggressiveStrategy:
         ) - {enemy.position for enemy in turn.visible_enemies}
         if self._preserves_resources() and turn.core is not None:
             local_radius = self.config.resource_patrol_radius * 2
-            local_resources = {
-                resource
-                for resource in resources
-                if manhattan(turn.core.position, resource) <= local_radius
-            }
-            if local_resources:
+            core_position = turn.core.position
+
+            hostile = {enemy.position for enemy in turn.visible_enemies}
+
+            def within(
+                radius: int, pool: set[Position] | frozenset[Position]
+            ) -> set[Position]:
+                return {
+                    resource
+                    for resource in pool
+                    if manhattan(core_position, resource) <= radius
+                } - hostile
+
+            local_resources = within(local_radius, resources)
+            if len(local_resources) < len(workers):
+                # More idle Workers than un-rested sites.  A resting site is a
+                # preference, not a gate: the surplus would otherwise sweep
+                # unknown cells at a tenth of the odds, so hand them the sites
+                # whose rest has run long enough to be worth a second look, and
+                # then the ones just outside the harvest ring.  Both are still
+                # bounded, and only Workers the short loop has no work for ever
+                # reach them.
+                fallback = within(
+                    local_radius,
+                    self.memory.resource_cells_worth_rechecking(turn.tick),
+                )
+                outreach = within(
+                    self.config.resource_outreach_radius,
+                    self.memory.resource_cells_worth_rechecking(turn.tick),
+                )
+            else:
+                fallback = set()
+                outreach = set()
+            if local_resources or fallback or outreach:
                 resources = local_resources
             elif self._unbounded_growth() and workers:
                 # Keep one deterministic Worker as a bounded resource scout.
@@ -2763,20 +2792,29 @@ class AggressiveStrategy:
                 workers = {scout.id: scout} if scout.id in workers else {}
             else:
                 resources = set()
+        else:
+            fallback = set()
+            outreach = set()
         assignments: dict[UUID, Position] = {}
-        while workers and resources:
-            _, worker_id, resource = min(
-                (
-                    manhattan(worker.position, resource),
-                    worker.id,
-                    resource,
+        taken = set(resources)
+        pools = [resources, fallback - taken, outreach - taken - fallback]
+        for pool in pools:
+            # Nearest and freshest evidence first, so a shorter walk to a
+            # resting site never outbids one actually seen holding a resource,
+            # and nothing leaves the harvest ring while work remains inside it.
+            while workers and pool:
+                _, worker_id, resource = min(
+                    (
+                        manhattan(worker.position, resource),
+                        worker.id,
+                        resource,
+                    )
+                    for worker in workers.values()
+                    for resource in pool
                 )
-                for worker in workers.values()
-                for resource in resources
-            )
-            assignments[worker_id] = resource
-            workers.pop(worker_id)
-            resources.remove(resource)
+                assignments[worker_id] = resource
+                workers.pop(worker_id)
+                pool.remove(resource)
         return assignments
 
     def _is_resource_scout(self, worker: Worker, turn: Turn) -> bool:

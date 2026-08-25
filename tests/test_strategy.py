@@ -1058,12 +1058,17 @@ def test_live_scout_returns_to_a_resource_cell_it_can_no_longer_see() -> None:
     )
     report = strategy.decide(forgotten)
 
-    scout_decision = next(
-        item for item in report.decisions if item.actor_id == object_id(2)
-    )
-    assert scout_decision.action == "MOVE"
-    assert scout_decision.reason == "claim nearest unassigned known resource"
-    assert scout_decision.target == (30, 0)
+    # The cell sits past the harvest ring but inside the outreach bound, so it
+    # goes to whichever Worker is closest rather than only to the lone scout.
+    claims = [
+        item
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned known resource"
+    ]
+    assert [(item.actor_id, item.target) for item in claims] == [
+        (object_id(3), (30, 0))
+    ]
+    assert claims[0].action == "MOVE"
 
 
 def test_whole_crew_returns_to_a_remembered_cell_inside_the_harvest_radius() -> None:
@@ -1119,11 +1124,96 @@ def test_an_emptied_cell_stops_drawing_claims_without_being_forgotten() -> None:
     assert decision.reason != "claim nearest unassigned known resource"
 
 
+def test_a_rested_site_is_rechecked_once_it_beats_a_blind_sweep() -> None:
+    """A resting site still outranks the unknown cells a Worker sweeps instead."""
+
+    from arena_hero_bot.memory import RESOURCE_RECHECK_FLOOR
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+
+    strategy.decide(
+        make_turn(
+            tick=100,
+            objects=[core(), unit(2, "WORKER", position=(20, 0))],
+            resource_cells=[(20, 0)],
+        )
+    )
+    strategy.decide(
+        make_turn(tick=101, objects=[core(), unit(2, "WORKER", position=(21, 0))])
+    )
+    assert memory.remembered_resource_cells(101) == frozenset()
+
+    # One Tick short of the floor the site is still resting, so the Worker has
+    # nothing to claim and falls back to the patrol ring.
+    early = strategy.decide(
+        make_turn(
+            tick=100 + RESOURCE_RECHECK_FLOOR,
+            objects=[core(), unit(2, "WORKER", position=(0, 1))],
+        )
+    )
+    decision = next(item for item in early.decisions if item.actor_id == object_id(2))
+    assert decision.reason != "claim nearest unassigned known resource"
+
+    # Past it the site is worth a second look, and a second look at a known
+    # site beats sweeping unknown cells by roughly ten to one.
+    late = strategy.decide(
+        make_turn(
+            tick=101 + RESOURCE_RECHECK_FLOOR,
+            objects=[core(), unit(2, "WORKER", position=(0, 1))],
+        )
+    )
+    decision = next(item for item in late.decisions if item.actor_id == object_id(2))
+    assert decision.reason == "claim nearest unassigned known resource"
+    assert decision.target == (20, 0)
+
+
+def test_idle_workers_reach_past_the_harvest_ring_only_when_it_is_swept() -> None:
+    """Sites just outside the ring beat a blind sweep, but never pre-empt it."""
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+
+    # One site inside the harvest ring, one well outside it.
+    strategy.decide(
+        make_turn(
+            tick=100,
+            objects=[
+                core(),
+                unit(2, "WORKER", position=(20, 0)),
+                unit(3, "WORKER", position=(40, 0)),
+            ],
+            resource_cells=[(20, 0), (40, 0)],
+        )
+    )
+
+    home = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 1)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
+    )
+    report = strategy.decide(home)
+    claims = [
+        item.target
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned known resource"
+    ]
+
+    # The inner site is un-rested evidence, so it is claimed first; the outer
+    # one is only reached because the second Worker has nothing left inside.
+    assert sorted(claim for claim in claims if claim) == [(20, 0), (40, 0)]
+
+
 def test_live_workers_drop_persisted_remote_resource_goals() -> None:
     memory = WorldMemory()
     memory.set_goal(
         object_id(3),
-        UnitGoal((0, 40), 100, "resource-claim-v1", last_progress_position=(0, 39)),
+        UnitGoal((0, 60), 100, "resource-claim-v1", last_progress_position=(0, 59)),
     )
     turn = make_turn(
         tick=101,
