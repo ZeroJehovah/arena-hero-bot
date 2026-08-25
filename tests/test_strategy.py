@@ -3136,15 +3136,16 @@ def test_combat_leash_never_blocks_return_fire_from_the_boundary() -> None:
         resources=0,
         objects=[
             core(),
-            unit(2, "RANGER", position=(18, 0)),
-            unit(31, "RANGER", controlled=False, position=(21, 0)),
+            unit(2, "RANGER", position=(20, 0)),
+            unit(31, "RANGER", controlled=False, position=(23, 0)),
         ],
     )
 
     decide(turn, config=config)
 
     shooter = turn.rangers[0]
-    assert manhattan((0, 0), (21, 0)) > config.combat_pursuit_radius
+    assert manhattan((0, 0), (20, 0)) == config.combat_pursuit_radius
+    assert manhattan((0, 0), (23, 0)) > config.combat_pursuit_radius
     assert turn.plan.unit_actions[shooter.id].type == "SHOOT"
 
 
@@ -3180,7 +3181,14 @@ AWAY_POSITIONS = {3: (14, 0), 6: (15, 0), 9: (14, 1), 12: (14, -1)}
 HOME_POSITIONS = {3: (0, 1), 6: (1, 0), 9: (2, 0), 12: (3, 0)}
 
 
-def _raid_turn(tick: int, *, core_hp: int = 5, away: bool = False, extra=()) -> object:
+def _raid_turn(
+    tick: int,
+    *,
+    core_hp: int = 5,
+    away: bool = False,
+    rival: tuple[int, int] = (25, 0),
+    extra=(),
+) -> object:
     places = AWAY_POSITIONS if away else HOME_POSITIONS
     return make_turn(
         tick=tick,
@@ -3200,7 +3208,7 @@ def _raid_turn(tick: int, *, core_hp: int = 5, away: bool = False, extra=()) -> 
                 40,
                 controlled=False,
                 owner_username="rival",
-                position=(25, 0),
+                position=rival,
             ),
             *extra,
         ],
@@ -3344,3 +3352,21 @@ def test_raid_launches_on_the_bearing_of_a_destroyed_enemy_fleet() -> None:
     assert strategy._raid_target is not None
     assert manhattan((0, 0), strategy._raid_target) == config.raid_radius
     assert strategy._raid_target[1] > 0
+
+
+def test_raid_does_not_launch_for_a_core_beyond_the_opportunity_radius() -> None:
+    # Enemy Core memory survives thousands of Ticks, so launching on any
+    # remembered Core inside the full travel radius would keep a standing
+    # expedition in the field for ever instead of answering a fleet we beat.
+    # Walking that far is allowed once committed; starting out on the strength
+    # of the sighting alone is not.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    distant = (40, 0)
+    assert config.raid_opportunity_radius < manhattan((0, 0), distant)
+    assert manhattan((0, 0), distant) <= config.raid_radius
+
+    strategy.decide(_raid_turn(100, rival=distant))
+
+    assert strategy._raid_ids == frozenset()
+    assert strategy._raid_target is None

@@ -106,10 +106,11 @@ class StrategyConfig:
     core_intruder_radius: int = 16
     core_assault_radius: int = 8
     core_escape_enemy_count: int = CORE_ESCAPE_MIN_ENEMIES
-    combat_pursuit_radius: int = 18
+    combat_pursuit_radius: int = 20
     raid_squad_size: int = 4
-    raid_radius: int = 30
-    raid_max_ticks: int = 100
+    raid_radius: int = 48
+    raid_opportunity_radius: int = 30
+    raid_max_ticks: int = 160
     raid_trigger_kills: int = 3
     raid_kill_window: int = 24
 
@@ -2888,11 +2889,18 @@ class AggressiveStrategy:
     ) -> bool:
         """Whether walking to ``goal`` keeps the combat zone bounded.
 
-        The defensive leash is the alert ring plus one Vanguard vision disc:
-        whatever a perimeter guard can see is worth fighting, one cell
-        further out is not.  Firing is deliberately never leashed - a Ranger
-        standing on the boundary must still be able to answer fire from
-        beyond it - so this gates movement goals only.
+        The defensive leash is set by a return race, not by vision.  The
+        perimeter caps at twelve cells and a guard on it sees to sixteen, so
+        a hostile that enters vision needs about fifteen Ticks to reach the
+        Core.  At the measured 0.61 cells/Tick a guard needs roughly 1.64
+        Ticks per cell to come home, which runs out of margin at twenty.
+        Twenty also stays clear of the enemy Core distances observed at
+        twenty-three and beyond, so cracking one stays a job for the raid
+        detachment rather than for the whole army.
+
+        Firing is deliberately never leashed - a Ranger standing on the
+        boundary must still be able to answer fire from beyond it - so this
+        gates movement goals only.
         """
 
         core = context.turn.core
@@ -2971,7 +2979,7 @@ class AggressiveStrategy:
             self._abort_raid(turn)
             return frozenset()
         if self._raid_ids:
-            objective = self._raid_target_for(turn)
+            objective = self._raid_target_for(turn, self.config.raid_radius)
             if (
                 turn.tick > self._raid_until_tick
                 or threat.combat_pressure
@@ -2992,7 +3000,10 @@ class AggressiveStrategy:
             or not self._offensive_patrol_enabled(turn)
         ):
             return frozenset()
-        objective = self._raid_target_for(turn)
+        objective = self._raid_target_for(
+            turn,
+            self.config.raid_opportunity_radius,
+        )
         if objective is None:
             return frozenset()
         squad = self._raid_squad(turn)
@@ -3004,13 +3015,22 @@ class AggressiveStrategy:
         self._combat_kills.clear()
         return self._raid_ids
 
-    def _raid_target_for(self, turn: Turn) -> Position | None:
-        """Pick the objective: a known nearby Core, else the attack bearing."""
+    def _raid_target_for(self, turn: Turn, radius: int) -> Position | None:
+        """Pick the objective: a known Core inside ``radius``, else the bearing.
+
+        The two callers pass different radii on purpose.  Launching on a
+        Core we merely happen to remember is an opportunistic decision, so it
+        stays inside the tight ``raid_opportunity_radius``; enemy Core
+        memory lives for thousands of Ticks, and a wide trigger here would
+        turn the detachment into a permanent standing expedition instead of
+        the answer to a fleet we just beat.  Refreshing the objective of a
+        raid that is already committed uses the full ``raid_radius``.
+        """
 
         core = turn.core
         if core is None:
             return None
-        known = self._remembered_enemy_cores(turn)
+        known = self._remembered_enemy_cores(turn, radius)
         if known:
             return min(
                 known,
@@ -3023,8 +3043,12 @@ class AggressiveStrategy:
             return None
         return self._kill_bearing_goal(turn)
 
-    def _remembered_enemy_cores(self, turn: Turn) -> tuple[EnemySighting, ...]:
-        """Return remembered enemy Cores inside raid range of our own Core."""
+    def _remembered_enemy_cores(
+        self,
+        turn: Turn,
+        radius: int,
+    ) -> tuple[EnemySighting, ...]:
+        """Return remembered enemy Cores within ``radius`` of our own Core."""
 
         core = turn.core
         if core is None:
@@ -3036,7 +3060,7 @@ class AggressiveStrategy:
                 self.config.enemy_core_memory_ttl,
             )
             if sighting.kind == "CORE"
-            and manhattan(core.position, sighting.position) <= self.config.raid_radius
+            and manhattan(core.position, sighting.position) <= radius
         )
 
     def _kill_bearing_goal(self, turn: Turn) -> Position | None:
@@ -3044,7 +3068,12 @@ class AggressiveStrategy:
 
         Contacts arrive from every bearing, so there is no standing direction
         worth fortifying; the only defensible heading for a search is the one
-        the fleet we just beat actually came from.
+        the fleet we just beat actually came from.  The reach is
+        ``raid_radius``: measured enemy Core distances cluster at 20-30 and
+        again at 42-47 with nothing in between, so stopping at 30 gave up the
+        second cluster for no saving, while 48 keeps the round trip inside
+        ``raid_max_ticks`` and never sends the detachment past the ring the
+        roaming squad already patrols.
         """
 
         core = turn.core
@@ -3141,7 +3170,7 @@ class AggressiveStrategy:
             for member in members
         ):
             return False
-        return not self._remembered_enemy_cores(turn)
+        return not self._remembered_enemy_cores(turn, self.config.raid_radius)
 
     def _abort_raid(self, turn: Turn) -> None:
         """Send the detachment home and hold off relaunching for a while."""
