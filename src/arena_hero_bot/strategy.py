@@ -1085,7 +1085,7 @@ class AggressiveStrategy:
             worker,
             assigned_resource,
             context,
-            reason="claim nearest unassigned visible resource",
+            reason="claim nearest unassigned known resource",
         ):
             self.memory.set_goal(
                 str(worker.id),
@@ -2738,9 +2738,13 @@ class AggressiveStrategy:
         """
 
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
-        resources = set(turn.resource_cells) - {
-            enemy.position for enemy in turn.visible_enemies
-        }
+        # Vision reaches four cells, so the visible pool empties the moment the
+        # cells beside the Core are spent even while known cells sit thirty out.
+        # Memory keeps those reachable; the radius policy below is unchanged.
+        resources = (
+            set(turn.resource_cells)
+            | set(self.memory.remembered_resource_cells(turn.tick))
+        ) - {enemy.position for enemy in turn.visible_enemies}
         if self._preserves_resources() and turn.core is not None:
             local_radius = self.config.resource_patrol_radius * 2
             local_resources = {

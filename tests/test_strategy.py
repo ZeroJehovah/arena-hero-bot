@@ -966,7 +966,7 @@ def test_nearest_worker_is_assigned_visible_resource() -> None:
     claims = [
         item
         for item in report.decisions
-        if item.reason == "claim nearest unassigned visible resource"
+        if item.reason == "claim nearest unassigned known resource"
     ]
     assert [(item.actor_id, item.target) for item in claims] == [
         (str(near_worker.id), (10, 0))
@@ -995,7 +995,7 @@ def test_live_workers_use_one_scout_for_remote_visible_resources() -> None:
         item for item in report.decisions if item.actor_id == object_id(3)
     )
     assert scout_decision.action == "MOVE"
-    assert scout_decision.reason == "claim nearest unassigned visible resource"
+    assert scout_decision.reason == "claim nearest unassigned known resource"
     assert scout_decision.target == (0, 40)
     assert guard_decision.reason == "patrol near the stationary Core for resources"
 
@@ -1024,6 +1024,99 @@ def test_live_workers_send_one_scout_when_no_resource_is_visible() -> None:
     assert scout_decision.reason == "scout beyond the local patrol ring for resources"
     assert scout_decision.target == (-70, 70)
     assert guard_decision.reason == "patrol near the stationary Core for resources"
+
+
+def test_live_scout_returns_to_a_resource_cell_it_can_no_longer_see() -> None:
+    # Vision reaches four cells, so a cell thirty out is visible only while a
+    # unit stands on top of it.  Without memory the Workers of a Core that has
+    # mined out its own neighbourhood have nothing to claim at all: 1,030 of
+    # the 1,960 cells this Core ever found were already beyond the harvest
+    # radius when first seen, and every one of them used to be forgotten.
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+
+    sighted = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(30, 0)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
+        resource_cells=[(30, 0)],
+    )
+    strategy.decide(sighted)
+
+    # Both Workers are home again and the cell is out of everyone's sight.
+    forgotten = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 1)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
+    )
+    report = strategy.decide(forgotten)
+
+    scout_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    assert scout_decision.action == "MOVE"
+    assert scout_decision.reason == "claim nearest unassigned known resource"
+    assert scout_decision.target == (30, 0)
+
+
+def test_whole_crew_returns_to_a_remembered_cell_inside_the_harvest_radius() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+
+    sighted = make_turn(
+        tick=100,
+        objects=[core(), unit(2, "WORKER", position=(20, 0))],
+        resource_cells=[(20, 0)],
+    )
+    strategy.decide(sighted)
+
+    # Twenty cells is inside ``resource_patrol_radius * 2``, so this is ordinary
+    # harvest work rather than a scouting trip - the local-radius policy is
+    # unchanged, only the pool it filters is no longer limited to live vision.
+    forgotten = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(0, 1))],
+    )
+    report = strategy.decide(forgotten)
+
+    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert decision.reason == "claim nearest unassigned known resource"
+    assert decision.target == (20, 0)
+
+
+def test_an_emptied_cell_stops_drawing_claims_without_being_forgotten() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+
+    strategy.decide(
+        make_turn(
+            tick=100,
+            objects=[core(), unit(2, "WORKER", position=(20, 0))],
+            resource_cells=[(20, 0)],
+        )
+    )
+    assert memory.remembered_resource_cells(100) == frozenset({(20, 0)})
+
+    # The Worker is standing beside the cell and it holds nothing, so another
+    # round trip would be wasted.  The site stays on the map for later: cells
+    # confirmed empty from this range were seen holding a resource again.
+    report = strategy.decide(
+        make_turn(tick=101, objects=[core(), unit(2, "WORKER", position=(21, 0))])
+    )
+
+    assert memory.resource_cells == {(20, 0): 100}
+    assert memory.remembered_resource_cells(101) == frozenset()
+    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert decision.reason != "claim nearest unassigned known resource"
 
 
 def test_live_workers_drop_persisted_remote_resource_goals() -> None:

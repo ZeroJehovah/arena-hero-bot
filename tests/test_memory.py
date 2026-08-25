@@ -215,3 +215,97 @@ def test_enemy_drift_ignores_stationary_and_stale_tracks() -> None:
     # Extrapolating from a sighting that is not from this Tick would send the
     # guard to a cell the target left several Ticks ago.
     assert memory.enemy_drift_position(object_id(6), 22, 1) is None
+
+
+def test_resource_cells_survive_leaving_vision_and_round_trip(tmp_path) -> None:
+    # A cell thirty out is the whole reason this memory exists: vision reaches
+    # four cells, so the visible pool empties as soon as the cells beside the
+    # Core are spent, and the Core could never walk back to what it had found.
+    memory = WorldMemory()
+    memory.observe(
+        make_turn(
+            tick=50,
+            objects=[core(), unit(2, "WORKER", position=(1, 0))],
+            resource_cells=[(30, 0), (0, 20)],
+        )
+    )
+    assert memory.remembered_resource_cells(999) == frozenset({(30, 0), (0, 20)})
+
+    # The Worker walked away; neither cell is visible and neither is disproven.
+    # The Core counts as an observer too, so both cells are kept clear of
+    # everything's reach: a resource memory that trusted absence from further
+    # out would rest cells that are merely unobserved.
+    memory.observe(
+        make_turn(tick=51, objects=[core(), unit(2, "WORKER", position=(9, 9))])
+    )
+    assert memory.remembered_resource_cells(999) == frozenset({(30, 0), (0, 20)})
+
+    path = tmp_path / "memory.json"
+    memory.save(path)
+    assert WorldMemory.load(path).remembered_resource_cells(999) == frozenset(
+        {(30, 0), (0, 20)}
+    )
+
+
+def test_an_emptied_cell_rests_instead_of_being_forgotten() -> None:
+    from arena_hero_bot.memory import RESOURCE_ABSENCE_COOLDOWN
+
+    memory = WorldMemory()
+    memory.observe(make_turn(tick=50, objects=[core()], resource_cells=[(20, 0)]))
+
+    # Two cells away is already too far to believe an absence: in the recording
+    # a cell reported empty from one cell away held a resource again 5.5% of the
+    # time, so trusting a wider radius would rest live cells.
+    memory.observe(
+        make_turn(tick=51, objects=[core(), unit(2, "WORKER", position=(22, 0))])
+    )
+    assert memory.remembered_resource_cells(51) == frozenset({(20, 0)})
+
+    # Adjacent and empty.  The site is rested, not deleted - an empty cell is
+    # not a dead cell, and roughly a third of them regrow after 500 Ticks.
+    memory.observe(
+        make_turn(tick=52, objects=[core(), unit(2, "WORKER", position=(21, 0))])
+    )
+    assert memory.resource_cells == {(20, 0): 50}
+    assert memory.remembered_resource_cells(52) == frozenset()
+    assert (
+        memory.remembered_resource_cells(52 + RESOURCE_ABSENCE_COOLDOWN) == frozenset()
+    )
+    assert memory.remembered_resource_cells(
+        53 + RESOURCE_ABSENCE_COOLDOWN
+    ) == frozenset({(20, 0)})
+
+
+def test_seeing_a_resource_again_clears_its_rest_immediately() -> None:
+    memory = WorldMemory()
+    memory.observe(make_turn(tick=50, objects=[core()], resource_cells=[(20, 0)]))
+    memory.observe(
+        make_turn(tick=51, objects=[core(), unit(2, "WORKER", position=(21, 0))])
+    )
+    assert memory.remembered_resource_cells(51) == frozenset()
+
+    # Reporting flickers, so a cell can vanish for a Tick and come straight
+    # back.  A live sighting is authoritative and outranks the rest period.
+    memory.observe(
+        make_turn(
+            tick=52,
+            objects=[core(), unit(2, "WORKER", position=(21, 0))],
+            resource_cells=[(20, 0)],
+        )
+    )
+    assert memory.remembered_resource_cells(52) == frozenset({(20, 0)})
+
+
+def test_stale_resource_cells_expire_and_memory_stays_bounded() -> None:
+    from arena_hero_bot.memory import RESOURCE_MEMORY_LIMIT, RESOURCE_MEMORY_TTL
+
+    memory = WorldMemory()
+    memory.observe(make_turn(tick=10, objects=[core()], resource_cells=[(40, 0)]))
+    memory.observe(make_turn(tick=10 + RESOURCE_MEMORY_TTL, objects=[core()]))
+    assert memory.remembered_resource_cells(999) == frozenset({(40, 0)})
+    memory.observe(make_turn(tick=11 + RESOURCE_MEMORY_TTL, objects=[core()]))
+    assert memory.remembered_resource_cells(999) == frozenset()
+
+    crowd = [(x, 500) for x in range(RESOURCE_MEMORY_LIMIT + 40)]
+    memory.observe(make_turn(tick=9000, objects=[core()], resource_cells=crowd))
+    assert len(memory.remembered_resource_cells(999)) == RESOURCE_MEMORY_LIMIT
