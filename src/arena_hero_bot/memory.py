@@ -9,17 +9,21 @@ from typing import Any
 
 from arena_hero import CoreView, Position, Turn, UnitView
 
-from arena_hero_bot.geometry import manhattan
-
 SCHEMA_VERSION = 1
 POSITION_HISTORY_LIMIT = 8
 ENEMY_POSITION_HISTORY_LIMIT = 4
 ENEMY_DRIFT_MAX_GAP = 3
 CONTESTED_CELL_TTL = 80
-RESOURCE_MEMORY_TTL = 4096
-RESOURCE_MEMORY_LIMIT = 512
+RESOURCE_MEMORY_TTL = 65536
+RESOURCE_MEMORY_LIMIT = 2048
 RESOURCE_ABSENCE_RADIUS = 1
 RESOURCE_ABSENCE_COOLDOWN = 512
+_ABSENCE_OFFSETS = tuple(
+    (dx, dy)
+    for dx in range(-RESOURCE_ABSENCE_RADIUS, RESOURCE_ABSENCE_RADIUS + 1)
+    for dy in range(-RESOURCE_ABSENCE_RADIUS, RESOURCE_ABSENCE_RADIUS + 1)
+    if abs(dx) + abs(dy) <= RESOURCE_ABSENCE_RADIUS
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +155,14 @@ class WorldMemory:
             self.goals.pop(unit_id, None)
             self.pending_move_targets.pop(unit_id, None)
 
+    def _closely_observed_cells(self, turn: Turn) -> set[Position]:
+        """Return the cells close enough this Tick to trust an absence."""
+
+        observers = [unit.position for unit in turn.units]
+        if turn.core is not None:
+            observers.append(turn.core.position)
+        return {(x + dx, y + dy) for x, y in observers for dx, dy in _ABSENCE_OFFSETS}
+
     def _observe_resource_cells(self, turn: Turn) -> None:
         """Track known harvest sites and when each was last found empty.
 
@@ -162,16 +174,24 @@ class WorldMemory:
         already beyond the local harvest radius when first seen, which is
         exactly the population that used to vanish.
 
-        An empty cell is not a dead cell.  In the recording, cells confirmed
-        empty from an adjacent cell later held a resource again: 2.3% of the
-        observations taken from the cell itself and 5.5% from one cell away.
-        Roughly half of those returned within 24 Ticks, which is the reporting
-        flicker, and the rest after 500 or more, which is regrowth.  So an
-        absence is never allowed to delete a site, only to rest it: sites go
-        quiet for ``RESOURCE_ABSENCE_COOLDOWN`` Ticks, comfortably longer than
-        the round trip to the nearest known cell, so one wasted walk cannot
-        repeat back to back.  Flicker costs nothing, because a cell we are
-        standing next to is in the live pool anyway.
+        An empty cell is not a dead cell.  Measuring the recording by how long
+        ago a cell was last confirmed empty from close range, and asking how
+        often the next close look found a resource there again, gives 0.03%
+        within 24 Ticks, 0.60% by 120, 1.35% by 512, then a plateau: 1.79% out
+        to 2,048 Ticks and 1.63% beyond.  So an absence is never allowed to
+        delete a site, only to rest it for ``RESOURCE_ABSENCE_COOLDOWN`` Ticks,
+        which is where that curve flattens.  Flicker costs nothing, because a
+        cell we are standing next to is in the live pool anyway.
+
+        That plateau also sets ``RESOURCE_MEMORY_TTL``.  Past roughly 512 Ticks
+        a sighting's age carries no signal - a site last seen 8,000 Ticks ago is
+        as likely to hold a resource as one seen 600 Ticks ago - so expiring
+        old sites only shrinks the candidate pool.  What earns the walk is that
+        1.8%: only 13% of the cells around this Core have ever held a resource,
+        so checking a remembered site beats sweeping an unknown one by about
+        7x.  ``RESOURCE_MEMORY_LIMIT`` alone keeps the pool bounded, set above
+        the 1,960 distinct cells found in 43,196 Ticks so that a Core which has
+        exhausted its neighbourhood keeps every candidate it has ever seen.
 
         ``RESOURCE_ABSENCE_RADIUS`` stays at one cell for the same reason.
         Believing absence from further out would rest live cells, while missing
@@ -182,21 +202,13 @@ class WorldMemory:
         for cell in turn.resource_cells:
             self.resource_cells[cell] = turn.tick
             self.resource_absences.pop(cell, None)
-        observers = [unit.position for unit in turn.units]
-        if turn.core is not None:
-            observers.append(turn.core.position)
+        for cell in self._closely_observed_cells(turn):
+            if cell in self.resource_cells and cell not in turn.resource_cells:
+                self.resource_absences[cell] = turn.tick
         for cell, seen_tick in list(self.resource_cells.items()):
             if turn.tick - seen_tick > RESOURCE_MEMORY_TTL:
                 del self.resource_cells[cell]
                 self.resource_absences.pop(cell, None)
-                continue
-            if cell in turn.resource_cells:
-                continue
-            if any(
-                manhattan(cell, observer) <= RESOURCE_ABSENCE_RADIUS
-                for observer in observers
-            ):
-                self.resource_absences[cell] = turn.tick
         if len(self.resource_cells) > RESOURCE_MEMORY_LIMIT:
             self.resource_cells = dict(
                 sorted(
