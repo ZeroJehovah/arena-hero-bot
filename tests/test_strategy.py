@@ -992,6 +992,32 @@ def test_live_workers_ignore_resources_outside_the_local_patrol_ring() -> None:
     assert worker_decision.target != (0, 40)
 
 
+def test_live_workers_drop_persisted_remote_resource_goals() -> None:
+    memory = WorldMemory()
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((0, 40), 100, "resource-claim-v1", last_progress_position=(0, 39)),
+    )
+    turn = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(0, 1))],
+    )
+
+    report = decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    goal = memory.goal_for(object_id(2))
+    assert goal is not None
+    assert goal.purpose == "resource-patrol-v3"
+    assert worker_decision.reason == "patrol near the stationary Core for resources"
+
+
 def test_worker_vacates_core_and_core_spawns_second_worker() -> None:
     turn = make_turn(
         resources=5,

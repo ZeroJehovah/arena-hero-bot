@@ -1104,7 +1104,16 @@ class AggressiveStrategy:
             and resource_goal is not None
             and resource_goal.purpose == RESOURCE_CLAIM_PURPOSE
         ):
-            if resource_goal.position in context.turn.resource_cells:
+            local_radius = self.config.resource_patrol_radius * 2
+            if (
+                self._preserves_resources()
+                and manhattan(core.position, resource_goal.position) > local_radius
+            ):
+                # A previously persisted claim may have been made before the
+                # live local-radius filter.  Drop it on the first Tick after
+                # deployment instead of renewing an already remote route.
+                self.memory.clear_goal(str(worker.id))
+            elif resource_goal.position in context.turn.resource_cells:
                 self.memory.clear_goal(str(worker.id))
             else:
                 age = context.turn.tick - resource_goal.assigned_tick
