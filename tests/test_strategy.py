@@ -497,6 +497,39 @@ def test_worker_renews_resource_goal_while_making_progress() -> None:
     assert renewed.assigned_tick == 105
 
 
+def test_worker_releases_empty_resource_goal_on_arrival() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    strategy.decide(
+        make_turn(
+            tick=100,
+            objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 0))],
+            resource_cells=[(0, 2)],
+        )
+    )
+    strategy.decide(
+        make_turn(
+            tick=101,
+            objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 1))],
+        )
+    )
+
+    arrived = make_turn(
+        tick=102,
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 2))],
+    )
+    report = strategy.decide(arrived)
+
+    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert decision.reason != "wait for recently seen resource to reappear"
+    goal = memory.goal_for(object_id(2))
+    assert goal is None or goal.purpose != "resource-claim-v1"
+
+
 def test_worker_deposits_at_core_and_waits_when_storage_full() -> None:
     deposit = make_turn(
         resources=5,
