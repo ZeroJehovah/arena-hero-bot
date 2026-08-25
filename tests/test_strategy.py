@@ -973,6 +973,25 @@ def test_nearest_worker_is_assigned_visible_resource() -> None:
     ]
 
 
+def test_live_workers_ignore_resources_outside_the_local_patrol_ring() -> None:
+    turn = make_turn(
+        objects=[core(), unit(2, "WORKER", position=(0, 0))],
+        resource_cells=[(0, 40)],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    assert worker_decision.action == "MOVE"
+    assert worker_decision.reason == "patrol near the stationary Core for resources"
+    assert worker_decision.target != (0, 40)
+
+
 def test_worker_vacates_core_and_core_spawns_second_worker() -> None:
     turn = make_turn(
         resources=5,

@@ -2711,12 +2711,25 @@ class AggressiveStrategy:
         return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
     def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
-        """Assign every visible resource to the nearest empty Worker."""
+        """Assign nearby visible resources to the nearest empty Worker.
+
+        In the live reserve-preserving mode, combat units can reveal resource
+        cells far beyond the Worker patrol ring.  Sending an economy unit to
+        those cells turns a short harvest loop into a long round trip, so
+        leave them to the local patrol rather than assigning them directly.
+        """
 
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
         resources = set(turn.resource_cells) - {
             enemy.position for enemy in turn.visible_enemies
         }
+        if self._preserves_resources() and turn.core is not None:
+            local_radius = self.config.resource_patrol_radius * 2
+            resources = {
+                resource
+                for resource in resources
+                if manhattan(turn.core.position, resource) <= local_radius
+            }
         assignments: dict[UUID, Position] = {}
         while workers and resources:
             _, worker_id, resource = min(
