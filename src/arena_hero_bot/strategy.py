@@ -59,6 +59,9 @@ CORE_WORKER_INTERCEPT_RADIUS = 4
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
 CORE_CAPACITY_HIGH_RESERVE = 100
+CORE_STOCKPILE_CAPACITY_PERCENT = 70
+CORE_BANKING_CAPACITY_PERCENT = 90
+CORE_EVASION_MIN_BREAKAWAY_DISTANCE = 5
 EARLY_COMBAT_MIN_UNITS = 2
 EARLY_COMBAT_GUARD_WORKERS = 4
 
@@ -75,8 +78,9 @@ class StrategyConfig:
     target_workers: int = 2
     max_population: int | None = 12
     resource_target: int = 0
+    growth_slowdown_population: int | None = 40
     safety_reserve: int = 10
-    resource_patrol_radius: int = 30
+    resource_patrol_radius: int = 14
     offensive_patrol_radius: int = 60
     offensive_patrol_goal_ttl: int = 160
     offensive_core_memory_ttl: int = 512
@@ -738,7 +742,14 @@ class AggressiveStrategy:
             self._record_wait(worker, context, "no Core while respawning")
             return
 
-        if context.combat_assault:
+        # ``_emergency_worker_goal`` places Workers on a ring around the Core
+        # at the assault radius.  Applying it to a Worker that is already
+        # further out dragged distant economy Units back toward the fight and
+        # abandoned resources they were about to claim, so only Workers inside
+        # the contested zone are pulled out of it.
+        if context.combat_assault and (
+            manhattan(worker.position, core.position) <= self.config.core_assault_radius
+        ):
             goal = self._emergency_worker_goal(worker, context)
             if goal == worker.position:
                 self._record_wait(
@@ -863,6 +874,18 @@ class AggressiveStrategy:
                 context,
                 reason="return carried resources to Core",
                 allow_goal=True,
+            ):
+                return
+            # Only one Worker can hold the Core cell per Tick and the guard
+            # ring adds more contention, so a loaded Worker regularly lost the
+            # race.  Waiting in place left it idle wherever it happened to
+            # stand; closing the remaining distance instead means the deposit
+            # lands on the Tick the cell frees up.
+            if manhattan(worker.position, core.position) > 1 and self._move(
+                worker,
+                core.position,
+                context,
+                reason="stage carried resources next to the busy Core",
             ):
                 return
             self._record_wait(worker, context, "Core cell is not currently reachable")
@@ -1036,9 +1059,13 @@ class AggressiveStrategy:
                 and manhattan(core.position, enemy.position) <= 4
             )
         )
-        overwhelmed = nearby_enemy and (
-            len(nearby_combat_enemies) >= self.config.core_escape_enemy_count
-            or (core.shield <= 2 and len(nearby_combat_enemies) >= 2)
+        overwhelmed = (
+            nearby_enemy
+            and self._can_break_away(context.turn, nearby_combat_enemies)
+            and (
+                len(nearby_combat_enemies) >= self.config.core_escape_enemy_count
+                or (core.shield <= 2 and len(nearby_combat_enemies) >= 2)
+            )
         )
         if overwhelmed:
             direction = self._core_escape_direction(context, nearby_combat_enemies)
@@ -1676,6 +1703,8 @@ class AggressiveStrategy:
         core = turn.core
         if core is None or core.view.state is CoreState.MOVING or not enemies:
             return False
+        if not self._can_break_away(turn, enemies):
+            return False
         if self._guardless_low_capacity_assault(turn, enemies):
             # A freshly respawned Core can spend several minutes below the
             # first Vanguard threshold.  Once a combat enemy enters the local
@@ -1749,6 +1778,41 @@ class AggressiveStrategy:
             and not turn.vanguards
             and not turn.rangers
             and bool(enemies)
+        )
+
+    def _can_break_away(
+        self,
+        turn: Turn,
+        enemies: tuple[CoreView | UnitView, ...],
+    ) -> bool:
+        """Return whether a Core migration can still outrun this pursuit.
+
+        A Core needs four Ticks per cell while Units cover one cell per Tick,
+        and a ``MOVING`` Core can neither ``HEAL`` nor ``REPAIR_SHIELD``.  An
+        Core that starts migrating with an unmatched pursuer already close
+        therefore trades its only repair option for a retreat it cannot win:
+        three of six recorded Core losses were chipped down mid-migration by
+        one or two pursuers.  When nearby guards at least match the pursuit
+        they can trade Ticks for the migration, so the usual evacuation
+        criteria still apply.
+        """
+
+        core = turn.core
+        if core is None:
+            return False
+        if not enemies:
+            return True
+        screen = [
+            unit
+            for unit in (*turn.vanguards, *turn.rangers)
+            if manhattan(core.position, unit.position)
+            <= self.config.core_assault_radius
+        ]
+        if len(screen) >= len(enemies):
+            return True
+        return (
+            min(manhattan(core.position, enemy.position) for enemy in enemies)
+            >= CORE_EVASION_MIN_BREAKAWAY_DISTANCE
         )
 
     def _has_local_combat_guard(self, turn: Turn) -> bool:
@@ -2521,9 +2585,33 @@ class AggressiveStrategy:
             and not self._near_remembered_worker_danger(current.position, turn)
             and manhattan(core.position, current.position)
             <= self.config.resource_patrol_radius * 2
-            and turn.tick - current.assigned_tick <= self.config.exploration_goal_ttl
         ):
-            return current.position
+            if current.last_progress_position is None:
+                current = UnitGoal(
+                    position=current.position,
+                    assigned_tick=current.assigned_tick,
+                    purpose=current.purpose,
+                    last_progress_position=worker.position,
+                )
+                self.memory.set_goal(unit_id, current)
+            if turn.tick - current.assigned_tick <= self.config.exploration_goal_ttl:
+                return current.position
+            # A patrol point can be further away in travel Ticks than the goal
+            # TTL allows.  Expiring it mid-transit made Workers rotate to the
+            # next point before ever arriving, so the sweep degenerated into
+            # walking.  Renew the goal while the Worker is still closing in.
+            progress_reference = current.last_progress_position
+            if progress_reference is not None and manhattan(
+                worker.position, current.position
+            ) < manhattan(progress_reference, current.position):
+                renewed = UnitGoal(
+                    position=current.position,
+                    assigned_tick=turn.tick,
+                    purpose=current.purpose,
+                    last_progress_position=worker.position,
+                )
+                self.memory.set_goal(unit_id, renewed)
+                return renewed.position
 
         phase = turn.tick // self.config.exploration_goal_ttl
         offsets = _resource_patrol_offsets(
@@ -2644,7 +2732,8 @@ class AggressiveStrategy:
         growth_target = self._growth_population_target()
         if growth_target is not None and turn.state.population >= growth_target:
             return None
-        if self._emergency_combat_mode(turn):
+        emergency = self._emergency_combat_mode(turn)
+        if emergency:
             candidates = (
                 (UnitType.RANGER, UnitType.VANGUARD)
                 if len(turn.rangers) * 2 < len(turn.vanguards)
@@ -2669,25 +2758,51 @@ class AggressiveStrategy:
             candidates = (UnitType.RANGER, UnitType.VANGUARD)
         else:
             candidates = (UnitType.VANGUARD, UnitType.RANGER)
-        return next(
-            (
-                unit_type
-                for unit_type in candidates
-                if (
-                    unit_cost(unit_type, turn.state.population)
-                    + self._spawn_safety_reserve(
-                        turn,
-                        production_cost=unit_cost(
-                            unit_type,
-                            turn.state.population,
-                        ),
-                        available_resources=resources,
-                    )
-                    <= resources
-                )
-            ),
-            None,
+        return self._affordable_spawn(
+            turn,
+            resources,
+            candidates,
+            strict_preference=not emergency,
         )
+
+    def _affordable_spawn(
+        self,
+        turn: Turn,
+        resources: int,
+        candidates: tuple[UnitType, ...],
+        *,
+        strict_preference: bool,
+    ) -> UnitType | None:
+        """Return the first candidate the Core can fund without losing intent.
+
+        Taking the first affordable candidate silently inverts the policy: a
+        Ranger costs more than a Vanguard, so the melee fallback always won
+        the race and the roster drifted to almost pure Vanguards even while
+        the policy asked for twice as many Rangers.  Outside emergencies the
+        Core saves for its preferred Unit instead, and only falls back when
+        that Unit cannot fit in Core storage at all.
+        """
+
+        def affordable(unit_type: UnitType) -> bool:
+            cost = unit_cost(unit_type, turn.state.population)
+            reserve = self._spawn_safety_reserve(
+                turn,
+                production_cost=cost,
+                available_resources=resources,
+            )
+            return cost + reserve <= resources
+
+        for index, unit_type in enumerate(candidates):
+            if affordable(unit_type):
+                return unit_type
+            if (
+                index == 0
+                and strict_preference
+                and unit_cost(unit_type, turn.state.population)
+                <= turn.resource_capacity
+            ):
+                return None
+        return None
 
     def _needs_resource_guard(self, turn: Turn) -> bool:
         if not self._preserves_resources() or turn.core is None:
@@ -2842,7 +2957,37 @@ class AggressiveStrategy:
             return 50
         if capacity <= CORE_CAPACITY_HIGH_RESERVE:
             return 95
-        return CORE_CAPACITY_HIGH_RESERVE
+        # Above the high tier a flat target pinned the live stockpile just
+        # over 100 forever: every deposit past ``target + unit_cost`` funded
+        # the next Unit immediately, so almost all income bought roster while
+        # the bank -- the only source of HEAL and REPAIR_SHIELD -- never grew.
+        # Scaling with the storage the roster already paid for keeps a real
+        # emergency reserve, and the banking tier slows growth once the army
+        # is large enough to hold the Core on its own.
+        percent = (
+            CORE_BANKING_CAPACITY_PERCENT
+            if self._growth_slowdown_active(turn)
+            else CORE_STOCKPILE_CAPACITY_PERCENT
+        )
+        return max(CORE_CAPACITY_HIGH_RESERVE, capacity * percent // 100)
+
+    def _growth_slowdown_active(self, turn: Turn) -> bool:
+        """Return whether growth should yield to banking at this population.
+
+        Unit prices rise 1.3x per five population while each Unit only adds
+        five storage, so past the soft threshold every additional guard costs
+        much more and adds very little to a Core that already holds a full
+        defensive ring.  Real enemy pressure lifts the slowdown so the bank
+        can be spent on defenders at once.
+        """
+
+        threshold = self.config.growth_slowdown_population
+        return (
+            threshold is not None
+            and self._unbounded_growth()
+            and turn.state.population >= threshold
+            and not self._emergency_combat_mode(turn)
+        )
 
     def _unbounded_growth(self) -> bool:
         """Return whether the live strategy has no fixed population/stockpile goal."""

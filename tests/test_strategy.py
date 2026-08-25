@@ -2,7 +2,7 @@
 
 from itertools import pairwise
 
-from arena_hero import Direction, SpawnAction, UnitType
+from arena_hero import Direction, SpawnAction, UnitType, unit_cost
 
 from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
@@ -200,7 +200,15 @@ def test_vanguards_spread_across_focus_target_escape_routes() -> None:
     assert len(goals) == len(set(goals))
 
 
-def test_core_evacuates_when_combat_group_is_overwhelmed() -> None:
+def test_outmatched_core_repairs_instead_of_an_unwinnable_migration() -> None:
+    """A Core cannot outrun pursuit it is already in contact with.
+
+    Migration costs four Ticks per cell where Units cover one cell per Tick,
+    and a ``MOVING`` Core can neither ``HEAL`` nor ``REPAIR_SHIELD``.  With a
+    single guard against five adjacent hostiles the retreat cannot be
+    screened, so holding the cell and restoring the shield strictly dominates.
+    """
+
     turn = make_turn(
         resources=10,
         objects=[
@@ -214,11 +222,10 @@ def test_core_evacuates_when_combat_group_is_overwhelmed() -> None:
         ],
     )
 
-    report = decide(turn)
+    decide(turn)
 
     assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
-    assert any("overwhelming enemy assault" in item.reason for item in report.decisions)
+    assert turn.plan.core_action.type == "REPAIR_SHIELD"
 
 
 def test_guardless_low_capacity_core_evacuates_before_first_hit() -> None:
@@ -1440,11 +1447,13 @@ def test_unbounded_growth_keeps_reserve_for_damaged_low_capacity_core() -> None:
     assert turn.plan.core_action is None
 
 
-def test_pre_evade_moves_core_before_a_melee_group_reaches_attack_range() -> None:
+def test_pre_evade_moves_core_when_guards_match_the_closing_group() -> None:
     turn = make_turn(
         objects=[
             core(),
             unit(2, "WORKER", position=(5, 5)),
+            unit(5, "VANGUARD", position=(0, -3)),
+            unit(6, "VANGUARD", position=(-3, 0)),
             unit(3, "VANGUARD", controlled=False, position=(0, 3)),
             unit(4, "VANGUARD", controlled=False, position=(1, 2)),
         ],
@@ -1458,6 +1467,27 @@ def test_pre_evade_moves_core_before_a_melee_group_reaches_attack_range() -> Non
     assert report.threat_level == "PRE_EVADE"
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "START_MOVE"
+
+
+def test_pre_evade_holds_an_unscreened_core_inside_breakaway_range() -> None:
+    turn = make_turn(
+        resources=5,
+        objects=[
+            core(shield=4),
+            unit(2, "WORKER", position=(5, 5)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 3)),
+            unit(4, "VANGUARD", controlled=False, position=(1, 2)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    assert report.threat_level == "PRE_EVADE"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "REPAIR_SHIELD"
 
 
 def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
@@ -1510,10 +1540,15 @@ def test_unbounded_growth_uses_capacity_stockpile_tiers() -> None:
     assert reserve_for_population(18) == 50  # capacity 90
     assert reserve_for_population(19) == 95  # capacity 95
     assert reserve_for_population(20) == 95  # capacity 100: previous tier
-    assert reserve_for_population(21) == 100  # capacity 105: high tier
-    assert reserve_for_population(29) == 100  # capacity 145
-    assert reserve_for_population(30) == 100  # capacity 150
-    assert reserve_for_population(31) == 100  # capacity 155
+    assert reserve_for_population(21) == 100  # capacity 105: floor still wins
+    assert reserve_for_population(29) == 101  # capacity 145: 70%
+    assert reserve_for_population(30) == 105  # capacity 150: 70%
+    assert reserve_for_population(31) == 108  # capacity 155: 70%
+    assert reserve_for_population(39) == 136  # capacity 195: 70%
+    # At the growth slowdown threshold the target jumps to the banking tier so
+    # income fills the emergency reserve instead of an ever pricier roster.
+    assert reserve_for_population(40) == 180  # capacity 200: 90%
+    assert reserve_for_population(41) == 184  # capacity 205: 90%
 
 
 def test_unbounded_growth_crosses_a_stockpile_boundary_without_deadlocking() -> None:
@@ -2450,11 +2485,15 @@ def test_resource_patrol_route_covers_square_without_vision_gaps() -> None:
     radius = StrategyConfig().resource_patrol_radius
     offsets = _resource_patrol_offsets(radius=radius, spacing=6)
 
-    assert radius == 30
-    assert len(offsets) == 120
+    assert radius == 14
+    assert len(offsets) == 36
     assert len(set(offsets)) == len(offsets)
     assert all(max(abs(x), abs(y)) <= radius for x, y in offsets)
-    assert all(manhattan(left, right) <= 12 for left, right in pairwise(offsets))
+    assert all(manhattan(left, right) <= 6 for left, right in pairwise(offsets))
+    # The furthest patrol point is one 28-cell leg from the Core rather than
+    # the 60-cell leg the old radius produced, so a sweep step is a round trip
+    # a Worker can finish instead of a walk that expires mid-transit.
+    assert max(abs(x) + abs(y) for x, y in offsets) == 28
 
 
 def test_strategy_avoids_recently_contested_resource_patrol_cell() -> None:
@@ -2650,3 +2689,165 @@ def test_reaching_exploration_goal_immediately_advances_toward_center() -> None:
     assert abs(next_goal.position[0]) < abs(first_goal.position[0])
     assert abs(next_goal.position[1]) < abs(first_goal.position[1])
     assert reached.plan.unit_actions[reached.workers[0].id].type == "MOVE"
+
+
+def test_core_saves_for_the_ranger_the_composition_policy_asks_for() -> None:
+    """Falling through to the cheaper Vanguard silently inverted the policy.
+
+    A Ranger costs more than a Vanguard, so taking the first affordable
+    candidate meant the melee fallback always won the race and the roster
+    drifted to almost pure Vanguards while the policy asked for twice as many
+    Rangers.  With enough resources for a Vanguard but not a Ranger the Core
+    now waits instead of spending.
+    """
+
+    roster = [
+        unit(number, "VANGUARD", position=(number, 3)) for number in range(2, 6)
+    ] + [unit(number, "WORKER", position=(number, 4)) for number in range(6, 8)]
+    vanguard_cost = unit_cost(UnitType.VANGUARD, len(roster))
+    ranger_cost = unit_cost(UnitType.RANGER, len(roster))
+    assert vanguard_cost < ranger_cost
+
+    turn = make_turn(resources=vanguard_cost, objects=[core(), *roster])
+    decide(turn, config=StrategyConfig(target_workers=2, max_population=None))
+    assert turn.plan.core_action is None
+
+    funded = make_turn(resources=ranger_cost, objects=[core(), *roster])
+    decide(funded, config=StrategyConfig(target_workers=2, max_population=None))
+    assert isinstance(funded.plan.core_action, SpawnAction)
+    assert funded.plan.core_action.unit_type is UnitType.RANGER
+
+
+def test_unaffordable_preference_still_falls_back_at_low_capacity() -> None:
+    """Saving must never deadlock a Core that can never hold the price."""
+
+    turn = make_turn(
+        resources=10,
+        objects=[core(), unit(2, "WORKER", position=(1, 0))],
+    )
+
+    decide(turn, config=StrategyConfig(target_workers=12, max_population=None))
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    # Capacity 10 cannot hold a Ranger, so the Vanguard fallback is correct.
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_growth_slowdown_banks_income_instead_of_buying_a_pricier_roster() -> None:
+    roster = [
+        unit(number, "VANGUARD", position=(number % 9, number // 9))
+        for number in range(2, 42)
+    ]
+    assert len(roster) == 40
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+
+    below_target = make_turn(resources=170, objects=[core(), *roster])
+    assert below_target.resource_capacity == 200
+    strategy.decide(below_target)
+    assert below_target.plan.core_action is None
+
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    banked = make_turn(resources=200, objects=[core(), *roster])
+    strategy.decide(banked)
+    assert banked.plan.core_action is not None
+    assert banked.plan.core_action.type == "SPAWN"
+
+
+def test_growth_slowdown_lifts_under_real_enemy_pressure() -> None:
+    """Pressure must unlock the bank the slowdown spent hours filling."""
+
+    roster = [
+        unit(number, "VANGUARD", position=(number % 7 + 1, number // 7))
+        for number in range(2, 42)
+    ]
+    turn = make_turn(
+        resources=170,
+        objects=[
+            core(),
+            *roster,
+            unit(90, "RANGER", controlled=False, position=(0, 12)),
+            unit(91, "RANGER", controlled=False, position=(1, 12)),
+        ],
+    )
+
+    decide(turn, config=StrategyConfig(target_workers=0, max_population=None))
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+
+
+def test_resource_patrol_goal_is_renewed_while_the_worker_closes_in() -> None:
+    """A far patrol point outlives the goal TTL in travel Ticks.
+
+    Rotating to the next sweep point mid-transit meant Workers walked between
+    targets they never reached, so the goal is renewed while progress lasts.
+    """
+
+    memory = WorldMemory()
+    config = StrategyConfig(resource_target=95, resource_patrol_radius=14)
+    strategy = AggressiveStrategy(memory, config)
+    first = make_turn(
+        tick=160,
+        objects=[core(position=(100, 100)), unit(2, "WORKER", position=(100, 100))],
+    )
+    strategy.decide(first)
+    goal = memory.goal_for(object_id(2))
+    assert goal is not None
+
+    closer = (
+        goal.position[0] + (1 if goal.position[0] < 100 else -1),
+        goal.position[1],
+    )
+    progressed = make_turn(
+        tick=first.tick + config.exploration_goal_ttl + 1,
+        objects=[core(position=(100, 100)), unit(2, "WORKER", position=closer)],
+    )
+    strategy.decide(progressed)
+    renewed = memory.goal_for(object_id(2))
+
+    assert renewed is not None
+    assert renewed.position == goal.position
+    assert renewed.assigned_tick == progressed.tick
+
+
+def test_loaded_worker_stages_next_to_a_busy_core_instead_of_idling() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "WORKER", position=(0, 1), cargo=1),
+            unit(3, "WORKER", position=(0, 4), cargo=1),
+        ],
+    )
+
+    report = decide(turn, config=StrategyConfig(target_workers=12, max_population=None))
+
+    far = next(worker for worker in turn.workers if worker.position == (0, 4))
+    staged = turn.plan.unit_actions[far.id]
+    assert staged.type == "MOVE"
+    assert staged.direction is Direction.UP
+    assert any(
+        item.actor_id == str(far.id)
+        and item.reason == "stage carried resources next to the busy Core"
+        for item in report.decisions
+    )
+
+
+def test_distant_worker_is_not_dragged_into_the_core_assault_zone() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0), shield=4),
+            unit(2, "WORKER", position=(0, 30)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 1)),
+            unit(4, "VANGUARD", controlled=False, position=(1, 0)),
+            unit(5, "RANGER", controlled=False, position=(-1, 0)),
+        ],
+    )
+
+    report = decide(turn, config=config)
+
+    distant = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert "assault zone" not in distant.reason
+    assert distant.reason == "patrol near the stationary Core for resources"
