@@ -3233,11 +3233,13 @@ def _raid_turn(
     away: bool = False,
     rival: tuple[int, int] = (25, 0),
     extra=(),
+    events=(),
 ) -> object:
     places = AWAY_POSITIONS if away else HOME_POSITIONS
     return make_turn(
         tick=tick,
         resources=0,
+        events=events,
         objects=[
             core(hp=core_hp),
             unit(3, "RANGER", position=places[3]),
@@ -3320,6 +3322,62 @@ def test_raid_turns_around_when_the_objective_is_defended_in_force() -> None:
     # Home is quiet, so the recall can only come from the odds at the objective.
     assert report.threat_level == "NORMAL"
     assert strategy._raid_ids == frozenset()
+    assert strategy._raid_cooldown_until == 101 + config.raid_max_ticks // 2
+
+
+def test_raid_holds_together_while_only_the_detachment_is_under_fire() -> None:
+    # The trigger for a raid is a burst of kills, so the raid is born inside a
+    # battle and its own fighting keeps `recent_attack` alive.  Recalling on
+    # that evidence made the detachment dissolve one Tick after it formed, with
+    # no hostile visible anywhere and none near the Core for a hundred Ticks.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(_raid_turn(100))
+    launched = strategy._raid_ids
+    assert launched
+
+    shot_at = _raid_turn(
+        101,
+        away=True,
+        events=[
+            {
+                "event_id": object_id(90),
+                "tick": 101,
+                "event_type": "UNIT_DAMAGED",
+                "reason_code": "ATTACK",
+                "actor_id": object_id(50),
+                "target_id": object_id(6),
+                "position": [15, 0],
+            }
+        ],
+    )
+    report = strategy.decide(shot_at)
+
+    # The fleet counts as engaged, but nothing has come near the Core.
+    assert report.threat_level == "ENGAGED"
+    assert report.threat_reason == "FLEET_ATTACK"
+    assert strategy._raid_ids == launched
+    assert strategy._raid_target == (25, 0)
+
+
+def test_raid_is_recalled_when_a_fleet_reaches_the_alert_ring() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(_raid_turn(100))
+    assert strategy._raid_ids
+
+    besieged = _raid_turn(
+        101,
+        away=True,
+        extra=[
+            unit(50, "VANGUARD", controlled=False, position=(10, 0)),
+            unit(51, "VANGUARD", controlled=False, position=(10, 1)),
+        ],
+    )
+    strategy.decide(besieged)
+
+    assert strategy._raid_ids == frozenset()
+    assert strategy._raid_target is None
     assert strategy._raid_cooldown_until == 101 + config.raid_max_ticks // 2
 
 

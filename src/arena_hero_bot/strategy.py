@@ -3004,7 +3004,7 @@ class AggressiveStrategy:
             objective = self._raid_target_for(turn, self.config.raid_radius)
             if (
                 turn.tick > self._raid_until_tick
-                or threat.combat_pressure
+                or self._raid_recall_needed(turn, threat)
                 or core.hp < 5
                 or core.shield < 5
                 or self._raid_outmatched(turn)
@@ -3017,8 +3017,7 @@ class AggressiveStrategy:
             return self._raid_ids
         if (
             turn.tick <= self._raid_cooldown_until
-            or threat.combat_pressure
-            or self._emergency_combat_mode(turn)
+            or self._raid_recall_needed(turn, threat)
             or not self._offensive_patrol_enabled(turn)
         ):
             return frozenset()
@@ -3036,6 +3035,32 @@ class AggressiveStrategy:
         self._raid_until_tick = turn.tick + self.config.raid_max_ticks
         self._combat_kills.clear()
         return self._raid_ids
+
+    def _raid_recall_needed(self, turn: Turn, threat: ThreatAssessment) -> bool:
+        """Whether the Core itself needs the detachment back at home.
+
+        ``ThreatAssessment.combat_pressure`` cannot answer this question.  It
+        is true whenever any unit of ours took damage in the last few Ticks,
+        anywhere on the map, so a detachment sent out to fight recalls itself
+        the moment it trades its first shot - and the trigger that launches it
+        is a burst of kills, which leaves a launch window one quiet Tick wide
+        in the middle of a battle.  Replaying the engagement this rule comes
+        from shows exactly that: the raid formed on the single Tick the fight
+        fell quiet and dissolved on the next, while no enemy fighter was
+        visible at all and none had been inside the alert ring for a hundred
+        Ticks.
+
+        Only evidence about the Core counts here - damage it has taken or is
+        in line to take, hostiles closing on it or pursuing towards it, and a
+        fleet already inside the alert ring.  The rest is the noise of a fight
+        the detachment is supposed to be finishing.
+        """
+
+        return (
+            threat.should_evacuate_core
+            or bool(threat.near_core_enemy_ids)
+            or self._emergency_combat_mode(turn)
+        )
 
     def _raid_target_for(self, turn: Turn, radius: int) -> Position | None:
         """Pick the objective: a known Core inside ``radius``, else the bearing.
