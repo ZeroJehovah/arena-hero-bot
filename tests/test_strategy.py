@@ -973,9 +973,13 @@ def test_nearest_worker_is_assigned_visible_resource() -> None:
     ]
 
 
-def test_live_workers_ignore_resources_outside_the_local_patrol_ring() -> None:
+def test_live_workers_use_one_scout_for_remote_visible_resources() -> None:
     turn = make_turn(
-        objects=[core(), unit(2, "WORKER", position=(0, 0))],
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
         resource_cells=[(0, 40)],
     )
 
@@ -984,23 +988,57 @@ def test_live_workers_ignore_resources_outside_the_local_patrol_ring() -> None:
         config=StrategyConfig(target_workers=12, max_population=None),
     )
 
-    worker_decision = next(
+    scout_decision = next(
         item for item in report.decisions if item.actor_id == object_id(2)
     )
-    assert worker_decision.action == "MOVE"
-    assert worker_decision.reason == "patrol near the stationary Core for resources"
-    assert worker_decision.target != (0, 40)
+    guard_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(3)
+    )
+    assert scout_decision.action == "MOVE"
+    assert scout_decision.reason == "claim nearest unassigned visible resource"
+    assert scout_decision.target == (0, 40)
+    assert guard_decision.reason == "patrol near the stationary Core for resources"
+
+
+def test_live_workers_send_one_scout_when_no_resource_is_visible() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(-100, 100)),
+            unit(2, "WORKER", position=(-100, 100)),
+            unit(3, "WORKER", position=(-99, 100)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    scout_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    guard_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(3)
+    )
+    assert scout_decision.action == "MOVE"
+    assert scout_decision.reason == "scout beyond the local patrol ring for resources"
+    assert scout_decision.target == (-70, 70)
+    assert guard_decision.reason == "patrol near the stationary Core for resources"
 
 
 def test_live_workers_drop_persisted_remote_resource_goals() -> None:
     memory = WorldMemory()
     memory.set_goal(
-        object_id(2),
+        object_id(3),
         UnitGoal((0, 40), 100, "resource-claim-v1", last_progress_position=(0, 39)),
     )
     turn = make_turn(
         tick=101,
-        objects=[core(), unit(2, "WORKER", position=(0, 1))],
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "WORKER", position=(0, 1)),
+        ],
     )
 
     report = decide(
@@ -1010,9 +1048,9 @@ def test_live_workers_drop_persisted_remote_resource_goals() -> None:
     )
 
     worker_decision = next(
-        item for item in report.decisions if item.actor_id == object_id(2)
+        item for item in report.decisions if item.actor_id == object_id(3)
     )
-    goal = memory.goal_for(object_id(2))
+    goal = memory.goal_for(object_id(3))
     assert goal is not None
     assert goal.purpose == "resource-patrol-v3"
     assert worker_decision.reason == "patrol near the stationary Core for resources"
@@ -1837,7 +1875,7 @@ def test_dense_core_guard_uses_unique_outer_slots_and_frees_worker_route() -> No
         item for item in report.decisions if item.actor_id == str(turn.workers[0].id)
     )
     assert worker_decision.action == "MOVE"
-    assert worker_decision.reason == "patrol near the stationary Core for resources"
+    assert worker_decision.reason == "scout beyond the local patrol ring for resources"
 
 
 def test_defensive_ring_radius_scales_with_guard_count_and_vision() -> None:

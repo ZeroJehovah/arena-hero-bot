@@ -1107,6 +1107,7 @@ class AggressiveStrategy:
             local_radius = self.config.resource_patrol_radius * 2
             if (
                 self._preserves_resources()
+                and not self._is_resource_scout(worker, context.turn)
                 and manhattan(core.position, resource_goal.position) > local_radius
             ):
                 # A previously persisted claim may have been made before the
@@ -1153,8 +1154,16 @@ class AggressiveStrategy:
                 self.memory.clear_goal(str(worker.id))
 
         if self._preserves_resources():
-            goal = self._resource_patrol_goal(worker, context.turn)
-            reason = "patrol near the stationary Core for resources"
+            if (
+                self._is_resource_scout(worker, context.turn)
+                and context.threat.level is ThreatLevel.NORMAL
+                and not self._has_local_resource_cells(context.turn)
+            ):
+                goal = self._exploration_goal(worker, context.turn.tick)
+                reason = "scout beyond the local patrol ring for resources"
+            else:
+                goal = self._resource_patrol_goal(worker, context.turn)
+                reason = "patrol near the stationary Core for resources"
         else:
             goal = self._exploration_goal(worker, context.turn.tick)
             reason = "scout for resources and enemies"
@@ -2734,11 +2743,22 @@ class AggressiveStrategy:
         }
         if self._preserves_resources() and turn.core is not None:
             local_radius = self.config.resource_patrol_radius * 2
-            resources = {
+            local_resources = {
                 resource
                 for resource in resources
                 if manhattan(turn.core.position, resource) <= local_radius
             }
+            if local_resources:
+                resources = local_resources
+            elif self._unbounded_growth() and workers:
+                # Keep one deterministic Worker as a bounded resource scout.
+                # The other Workers remain in the short deposit loop, while
+                # the scout can discover or finish a remote node without
+                # reopening the old all-Workers long-haul behavior.
+                scout = min(turn.workers, key=lambda worker: worker.id.bytes)
+                workers = {scout.id: scout} if scout.id in workers else {}
+            else:
+                resources = set()
         assignments: dict[UUID, Position] = {}
         while workers and resources:
             _, worker_id, resource = min(
@@ -2754,6 +2774,27 @@ class AggressiveStrategy:
             workers.pop(worker_id)
             resources.remove(resource)
         return assignments
+
+    def _is_resource_scout(self, worker: Worker, turn: Turn) -> bool:
+        """Return whether this Worker is the sole long-range economy scout."""
+
+        if not self._unbounded_growth() or not turn.workers:
+            return False
+        scout = min(turn.workers, key=lambda item: item.id.bytes)
+        return worker.id == scout.id
+
+    def _has_local_resource_cells(self, turn: Turn) -> bool:
+        """Return whether a visible, non-hostile resource is inside the loop."""
+
+        if turn.core is None:
+            return False
+        enemy_positions = {enemy.position for enemy in turn.visible_enemies}
+        local_radius = self.config.resource_patrol_radius * 2
+        return any(
+            resource not in enemy_positions
+            and manhattan(turn.core.position, resource) <= local_radius
+            for resource in turn.resource_cells
+        )
 
     def _core_migration_direction(self, context: _TurnContext) -> Direction | None:
         """Choose one currently legal-looking Core step toward the origin."""
