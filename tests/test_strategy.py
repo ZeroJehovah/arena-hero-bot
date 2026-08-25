@@ -4,7 +4,7 @@ from itertools import pairwise
 
 from arena_hero import Direction, SpawnAction, UnitType, unit_cost
 
-from arena_hero_bot.geometry import manhattan
+from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
     AggressiveStrategy,
@@ -3048,3 +3048,299 @@ def test_critical_screen_vanguard_rotates_out_instead_of_holding_its_post() -> N
     wounded = next(item for item in report.decisions if item.actor_id == object_id(8))
     assert wounded.reason != "hold the Core screen while the strike team attacks"
     assert "critical" in wounded.reason
+
+
+def _reasons_by_number(report) -> dict[int, str]:
+    """Map factory Unit numbers to the reason recorded for that Unit."""
+
+    lookup = {item.actor_id: item.reason for item in report.decisions}
+    return {
+        number: lookup[object_id(number)]
+        for number in range(1, 64)
+        if object_id(number) in lookup
+    }
+
+
+PERIMETER_REASON = "hold a defensive perimeter around the resource Core"
+
+
+def _walks_towards_core(turn, number: int) -> bool:
+    """Whether the named Unit stepped closer to its own Core this Tick."""
+
+    mover = next(item for item in turn.units if str(item.id) == object_id(number))
+    step = turn.plan.unit_actions[mover.id]
+    if step.type != "MOVE":
+        return False
+    origin = turn.core.position
+    return manhattan(origin, add(mover.position, step.direction)) < manhattan(
+        origin, mover.position
+    )
+
+
+def test_defensive_leash_returns_the_main_force_to_the_perimeter() -> None:
+    # A damaged Core puts the fleet in emergency mode, which hands every
+    # non-garrison guard the fleet-wide enemy list.  The hostile sits 25 cells
+    # out, well beyond ``combat_pursuit_radius``, so the chase must not start.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(hp=4),
+            unit(3, "VANGUARD", position=(14, 0)),
+            unit(2, "VANGUARD", position=(0, 2)),
+            unit(4, "VANGUARD", position=(0, 3)),
+            unit(5, "VANGUARD", position=(0, 4)),
+            unit(31, "VANGUARD", controlled=False, position=(25, 0)),
+        ],
+    )
+
+    report = decide(turn, config=config)
+    reasons = _reasons_by_number(report)
+
+    assert reasons[3] == PERIMETER_REASON
+    chaser = next(item for item in report.decisions if item.actor_id == object_id(3))
+    assert chaser.target is not None
+    assert manhattan((0, 0), chaser.target) <= config.combat_pursuit_radius
+    assert _walks_towards_core(turn, 3)
+
+
+def test_combat_leash_still_allows_an_outside_unit_to_close_inwards() -> None:
+    # A unit that drifted past the leash must not be frozen out there: a goal
+    # that is strictly closer to the Core than the unit already is stays legal.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(hp=4),
+            unit(3, "VANGUARD", position=(30, 0)),
+            unit(2, "VANGUARD", position=(0, 2)),
+            unit(4, "VANGUARD", position=(0, 3)),
+            unit(5, "VANGUARD", position=(0, 4)),
+            unit(31, "VANGUARD", controlled=False, position=(22, 0)),
+        ],
+    )
+
+    report = decide(turn, config=config)
+    reasons = _reasons_by_number(report)
+
+    assert reasons[3] != PERIMETER_REASON
+    assert "VANGUARD" in reasons[3]
+    assert _walks_towards_core(turn, 3)
+
+
+def test_combat_leash_never_blocks_return_fire_from_the_boundary() -> None:
+    # The leash gates movement goals only.  A Ranger standing on the boundary
+    # keeps its full three-cell reach into the ground beyond it.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(18, 0)),
+            unit(31, "RANGER", controlled=False, position=(21, 0)),
+        ],
+    )
+
+    decide(turn, config=config)
+
+    shooter = turn.rangers[0]
+    assert manhattan((0, 0), (21, 0)) > config.combat_pursuit_radius
+    assert turn.plan.unit_actions[shooter.id].type == "SHOOT"
+
+
+def test_garrison_guards_stay_on_the_ring_through_an_emergency() -> None:
+    # Contacts arrive from all eight bearings, so a single sighting must never
+    # empty the perimeter.  Units 2, 4 and 5 are the stable garrison share.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(hp=4),
+            unit(2, "VANGUARD", position=(0, 8)),
+            unit(4, "VANGUARD", position=(0, 9)),
+            unit(5, "VANGUARD", position=(0, 10)),
+            unit(7, "VANGUARD", position=(0, -8)),
+            unit(8, "VANGUARD", position=(0, -9)),
+            unit(3, "VANGUARD", position=(6, 0)),
+            unit(6, "VANGUARD", position=(7, 0)),
+            unit(9, "VANGUARD", position=(5, 0)),
+            unit(31, "VANGUARD", controlled=False, position=(10, 0)),
+        ],
+    )
+
+    report = decide(turn, config=config)
+    reasons = _reasons_by_number(report)
+
+    assert [reasons[number] for number in (2, 4, 5)] == [PERIMETER_REASON] * 3
+    # The far-side guards outside the garrison keep answering the contact.
+    assert any(reasons[number] != PERIMETER_REASON for number in (7, 8))
+
+
+AWAY_POSITIONS = {3: (14, 0), 6: (15, 0), 9: (14, 1), 12: (14, -1)}
+HOME_POSITIONS = {3: (0, 1), 6: (1, 0), 9: (2, 0), 12: (3, 0)}
+
+
+def _raid_turn(tick: int, *, core_hp: int = 5, away: bool = False, extra=()) -> object:
+    places = AWAY_POSITIONS if away else HOME_POSITIONS
+    return make_turn(
+        tick=tick,
+        resources=0,
+        objects=[
+            core(hp=core_hp),
+            unit(3, "RANGER", position=places[3]),
+            unit(6, "VANGUARD", position=places[6]),
+            unit(9, "VANGUARD", position=places[9]),
+            unit(12, "VANGUARD", position=places[12]),
+            unit(15, "VANGUARD", position=(0, -1)),
+            unit(18, "VANGUARD", position=(0, -2)),
+            unit(2, "VANGUARD", position=(-1, 0)),
+            unit(4, "VANGUARD", position=(-2, 0)),
+            unit(5, "VANGUARD", position=(-3, 0)),
+            core(
+                40,
+                controlled=False,
+                owner_username="rival",
+                position=(25, 0),
+            ),
+            *extra,
+        ],
+    )
+
+
+def test_raid_commits_only_a_small_detachment_to_a_nearby_enemy_core() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    turn = _raid_turn(100)
+
+    report = strategy.decide(turn)
+
+    assert {str(unit_id) for unit_id in strategy._raid_ids} == {
+        object_id(number) for number in (3, 6, 9, 12)
+    }
+    assert strategy._raid_target == (25, 0)
+    assert strategy._raid_until_tick == 100 + config.raid_max_ticks
+    # Everyone else keeps their station or their patrol: the rival Core is not
+    # a fleet-wide objective any more.
+    committed = {
+        item.actor_id
+        for item in report.decisions
+        if item.reason is not None and "Core @rival" in item.reason
+    }
+    assert committed <= {object_id(number) for number in (3, 6, 9, 12)}
+
+
+def test_raid_recalls_the_detachment_once_the_time_cap_expires() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(_raid_turn(100))
+    assert strategy._raid_ids
+
+    expired = _raid_turn(100 + config.raid_max_ticks + 1, away=True)
+    report = strategy.decide(expired)
+    reasons = _reasons_by_number(report)
+
+    assert strategy._raid_ids == frozenset()
+    assert strategy._raid_target is None
+    assert all(
+        "return intercepted expedition" in reasons[number] for number in (3, 6, 9, 12)
+    )
+
+
+def test_raid_turns_around_when_the_objective_is_defended_in_force() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(_raid_turn(100))
+    assert strategy._raid_ids
+
+    defended = _raid_turn(
+        101,
+        away=True,
+        extra=[
+            unit(50, "VANGUARD", controlled=False, position=(18, 0)),
+            unit(51, "VANGUARD", controlled=False, position=(18, 1)),
+            unit(52, "RANGER", controlled=False, position=(19, 0)),
+            unit(53, "RANGER", controlled=False, position=(19, 1)),
+        ],
+    )
+    report = strategy.decide(defended)
+
+    # Home is quiet, so the recall can only come from the odds at the objective.
+    assert report.threat_level == "NORMAL"
+    assert strategy._raid_ids == frozenset()
+    assert strategy._raid_cooldown_until == 101 + config.raid_max_ticks // 2
+
+
+def test_raid_is_recalled_when_the_home_core_takes_damage() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(_raid_turn(100))
+    assert strategy._raid_ids
+
+    strategy.decide(_raid_turn(101, core_hp=4, away=True))
+
+    assert strategy._raid_ids == frozenset()
+    assert strategy._raid_target is None
+
+
+def test_raid_launches_on_the_bearing_of_a_destroyed_enemy_fleet() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    escort = [
+        unit(50, "VANGUARD", controlled=False, position=(0, 20)),
+        unit(51, "VANGUARD", controlled=False, position=(1, 20)),
+        unit(52, "RANGER", controlled=False, position=(2, 20)),
+    ]
+    sighted = make_turn(
+        tick=100,
+        resources=0,
+        objects=[
+            core(),
+            unit(3, "RANGER", position=(0, 1)),
+            unit(6, "VANGUARD", position=(1, 0)),
+            unit(9, "VANGUARD", position=(2, 0)),
+            unit(12, "VANGUARD", position=(3, 0)),
+            unit(15, "VANGUARD", position=(0, -1)),
+            unit(2, "VANGUARD", position=(-1, 0)),
+            unit(4, "VANGUARD", position=(-2, 0)),
+            unit(5, "VANGUARD", position=(-3, 0)),
+            *escort,
+        ],
+    )
+    strategy.decide(sighted)
+    assert strategy._raid_ids == frozenset()
+
+    destroyed = make_turn(
+        tick=101,
+        resources=0,
+        objects=[
+            core(),
+            unit(3, "RANGER", position=(0, 1)),
+            unit(6, "VANGUARD", position=(1, 0)),
+            unit(9, "VANGUARD", position=(2, 0)),
+            unit(12, "VANGUARD", position=(3, 0)),
+            unit(15, "VANGUARD", position=(0, -1)),
+            unit(2, "VANGUARD", position=(-1, 0)),
+            unit(4, "VANGUARD", position=(-2, 0)),
+            unit(5, "VANGUARD", position=(-3, 0)),
+        ],
+        events=[
+            {
+                "event_id": object_id(90 + index),
+                "tick": 101,
+                "event_type": "DESTRUCTION_PARTICIPATION",
+                "reason_code": "UNIT",
+                "target_id": object_id(50 + index),
+                "position": [index, 20],
+            }
+            for index in range(3)
+        ],
+    )
+    strategy.decide(destroyed)
+
+    assert {str(unit_id) for unit_id in strategy._raid_ids} == {
+        object_id(number) for number in (3, 6, 9, 12)
+    }
+    # The bearing runs due north from the Core, extended to the raid radius.
+    assert strategy._raid_target is not None
+    assert manhattan((0, 0), strategy._raid_target) == config.raid_radius
+    assert strategy._raid_target[1] > 0

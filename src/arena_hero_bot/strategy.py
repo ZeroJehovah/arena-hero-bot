@@ -68,6 +68,9 @@ CORE_BANKING_CAPACITY_PERCENT = 90
 CORE_EVASION_MIN_BREAKAWAY_DISTANCE = 5
 EARLY_COMBAT_MIN_UNITS = 2
 EARLY_COMBAT_GUARD_WORKERS = 4
+GARRISON_MIN_GUARDS = 3
+GARRISON_ROSTER_SHARE = 4
+RAID_ABORT_SCAN_RADIUS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +106,12 @@ class StrategyConfig:
     core_intruder_radius: int = 16
     core_assault_radius: int = 8
     core_escape_enemy_count: int = CORE_ESCAPE_MIN_ENEMIES
+    combat_pursuit_radius: int = 18
+    raid_squad_size: int = 4
+    raid_radius: int = 30
+    raid_max_ticks: int = 100
+    raid_trigger_kills: int = 3
+    raid_kill_window: int = 24
 
 
 @dataclass(slots=True)
@@ -129,6 +138,8 @@ class _TurnContext:
     squad_return_ids: frozenset[UUID] = field(default_factory=frozenset)
     intruder_intercept_ids: frozenset[UUID] = field(default_factory=frozenset)
     emergency: bool = False
+    garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
+    raid_ids: frozenset[UUID] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,11 +172,22 @@ class AggressiveStrategy:
         self._intruder_hunt_id: str | None = None
         self._combat_policy = CombatPolicy()
         self._squad_return_until: dict[UUID, int] = {}
+        # Raid state deliberately lives on the strategy instead of
+        # ``WorldMemory``: a restart then aborts the raid and walks the
+        # detachment home, which is the safe direction to fail in.
+        self._combat_kills: list[tuple[int, Position]] = []
+        self._raid_ids: frozenset[UUID] = frozenset()
+        self._raid_target: Position | None = None
+        self._raid_until_tick: int = -1
+        self._raid_cooldown_until: int = -1
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
 
         turn.clear()
+        # ``observe`` drops destroyed enemies from memory, taking the only
+        # record of what they were with them, so log the kills first.
+        self._record_combat_kills(turn)
         self.memory.observe(turn)
         obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         threat = self._combat_policy.assess(turn, obstacles)
@@ -191,7 +213,9 @@ class AggressiveStrategy:
         if turn.core is not None:
             occupied.add(turn.core.position)
         focus_target = self._focus_target(turn)
-        squad_return_ids = self._update_squad_returns(turn, threat)
+        raid_ids = self._update_raid(turn, threat)
+        squad_return_ids = self._update_squad_returns(turn, threat, raid_ids)
+        garrison_ids = self._garrison_ids(turn, raid_ids)
         context = _TurnContext(
             turn=turn,
             report=report,
@@ -213,6 +237,8 @@ class AggressiveStrategy:
                 self._intruder_anchor(turn, focus_target, recent_enemies),
             ),
             emergency=emergency,
+            garrison_ids=garrison_ids,
+            raid_ids=raid_ids,
         )
         assault_enemies = self._core_assault_enemies(turn)
         if threat.requires_coordination or self._needs_preemptive_ranger_evasion(
@@ -281,8 +307,8 @@ class AggressiveStrategy:
         visible_enemies = self._visible_combat_targets(
             ranger,
             context.turn,
-            offensive=offensive,
-            emergency=context.emergency,
+            fleet_wide=(context.emergency and ranger.id not in context.garrison_ids)
+            or ranger.id in context.raid_ids,
             intercept_ids=context.intruder_intercept_ids,
         )
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
@@ -337,6 +363,9 @@ class AggressiveStrategy:
                         and standoff != ranger.position
                         and self._ranger_range(ranger.position, target.position)
                         < RANGER_STANDOFF_RANGE
+                        # Deliberately unleashed: backing off to max range
+                        # is a retreat from the target, not a push towards
+                        # it, and a Ranger must never be denied that step.
                         and self._move(
                             ranger,
                             standoff,
@@ -405,16 +434,20 @@ class AggressiveStrategy:
             )
         if visible_target is not None:
             goal = self._ranger_approach_goal(ranger, visible_target, context)
-            if goal is not None and self._move(
+            if goal is not None and self._move_within_leash(
                 ranger,
                 goal,
                 context,
+                offensive=offensive,
                 reason=f"close firing angle on {self._enemy_label(visible_target)}",
             ):
                 return
 
         remembered_enemies = (
-            self._offensive_enemies(context.turn)
+            self._offensive_enemies(
+                context.turn,
+                raiding=ranger.id in context.raid_ids,
+            )
             if offensive
             else self._defensive_memory_targets(ranger, context, recent_enemies)
         )
@@ -422,10 +455,11 @@ class AggressiveStrategy:
             ranger.position,
             remembered_enemies,
         )
-        if remembered is not None and self._move(
+        if remembered is not None and self._move_within_leash(
             ranger,
             remembered.position,
             context,
+            offensive=offensive,
             reason=f"hunt last seen {remembered.kind.lower()}",
         ):
             return
@@ -461,8 +495,8 @@ class AggressiveStrategy:
         visible_enemies = self._visible_combat_targets(
             vanguard,
             context.turn,
-            offensive=offensive,
-            emergency=context.emergency,
+            fleet_wide=(context.emergency and vanguard.id not in context.garrison_ids)
+            or vanguard.id in context.raid_ids,
             intercept_ids=context.intruder_intercept_ids,
         )
         if context.combat_assault and vanguard.id not in context.vanguard_attack_ids:
@@ -536,10 +570,11 @@ class AggressiveStrategy:
                 and visible_target.id == context.focus_target.id
             ):
                 goal = self._vanguard_block_goal(vanguard, visible_target, context)
-                if goal is not None and self._move(
+                if goal is not None and self._move_within_leash(
                     vanguard,
                     goal,
                     context,
+                    offensive=offensive,
                     reason=(
                         f"close escape routes around "
                         f"{self._enemy_label(visible_target)}"
@@ -572,10 +607,11 @@ class AggressiveStrategy:
                         position,
                     ),
                 )
-                if self._move(
+                if self._move_within_leash(
                     vanguard,
                     goal,
                     context,
+                    offensive=offensive,
                     reason=f"rush {self._enemy_label(visible_target)}",
                 ):
                     return
@@ -588,7 +624,10 @@ class AggressiveStrategy:
             return
 
         remembered_enemies = (
-            self._offensive_enemies(context.turn)
+            self._offensive_enemies(
+                context.turn,
+                raiding=vanguard.id in context.raid_ids,
+            )
             if offensive
             else self._defensive_memory_targets(vanguard, context, recent_enemies)
         )
@@ -596,10 +635,11 @@ class AggressiveStrategy:
             vanguard.position,
             remembered_enemies,
         )
-        if remembered is not None and self._move(
+        if remembered is not None and self._move_within_leash(
             vanguard,
             remembered.position,
             context,
+            offensive=offensive,
             reason=f"hunt last seen {remembered.kind.lower()}",
         ):
             return
@@ -1694,18 +1734,23 @@ class AggressiveStrategy:
         unit: Ranger | Vanguard,
         turn: Turn,
         *,
-        offensive: bool,
-        emergency: bool = False,
+        fleet_wide: bool = False,
         intercept_ids: frozenset[UUID] = frozenset(),
     ) -> tuple[CoreView | UnitView, ...]:
-        """Limit defensive reactions to enemies in that guard's local area.
+        """Limit reactions to enemies in that unit's own local area.
 
         ``turn.visible_enemies`` is fleet-wide, so an escort member is allowed
         to act on an intruder that only a Worker can currently see.  Every
-        other guard keeps the strict own-vision rule and stays on station.
+        other unit keeps the strict own-vision rule and stays on station.
+
+        ``fleet_wide`` is granted to the raid detachment and, during an
+        emergency, to every guard outside the garrison.  It used to be handed
+        to the roaming squad too, which meant a single Worker sighting forty
+        cells out pulled the whole roaming third onto it -- exactly the
+        open-ended commitment the movement leash exists to prevent.
         """
 
-        if offensive or emergency:
+        if fleet_wide:
             return turn.visible_enemies
         escorting = unit.id in intercept_ids
         return tuple(
@@ -2299,8 +2344,20 @@ class AggressiveStrategy:
             and turn.resources >= self._stockpile_target(turn)
         )
 
-    def _offensive_enemies(self, turn: Turn) -> tuple[EnemySighting, ...]:
-        """Return recent targets suitable for a roaming squad to pursue."""
+    def _offensive_enemies(
+        self,
+        turn: Turn,
+        *,
+        raiding: bool = False,
+    ) -> tuple[EnemySighting, ...]:
+        """Return recent targets suitable for a roaming squad to pursue.
+
+        A remembered enemy Core is offered to the raid detachment only.
+        Enemy Cores sit a median 59 cells away, so letting the whole
+        roaming third walk at one is a two-hundred-Tick commitment of a
+        third of the army - the open-ended kind of push the leash exists
+        to stop.  The bounded four-unit raid takes that job instead.
+        """
 
         if not self._offensive_patrol_enabled(turn):
             return ()
@@ -2312,7 +2369,8 @@ class AggressiveStrategy:
             enemy
             for enemy in enemies
             if (
-                enemy.kind == "CORE"
+                raiding
+                and enemy.kind == "CORE"
                 and turn.tick - enemy.tick <= self.config.offensive_core_memory_ttl
             )
             or (
@@ -2329,6 +2387,15 @@ class AggressiveStrategy:
         offensive: bool = False,
         context: _TurnContext | None = None,
     ) -> tuple[Position, str]:
+        if (
+            context is not None
+            and self._raid_target is not None
+            and unit.id in context.raid_ids
+        ):
+            return (
+                self._raid_target,
+                "raid the enemy Core along the attack bearing",
+            )
         if offensive and self._offensive_patrol_enabled(turn):
             return self._combat_patrol_goal(unit, turn)
         if not self._preserves_resources() or turn.core is None:
@@ -2764,12 +2831,344 @@ class AggressiveStrategy:
                 ):
                     break
 
+    def _record_combat_kills(self, turn: Turn) -> None:
+        """Log where enemy fighters died, before memory forgets what they were.
+
+        ``WorldMemory.observe`` pops a destroyed enemy at the top of every
+        Turn, so the sighting that carries ``unit_type`` only exists until
+        then.  Worker kills are ignored: a thief dying inside our own zone
+        says nothing about where a hostile fleet came from.
+        """
+
+        window = self.config.raid_kill_window
+        self._combat_kills = [
+            entry for entry in self._combat_kills if turn.tick - entry[0] <= window
+        ]
+        combat_types = {UnitType.VANGUARD.value, UnitType.RANGER.value}
+        for event in turn.events:
+            if event.event_type != "DESTRUCTION_PARTICIPATION":
+                continue
+            if event.target_id is None or event.position is None:
+                continue
+            sighting = self.memory.enemies.get(str(event.target_id))
+            if sighting is None:
+                continue
+            if sighting.kind == "UNIT" and sighting.unit_type not in combat_types:
+                continue
+            self._combat_kills.append((turn.tick, event.position))
+
+    def _recent_combat_kills(self, turn: Turn) -> int:
+        """Count fighters killed inside the raid trigger window."""
+
+        window = self.config.raid_kill_window
+        return sum(1 for tick, _ in self._combat_kills if turn.tick - tick <= window)
+
+    def _combat_leash_radius(
+        self,
+        unit: Ranger | Vanguard,
+        context: _TurnContext,
+        *,
+        offensive: bool,
+    ) -> int:
+        """Return how far from the Core this unit may walk to reach a target."""
+
+        if unit.id in context.raid_ids:
+            return self.config.raid_radius
+        if offensive:
+            return self.config.offensive_patrol_radius
+        return self.config.combat_pursuit_radius
+
+    def _within_combat_leash(
+        self,
+        unit: Ranger | Vanguard,
+        goal: Position,
+        context: _TurnContext,
+        *,
+        offensive: bool,
+    ) -> bool:
+        """Whether walking to ``goal`` keeps the combat zone bounded.
+
+        The defensive leash is the alert ring plus one Vanguard vision disc:
+        whatever a perimeter guard can see is worth fighting, one cell
+        further out is not.  Firing is deliberately never leashed - a Ranger
+        standing on the boundary must still be able to answer fire from
+        beyond it - so this gates movement goals only.
+        """
+
+        core = context.turn.core
+        if core is None:
+            return True
+        distance = manhattan(core.position, goal)
+        if distance <= self._combat_leash_radius(unit, context, offensive=offensive):
+            return True
+        # A unit that already drifted outside its leash keeps the right to
+        # walk inwards, or it would stall out there for the rest of its life.
+        return distance < manhattan(core.position, unit.position)
+
+    def _move_within_leash(
+        self,
+        unit: Ranger | Vanguard,
+        goal: Position,
+        context: _TurnContext,
+        *,
+        offensive: bool,
+        reason: str,
+    ) -> bool:
+        """Move towards ``goal`` only while it stays inside the combat zone."""
+
+        if not self._within_combat_leash(unit, goal, context, offensive=offensive):
+            return False
+        return self._move(unit, goal, context, reason=reason)
+
+    def _garrison_ids(
+        self,
+        turn: Turn,
+        raid_ids: frozenset[UUID] = frozenset(),
+    ) -> frozenset[UUID]:
+        """Keep a fixed share of guards on the ring through any emergency.
+
+        ``_visible_combat_targets`` hands every guard the fleet-wide enemy
+        list once an emergency starts, so one contact used to pull all of
+        them off station.  Contacts arrive from all eight bearings, so that
+        leaves the far side of the Core open to the next attacker.  Garrison
+        membership comes from the stable UUID split so it cannot flicker
+        between Ticks, and it never overlaps the roaming/raid third.
+        """
+
+        guards = sorted(
+            (
+                unit
+                for unit in (*turn.rangers, *turn.vanguards)
+                if unit.id.int % 3 != 0 and unit.id not in raid_ids
+            ),
+            key=lambda unit: unit.id.bytes,
+        )
+        if not guards:
+            return frozenset()
+        roster = len(turn.rangers) + len(turn.vanguards)
+        size = min(
+            len(guards),
+            max(GARRISON_MIN_GUARDS, roster // GARRISON_ROSTER_SHARE),
+        )
+        return frozenset(unit.id for unit in guards[:size])
+
+    def _update_raid(self, turn: Turn, threat: ThreatAssessment) -> frozenset[UUID]:
+        """Run the bounded counter-attack that hunts a nearby enemy Core.
+
+        The engagement this rule comes from ended with one Vanguard adjacent
+        to an enemy Core and two Rangers in range, so four units are enough
+        to crack a 5/5 Core once its escort is dead.  Committing the whole
+        fleet emptied the perimeter for no extra damage, so the raid is
+        capped in size, in distance (``raid_radius``) and in time
+        (``raid_max_ticks``), and it turns around rather than fight a
+        garrison it cannot eat.
+        """
+
+        core = turn.core
+        live = frozenset(unit.id for unit in (*turn.vanguards, *turn.rangers))
+        self._raid_ids &= live
+        if core is None:
+            self._abort_raid(turn)
+            return frozenset()
+        if self._raid_ids:
+            objective = self._raid_target_for(turn)
+            if (
+                turn.tick > self._raid_until_tick
+                or threat.combat_pressure
+                or core.hp < 5
+                or core.shield < 5
+                or self._raid_outmatched(turn)
+                or self._raid_objective_spent(turn)
+            ):
+                self._abort_raid(turn)
+                return frozenset()
+            if objective is not None:
+                self._raid_target = objective
+            return self._raid_ids
+        if (
+            turn.tick <= self._raid_cooldown_until
+            or threat.combat_pressure
+            or self._emergency_combat_mode(turn)
+            or not self._offensive_patrol_enabled(turn)
+        ):
+            return frozenset()
+        objective = self._raid_target_for(turn)
+        if objective is None:
+            return frozenset()
+        squad = self._raid_squad(turn)
+        if len(squad) < self.config.raid_squad_size:
+            return frozenset()
+        self._raid_ids = frozenset(unit.id for unit in squad)
+        self._raid_target = objective
+        self._raid_until_tick = turn.tick + self.config.raid_max_ticks
+        self._combat_kills.clear()
+        return self._raid_ids
+
+    def _raid_target_for(self, turn: Turn) -> Position | None:
+        """Pick the objective: a known nearby Core, else the attack bearing."""
+
+        core = turn.core
+        if core is None:
+            return None
+        known = self._remembered_enemy_cores(turn)
+        if known:
+            return min(
+                known,
+                key=lambda sighting: (
+                    manhattan(core.position, sighting.position),
+                    sighting.object_id,
+                ),
+            ).position
+        if self._recent_combat_kills(turn) < self.config.raid_trigger_kills:
+            return None
+        return self._kill_bearing_goal(turn)
+
+    def _remembered_enemy_cores(self, turn: Turn) -> tuple[EnemySighting, ...]:
+        """Return remembered enemy Cores inside raid range of our own Core."""
+
+        core = turn.core
+        if core is None:
+            return ()
+        return tuple(
+            sighting
+            for sighting in self.memory.recent_enemies(
+                turn.tick,
+                self.config.enemy_core_memory_ttl,
+            )
+            if sighting.kind == "CORE"
+            and manhattan(core.position, sighting.position) <= self.config.raid_radius
+        )
+
+    def _kill_bearing_goal(self, turn: Turn) -> Position | None:
+        """Extend the Core-to-kill-centroid bearing out to the raid radius.
+
+        Contacts arrive from every bearing, so there is no standing direction
+        worth fortifying; the only defensible heading for a search is the one
+        the fleet we just beat actually came from.
+        """
+
+        core = turn.core
+        if core is None:
+            return None
+        window = self.config.raid_kill_window
+        cells = [
+            position
+            for tick, position in self._combat_kills
+            if turn.tick - tick <= window
+        ]
+        if not cells:
+            return None
+        offset_x = sum(cell[0] for cell in cells) / len(cells) - core.position[0]
+        offset_y = sum(cell[1] for cell in cells) / len(cells) - core.position[1]
+        span = abs(offset_x) + abs(offset_y)
+        if span == 0:
+            return None
+        scale = self.config.raid_radius / span
+        return (
+            core.position[0] + round(offset_x * scale),
+            core.position[1] + round(offset_y * scale),
+        )
+
+    def _raid_members(self, turn: Turn) -> tuple[Ranger | Vanguard, ...]:
+        """Return the live units currently assigned to the raid."""
+
+        return tuple(
+            unit
+            for unit in (*turn.rangers, *turn.vanguards)
+            if unit.id in self._raid_ids
+        )
+
+    def _raid_squad(self, turn: Turn) -> tuple[Ranger | Vanguard, ...]:
+        """Pick the smallest detachment that can still crack a Core.
+
+        One Ranger buys the Manhattan-5 vision disc a search needs; the rest
+        are Vanguards, which carry twice the hit points and did the actual
+        Core damage in the engagement this rule was derived from.
+        """
+
+        def eligible(unit: Ranger | Vanguard) -> bool:
+            return (
+                self._is_offensive_combat_unit(unit, turn)
+                and unit.id not in self._squad_return_until
+            )
+
+        rangers = sorted(
+            (unit for unit in turn.rangers if eligible(unit)),
+            key=lambda unit: unit.id.bytes,
+        )
+        vanguards = sorted(
+            (unit for unit in turn.vanguards if eligible(unit)),
+            key=lambda unit: unit.id.bytes,
+        )
+        size = self.config.raid_squad_size
+        squad: list[Ranger | Vanguard] = list(rangers[:1])
+        squad.extend(vanguards[: size - len(squad)])
+        squad.extend(rangers[1 : size - len(squad) + 1])
+        return tuple(squad[:size])
+
+    def _raid_outmatched(self, turn: Turn) -> bool:
+        """Whether the objective is held by more fighters than we sent.
+
+        A four-unit detachment trades evenly at best away from home, so an
+        equal count is already a reason to turn around rather than a reason
+        to commit.
+        """
+
+        members = self._raid_members(turn)
+        if not members:
+            return True
+        hostiles = sum(
+            1
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and any(
+                manhattan(member.position, enemy.position) <= RAID_ABORT_SCAN_RADIUS
+                for member in members
+            )
+        )
+        return hostiles >= len(members)
+
+    def _raid_objective_spent(self, turn: Turn) -> bool:
+        """Whether the detachment arrived and found nothing left to kill."""
+
+        target = self._raid_target
+        if target is None:
+            return True
+        members = self._raid_members(turn)
+        if not any(
+            manhattan(member.position, target) <= RANGER_VISION_RADIUS
+            for member in members
+        ):
+            return False
+        return not self._remembered_enemy_cores(turn)
+
+    def _abort_raid(self, turn: Turn) -> None:
+        """Send the detachment home and hold off relaunching for a while."""
+
+        for unit_id in self._raid_ids:
+            self._squad_return_until[unit_id] = max(
+                self._squad_return_until.get(unit_id, 0),
+                turn.tick + self.config.raid_max_ticks,
+            )
+        if self._raid_ids:
+            self._raid_cooldown_until = turn.tick + self.config.raid_max_ticks // 2
+        self._raid_ids = frozenset()
+        self._raid_target = None
+        self._raid_until_tick = -1
+
     def _update_squad_returns(
         self,
         turn: Turn,
         threat: ThreatAssessment,
+        raid_ids: frozenset[UUID] = frozenset(),
     ) -> frozenset[UUID]:
-        """Recall an intercepted roaming pair for a bounded return window."""
+        """Recall an intercepted roaming pair for a bounded return window.
+
+        The raid detachment is exempt: making contact is the point of the
+        raid, so the generic intercept recall would cancel it on arrival.
+        ``_update_raid`` owns that decision instead.
+        """
 
         live_ids = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
         self._squad_return_until = {
@@ -2792,7 +3191,7 @@ class AggressiveStrategy:
                 # Keep the deterministic one-third expedition identity used by
                 # the existing patrol, but recall it as soon as it is locally
                 # intercepted instead of chasing through the contact.
-                if unit.id.int % 3 != 0:
+                if unit.id.int % 3 != 0 or unit.id in raid_ids:
                     continue
                 if any(
                     manhattan(unit.position, enemy.position) <= 5
