@@ -1415,6 +1415,25 @@ def test_critical_vanguard_fights_before_withdrawing_during_core_assault() -> No
     )
 
 
+def test_wounded_vanguard_withdraws_before_reaching_half_health() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "VANGUARD", position=(0, 0), hp=3),
+        ],
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert action.type == "MOVE"
+    assert any(
+        item.actor_id == object_id(2)
+        and item.reason == "return critical unit to Core for healing"
+        for item in report.decisions
+    )
+
+
 def test_core_and_unit_pick_up_ground_beacon() -> None:
     unit_turn = make_turn(
         objects=[core(), unit(2, "VANGUARD", position=(1, 0))],

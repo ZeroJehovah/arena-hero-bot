@@ -496,6 +496,7 @@ class AggressiveStrategy:
         if not context.combat_assault and self._recover_if_critical(
             vanguard,
             maximum_hp=4,
+            critical_hp=3,
             context=context,
         ):
             return
@@ -626,6 +627,7 @@ class AggressiveStrategy:
         if context.combat_assault and self._recover_if_critical(
             vanguard,
             maximum_hp=4,
+            critical_hp=3,
             context=context,
         ):
             return
@@ -702,7 +704,12 @@ class AggressiveStrategy:
         # died: three Vanguards were lost that way in a single fleet attack,
         # one of them waiting motionless for four Ticks at 2 HP.  Rotating it
         # out costs one ring cell and saves the Unit.
-        if self._recover_if_critical(vanguard, maximum_hp=4, context=context):
+        if self._recover_if_critical(
+            vanguard,
+            maximum_hp=4,
+            critical_hp=3,
+            context=context,
+        ):
             return
 
         goal = self._combat_screen_goal(vanguard, context)
@@ -1429,9 +1436,11 @@ class AggressiveStrategy:
         unit: Unit,
         *,
         maximum_hp: int,
+        critical_hp: int | None = None,
         context: _TurnContext,
     ) -> bool:
-        if unit.hp > maximum_hp // 2:
+        retreat_threshold = maximum_hp // 2 if critical_hp is None else critical_hp
+        if unit.hp > retreat_threshold:
             return False
         if self._heal_if_critical(unit, maximum_hp=maximum_hp, context=context):
             return True
