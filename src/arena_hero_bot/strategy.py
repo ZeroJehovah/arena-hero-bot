@@ -1065,23 +1065,41 @@ class AggressiveStrategy:
         ):
             if resource_goal.position in context.turn.resource_cells:
                 self.memory.clear_goal(str(worker.id))
-            elif context.turn.tick - resource_goal.assigned_tick <= RESOURCE_CLAIM_TTL:
-                if worker.position == resource_goal.position:
-                    self._record_wait(
-                        worker,
-                        context,
-                        "wait for recently seen resource to reappear",
-                    )
-                    return
-                if self._move(
-                    worker,
-                    resource_goal.position,
-                    context,
-                    reason="continue toward recently seen resource",
-                ):
-                    return
-                self.memory.clear_goal(str(worker.id))
             else:
+                age = context.turn.tick - resource_goal.assigned_tick
+                progress_reference = resource_goal.last_progress_position
+                progressing = progress_reference is not None and manhattan(
+                    worker.position, resource_goal.position
+                ) < manhattan(progress_reference, resource_goal.position)
+                if age <= RESOURCE_CLAIM_TTL or progressing:
+                    if worker.position == resource_goal.position:
+                        self._record_wait(
+                            worker,
+                            context,
+                            "wait for recently seen resource to reappear",
+                        )
+                        return
+                    if self._move(
+                        worker,
+                        resource_goal.position,
+                        context,
+                        reason="continue toward recently seen resource",
+                    ):
+                        if progressing and age > RESOURCE_CLAIM_TTL:
+                            # A visible resource can be several travel Ticks
+                            # away.  Keep a stale observation only while the
+                            # Worker is demonstrably closing in; a stalled
+                            # route still expires at the short TTL.
+                            self.memory.set_goal(
+                                str(worker.id),
+                                UnitGoal(
+                                    position=resource_goal.position,
+                                    assigned_tick=context.turn.tick,
+                                    purpose=resource_goal.purpose,
+                                    last_progress_position=worker.position,
+                                ),
+                            )
+                        return
                 self.memory.clear_goal(str(worker.id))
 
         if self._preserves_resources():

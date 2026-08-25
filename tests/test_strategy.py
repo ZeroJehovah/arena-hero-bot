@@ -465,6 +465,38 @@ def test_worker_keeps_recent_resource_goal_across_missing_observation() -> None:
     assert third.plan.unit_actions[third.workers[0].id].type == "HARVEST"
 
 
+def test_worker_renews_resource_goal_while_making_progress() -> None:
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory)
+
+    first = make_turn(
+        tick=100,
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 0))],
+        resource_cells=[(0, 6)],
+    )
+    strategy.decide(first)
+    goal = memory.goal_for(object_id(2))
+    assert goal is not None
+    assert goal.assigned_tick == 100
+
+    progressed = make_turn(
+        tick=105,
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 5))],
+    )
+    report = strategy.decide(progressed)
+    action = progressed.plan.unit_actions[progressed.workers[0].id]
+
+    assert action.type == "MOVE"
+    assert any(
+        item.reason == "continue toward recently seen resource"
+        for item in report.decisions
+    )
+    renewed = memory.goal_for(object_id(2))
+    assert renewed is not None
+    assert renewed.position == (0, 6)
+    assert renewed.assigned_tick == 105
+
+
 def test_worker_deposits_at_core_and_waits_when_storage_full() -> None:
     deposit = make_turn(
         resources=5,
