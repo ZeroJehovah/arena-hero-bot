@@ -2942,3 +2942,23 @@ def test_intruder_hunt_expires_once_the_sighting_goes_stale() -> None:
         report = strategy.decide(turn)
 
     assert all(item.reason != "hunt last seen unit" for item in report.decisions)
+
+
+def test_ranger_shoots_an_intruder_without_joining_the_chase() -> None:
+    strategy = AggressiveStrategy(WorldMemory())
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "RANGER", position=(0, 1)),
+            unit(3, "VANGUARD", position=(1, 0)),
+            unit(9, "WORKER", controlled=False, position=(0, 4)),
+        ],
+    )
+
+    report = strategy.decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "SHOOT"
+    # A Worker cannot shoot back, so backing off to max range would only give
+    # the thief a free Tick.
+    assert not any("disengage" in item.reason for item in report.decisions)

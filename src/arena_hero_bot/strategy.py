@@ -285,9 +285,18 @@ class AggressiveStrategy:
             intercept_ids=context.intruder_intercept_ids,
         )
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        # A Ranger outranges a Worker by three cells and is the cheapest way
+        # to finish a thief off, but it is far too fragile to join the chase.
+        # Thieves are offered to the firing solution only; where the Ranger
+        # stands is still decided by the rest of its logic below.
+        firing_pool = visible_enemies + self._opportunity_intruders(
+            context,
+            visible_enemies,
+            offensive=offensive,
+        )
         shootable = [
             (enemy, shot_cell)
-            for enemy in visible_enemies
+            for enemy in firing_pool
             if (
                 shot_cell := self._ranger_shot_cell(
                     ranger,
@@ -298,7 +307,7 @@ class AggressiveStrategy:
             )
         ]
         if shootable:
-            focused = self._preferred_target(context.focus_target, visible_enemies)
+            focused = self._preferred_target(context.focus_target, firing_pool)
             target = context.damage_ledger.select(
                 tuple(item[0] for item in shootable),
                 focused,
@@ -316,7 +325,10 @@ class AggressiveStrategy:
             if target is None or shot_cell is None:
                 shootable = []
             else:
-                if isinstance(target, UnitView):
+                if (
+                    isinstance(target, UnitView)
+                    and target.unit_type is not UnitType.WORKER
+                ):
                     standoff = self._ranger_approach_goal(ranger, target, context)
                     if (
                         not context.combat_assault
@@ -1630,6 +1642,24 @@ class AggressiveStrategy:
         if target is None:
             return None
         return target
+
+    def _opportunity_intruders(
+        self,
+        context: _TurnContext,
+        known: tuple[CoreView | UnitView, ...],
+        *,
+        offensive: bool,
+    ) -> tuple[UnitView, ...]:
+        """Return in-zone thieves a Ranger may shoot without giving chase."""
+
+        if offensive:
+            return ()
+        seen = {enemy.id for enemy in known}
+        return tuple(
+            enemy
+            for enemy in self._core_intruders(context.turn)
+            if enemy.id not in seen
+        )
 
     def _visible_combat_targets(
         self,
