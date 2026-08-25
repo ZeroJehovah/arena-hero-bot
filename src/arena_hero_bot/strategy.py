@@ -649,6 +649,15 @@ class AggressiveStrategy:
             )
             return
 
+        # A screening Vanguard used to hold its ring cell no matter how much
+        # damage it had taken.  Ranged attackers outrange the sweep above, so a
+        # critical screen kept standing on its post, unable to answer, until it
+        # died: three Vanguards were lost that way in a single fleet attack,
+        # one of them waiting motionless for four Ticks at 2 HP.  Rotating it
+        # out costs one ring cell and saves the Unit.
+        if self._recover_if_critical(vanguard, maximum_hp=4, context=context):
+            return
+
         goal = self._combat_screen_goal(vanguard, context)
         self._move_or_wait(
             vanguard,

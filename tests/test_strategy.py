@@ -2984,3 +2984,35 @@ def test_defensive_perimeter_stops_growing_with_the_army() -> None:
         manhattan((0, 0), slot) <= StrategyConfig().defensive_perimeter_max_radius
         for slot in layout.assignments.values()
     )
+
+
+def test_critical_screen_vanguard_rotates_out_instead_of_holding_its_post() -> None:
+    """A wounded screen Vanguard must leave its ring cell rather than die on it.
+
+    Ranged attackers outrange the screen sweep, so a critical Vanguard that
+    keeps its post cannot answer and simply dies there.
+    """
+
+    turn = make_turn(
+        resources=20,
+        objects=[
+            core(),
+            *[
+                unit(number, "VANGUARD", position=(10, number))
+                for number in range(2, 8)
+            ],
+            unit(8, "VANGUARD", position=(10, 9), hp=1),
+            unit(20, "RANGER", controlled=False, position=(0, 5)),
+            unit(21, "RANGER", controlled=False, position=(1, 5)),
+            unit(22, "VANGUARD", controlled=False, position=(-1, 5)),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    wounded = next(item for item in report.decisions if item.actor_id == object_id(8))
+    assert wounded.reason != "hold the Core screen while the strike team attacks"
+    assert "critical" in wounded.reason
