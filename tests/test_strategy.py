@@ -3694,3 +3694,82 @@ def test_raid_does_not_launch_for_a_core_beyond_the_opportunity_radius() -> None
 
     assert strategy._raid_ids == frozenset()
     assert strategy._raid_target is None
+
+
+def test_a_worker_keeps_the_cell_it_claimed_when_the_pairing_would_flip() -> None:
+    """A shorter pairing must not steal a cell a Worker is already closing on."""
+
+    memory = WorldMemory()
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((12, 0), 100, "resource-claim-v1", last_progress_position=(2, 0)),
+    )
+    turn = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(3, 0)),
+            unit(3, "WORKER", position=(6, 0)),
+        ],
+        resource_cells=[(4, 0), (12, 0)],
+    )
+
+    report = decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+    claims = {
+        item.actor_id: item.target
+        for item in report.decisions
+        if item.reason
+        in {
+            "claim nearest unassigned known resource",
+            "continue toward recently seen resource",
+        }
+    }
+
+    # Worker 2 sits one cell from (4, 0), so the unpinned greedy would hand it
+    # that cell and push Worker 3 six cells out, throwing away the approach
+    # Worker 2 has already made.
+    assert claims[object_id(2)] == (12, 0)
+    assert claims[object_id(3)] == (4, 0)
+
+
+def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
+    """A held claim is bounded: a stalled Worker rejoins the greedy pass."""
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((12, 0), 100, "resource-claim-v1", last_progress_position=(3, 0)),
+    )
+
+    targets = []
+    for tick in range(101, 107):
+        # The Worker is pinned at (3, 0) every Tick, so it never closes on the
+        # cell it claimed - the stall the budget exists to bound.
+        report = strategy.decide(
+            make_turn(
+                tick=tick,
+                objects=[core(), unit(2, "WORKER", position=(3, 0))],
+                resource_cells=[(4, 0), (12, 0)],
+            )
+        )
+        targets.append(
+            next(
+                (
+                    item.target
+                    for item in report.decisions
+                    if item.actor_id == object_id(2)
+                    and item.reason == "claim nearest unassigned known resource"
+                ),
+                None,
+            )
+        )
+
+    # Held for the budget, then released to the cell one step away.
+    assert targets[:3] == [(12, 0), (12, 0), (12, 0)]
+    assert targets[3:] == [(4, 0), (4, 0), (4, 0)]

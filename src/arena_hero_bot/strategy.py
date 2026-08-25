@@ -46,6 +46,7 @@ RESOURCE_CLAIM_PURPOSE = "resource-claim-v1"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
+CLAIM_STALL_BUDGET = 3
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -174,6 +175,10 @@ class AggressiveStrategy:
         self._intruder_hunt_id: str | None = None
         self._combat_policy = CombatPolicy()
         self._squad_return_until: dict[UUID, int] = {}
+        # Claim hysteresis, kept off ``WorldMemory`` for the same reason as
+        # the raid state below: a restart forgets it and the next Tick simply
+        # re-matches every Worker once.
+        self._claim_stalls: dict[UUID, int] = {}
         # Raid state deliberately lives on the strategy instead of
         # ``WorldMemory``: a restart then aborts the raid and walks the
         # detachment home, which is the safe direction to fail in.
@@ -2798,6 +2803,7 @@ class AggressiveStrategy:
         assignments: dict[UUID, Position] = {}
         taken = set(resources)
         pools = [resources, fallback - taken, outreach - taken - fallback]
+        self._hold_existing_claims(workers, pools, assignments)
         for pool in pools:
             # Nearest and freshest evidence first, so a shorter walk to a
             # resting site never outbids one actually seen holding a resource,
@@ -2816,6 +2822,58 @@ class AggressiveStrategy:
                 workers.pop(worker_id)
                 pool.remove(resource)
         return assignments
+
+    def _hold_existing_claims(
+        self,
+        workers: dict[UUID, Worker],
+        pools: list[set[Position]],
+        assignments: dict[UUID, Position],
+    ) -> None:
+        """Keep a Worker on the cell it already claimed while it closes in.
+
+        The greedy pass re-matches every candidate from scratch each Tick, so
+        as the Workers walk the minimal pairing flips and two of them trade
+        targets mid-route.  Measured over Ticks 167705-167742: 42 of 99 target
+        changes happened with the old cell still more than one cell away, and
+        22.9% of all Worker travel went into approaches that were reassigned
+        before arrival.  One Worker dropped a cell 11 out for one 32 out.
+
+        Holding a claim can cost distance on the Tick it is held, because the
+        pairing it refuses really is the shorter one.  It buys something worth
+        more at a 1.8% refill rate: an approach that terminates in an
+        observation.  An abandoned approach never confirms its cell, so it
+        feeds nothing back into the absence and recheck machinery that decides
+        where the next Worker goes.
+
+        Arrival needs no special case.  A Worker reaching an empty cell
+        records the absence before this runs, which takes the cell out of
+        every pool for RESOURCE_RECHECK_FLOOR Ticks, so the observation itself
+        releases the claim.  Only a Worker that cannot close the distance
+        needs a bound, which is what the stall budget provides.
+        """
+
+        stalls = self._claim_stalls
+        for worker in list(workers.values()):
+            goal = self.memory.goal_for(str(worker.id))
+            if goal is None or goal.purpose != RESOURCE_CLAIM_PURPOSE:
+                continue
+            pool = next((item for item in pools if goal.position in item), None)
+            if pool is None:
+                continue
+            reference = goal.last_progress_position
+            closing = reference is None or manhattan(
+                worker.position, goal.position
+            ) < manhattan(reference, goal.position)
+            stalled = 0 if closing else stalls.get(worker.id, 0) + 1
+            if stalled > CLAIM_STALL_BUDGET:
+                continue
+            stalls[worker.id] = stalled
+            assignments[worker.id] = goal.position
+            workers.pop(worker.id)
+            pool.remove(goal.position)
+        for worker_id in set(stalls) - set(assignments):
+            # Drops both released claims and Workers that no longer exist.
+            del stalls[worker_id]
 
     def _is_resource_scout(self, worker: Worker, turn: Turn) -> bool:
         """Return whether this Worker is the sole long-range economy scout."""
