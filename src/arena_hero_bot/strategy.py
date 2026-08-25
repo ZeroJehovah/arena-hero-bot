@@ -97,6 +97,7 @@ class StrategyConfig:
     worker_threat_radius: int = 6
     worker_threat_memory_ttl: int = 24
     intruder_hunt_ttl: int = 24
+    defensive_perimeter_max_radius: int = 12
     resource_guard_min_workers: int = 6
     combat_alert_radius: int = 14
     core_intruder_radius: int = 16
@@ -2378,9 +2379,18 @@ class AggressiveStrategy:
         unavailable = set(context.enemy_positions)
         unavailable.add(core.position)
         visions = {unit.id: _combat_vision_radius(unit) for unit in guards}
+        # The count-and-vision radius grows linearly with the army, so a
+        # 29-guard fleet parked its whole perimeter 30 cells out and left the
+        # interior empty: anything already inside the ring could only be
+        # chased from behind, and an equal-speed runner is uncatchable that
+        # way.  Capping the radius keeps the guards between the intruder and
+        # the Core, where they are also closer to home if a real attack lands.
         base_radius = max(
             DEFENSIVE_PERIMETER_MIN_RADIUS,
-            sum(visions.values()) // 4,
+            min(
+                self.config.defensive_perimeter_max_radius,
+                sum(visions.values()) // 4,
+            ),
         )
 
         def ring_for(radius: int) -> tuple[Position, ...]:

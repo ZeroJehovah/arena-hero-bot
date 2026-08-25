@@ -2962,3 +2962,25 @@ def test_ranger_shoots_an_intruder_without_joining_the_chase() -> None:
     # A Worker cannot shoot back, so backing off to max range would only give
     # the thief a free Tick.
     assert not any("disengage" in item.reason for item in report.decisions)
+
+
+def test_defensive_perimeter_stops_growing_with_the_army() -> None:
+    # The count-and-vision radius alone put a 29-guard fleet 30 cells out and
+    # left the whole interior unguarded.
+    guards = [unit(10 + index, "VANGUARD", position=(0, 40)) for index in range(29)]
+    turn = make_turn(
+        objects=[core(position=(0, 0)), *guards],
+        resources=0,
+    )
+    strategy = AggressiveStrategy(
+        WorldMemory(), StrategyConfig(target_workers=0, max_population=None)
+    )
+    strategy.decide(turn)
+
+    layout = strategy._defensive_layout
+    assert layout is not None
+    assert layout.radius <= StrategyConfig().defensive_perimeter_max_radius
+    assert all(
+        manhattan((0, 0), slot) <= StrategyConfig().defensive_perimeter_max_radius
+        for slot in layout.assignments.values()
+    )
