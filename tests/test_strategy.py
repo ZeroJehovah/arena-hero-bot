@@ -1142,43 +1142,54 @@ def test_combat_unit_hunts_recent_enemy_after_losing_vision() -> None:
     assert any("last seen core" in item.reason for item in report.decisions)
 
 
-def test_defensive_vanguard_does_not_hunt_remembered_worker_over_resource() -> None:
-    memory = WorldMemory()
+def _remembered_intruder_report(intruder_position, vanguard_positions):
+    """Sight one enemy Worker, then replay the same Tick without vision."""
+
     strategy = AggressiveStrategy(
-        memory,
+        WorldMemory(),
         StrategyConfig(target_workers=0, max_population=None),
     )
-    observed = make_turn(
-        tick=100,
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(0, 1)),
-            unit(20, "WORKER", controlled=False, position=(1, 1)),
-        ],
-        resource_cells=[(1, 1)],
+    guards = [
+        unit(10 + index, "VANGUARD", position=position)
+        for index, position in enumerate(vanguard_positions)
+    ]
+    strategy.decide(
+        make_turn(
+            tick=100,
+            objects=[
+                core(),
+                *guards,
+                unit(20, "WORKER", controlled=False, position=intruder_position),
+            ],
+            resource_cells=[intruder_position],
+        )
     )
-    strategy.decide(observed)
-
     recovered = make_turn(
         tick=101,
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(0, 1)),
-            unit(3, "WORKER", position=(0, 3)),
-        ],
-        resource_cells=[(1, 1)],
+        objects=[core(), *guards, unit(3, "WORKER", position=(0, 3))],
+        resource_cells=[intruder_position],
     )
-    report = strategy.decide(recovered)
+    return recovered, strategy.decide(recovered)
 
-    vanguard_decision = next(
-        item
-        for item in report.decisions
-        if item.actor_id == str(recovered.vanguards[0].id)
-    )
-    assert (
-        vanguard_decision.reason
-        == "hold a defensive perimeter around the resource Core"
-    )
+
+def test_only_the_escort_hunts_a_remembered_intruder() -> None:
+    # A thief inside the economy zone has to be run down even while the cell
+    # is dark, but the rest of the roster keeps its perimeter slot instead of
+    # stampeding after a single Worker.
+    positions = ((0, 1), (0, -1), (1, 0), (-1, 0), (0, 2), (0, -2))
+    recovered, report = _remembered_intruder_report((1, 1), positions)
+
+    guards = {str(vanguard.id) for vanguard in recovered.vanguards}
+    reasons = [item for item in report.decisions if item.actor_id in guards]
+    hunting = [item for item in reasons if item.reason == "hunt last seen unit"]
+    holding = [item for item in reasons if "perimeter" in item.reason]
+    assert 0 < len(hunting) <= 4
+    assert holding
+
+
+def test_a_remembered_worker_outside_the_economy_zone_is_ignored() -> None:
+    _, report = _remembered_intruder_report((0, 40), ((0, 1),))
+
     assert not any("hunt last seen unit" in item.reason for item in report.decisions)
 
 
@@ -2851,3 +2862,83 @@ def test_distant_worker_is_not_dragged_into_the_core_assault_zone() -> None:
     distant = next(item for item in report.decisions if item.actor_id == object_id(2))
     assert "assault zone" not in distant.reason
     assert distant.reason == "patrol near the stationary Core for resources"
+
+
+def _hunt_sequence(enemy_path, *, tick0=100, vanguards=((0, 0),)):
+    """Replay an intruder track through one persistent strategy instance."""
+
+    strategy = AggressiveStrategy(WorldMemory())
+    turns = []
+    for offset, enemy_position in enumerate(enemy_path):
+        objects: list = [core(position=(-3, 0))]
+        objects += [
+            unit(10 + index, "VANGUARD", position=position)
+            for index, position in enumerate(vanguards)
+        ]
+        if enemy_position is not None:
+            objects.append(unit(9, "WORKER", controlled=False, position=enemy_position))
+        turn = make_turn(tick=tick0 + offset, resources=0, objects=objects)
+        report = strategy.decide(turn)
+        turns.append((turn, report))
+    return turns
+
+
+def test_vanguard_sweeps_the_cell_an_intruder_walks_into() -> None:
+    # The thief is diagonal to the guard right now, so the old adjacency-only
+    # sweep could never fire; its drift puts it in the swept cell after
+    # movement, which is the snapshot combat actually resolves on.
+    turns = _hunt_sequence([(1, 2), (1, 1)])
+
+    turn, report = turns[-1]
+    action = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert action.type == "SWEEP"
+    assert action.direction is Direction.RIGHT
+    assert any(
+        item.action == "SWEEP" and item.target == (1, 0) for item in report.decisions
+    )
+
+
+def test_vanguard_skips_a_sweep_the_intruder_walks_out_of() -> None:
+    # Adjacent, but drifting on out of the cell: swinging at it is a
+    # guaranteed miss, so cutting the runner off is worth strictly more.
+    turns = _hunt_sequence([(1, 1), (1, 0)])
+
+    turn, _ = turns[-1]
+    action = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert action.type == "MOVE"
+
+
+def test_vanguard_aims_ahead_of_a_fleeing_intruder() -> None:
+    turns = _hunt_sequence([(4, 0), (5, 0)])
+
+    _, report = turns[-1]
+    decision = report.decisions[0]
+    assert decision.action == "MOVE"
+    # A goal behind or level with the runner means a permanent two-cell gap.
+    assert decision.target is not None and decision.target[0] > 5
+
+
+def test_vanguard_escort_keeps_hunting_an_intruder_through_a_vision_gap() -> None:
+    turns = _hunt_sequence([(4, 0), (5, 0), None, None])
+
+    for turn, report in turns[2:]:
+        action = turn.plan.unit_actions[turn.vanguards[0].id]
+        assert action.type == "MOVE"
+        assert action.direction is Direction.RIGHT
+        assert any(
+            item.reason == "hunt last seen unit" and item.target == (5, 0)
+            for item in report.decisions
+        )
+
+
+def test_intruder_hunt_expires_once_the_sighting_goes_stale() -> None:
+    config = StrategyConfig(intruder_hunt_ttl=1)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    for tick, enemy_position in ((100, (4, 0)), (101, (5, 0)), (110, None)):
+        objects: list = [core(position=(-3, 0)), unit(10, "VANGUARD", position=(0, 0))]
+        if enemy_position is not None:
+            objects.append(unit(9, "WORKER", controlled=False, position=enemy_position))
+        turn = make_turn(tick=tick, resources=0, objects=objects)
+        report = strategy.decide(turn)
+
+    assert all(item.reason != "hunt last seen unit" for item in report.decisions)

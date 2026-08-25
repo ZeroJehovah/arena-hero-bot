@@ -176,3 +176,42 @@ def test_destruction_event_forgets_enemy_and_motion_history() -> None:
     assert enemy_id not in memory.enemies
     assert enemy_id not in memory.enemy_position_history
     assert memory.recent_enemies(22, ttl=100) == ()
+
+
+def test_enemy_drift_leads_a_track_seen_across_a_vision_gap() -> None:
+    memory = WorldMemory()
+    for tick, position in ((20, (0, 6)), (22, (0, 4))):
+        memory.observe(
+            make_turn(
+                tick=tick,
+                objects=[
+                    core(),
+                    unit(6, "WORKER", controlled=False, position=position),
+                ],
+            )
+        )
+
+    # The strict predictor needs three consecutive same-delta observations,
+    # which a flickering intruder track never supplies.
+    assert memory.predicted_enemy_position(object_id(6), 22) is None
+    assert memory.enemy_drift_position(object_id(6), 22, 1) == (0, 3)
+    assert memory.enemy_drift_position(object_id(6), 22, 2) == (0, 2)
+
+
+def test_enemy_drift_ignores_stationary_and_stale_tracks() -> None:
+    memory = WorldMemory()
+    for tick in (20, 21):
+        memory.observe(
+            make_turn(
+                tick=tick,
+                objects=[
+                    core(),
+                    unit(6, "WORKER", controlled=False, position=(0, 4)),
+                ],
+            )
+        )
+
+    assert memory.enemy_drift_position(object_id(6), 21, 1) is None
+    # Extrapolating from a sighting that is not from this Tick would send the
+    # guard to a cell the target left several Ticks ago.
+    assert memory.enemy_drift_position(object_id(6), 22, 1) is None

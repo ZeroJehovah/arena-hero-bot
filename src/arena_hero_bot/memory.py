@@ -12,6 +12,7 @@ from arena_hero import CoreView, Position, Turn, UnitView
 SCHEMA_VERSION = 1
 POSITION_HISTORY_LIMIT = 8
 ENEMY_POSITION_HISTORY_LIMIT = 4
+ENEMY_DRIFT_MAX_GAP = 3
 CONTESTED_CELL_TTL = 80
 
 
@@ -190,6 +191,42 @@ class WorldMemory:
             return None
         return current[0] + current_delta[0], current[1] + current_delta[1]
 
+    def enemy_drift_position(
+        self,
+        enemy_id: str,
+        tick: int,
+        steps: int = 1,
+    ) -> Position | None:
+        """Extrapolate a hostile's recent drift ``steps`` Ticks ahead.
+
+        ``predicted_enemy_position`` only fires after three consecutive
+        same-delta observations, which almost never happens for an intruder
+        that keeps flickering in and out of fleet vision.  Combat resolves on
+        the post-movement snapshot, so a chaser that aims at the cell a target
+        currently stands in always swings at empty ground.  This looser
+        estimate uses the oldest sample still inside ``ENEMY_DRIFT_MAX_GAP``
+        and returns a lead cell, which is what interception needs.
+        """
+
+        history = self.enemy_position_history.get(enemy_id, [])
+        if steps <= 0 or len(history) < 2:
+            return None
+        current_tick, current = history[-1]
+        if current_tick != tick:
+            return None
+        for older_tick, older in reversed(history[:-1]):
+            span = current_tick - older_tick
+            if not 1 <= span <= ENEMY_DRIFT_MAX_GAP:
+                continue
+            delta = current[0] - older[0], current[1] - older[1]
+            if delta == (0, 0):
+                return None
+            return (
+                current[0] + _scaled_delta(delta[0], steps, span),
+                current[1] + _scaled_delta(delta[1], steps, span),
+            )
+        return None
+
     def goal_for(self, unit_id: str) -> UnitGoal | None:
         """Return a Unit's current durable exploration goal."""
 
@@ -335,3 +372,12 @@ def _optional_position(value: object) -> Position | None:
     if value is None:
         return None
     return _position(value)
+
+
+def _scaled_delta(delta: int, steps: int, span: int) -> int:
+    """Scale one axis of an observed delta, rounding half away from zero."""
+
+    if delta == 0:
+        return 0
+    sign = 1 if delta > 0 else -1
+    return sign * ((abs(delta) * steps + span // 2) // span)

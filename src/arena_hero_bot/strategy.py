@@ -56,6 +56,10 @@ COMBAT_SCREEN_RADIUS = 3
 CORE_ESCAPE_MIN_ENEMIES = 3
 MAX_VANGUARD_ATTACKERS = 4
 CORE_WORKER_INTERCEPT_RADIUS = 4
+CORE_INTRUDER_INTERCEPTORS = 4
+INTRUDER_LEAD_STEPS = 2
+SWEEP_STAY_WEIGHT = 1
+SWEEP_LIKELY_WEIGHT = 3
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
 CORE_CAPACITY_HIGH_RESERVE = 100
@@ -92,8 +96,10 @@ class StrategyConfig:
     exploration_radius: int = 24
     worker_threat_radius: int = 6
     worker_threat_memory_ttl: int = 24
+    intruder_hunt_ttl: int = 24
     resource_guard_min_workers: int = 6
     combat_alert_radius: int = 14
+    core_intruder_radius: int = 16
     core_assault_radius: int = 8
     core_escape_enemy_count: int = CORE_ESCAPE_MIN_ENEMIES
 
@@ -120,6 +126,7 @@ class _TurnContext:
     threat: ThreatAssessment = field(default_factory=ThreatAssessment)
     damage_ledger: CombatTargetLedger = field(default_factory=CombatTargetLedger)
     squad_return_ids: frozenset[UUID] = field(default_factory=frozenset)
+    intruder_intercept_ids: frozenset[UUID] = field(default_factory=frozenset)
     emergency: bool = False
 
 
@@ -150,6 +157,7 @@ class AggressiveStrategy:
         # radii even when there was no enemy to react to.
         self._defensive_layout: _DefensiveLayout | None = None
         self._combat_focus_id: str | None = None
+        self._intruder_hunt_id: str | None = None
         self._combat_policy = CombatPolicy()
         self._squad_return_until: dict[UUID, int] = {}
 
@@ -198,6 +206,10 @@ class AggressiveStrategy:
                 turn,
                 focus_target,
                 emergency,
+            ),
+            intruder_intercept_ids=self._intruder_intercept_ids(
+                turn,
+                self._intruder_anchor(turn, focus_target, recent_enemies),
             ),
             emergency=emergency,
         )
@@ -270,6 +282,7 @@ class AggressiveStrategy:
             context.turn,
             offensive=offensive,
             emergency=context.emergency,
+            intercept_ids=context.intruder_intercept_ids,
         )
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
         shootable = [
@@ -388,15 +401,10 @@ class AggressiveStrategy:
                 return
 
         remembered_enemies = (
-            self._offensive_enemies(context.turn) if offensive else recent_enemies
+            self._offensive_enemies(context.turn)
+            if offensive
+            else self._defensive_memory_targets(ranger, context, recent_enemies)
         )
-        if not offensive:
-            remembered_enemies = tuple(
-                enemy
-                for enemy in remembered_enemies
-                if self._is_combat_memory_target(enemy)
-                and self._combat_target_is_local(ranger, enemy.position)
-            )
         remembered = self._best_remembered_target(
             ranger.position,
             remembered_enemies,
@@ -442,44 +450,50 @@ class AggressiveStrategy:
             context.turn,
             offensive=offensive,
             emergency=context.emergency,
+            intercept_ids=context.intruder_intercept_ids,
         )
         if context.combat_assault and vanguard.id not in context.vanguard_attack_ids:
             self._decide_vanguard_screen(vanguard, context, visible_enemies)
             return
-        adjacent_groups: dict[Direction, list[CoreView | UnitView]] = {}
-        for enemy in visible_enemies:
-            direction = direction_between(vanguard.position, enemy.position)
-            if direction is not None:
-                adjacent_groups.setdefault(direction, []).append(enemy)
-        if adjacent_groups:
+        sweep_groups = self._sweep_groups(vanguard, context, visible_enemies)
+        if sweep_groups:
             focused_group = next(
                 (
                     item
-                    for item in adjacent_groups.items()
+                    for item in sweep_groups.items()
                     if context.focus_target is not None
-                    and any(enemy.id == context.focus_target.id for enemy in item[1])
+                    and any(enemy.id == context.focus_target.id for enemy in item[1][0])
+                    and item[1][1] >= SWEEP_LIKELY_WEIGHT
                 ),
                 None,
             )
-            direction, targets = focused_group or max(
-                adjacent_groups.items(),
-                key=lambda item: sum(
-                    self._enemy_score(enemy, vanguard.position, context.turn)
-                    + (100 if context.damage_ledger.remaining(enemy) > 0 else -100)
-                    for enemy in item[1]
+            direction, (targets, weight) = focused_group or max(
+                sweep_groups.items(),
+                key=lambda item: (
+                    item[1][1],
+                    sum(
+                        self._enemy_score(enemy, vanguard.position, context.turn)
+                        + (100 if context.damage_ledger.remaining(enemy) > 0 else -100)
+                        for enemy in item[1][0]
+                    ),
                 ),
             )
-            vanguard.sweep(direction)
-            for target in targets:
-                context.damage_ledger.record(target)
-            context.report.add(
-                actor_id=str(vanguard.id),
-                actor_kind="VANGUARD",
-                action="SWEEP",
-                reason=f"hit {len(targets)} adjacent hostile object(s)",
-                target=add(vanguard.position, direction),
-            )
-            return
+            # A sweep is spent on the cell as it looks after movement.  Only
+            # commit the Tick when a hostile is expected to still be standing
+            # there; otherwise repositioning to cut the target off is worth
+            # strictly more than swinging at the cell it is walking out of.
+            if weight >= SWEEP_LIKELY_WEIGHT:
+                vanguard.sweep(direction)
+                for target in targets:
+                    context.damage_ledger.record(target)
+                context.report.add(
+                    actor_id=str(vanguard.id),
+                    actor_kind="VANGUARD",
+                    action="SWEEP",
+                    reason=f"hit {len(targets)} adjacent hostile object(s)",
+                    target=add(vanguard.position, direction),
+                )
+                return
 
         if (
             vanguard.id in context.squad_return_ids
@@ -519,21 +533,29 @@ class AggressiveStrategy:
                     ),
                 ):
                     return
-            candidates = [
-                position
-                for position in adjacent_positions(visible_target.position)
-                if position not in self.memory.obstacles
-                and position not in context.enemy_positions
-                and (
-                    position == vanguard.position
-                    or position not in context.occupied | context.reserved
-                )
-            ]
-            if candidates:
+            # Stepping into a cell next to where the target stands *now*
+            # lands the chaser exactly where the target just was, so an
+            # equal-speed runner keeps a permanent two-cell gap.  Aim at the
+            # cell its recent drift leads to instead and the gap can close.
+            intercept = self._intercept_cell(visible_target, context)
+            for anchor in dict.fromkeys((intercept, visible_target.position)):
+                candidates = [
+                    position
+                    for position in adjacent_positions(anchor)
+                    if position not in self.memory.obstacles
+                    and position not in context.enemy_positions
+                    and (
+                        position == vanguard.position
+                        or position not in context.occupied | context.reserved
+                    )
+                ]
+                if not candidates:
+                    continue
                 goal = min(
                     candidates,
                     key=lambda position: (
                         manhattan(vanguard.position, position),
+                        manhattan(intercept, position),
                         position,
                     ),
                 )
@@ -553,15 +575,10 @@ class AggressiveStrategy:
             return
 
         remembered_enemies = (
-            self._offensive_enemies(context.turn) if offensive else recent_enemies
+            self._offensive_enemies(context.turn)
+            if offensive
+            else self._defensive_memory_targets(vanguard, context, recent_enemies)
         )
-        if not offensive:
-            remembered_enemies = tuple(
-                enemy
-                for enemy in remembered_enemies
-                if self._is_combat_memory_target(enemy)
-                and self._combat_target_is_local(vanguard, enemy.position)
-            )
         remembered = self._best_remembered_target(
             vanguard.position,
             remembered_enemies,
@@ -697,17 +714,87 @@ class AggressiveStrategy:
             available.remove(position)
         return assignments
 
+    def _intercept_cell(
+        self,
+        enemy: CoreView | UnitView,
+        context: _TurnContext,
+        steps: int = INTRUDER_LEAD_STEPS,
+    ) -> Position:
+        """Return the cell to converge on, leading a moving target."""
+
+        lead = self.memory.enemy_drift_position(
+            str(enemy.id),
+            context.turn.tick,
+            steps,
+        )
+        if lead is None or lead in self.memory.obstacles:
+            return enemy.position
+        if lead in context.turn.obstacle_cells:
+            return enemy.position
+        return lead
+
+    def _sweep_groups(
+        self,
+        vanguard: Vanguard,
+        context: _TurnContext,
+        visible_enemies: tuple[CoreView | UnitView, ...],
+    ) -> dict[Direction, tuple[tuple[CoreView | UnitView, ...], int]]:
+        """Group reachable hostiles per sweep direction with a hit confidence.
+
+        Combat resolves on the snapshot taken after movement, so the useful
+        question is not "who stands next to me" but "who will stand in the
+        cell I am about to sweep".  A hostile whose drift leads into the cell,
+        and a hostile with no movement evidence at all, are both likely to be
+        there.  One that is visibly walking out of the cell is not.
+        """
+
+        collected: dict[Direction, dict[str, CoreView | UnitView]] = {}
+        weights: dict[Direction, int] = {}
+        for enemy in visible_enemies:
+            lead = self.memory.enemy_drift_position(
+                str(enemy.id),
+                context.turn.tick,
+                1,
+            )
+            reachable: dict[Direction, int] = {}
+            here = direction_between(vanguard.position, enemy.position)
+            if here is not None:
+                reachable[here] = (
+                    SWEEP_STAY_WEIGHT
+                    if lead is not None and lead != enemy.position
+                    else SWEEP_LIKELY_WEIGHT
+                )
+            if lead is not None and lead != enemy.position:
+                ahead = direction_between(vanguard.position, lead)
+                if ahead is not None:
+                    reachable[ahead] = SWEEP_LIKELY_WEIGHT
+            for direction, weight in reachable.items():
+                collected.setdefault(direction, {})[str(enemy.id)] = enemy
+                weights[direction] = weights.get(direction, 0) + weight
+        return {
+            direction: (tuple(targets.values()), weights[direction])
+            for direction, targets in collected.items()
+        }
+
     def _vanguard_block_goal(
         self,
         vanguard: Vanguard,
         target: CoreView | UnitView,
         context: _TurnContext,
     ) -> Position | None:
-        """Assign the focus target's adjacent escape cells across Vanguards."""
+        """Assign the focus target's adjacent escape cells across Vanguards.
 
+        The ring is placed around the cell the target is heading for, not the
+        one it is standing in, so the escort arrives where the escape routes
+        actually are.  Only the detached escort takes part in the rotation;
+        spreading the slots over the whole roster gave each blocker an
+        effectively random preference.
+        """
+
+        anchor = self._intercept_cell(target, context)
         slots = [
             position
-            for position in adjacent_positions(target.position)
+            for position in adjacent_positions(anchor)
             if position not in self.memory.obstacles
             and position not in context.turn.obstacle_cells
             and position not in context.enemy_positions
@@ -715,16 +802,24 @@ class AggressiveStrategy:
         ]
         if not slots:
             return None
+        escort = context.intruder_intercept_ids
         ordered_vanguards = sorted(
-            context.turn.vanguards,
+            (
+                unit
+                for unit in context.turn.vanguards
+                if not escort or unit.id in escort
+            ),
             key=lambda unit: unit.id.bytes,
         )
         index = next(
-            index
-            for index, unit in enumerate(ordered_vanguards)
-            if unit.id == vanguard.id
+            (
+                index
+                for index, unit in enumerate(ordered_vanguards)
+                if unit.id == vanguard.id
+            ),
+            0,
         )
-        preferred = adjacent_positions(target.position)
+        preferred = adjacent_positions(anchor)
         rotation = index % len(preferred)
         rotated = preferred[rotation:] + preferred[:rotation]
         return min(
@@ -1543,24 +1638,136 @@ class AggressiveStrategy:
         *,
         offensive: bool,
         emergency: bool = False,
+        intercept_ids: frozenset[UUID] = frozenset(),
     ) -> tuple[CoreView | UnitView, ...]:
-        """Limit defensive reactions to enemies in that guard's local area."""
+        """Limit defensive reactions to enemies in that guard's local area.
+
+        ``turn.visible_enemies`` is fleet-wide, so an escort member is allowed
+        to act on an intruder that only a Worker can currently see.  Every
+        other guard keeps the strict own-vision rule and stays on station.
+        """
 
         if offensive or emergency:
             return turn.visible_enemies
+        escorting = unit.id in intercept_ids
         return tuple(
             enemy
             for enemy in turn.visible_enemies
             if self._combat_target_is_local(unit, enemy.position)
             or (
-                isinstance(unit, Vanguard)
+                escorting
                 and isinstance(enemy, UnitView)
                 and enemy.unit_type is UnitType.WORKER
                 and turn.core is not None
                 and manhattan(turn.core.position, enemy.position)
-                <= CORE_WORKER_INTERCEPT_RADIUS
+                <= self.config.core_intruder_radius
             )
         )
+
+    def _core_intruders(self, turn: Turn) -> tuple[UnitView, ...]:
+        """Return visible enemy Workers loitering inside the economy zone.
+
+        An enemy Worker cannot attack, so it never belongs in the threat
+        ladder that decides evacuation or combat posture.  It does steal the
+        resource cells this Core lives on and scouts for its own army, so it
+        still has to be hunted down.  Ordering by Core distance keeps the
+        closest thief as the focus while it stays inside the zone.
+        """
+
+        core = turn.core
+        if core is None:
+            return ()
+        radius = self.config.core_intruder_radius
+        return tuple(
+            sorted(
+                (
+                    enemy
+                    for enemy in turn.visible_enemies
+                    if isinstance(enemy, UnitView)
+                    and enemy.unit_type is UnitType.WORKER
+                    and manhattan(core.position, enemy.position) <= radius
+                ),
+                key=lambda enemy: (
+                    manhattan(core.position, enemy.position),
+                    str(enemy.id),
+                ),
+            )
+        )
+
+    def _intruder_anchor(
+        self,
+        turn: Turn,
+        focus_target: CoreView | UnitView | None,
+        recent_enemies: tuple[EnemySighting, ...],
+    ) -> Position | None:
+        """Return the cell the intruder escort should converge on.
+
+        Vision over a thief inside the economy zone flickers, because the
+        perimeter guards face outward and the cell is usually only covered by
+        a passing Worker.  The escort used to disband on the first dark Tick,
+        so the hunt restarted from scratch every few Ticks and the Worker
+        strolled away.  Holding the last known cell keeps the same squad
+        committed across the gap; the hunt is dropped once that sighting goes
+        stale or leaves the zone.
+        """
+
+        core = turn.core
+        if core is None:
+            self._intruder_hunt_id = None
+            return None
+        if (
+            isinstance(focus_target, UnitView)
+            and focus_target.unit_type is UnitType.WORKER
+        ):
+            self._intruder_hunt_id = str(focus_target.id)
+            return focus_target.position
+        if focus_target is not None:
+            # Anything that can actually shoot outranks a thief, but the hunt
+            # is only paused: the escort resumes once the fight is over.
+            return None
+        if self._intruder_hunt_id is None:
+            return None
+        radius = self.config.core_intruder_radius
+        sighting = next(
+            (
+                enemy
+                for enemy in recent_enemies
+                if enemy.object_id == self._intruder_hunt_id
+                and turn.tick - enemy.tick <= self.config.intruder_hunt_ttl
+                and manhattan(core.position, enemy.position) <= radius
+            ),
+            None,
+        )
+        if sighting is None:
+            self._intruder_hunt_id = None
+            return None
+        return sighting.position
+
+    def _intruder_intercept_ids(
+        self,
+        turn: Turn,
+        anchor: Position | None,
+    ) -> frozenset[UUID]:
+        """Reserve a bounded escort for one intruder.
+
+        A lone chaser can never catch an equal-speed target: it steps into the
+        cell the target just left and the gap stays at two forever.  Killing
+        one needs its escape cells covered, so a small squad is detached while
+        every other guard keeps its perimeter slot instead of stampeding
+        across the map after a single Worker.
+        """
+
+        if anchor is None or not turn.vanguards:
+            return frozenset()
+        ordered = sorted(
+            turn.vanguards,
+            key=lambda unit: (
+                manhattan(unit.position, anchor),
+                unit.hp <= 2,
+                unit.id.bytes,
+            ),
+        )
+        return frozenset(unit.id for unit in ordered[:CORE_INTRUDER_INTERCEPTORS])
 
     def _focus_target(self, turn: Turn) -> CoreView | UnitView | None:
         enemies: list[CoreView | UnitView] = [
@@ -1573,29 +1780,20 @@ class AggressiveStrategy:
             )
         ]
         if not enemies:
-            nearby_workers = tuple(
-                enemy
-                for enemy in turn.visible_enemies
-                if (
-                    isinstance(enemy, UnitView)
-                    and enemy.unit_type is UnitType.WORKER
-                    and turn.core is not None
-                    and turn.vanguards
-                    and manhattan(turn.core.position, enemy.position)
-                    <= CORE_WORKER_INTERCEPT_RADIUS
-                )
-            )
-            if not nearby_workers:
+            intruders = self._core_intruders(turn) if turn.vanguards else ()
+            if not intruders:
                 self._combat_focus_id = None
                 return None
-            target = min(
-                nearby_workers,
-                key=lambda enemy: (
-                    manhattan(turn.core.position, enemy.position)
-                    if turn.core is not None
-                    else 0,
-                    str(enemy.id),
+            # Stay on the intruder already being hunted while it remains
+            # inside the zone; swapping focus every Tick restarted the pincer
+            # and let each thief walk away untouched.
+            target = next(
+                (
+                    enemy
+                    for enemy in intruders
+                    if str(enemy.id) == self._combat_focus_id
                 ),
+                intruders[0],
             )
             self._combat_focus_id = str(target.id)
             return target
@@ -1897,18 +2095,22 @@ class AggressiveStrategy:
         turn: Turn,
         obstacles: set[Position] | frozenset[Position],
     ) -> Position | None:
-        predicted = self.memory.predicted_enemy_position(str(enemy.id), turn.tick)
-        # A lead is useful at the edge of the weapon range.  At range 1-2 a
-        # target can stop, turn, or collide before the shot resolves; the
-        # battle log showed that blindly leading close targets amplified
-        # misses while the enemy was already on top of the Core.
-        candidates = (
-            (predicted, enemy.position)
-            if predicted is not None
-            and self._ranger_range(ranger.position, enemy.position)
-            == RANGER_STANDOFF_RANGE
-            else (enemy.position,)
+        # Movement resolves before the shot, so aiming at the cell a moving
+        # target currently occupies is a guaranteed miss.  ``drift`` is the
+        # loose one-step estimate and fires far more often than the strict
+        # three-Tick predictor, which almost never triggers while vision over
+        # the target keeps flickering.  At range 1 the target is close enough
+        # to stall or collide, so the standing cell is still the better guess
+        # there; from range 2 outwards the lead is preferred.
+        strict = self.memory.predicted_enemy_position(str(enemy.id), turn.tick)
+        drift = self.memory.enemy_drift_position(str(enemy.id), turn.tick, 1)
+        predicted = strict or drift
+        leads = (
+            predicted is not None
+            and predicted != enemy.position
+            and self._ranger_range(ranger.position, enemy.position) > 1
         )
+        candidates = (predicted, enemy.position) if leads else (enemy.position,)
         for cell in dict.fromkeys(cell for cell in candidates if cell is not None):
             if line_of_fire(ranger.position, cell, obstacles):
                 return cell
@@ -1921,9 +2123,45 @@ class AggressiveStrategy:
     ) -> bool:
         return manhattan(unit.position, target) <= _combat_vision_radius(unit)
 
+    def _defensive_memory_targets(
+        self,
+        unit: Ranger | Vanguard,
+        context: _TurnContext,
+        recent_enemies: tuple[EnemySighting, ...],
+    ) -> tuple[EnemySighting, ...]:
+        """Pick the last-seen hostiles this guard is allowed to walk towards.
+
+        Vision over an intruder flickers constantly, because the perimeter
+        guards face outward and the cell is usually only covered by a passing
+        Worker.  Dropping remembered Workers outright therefore cancelled the
+        hunt every few Ticks and reset it from scratch, which is why thieves
+        survived hundreds of Ticks inside the zone.  The detached escort keeps
+        the last known cell of an intruder; everyone else still ignores
+        remembered Workers and stays on station.
+        """
+
+        core = context.turn.core
+        escorting = unit.id in context.intruder_intercept_ids
+        radius = self.config.core_intruder_radius
+        targets: list[EnemySighting] = []
+        for enemy in recent_enemies:
+            if self._is_combat_memory_target(enemy):
+                if self._combat_target_is_local(unit, enemy.position):
+                    targets.append(enemy)
+                continue
+            if (
+                escorting
+                and core is not None
+                and enemy.kind == "UNIT"
+                and enemy.unit_type == UnitType.WORKER.value
+                and manhattan(core.position, enemy.position) <= radius
+            ):
+                targets.append(enemy)
+        return tuple(targets)
+
     @staticmethod
     def _is_combat_memory_target(enemy: EnemySighting) -> bool:
-        """Keep defensive guards from chasing remembered enemy Workers."""
+        """Whether a remembered hostile can attack and is worth intercepting."""
 
         return enemy.kind == "CORE" or enemy.unit_type in {
             UnitType.RANGER.value,
