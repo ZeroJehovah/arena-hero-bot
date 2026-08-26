@@ -3090,7 +3090,21 @@ class AggressiveStrategy:
             outreach = set()
         assignments: dict[UUID, Position] = {}
         taken = set(resources)
-        pools = [resources, fallback - taken, outreach - taken - fallback]
+        outreach_only = outreach - fallback
+        if (
+            fallback
+            and len(fallback) >= len(workers)
+            and outreach_only
+            and not resources
+        ):
+            # Once fresh inner evidence is gone, a full inner recheck pool can
+            # starve the wider ring forever: every newly freed Worker takes
+            # another nearby site before it gets a chance to test an older
+            # outer one.  Keep existing claims in place, but let new claims
+            # sample the bounded outreach pool first in this one case.
+            pools = [resources, outreach_only, fallback - taken]
+        else:
+            pools = [resources, fallback - taken, outreach - taken - fallback]
         self._hold_existing_claims(workers, pools, assignments)
         for pool in pools:
             # Nearest and freshest evidence first, so a shorter walk to a

@@ -1280,6 +1280,35 @@ def test_idle_workers_reach_past_the_harvest_ring_only_when_it_is_swept() -> Non
     assert sorted(claim for claim in claims if claim) == [(20, 0), (40, 0)]
 
 
+def test_saturated_inner_rechecks_allow_new_outreach_claims() -> None:
+    """A full inner recheck pool must not starve the bounded outer ring."""
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    inner = [(10, y) for y in range(12)]
+    outer = (40, 0)
+    memory.resource_cells = dict.fromkeys([*inner, outer], 100)
+    memory.resource_absences = dict.fromkeys([*inner, outer], 0)
+    strategy = AggressiveStrategy(memory, config)
+
+    turn = make_turn(
+        tick=200,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "WORKER", position=(0, 1)),
+        ],
+    )
+    report = strategy.decide(turn)
+    claims = [
+        item.target
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned known resource"
+    ]
+
+    assert outer in claims
+
+
 def test_live_workers_drop_persisted_remote_resource_goals() -> None:
     memory = WorldMemory()
     memory.set_goal(
