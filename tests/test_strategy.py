@@ -1495,6 +1495,44 @@ def test_wounded_vanguard_on_core_cell_is_healed_not_parked() -> None:
     assert turn.plan.unit_actions[turn.vanguards[0].id].type == "HEAL"
 
 
+def test_workers_trade_claims_instead_of_walking_past_each_other() -> None:
+    """Crossed claims cost travel that a swap gives back for free.
+
+    Both cells stay claimed either way, so the swap keeps the observation
+    that ``_hold_existing_claims`` protects and drops the crossing.
+    """
+
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "WORKER", position=(2, 0)),
+            unit(3, "WORKER", position=(9, 0)),
+        ],
+        resource_cells=[(10, 0), (3, 0)],
+    )
+    memory = WorldMemory()
+    # The held claims are the crossing: each Worker is walking to the cell
+    # beside the other one.
+    for number, goal in ((2, (10, 0)), (3, (3, 0))):
+        memory.set_goal(
+            object_id(number),
+            UnitGoal(
+                position=goal,
+                assigned_tick=turn.tick,
+                purpose="resource-claim-v1",
+            ),
+        )
+
+    report = decide(turn, memory)
+
+    claims = {
+        item.actor_id: tuple(item.target)
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned known resource"
+    }
+    assert claims == {object_id(2): (3, 0), object_id(3): (10, 0)}
+
+
 def test_boxed_in_core_occupant_nudges_a_neighbour_aside() -> None:
     """The Core cell must empty even when every exit is held by a friend.
 
@@ -3891,7 +3929,14 @@ def test_raid_does_not_launch_for_a_core_beyond_the_opportunity_radius() -> None
 
 
 def test_a_worker_keeps_the_cell_it_claimed_when_the_pairing_would_flip() -> None:
-    """A shorter pairing must not steal a cell a Worker is already closing on."""
+    """A shorter pairing must not steal a cell a Worker is already closing on.
+
+    The harm the hold prevents is an *abandoned* cell.  With one Worker and
+    two cells, dropping the far claim for the near one leaves nothing to
+    confirm (12, 0), so the recheck machinery never hears about it.  A second
+    Worker would make the flip a swap instead, which ``_uncross_claims``
+    allows precisely because nothing is abandoned.
+    """
 
     memory = WorldMemory()
     memory.set_goal(
@@ -3903,7 +3948,6 @@ def test_a_worker_keeps_the_cell_it_claimed_when_the_pairing_would_flip() -> Non
         objects=[
             core(),
             unit(2, "WORKER", position=(3, 0)),
-            unit(3, "WORKER", position=(6, 0)),
         ],
         resource_cells=[(4, 0), (12, 0)],
     )
@@ -3924,10 +3968,9 @@ def test_a_worker_keeps_the_cell_it_claimed_when_the_pairing_would_flip() -> Non
     }
 
     # Worker 2 sits one cell from (4, 0), so the unpinned greedy would hand it
-    # that cell and push Worker 3 six cells out, throwing away the approach
+    # that cell and leave (12, 0) unclaimed, throwing away the approach
     # Worker 2 has already made.
     assert claims[object_id(2)] == (12, 0)
-    assert claims[object_id(3)] == (4, 0)
 
 
 def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
