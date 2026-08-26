@@ -4047,3 +4047,81 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
 
     assert targets[:6] == [(12, 0)] * 6
     assert targets[6] == (5, 0)
+
+
+def test_worker_claim_skips_resource_inside_enemy_core_exclusion() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(
+        resource_target=95,
+        resource_patrol_radius=18,
+        worker_threat_radius=2,
+    )
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(2, 0)),
+            core(3, controlled=False, owner_username="rival", position=(6, 0)),
+        ],
+        resource_cells=[(5, 0), (-4, 0)],
+    )
+    strategy.decide(observed)
+
+    hidden = make_turn(
+        tick=125,
+        objects=[core(), unit(2, "WORKER", position=(2, 0))],
+    )
+    strategy.decide(hidden)
+
+    claim = memory.goal_for(object_id(2))
+    assert claim is not None
+    assert claim.purpose == "resource-claim-v1"
+    assert claim.position == (-4, 0)
+    assert hidden.plan.unit_actions[hidden.workers[0].id].direction is Direction.LEFT
+
+
+def test_worker_rests_a_resource_no_route_can_reach() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(resource_target=95, resource_patrol_radius=18)
+    strategy = AggressiveStrategy(memory, config)
+    walled = make_turn(
+        tick=100,
+        objects=[core(), unit(2, "WORKER", position=(2, 0))],
+        resource_cells=[(5, 0), (-4, 0)],
+        obstacles=[(4, 0), (6, 0), (5, -1), (5, 1)],
+    )
+    strategy.decide(walled)
+
+    assert (5, 0) in strategy._unreachable_claims
+    released = memory.goal_for(object_id(2))
+    assert released is None or released.position != (5, 0)
+
+    retry = make_turn(
+        tick=101,
+        objects=[core(), unit(2, "WORKER", position=(2, 0))],
+    )
+    strategy.decide(retry)
+
+    claim = memory.goal_for(object_id(2))
+    assert claim is not None
+    assert claim.purpose == "resource-claim-v1"
+    assert claim.position == (-4, 0)
+    assert retry.plan.unit_actions[retry.workers[0].id].direction is Direction.LEFT
+
+
+def test_worker_drops_a_persisted_claim_no_route_can_reach() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(resource_target=95, resource_patrol_radius=18)
+    strategy = AggressiveStrategy(memory, config)
+    turn = make_turn(
+        tick=100,
+        objects=[core(), unit(2, "WORKER", position=(2, 0))],
+        obstacles=[(4, 0), (6, 0), (5, -1), (5, 1)],
+    )
+    memory.set_goal(object_id(2), UnitGoal((5, 0), 90, "resource-claim-v1"))
+    strategy.decide(turn)
+
+    assert (5, 0) in strategy._unreachable_claims
+    goal = memory.goal_for(object_id(2))
+    assert goal is None or goal.position != (5, 0)

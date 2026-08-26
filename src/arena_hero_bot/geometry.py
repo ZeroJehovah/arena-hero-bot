@@ -99,8 +99,18 @@ def next_step(
     direction_offset: int = 0,
     max_expansions: int = 4096,
     allow_goal: bool = False,
+    require_path: bool = False,
 ) -> Direction | None:
-    """Find one deterministic A* step with a penalty for recent cells."""
+    """Find one deterministic A* step with a penalty for recent cells.
+
+    When no route to ``goal`` exists the greedy fallback below still returns
+    the neighbour closest to it.  That is the right answer while the blockage
+    is transient, because units shuffle and one step of pressure resolves it.
+    It is the wrong answer when the goal is walled off for good: the caller
+    cannot tell progress from an orbit around the wall, so it keeps asking and
+    the unit circles forever.  ``require_path=True`` returns ``None`` in that
+    case so the caller can choose a reachable goal instead.
+    """
 
     if origin == goal:
         return None
@@ -140,6 +150,8 @@ def next_step(
             )
 
     if goal not in came_from:
+        if require_path:
+            return None
         candidates = [
             add(origin, direction)
             for direction in rotated

@@ -57,3 +57,12 @@ def test_pathfinder_respects_blocked_goal_unless_allowed() -> None:
 def test_pathfinder_returns_none_when_surrounded() -> None:
     blocked = {(0, -1), (1, 0), (0, 1), (-1, 0)}
     assert next_step((0, 0), (5, 0), blocked=blocked) is None
+
+
+def test_pathfinder_distinguishes_no_route_from_a_greedy_step() -> None:
+    walled = {(2, 0), (4, 0), (3, -1), (3, 1)}
+    assert next_step((0, 0), (3, 0), blocked=set(walled)) is Direction.RIGHT
+    assert next_step((0, 0), (3, 0), blocked=set(walled), require_path=True) is None
+    assert (
+        next_step((0, 0), (3, 0), blocked=set(), require_path=True) is Direction.RIGHT
+    )

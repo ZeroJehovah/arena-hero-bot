@@ -47,6 +47,7 @@ RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
 CLAIM_STALL_BUDGET = 3
+UNREACHABLE_CLAIM_COOLDOWN = 128
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -180,6 +181,11 @@ class AggressiveStrategy:
         # the raid state below: a restart forgets it and the next Tick simply
         # re-matches every Worker once.
         self._claim_stalls: dict[UUID, int] = {}
+        # Cells a Worker could not route to, kept off ``WorldMemory`` for the
+        # same reason: reachability is a property of the current obstacle and
+        # threat picture, so a restart should re-ask the question rather than
+        # inherit an answer.
+        self._unreachable_claims: dict[Position, int] = {}
         # Raid state deliberately lives on the strategy instead of
         # ``WorldMemory``: a restart then aborts the raid and walks the
         # detachment home, which is the safe direction to fail in.
@@ -1101,6 +1107,20 @@ class AggressiveStrategy:
         if self._recover_if_critical(worker, maximum_hp=2, context=context):
             return
 
+        if assigned_resource is not None and not self._has_static_route(
+            worker,
+            assigned_resource,
+            context,
+            allow_goal=True,
+        ):
+            # The claim is walled off rather than merely crowded, so every
+            # approach to it is an orbit: the route never closes, the Worker
+            # never stands on the cell, no absence is ever recorded, and the
+            # cell therefore stays the nearest candidate forever.  Rest it and
+            # fall through to patrol, which already avoids remembered danger.
+            self._release_unreachable_claim(worker, assigned_resource, context)
+            assigned_resource = None
+
         if assigned_resource is not None and self._move(
             worker,
             assigned_resource,
@@ -1160,6 +1180,17 @@ class AggressiveStrategy:
                 self.memory.clear_goal(str(worker.id))
             elif resource_goal.position in context.turn.resource_cells:
                 self.memory.clear_goal(str(worker.id))
+            elif not self._has_static_route(
+                worker,
+                resource_goal.position,
+                context,
+                allow_goal=True,
+            ):
+                self._release_unreachable_claim(
+                    worker,
+                    resource_goal.position,
+                    context,
+                )
             else:
                 age = context.turn.tick - resource_goal.assigned_tick
                 progress_reference = resource_goal.last_progress_position
@@ -1709,6 +1740,52 @@ class AggressiveStrategy:
         ]
         return tuple(dict.fromkeys((*visible, *remembered)))
 
+    def _static_blockers(self, unit: Unit, context: _TurnContext) -> set[Position]:
+        """Return the blockers for ``unit`` that outlive this Tick.
+
+        Our own bodies and queued destinations are deliberately left out: they
+        move every Tick, so they say nothing about whether a cell can ever be
+        reached.  Everything here still blocks the route on the next Tick.
+        """
+
+        blocked = set(self.memory.obstacles)
+        blocked.update(self.memory.contested_positions)
+        blocked.update(context.turn.obstacle_cells)
+        if isinstance(unit, Worker):
+            blocked.update(self._worker_threat_exclusion_cells(context.turn))
+        return blocked
+
+    def _has_static_route(
+        self,
+        unit: Unit,
+        goal: Position,
+        context: _TurnContext,
+        *,
+        allow_goal: bool = False,
+    ) -> bool:
+        """Return whether ``goal`` is reachable ignoring our own traffic.
+
+        ``next_step`` answers an unreachable goal with the neighbour closest to
+        it.  That is right while the blockage is transient, because units
+        shuffle and one step of pressure resolves it, and wrong when the goal is
+        walled off: the caller cannot tell that step from an orbit around the
+        wall, so it keeps asking and the Unit circles the rim forever.  This
+        asks the question the fallback hides, against the blockers above.
+        """
+
+        if unit.position == goal:
+            return True
+        return (
+            next_step(
+                unit.position,
+                goal,
+                blocked=self._static_blockers(unit, context),
+                allow_goal=allow_goal,
+                require_path=True,
+            )
+            is not None
+        )
+
     def _move(
         self,
         unit: Unit,
@@ -1720,13 +1797,9 @@ class AggressiveStrategy:
     ) -> bool:
         if unit.position == goal:
             return False
-        blocked = set(self.memory.obstacles)
-        blocked.update(self.memory.contested_positions)
-        blocked.update(context.turn.obstacle_cells)
+        blocked = self._static_blockers(unit, context)
         blocked.update(context.occupied)
         blocked.update(context.reserved)
-        if isinstance(unit, Worker):
-            blocked.update(self._worker_threat_exclusion_cells(context.turn))
         direction = next_step(
             unit.position,
             goal,
@@ -2931,13 +3004,34 @@ class AggressiveStrategy:
         """
 
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
+        self._unreachable_claims = {
+            cell: seen_tick
+            for cell, seen_tick in self._unreachable_claims.items()
+            if turn.tick - seen_tick < UNREACHABLE_CLAIM_COOLDOWN
+        }
+        # A Worker-only exclusion disk sits around every remembered enemy Core
+        # and every recently seen hostile fighter, and ``_move`` refuses to
+        # route a Worker into one.  The pairing below only measured distance, so
+        # a cell inside a disk stayed the nearest candidate for the Workers
+        # beside it and every claim on it became an orbit around the rim - one
+        # that never arrives, so it never records the absence that would rest
+        # the cell.  Take those cells out of the contest instead, together with
+        # the ones a route has just failed to reach.  A cell a Worker already
+        # stands on stays in: arrival harvests it.
+        unreachable = (
+            self._worker_threat_exclusion_cells(turn) | set(self._unreachable_claims)
+        ) - {worker.position for worker in workers.values()}
         # Vision reaches four cells, so the visible pool empties the moment the
         # cells beside the Core are spent even while known cells sit thirty out.
         # Memory keeps those reachable; the radius policy below is unchanged.
         resources = (
-            set(turn.resource_cells)
-            | set(self.memory.remembered_resource_cells(turn.tick))
-        ) - {enemy.position for enemy in turn.visible_enemies}
+            (
+                set(turn.resource_cells)
+                | set(self.memory.remembered_resource_cells(turn.tick))
+            )
+            - {enemy.position for enemy in turn.visible_enemies}
+            - unreachable
+        )
         if self._preserves_resources() and turn.core is not None:
             local_radius = self.config.resource_patrol_radius * 2
             core_position = turn.core.position
@@ -2947,11 +3041,15 @@ class AggressiveStrategy:
             def within(
                 radius: int, pool: set[Position] | frozenset[Position]
             ) -> set[Position]:
-                return {
-                    resource
-                    for resource in pool
-                    if manhattan(core_position, resource) <= radius
-                } - hostile
+                return (
+                    {
+                        resource
+                        for resource in pool
+                        if manhattan(core_position, resource) <= radius
+                    }
+                    - hostile
+                    - unreachable
+                )
 
             local_resources = within(local_radius, resources)
             if len(local_resources) < len(workers):
@@ -3010,6 +3108,21 @@ class AggressiveStrategy:
                 pool.remove(resource)
         self._uncross_claims(turn, assignments)
         return assignments
+
+    def _release_unreachable_claim(
+        self,
+        worker: Worker,
+        cell: Position,
+        context: _TurnContext,
+    ) -> None:
+        """Rest a claimed cell no route reaches and free the Worker."""
+
+        self._unreachable_claims[cell] = context.turn.tick
+        context.resource_assignments.pop(worker.id, None)
+        self._claim_stalls.pop(worker.id, None)
+        goal = self.memory.goal_for(str(worker.id))
+        if goal is not None and goal.purpose == RESOURCE_CLAIM_PURPOSE:
+            self.memory.clear_goal(str(worker.id))
 
     def _uncross_claims(
         self,
