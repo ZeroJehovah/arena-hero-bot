@@ -1495,6 +1495,50 @@ def test_wounded_vanguard_on_core_cell_is_healed_not_parked() -> None:
     assert turn.plan.unit_actions[turn.vanguards[0].id].type == "HEAL"
 
 
+def test_boxed_in_core_occupant_nudges_a_neighbour_aside() -> None:
+    """The Core cell must empty even when every exit is held by a friend.
+
+    Live Ticks 169831-170550: the Core sat in a pocket with two obstacle
+    neighbours, and the other two filled with loaded Workers queueing for the
+    Core cell.  The occupant had nowhere to step, the Workers would not leave
+    without depositing, and the base froze for 700 Ticks with no deposit and
+    no spawn.  One neighbour has to yield the Tick.
+    """
+
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "WORKER", position=(0, 1), cargo=1),
+            unit(4, "WORKER", position=(-1, 0), cargo=1),
+        ],
+        obstacles=[(0, -1), (1, 0)],
+    )
+
+    report = decide(turn)
+
+    stepped_aside = [
+        item
+        for item in report.decisions
+        if item.reason == "step aside so the Core cell can empty"
+    ]
+    assert len(stepped_aside) == 1
+    assert stepped_aside[0].actor_kind == "WORKER"
+    vacated = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert vacated.action == "MOVE"
+    assert vacated.reason.startswith("free the Core cell instead of: ")
+    assert turn.plan.unit_actions[turn.vanguards[0].id].type == "MOVE"
+    # The nudged Worker keeps exactly one action; it is not re-planned back
+    # onto the cell it was just asked to give up.
+    assert (
+        sum(
+            1 for item in report.decisions if item.actor_id == stepped_aside[0].actor_id
+        )
+        == 1
+    )
+
+
 def test_unhealable_unit_vacates_the_core_cell() -> None:
     turn = make_turn(
         resources=0,

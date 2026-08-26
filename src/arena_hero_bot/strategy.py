@@ -143,6 +143,7 @@ class _TurnContext:
     emergency: bool = False
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
+    preplanned_ids: set[UUID] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +281,8 @@ class AggressiveStrategy:
             self._clear_core_escape_lane(context)
 
         for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
+            if ranger.id in context.preplanned_ids:
+                continue
             self._decide_ranger(
                 ranger,
                 context,
@@ -287,6 +290,8 @@ class AggressiveStrategy:
                 offensive=self._is_offensive_combat_unit(ranger, turn, threat),
             )
         for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
+            if vanguard.id in context.preplanned_ids:
+                continue
             self._decide_vanguard(
                 vanguard,
                 context,
@@ -298,6 +303,8 @@ class AggressiveStrategy:
             turn.workers,
             key=lambda unit: self._worker_priority(unit, core_position),
         ):
+            if worker.id in context.preplanned_ids:
+                continue
             self._decide_worker(worker, context)
         self._decide_core(context)
         report.planned_damage = dict(context.damage_ledger.planned_damage)
@@ -1775,13 +1782,10 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None or unit.position != core.position:
             return False
-        candidates = [
-            position
-            for position in adjacent_positions(core.position)
-            if position not in self.memory.obstacles
-            and position not in context.turn.obstacle_cells
-            and position not in context.occupied | context.reserved
-        ]
+        blocked = self.memory.obstacles | set(context.turn.obstacle_cells)
+        candidates = self._core_exit_cells(context, blocked)
+        if not candidates and self._nudge_core_neighbour(context, blocked):
+            candidates = self._core_exit_cells(context, blocked)
         if not candidates:
             return False
         return self._move(
@@ -1791,6 +1795,79 @@ class AggressiveStrategy:
             reason=f"free the Core cell instead of: {reason}",
             allow_goal=True,
         )
+
+    def _core_exit_cells(
+        self,
+        context: _TurnContext,
+        blocked: set[Position],
+    ) -> list[Position]:
+        core = context.turn.core
+        if core is None:
+            return []
+        return [
+            position
+            for position in adjacent_positions(core.position)
+            if position not in blocked
+            and position not in context.occupied
+            and position not in context.reserved
+        ]
+
+    def _nudge_core_neighbour(
+        self,
+        context: _TurnContext,
+        blocked: set[Position],
+    ) -> bool:
+        """Ask an un-planned neighbour to step aside so the Core cell can empty.
+
+        The Core can sit in a pocket with only two open neighbours, and both
+        of them fill with loaded Workers queueing for the Core cell.  The
+        occupant then has nowhere to go, the Workers will not leave until they
+        have deposited, and the base deadlocks: the one cell that funds every
+        deposit and every spawn stays held.  It cost 1000 Ticks of frozen
+        income at Tick 169831.  Someone has to yield, and the neighbour is the
+        one with somewhere to go; it loses a single Tick and the Core cell
+        frees up on the same Tick the occupant steps into the gap.
+        """
+
+        core = context.turn.core
+        if core is None:
+            return False
+        ring = set(adjacent_positions(core.position))
+        # A Unit that already has a decision this Tick is off limits: moving
+        # it now would leave a stale WAIT in the report or overwrite a plan
+        # action that the rest of the Turn already reasoned about.
+        decided = {item.actor_id for item in context.report.decisions}
+        neighbours = sorted(
+            (
+                unit
+                for unit in context.turn.units
+                if unit.position in ring
+                and str(unit.id) not in decided
+                and unit.id not in context.turn.plan.unit_actions
+            ),
+            key=lambda unit: unit.id.bytes,
+        )
+        for neighbour in neighbours:
+            for direction in DIRECTIONS:
+                destination = add(neighbour.position, direction)
+                if (
+                    destination == core.position
+                    or destination in blocked
+                    or destination in context.occupied
+                    or destination in context.reserved
+                    or destination in context.enemy_positions
+                ):
+                    continue
+                if self._queue_move(
+                    neighbour,
+                    direction,
+                    context,
+                    reason="step aside so the Core cell can empty",
+                    target=destination,
+                ):
+                    context.preplanned_ids.add(neighbour.id)
+                    return True
+        return False
 
     def _record_wait(self, unit: Unit, context: _TurnContext, reason: str) -> None:
         if self._vacate_core_cell(unit, context, reason):
