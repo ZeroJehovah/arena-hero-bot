@@ -1403,22 +1403,53 @@ class AggressiveStrategy:
         )
         return True
 
+    def _heal_available(
+        self,
+        unit: Unit,
+        *,
+        maximum_hp: int,
+        critical_hp: int | None = None,
+        context: _TurnContext,
+    ) -> bool:
+        """Report whether the Core would fund a heal for ``unit``.
+
+        The heal gate has to use the same threshold that sent the Unit home.
+        When the withdrawal threshold was raised above ``maximum_hp // 2`` and
+        this gate was left behind, a Vanguard at three HP counted as critical,
+        walked onto the Core cell, and then never qualified for the heal it
+        came for.  It held the cell for 650 Ticks, and since that one cell is
+        the only place a Worker can deposit and the only place the Core can
+        spawn, income and growth both stopped with it.
+        """
+
+        core = context.turn.core
+        heal_threshold = maximum_hp // 2 if critical_hp is None else critical_hp
+        missing_hp = maximum_hp - unit.hp
+        return (
+            core is not None
+            and core.view.state is CoreState.NORMAL
+            and unit.hp <= heal_threshold
+            and missing_hp > 0
+            and context.remaining_resources >= missing_hp
+        )
+
     def _heal_if_critical(
         self,
         unit: Unit,
         *,
         maximum_hp: int,
+        critical_hp: int | None = None,
         context: _TurnContext,
     ) -> bool:
         core = context.turn.core
         missing_hp = maximum_hp - unit.hp
-        if (
-            core is None
-            or core.view.state is not CoreState.NORMAL
-            or unit.position != core.position
-            or unit.hp > maximum_hp // 2
-            or missing_hp <= 0
-            or context.remaining_resources < missing_hp
+        if core is None or unit.position != core.position:
+            return False
+        if not self._heal_available(
+            unit,
+            maximum_hp=maximum_hp,
+            critical_hp=critical_hp,
+            context=context,
         ):
             return False
         unit.heal()
@@ -1443,14 +1474,46 @@ class AggressiveStrategy:
         retreat_threshold = maximum_hp // 2 if critical_hp is None else critical_hp
         if unit.hp > retreat_threshold:
             return False
-        if self._heal_if_critical(unit, maximum_hp=maximum_hp, context=context):
+        if self._heal_if_critical(
+            unit,
+            maximum_hp=maximum_hp,
+            critical_hp=critical_hp,
+            context=context,
+        ):
             return True
 
         core = context.turn.core
         if core is None:
             return False
         reason = "return critical unit to Core for healing"
+        staging_cells = [
+            position
+            for position in adjacent_positions(core.position)
+            if position not in self.memory.obstacles
+            and position not in context.turn.obstacle_cells
+            and position not in context.occupied | context.reserved
+        ]
+        staging_goal = (
+            min(
+                staging_cells,
+                key=lambda position: (manhattan(unit.position, position), position),
+            )
+            if staging_cells
+            else None
+        )
         if unit.position == core.position:
+            # Reaching here means the heal above was refused, so holding the
+            # cell buys nothing and blocks both deposits and spawns.  Step
+            # aside and let the queue move; the Unit is still parked on the
+            # ring and heals as soon as the Core can fund it.
+            if staging_goal is not None and self._move(
+                unit,
+                staging_goal,
+                context,
+                reason="free the Core cell while healing is unavailable",
+                allow_goal=True,
+            ):
+                return True
             self._record_wait(unit, context, "wait at Core for healing resources")
             return True
         if self._core_has_room_for(unit, context) and self._move(
@@ -1462,20 +1525,13 @@ class AggressiveStrategy:
         ):
             return True
 
-        staging_cells = [
-            position
-            for position in adjacent_positions(core.position)
-            if position not in self.memory.obstacles
-            and position not in context.turn.obstacle_cells
-            and position not in context.occupied | context.reserved
-        ]
-        if staging_cells:
-            goal = min(
-                staging_cells,
-                key=lambda position: (manhattan(unit.position, position), position),
-            )
-            if self._move(unit, goal, context, reason=reason):
-                return True
+        if staging_goal is not None and self._move(
+            unit,
+            staging_goal,
+            context,
+            reason=reason,
+        ):
+            return True
         self._record_wait(unit, context, f"no safe path for: {reason}")
         return True
 

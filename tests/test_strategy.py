@@ -1469,6 +1469,49 @@ def test_wounded_vanguard_withdraws_before_reaching_half_health() -> None:
     )
 
 
+def test_wounded_vanguard_on_core_cell_is_healed_not_parked() -> None:
+    """The withdrawal threshold and the heal gate must agree.
+
+    A Vanguard at three HP withdraws to the Core; if the heal still demanded
+    half health it stayed there forever, and the Core cell is the only cell a
+    Worker can deposit on and the only cell the Core can spawn from.
+    """
+
+    turn = make_turn(
+        resources=20,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "VANGUARD", position=(0, 0), hp=3),
+        ],
+    )
+
+    report = decide(turn)
+
+    healed = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert healed.action == "HEAL"
+    assert turn.plan.unit_actions[turn.vanguards[0].id].type == "HEAL"
+
+
+def test_unhealable_unit_vacates_the_core_cell() -> None:
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "VANGUARD", position=(0, 0), hp=3),
+        ],
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert action.type == "MOVE"
+    assert any(
+        item.actor_id == object_id(2)
+        and item.reason == "free the Core cell while healing is unavailable"
+        for item in report.decisions
+    )
+
+
 def test_core_and_unit_pick_up_ground_beacon() -> None:
     unit_turn = make_turn(
         objects=[core(), unit(2, "VANGUARD", position=(1, 0))],
