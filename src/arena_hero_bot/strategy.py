@@ -1486,34 +1486,7 @@ class AggressiveStrategy:
         if core is None:
             return False
         reason = "return critical unit to Core for healing"
-        staging_cells = [
-            position
-            for position in adjacent_positions(core.position)
-            if position not in self.memory.obstacles
-            and position not in context.turn.obstacle_cells
-            and position not in context.occupied | context.reserved
-        ]
-        staging_goal = (
-            min(
-                staging_cells,
-                key=lambda position: (manhattan(unit.position, position), position),
-            )
-            if staging_cells
-            else None
-        )
         if unit.position == core.position:
-            # Reaching here means the heal above was refused, so holding the
-            # cell buys nothing and blocks both deposits and spawns.  Step
-            # aside and let the queue move; the Unit is still parked on the
-            # ring and heals as soon as the Core can fund it.
-            if staging_goal is not None and self._move(
-                unit,
-                staging_goal,
-                context,
-                reason="free the Core cell while healing is unavailable",
-                allow_goal=True,
-            ):
-                return True
             self._record_wait(unit, context, "wait at Core for healing resources")
             return True
         if self._core_has_room_for(unit, context) and self._move(
@@ -1525,13 +1498,20 @@ class AggressiveStrategy:
         ):
             return True
 
-        if staging_goal is not None and self._move(
-            unit,
-            staging_goal,
-            context,
-            reason=reason,
-        ):
-            return True
+        staging_cells = [
+            position
+            for position in adjacent_positions(core.position)
+            if position not in self.memory.obstacles
+            and position not in context.turn.obstacle_cells
+            and position not in context.occupied | context.reserved
+        ]
+        if staging_cells:
+            goal = min(
+                staging_cells,
+                key=lambda position: (manhattan(unit.position, position), position),
+            )
+            if self._move(unit, goal, context, reason=reason):
+                return True
         self._record_wait(unit, context, f"no safe path for: {reason}")
         return True
 
@@ -1775,7 +1755,46 @@ class AggressiveStrategy:
         )
         return True
 
+    def _vacate_core_cell(
+        self,
+        unit: Unit,
+        context: _TurnContext,
+        reason: str,
+    ) -> bool:
+        """Step ``unit`` off the Core cell when it would otherwise idle there.
+
+        The Core cell is the only cell a Worker can deposit on and the only
+        cell the Core can spawn from, so a single Unit resting on it stalls
+        the entire base.  It happened twice from different branches: a
+        Vanguard waiting for a heal it did not qualify for, and the same
+        Vanguard afterwards boxed in by its own guard ring with "no safe
+        path" to roam.  Waiting there is never the better move, so the guard
+        belongs at the one place every branch funnels into.
+        """
+
+        core = context.turn.core
+        if core is None or unit.position != core.position:
+            return False
+        candidates = [
+            position
+            for position in adjacent_positions(core.position)
+            if position not in self.memory.obstacles
+            and position not in context.turn.obstacle_cells
+            and position not in context.occupied | context.reserved
+        ]
+        if not candidates:
+            return False
+        return self._move(
+            unit,
+            min(candidates),
+            context,
+            reason=f"free the Core cell instead of: {reason}",
+            allow_goal=True,
+        )
+
     def _record_wait(self, unit: Unit, context: _TurnContext, reason: str) -> None:
+        if self._vacate_core_cell(unit, context, reason):
+            return
         context.report.add(
             actor_id=str(unit.id),
             actor_kind=unit.unit_type.value,

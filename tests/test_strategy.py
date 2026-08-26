@@ -565,7 +565,7 @@ def test_worker_releases_empty_resource_goal_on_arrival() -> None:
     assert goal is None or goal.purpose != "resource-claim-v1"
 
 
-def test_worker_deposits_at_core_and_waits_when_storage_full() -> None:
+def test_worker_deposits_at_core_and_frees_it_when_storage_full() -> None:
     deposit = make_turn(
         resources=5,
         objects=[core(), unit(2, "WORKER", position=(0, 0), cargo=1)],
@@ -578,8 +578,11 @@ def test_worker_deposits_at_core_and_waits_when_storage_full() -> None:
         objects=[core(), unit(2, "WORKER", position=(0, 0), cargo=1)],
     )
     report = decide(full)
-    assert full.workers[0].id not in full.plan.unit_actions
-    assert any(item.reason == "Core storage is full" for item in report.decisions)
+    assert full.plan.unit_actions[full.workers[0].id].type == "MOVE"
+    assert any(
+        item.reason == "free the Core cell instead of: Core storage is full"
+        for item in report.decisions
+    )
 
 
 def test_only_one_worker_reserves_the_core_cell() -> None:
@@ -1507,7 +1510,8 @@ def test_unhealable_unit_vacates_the_core_cell() -> None:
     assert action.type == "MOVE"
     assert any(
         item.actor_id == object_id(2)
-        and item.reason == "free the Core cell while healing is unavailable"
+        and item.reason
+        == "free the Core cell instead of: wait at Core for healing resources"
         for item in report.decisions
     )
 
