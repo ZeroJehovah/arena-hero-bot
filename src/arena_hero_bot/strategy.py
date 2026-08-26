@@ -1099,6 +1099,7 @@ class AggressiveStrategy:
             assigned_resource,
             context,
             reason="claim nearest unassigned known resource",
+            allow_goal=True,
         ):
             self.memory.set_goal(
                 str(worker.id),

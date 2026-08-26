@@ -431,6 +431,41 @@ def test_worker_harvests_then_returns_cargo() -> None:
     assert action.direction is Direction.LEFT
 
 
+def test_worker_can_enter_resource_cell_occupied_by_guard() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+    resource = (0, -2)
+
+    approaching = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, -1)),
+            unit(3, "VANGUARD", position=resource),
+        ],
+        resource_cells=[resource],
+    )
+    strategy.decide(approaching)
+
+    worker = approaching.workers[0]
+    approaching_action = approaching.plan.unit_actions[worker.id]
+    assert approaching_action.type == "MOVE"
+    assert getattr(approaching_action, "direction", None) is Direction.UP
+
+    arrived = make_turn(
+        tick=1,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=resource),
+            unit(3, "VANGUARD", position=resource),
+        ],
+        resource_cells=[resource],
+    )
+    strategy.decide(arrived)
+
+    assert arrived.plan.unit_actions[arrived.workers[0].id].type == "HARVEST"
+
+
 def test_worker_keeps_recent_resource_goal_across_missing_observation() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)
