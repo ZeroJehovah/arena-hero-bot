@@ -87,7 +87,7 @@ class StrategyConfig:
     target_workers: int = 2
     max_population: int | None = 12
     resource_target: int = 0
-    growth_slowdown_population: int | None = 40
+    growth_slowdown_population: int | None = 38
     safety_reserve: int = 10
     resource_patrol_radius: int = 14
     resource_outreach_radius: int = 48

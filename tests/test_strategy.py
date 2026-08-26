@@ -3321,6 +3321,24 @@ def test_growth_slowdown_banks_before_crossing_the_threshold() -> None:
     assert turn.plan.core_action is None
 
 
+def test_growth_slowdown_banks_before_high_cost_live_growth() -> None:
+    roster = (
+        [unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 21)]
+        + [unit(number, "RANGER", position=(number, 3)) for number in range(21, 27)]
+        + [unit(number, "WORKER", position=(number, 4)) for number in range(27, 39)]
+    )
+    turn = make_turn(resources=163, objects=[core(), *roster])
+
+    decide(turn, config=StrategyConfig(target_workers=12, max_population=None))
+
+    # At population 37, a Ranger costs 34.  Banking only 70% of the
+    # 185-capacity Core would spend the whole surplus at 163 and leave the
+    # newly enlarged Core below its higher reserve.
+    assert turn.state.population == 37
+    assert turn.resource_capacity == 185
+    assert turn.plan.core_action is None
+
+
 def test_growth_slowdown_lifts_under_real_enemy_pressure() -> None:
     """Pressure must unlock the bank the slowdown spent hours filling."""
 
