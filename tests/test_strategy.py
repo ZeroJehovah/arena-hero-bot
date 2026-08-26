@@ -875,7 +875,7 @@ def test_worker_retreats_from_recently_seen_enemy_core() -> None:
         objects=[core(), unit(2, "WORKER", position=(5, 0))],
     )
     long_term_report = strategy.decide(long_term)
-    assert any(
+    assert not any(
         item.reason == "retreat from visible enemy pressure"
         for item in long_term_report.decisions
     )
@@ -2965,6 +2965,31 @@ def test_worker_path_avoids_remembered_enemy_core_exclusion() -> None:
     action = hidden.plan.unit_actions[hidden.workers[0].id]
     assert action.type == "MOVE"
     assert action.direction is not Direction.RIGHT
+
+
+def test_worker_releases_stale_enemy_core_exclusion() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(worker_threat_radius=2)
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(3, 0)),
+            core(3, controlled=False, owner_username="rival", position=(6, 0)),
+        ],
+    )
+    strategy.decide(observed)
+    assert (6, 0) in strategy._remembered_worker_danger_positions(observed)
+    assert (5, 0) in strategy._worker_threat_exclusion_cells(observed)
+
+    expired = make_turn(
+        tick=261,
+        objects=[core(), unit(2, "WORKER", position=(3, 0))],
+    )
+    strategy.decide(expired)
+    assert (6, 0) not in strategy._remembered_worker_danger_positions(expired)
+    assert (5, 0) not in strategy._worker_threat_exclusion_cells(expired)
 
 
 def test_worker_path_temporarily_avoids_recent_combat_enemy() -> None:

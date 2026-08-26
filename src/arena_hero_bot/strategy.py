@@ -1726,7 +1726,10 @@ class AggressiveStrategy:
                 self.config.enemy_core_memory_ttl,
             )
             if (
-                enemy.kind == "CORE"
+                (
+                    enemy.kind == "CORE"
+                    and context.turn.tick - enemy.tick <= self.config.enemy_memory_ttl
+                )
                 or (
                     enemy.kind == "UNIT"
                     and enemy.unit_type
@@ -3928,11 +3931,17 @@ class AggressiveStrategy:
                 turn.tick,
                 self.config.enemy_core_memory_ttl,
             )
-            if enemy.kind == "CORE"
-            or (
-                enemy.kind == "UNIT"
-                and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
-                and turn.tick - enemy.tick <= self.config.worker_threat_memory_ttl
+            if (
+                (
+                    enemy.kind == "CORE"
+                    and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
+                )
+                or (
+                    enemy.kind == "UNIT"
+                    and enemy.unit_type
+                    in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                    and turn.tick - enemy.tick <= self.config.worker_threat_memory_ttl
+                )
             )
         )
 
