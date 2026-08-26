@@ -1108,15 +1108,38 @@ class AggressiveStrategy:
             reason="claim nearest unassigned known resource",
             allow_goal=True,
         ):
-            self.memory.set_goal(
-                str(worker.id),
-                UnitGoal(
-                    position=assigned_resource,
-                    assigned_tick=context.turn.tick,
-                    purpose=RESOURCE_CLAIM_PURPOSE,
-                    last_progress_position=worker.position,
-                ),
-            )
+            existing_goal = self.memory.goal_for(str(worker.id))
+            if (
+                existing_goal is None
+                or existing_goal.purpose != RESOURCE_CLAIM_PURPOSE
+                or existing_goal.position != assigned_resource
+            ):
+                self.memory.set_goal(
+                    str(worker.id),
+                    UnitGoal(
+                        position=assigned_resource,
+                        assigned_tick=context.turn.tick,
+                        purpose=RESOURCE_CLAIM_PURPOSE,
+                        last_progress_position=worker.position,
+                    ),
+                )
+            elif existing_goal.last_progress_position is None or manhattan(
+                worker.position, assigned_resource
+            ) < manhattan(existing_goal.last_progress_position, assigned_resource):
+                # Keep the best-known progress for a held claim.  Replacing
+                # this with the current cell every Tick makes a route that
+                # circles around a blocked cluster look healthy forever: one
+                # occasional step closer resets the stall budget before the
+                # Worker ever reaches the resource.
+                self.memory.set_goal(
+                    str(worker.id),
+                    UnitGoal(
+                        position=existing_goal.position,
+                        assigned_tick=existing_goal.assigned_tick,
+                        purpose=existing_goal.purpose,
+                        last_progress_position=worker.position,
+                    ),
+                )
             return
 
         resource_goal = self.memory.goal_for(str(worker.id))

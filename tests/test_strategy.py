@@ -4010,3 +4010,40 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
     # Held for the budget, then released to the cell one step away.
     assert targets[:3] == [(12, 0), (12, 0), (12, 0)]
     assert targets[3:] == [(4, 0), (4, 0), (4, 0)]
+
+
+def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None:
+    """A detour cannot reset the claim stall budget at every Tick."""
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((12, 0), 100, "resource-claim-v1", last_progress_position=(3, 0)),
+    )
+
+    positions = [(3, 0), (4, 0), (5, 0), (4, 0), (4, 0), (4, 0), (4, 0)]
+    targets = []
+    for tick, position in enumerate(positions, start=101):
+        report = strategy.decide(
+            make_turn(
+                tick=tick,
+                objects=[core(), unit(2, "WORKER", position=position)],
+                resource_cells=[(5, 0), (12, 0)],
+            )
+        )
+        targets.append(
+            next(
+                (
+                    item.target
+                    for item in report.decisions
+                    if item.actor_id == object_id(2)
+                    and item.reason == "claim nearest unassigned known resource"
+                ),
+                None,
+            )
+        )
+
+    assert targets[:6] == [(12, 0)] * 6
+    assert targets[6] == (5, 0)
