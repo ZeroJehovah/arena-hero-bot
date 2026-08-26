@@ -18,7 +18,7 @@ RESOURCE_MEMORY_TTL = 65536
 RESOURCE_MEMORY_LIMIT = 2048
 RESOURCE_ABSENCE_RADIUS = 1
 RESOURCE_ABSENCE_COOLDOWN = 512
-RESOURCE_RECHECK_FLOOR = 96
+RESOURCE_RECHECK_FLOOR = 128
 _ABSENCE_OFFSETS = tuple(
     (dx, dy)
     for dx in range(-RESOURCE_ABSENCE_RADIUS, RESOURCE_ABSENCE_RADIUS + 1)
@@ -235,9 +235,9 @@ class WorldMemory:
         ago.  So the cooldown is a preference, not a gate, and the floor below
         is only there to skip the two cases the curve says are worthless: the
         0.03% inside 24 Ticks, and a Worker turning round on the cell it just
-        left.  At 96 Ticks the floor remains just longer than the roughly
-        90-Tick round trip inside the harvest radius, while leaving more inner
-        sites available for rechecking before Workers are sent outward.
+        left.  At 128 Ticks the rate is already near its plateau and the floor
+        stays comfortably longer than the roughly 90-Tick round trip inside
+        the harvest radius, so two Workers cannot trade the same site back.
         """
 
         return frozenset(
