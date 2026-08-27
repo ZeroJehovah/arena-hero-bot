@@ -3368,6 +3368,23 @@ def test_growth_slowdown_banks_before_high_cost_live_growth() -> None:
     assert turn.plan.core_action is None
 
 
+def test_growth_slowdown_banks_before_replacing_lost_high_cost_unit() -> None:
+    roster = (
+        [unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 21)]
+        + [unit(number, "RANGER", position=(number, 3)) for number in range(21, 26)]
+        + [unit(number, "WORKER", position=(number, 4)) for number in range(26, 38)]
+    )
+    turn = make_turn(resources=166, objects=[core(), *roster])
+
+    decide(turn, config=StrategyConfig(target_workers=12, max_population=None))
+
+    # Replacing the sixth Ranger would cross the banking threshold.  Do not
+    # spend the 34-resource replacement while the post-spawn reserve is 162.
+    assert turn.state.population == 36
+    assert turn.resource_capacity == 180
+    assert turn.plan.core_action is None
+
+
 def test_growth_slowdown_lifts_under_real_enemy_pressure() -> None:
     """Pressure must unlock the bank the slowdown spent hours filling."""
 

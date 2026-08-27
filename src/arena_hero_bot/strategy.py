@@ -4197,11 +4197,17 @@ class AggressiveStrategy:
         missing_recovery = max(0, 5 - core.hp) + max(0, 5 - core.shield)
         if self._emergency_combat_mode(turn):
             return max(self.config.safety_reserve, missing_recovery)
+        stockpile_target = self._stockpile_target(
+            turn,
+            population=(turn.state.population + 1)
+            if production_cost is not None
+            else None,
+        )
         reserve = max(
             0,
             self.config.safety_reserve,
             missing_recovery,
-            self._stockpile_target(turn),
+            stockpile_target,
         )
         if production_cost is not None:
             # In the low-capacity growth tier, a healthy Core should spend
@@ -4216,7 +4222,7 @@ class AggressiveStrategy:
                 and available_resources is not None
                 and available_resources <= turn.resource_capacity
             ):
-                return max(missing_recovery, self._stockpile_target(turn))
+                return max(missing_recovery, stockpile_target)
             # At an exact capacity-tier boundary, ``reserve + cost`` can be
             # larger than the entire Core.  Permit the smallest transition
             # spend needed to cross that boundary; otherwise a no-cap strategy
@@ -4237,7 +4243,12 @@ class AggressiveStrategy:
                 reserve = min(reserve, max_affordable_reserve)
         return reserve
 
-    def _stockpile_target(self, turn: Turn) -> int:
+    def _stockpile_target(
+        self,
+        turn: Turn,
+        *,
+        population: int | None = None,
+    ) -> int:
         """Return the shop-aligned live stockpile target for Core capacity."""
 
         capacity = turn.resource_capacity
@@ -4256,12 +4267,17 @@ class AggressiveStrategy:
         # is large enough to hold the Core on its own.
         percent = (
             CORE_BANKING_CAPACITY_PERCENT
-            if self._growth_slowdown_active(turn)
+            if self._growth_slowdown_active(turn, population=population)
             else CORE_STOCKPILE_CAPACITY_PERCENT
         )
         return max(CORE_CAPACITY_HIGH_RESERVE, capacity * percent // 100)
 
-    def _growth_slowdown_active(self, turn: Turn) -> bool:
+    def _growth_slowdown_active(
+        self,
+        turn: Turn,
+        *,
+        population: int | None = None,
+    ) -> bool:
         """Return whether growth should yield to banking at this population.
 
         Unit prices rise 1.3x per five population while each Unit only adds
@@ -4276,10 +4292,11 @@ class AggressiveStrategy:
 
         threshold = self.config.growth_slowdown_population
         banking_threshold = max(1, threshold - 1) if threshold is not None else None
+        current_population = turn.state.population if population is None else population
         return (
             banking_threshold is not None
             and self._unbounded_growth()
-            and turn.state.population >= banking_threshold
+            and current_population >= banking_threshold
             and not self._emergency_combat_mode(turn)
         )
 
