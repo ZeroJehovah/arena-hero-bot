@@ -3147,18 +3147,19 @@ class AggressiveStrategy:
             self._worker_threat_exclusion_cells(turn) | set(self._unreachable_claims)
         ) - {worker.position for worker in workers.values()}
         hostile = {enemy.position for enemy in turn.visible_enemies}
-        resources = (
-            (
-                set(turn.resource_cells)
-                | set(self.memory.remembered_resource_cells(turn.tick))
-            )
+        visible_resources = set(turn.resource_cells) - hostile - unreachable
+        remembered_resources = (
+            set(self.memory.remembered_resource_cells(turn.tick))
             - hostile
             - unreachable
+            - visible_resources
         )
+        resources = visible_resources | remembered_resources
         rechecks = (
             set(self.memory.resource_cells_worth_rechecking(turn.tick))
             - hostile
             - unreachable
+            - resources
         )
         if not self._preserves_resources():
             rechecks = set()
@@ -3169,8 +3170,12 @@ class AggressiveStrategy:
             scout = min(turn.workers, key=lambda worker: worker.id.bytes)
             workers = {scout.id: scout} if scout.id in workers else {}
         assignments: dict[UUID, Position] = {}
-        taken = set(resources)
-        pools = [resources, rechecks - taken]
+        # A currently visible resource is confirmed live; prefer it over a
+        # remembered site even when the latter happens to be a few cells
+        # nearer.  Keep the remembered and recheck pools separate so the
+        # unbounded remote-resource policy still offers every known site, but
+        # does not send all Workers past fresh income to stale coordinates.
+        pools = [visible_resources, remembered_resources, rechecks]
         self._hold_existing_claims(workers, pools, assignments)
         for pool in pools:
             # Freshest evidence first, then nearest site, so a short walk to
