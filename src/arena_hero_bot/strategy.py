@@ -4065,6 +4065,11 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return False
+        # A loaded Worker has nowhere useful to go on a full Core: entering
+        # the cell only replaces the current blocker and keeps the one-cell
+        # deposit/spawn choke point closed.
+        if self._unbounded_growth() and context.remaining_resource_space <= 0:
+            return False
         if core.position in context.reserved:
             return False
         occupants = [
@@ -4421,9 +4426,13 @@ class AggressiveStrategy:
     @staticmethod
     def _worker_priority(
         worker: Worker, core_position: Position | None
-    ) -> tuple[bool, bytes]:
-        vacates_core = worker.position == core_position and worker.cargo == 0
-        return not vacates_core, worker.id.bytes
+    ) -> tuple[bool, bool, bytes]:
+        at_core = worker.position == core_position
+        # Any Core occupant must be handled before the queue surrounding it:
+        # a loaded occupant also needs to leave when storage is full, and it
+        # may need an unplanned neighbour to yield a step first.  Keep the
+        # old empty-Worker precedence among Core occupants.
+        return not at_core, worker.cargo > 0, worker.id.bytes
 
     @staticmethod
     def _enemy_label(enemy: CoreView | UnitView) -> str:

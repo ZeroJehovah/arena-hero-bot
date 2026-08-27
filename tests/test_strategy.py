@@ -1,6 +1,7 @@
 """Representative aggressive tactic scenarios."""
 
 from itertools import pairwise
+from uuid import UUID
 
 from arena_hero import (
     Direction,
@@ -609,6 +610,42 @@ def test_only_one_worker_reserves_the_core_cell() -> None:
     assert len(moving_home) == 1
     assert any(
         "Core cell is not currently reachable" in item.reason
+        for item in report.decisions
+    )
+
+
+def test_loaded_core_worker_clears_full_cell_before_neighbours_reenter() -> None:
+    """A full Core must not rotate loaded Workers through its only choke point."""
+
+    turn = make_turn(
+        resources=15,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 1), cargo=1),
+            unit(3, "WORKER", position=(-1, 0), cargo=1),
+            unit(4, "WORKER", position=(0, 0), cargo=1),
+        ],
+        obstacles=[(0, -1), (1, 0)],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    occupant = object_id(4)
+    assert turn.plan.unit_actions[UUID(occupant)].type == "MOVE"
+    assert any(
+        item.actor_id == occupant
+        and item.reason == "free the Core cell instead of: Core storage is full"
+        for item in report.decisions
+    )
+    assert all(
+        not (
+            item.actor_kind == "WORKER"
+            and item.action == "MOVE"
+            and item.target == (0, 0)
+        )
         for item in report.decisions
     )
 
