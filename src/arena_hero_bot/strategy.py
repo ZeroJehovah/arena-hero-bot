@@ -1189,17 +1189,7 @@ class AggressiveStrategy:
             and resource_goal is not None
             and resource_goal.purpose == RESOURCE_CLAIM_PURPOSE
         ):
-            reach = self.config.resource_outreach_radius
-            if (
-                self._preserves_resources()
-                and not self._is_resource_scout(worker, context.turn)
-                and manhattan(core.position, resource_goal.position) > reach
-            ):
-                # A previously persisted claim may have been made before the
-                # live radius filter.  Drop it on the first Tick after
-                # deployment instead of renewing an already remote route.
-                self.memory.clear_goal(str(worker.id))
-            elif resource_goal.position in context.turn.resource_cells:
+            if resource_goal.position in context.turn.resource_cells:
                 self.memory.clear_goal(str(worker.id))
             elif not self._has_static_route(
                 worker,
@@ -3130,12 +3120,12 @@ class AggressiveStrategy:
         return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
     def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
-        """Assign nearby visible resources to the nearest empty Worker.
+        """Assign known resource cells to the nearest empty Worker.
 
-        In the live reserve-preserving mode, combat units can reveal resource
-        cells far beyond the Worker patrol ring.  Sending an economy unit to
-        those cells turns a short harvest loop into a long round trip, so
-        leave them to the local patrol rather than assigning them directly.
+        Every cell currently visible or remembered as having held a resource
+        is a valid target, regardless of how far it sits from the Core.
+        Enemy and unreachable cells stay excluded so a Worker does not walk
+        into a known threat or a walled-off route.
         """
 
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
@@ -3156,92 +3146,35 @@ class AggressiveStrategy:
         unreachable = (
             self._worker_threat_exclusion_cells(turn) | set(self._unreachable_claims)
         ) - {worker.position for worker in workers.values()}
-        # Vision reaches four cells, so the visible pool empties the moment the
-        # cells beside the Core are spent even while known cells sit thirty out.
-        # Memory keeps those reachable; the radius policy below is unchanged.
+        hostile = {enemy.position for enemy in turn.visible_enemies}
         resources = (
             (
                 set(turn.resource_cells)
                 | set(self.memory.remembered_resource_cells(turn.tick))
             )
-            - {enemy.position for enemy in turn.visible_enemies}
+            - hostile
             - unreachable
         )
-        if self._preserves_resources() and turn.core is not None:
-            local_radius = self.config.resource_patrol_radius * 2
-            core_position = turn.core.position
-
-            hostile = {enemy.position for enemy in turn.visible_enemies}
-
-            def within(
-                radius: int, pool: set[Position] | frozenset[Position]
-            ) -> set[Position]:
-                return (
-                    {
-                        resource
-                        for resource in pool
-                        if manhattan(core_position, resource) <= radius
-                    }
-                    - hostile
-                    - unreachable
-                )
-
-            local_resources = within(local_radius, resources)
-            if len(local_resources) < len(workers):
-                # More idle Workers than un-rested sites.  A resting site is a
-                # preference, not a gate: the surplus would otherwise sweep
-                # unknown cells at a tenth of the odds, so hand them the sites
-                # whose rest has run long enough to be worth a second look, and
-                # then the ones just outside the harvest ring.  Both are still
-                # bounded, and only Workers the short loop has no work for ever
-                # reach them.
-                fallback = within(
-                    local_radius,
-                    self.memory.resource_cells_worth_rechecking(turn.tick),
-                )
-                outreach = within(
-                    self.config.resource_outreach_radius,
-                    self.memory.resource_cells_worth_rechecking(turn.tick),
-                )
-            else:
-                fallback = set()
-                outreach = set()
-            if local_resources or fallback or outreach:
-                resources = local_resources
-            elif self._unbounded_growth() and workers:
-                # Keep one deterministic Worker as a bounded resource scout.
-                # The other Workers remain in the short deposit loop, while
-                # the scout can discover or finish a remote node without
-                # reopening the old all-Workers long-haul behavior.
-                scout = min(turn.workers, key=lambda worker: worker.id.bytes)
-                workers = {scout.id: scout} if scout.id in workers else {}
-            else:
-                resources = set()
-        else:
-            fallback = set()
-            outreach = set()
+        rechecks = (
+            set(self.memory.resource_cells_worth_rechecking(turn.tick))
+            - hostile
+            - unreachable
+        )
+        if not self._preserves_resources():
+            rechecks = set()
+        elif not resources and not rechecks and self._unbounded_growth() and workers:
+            # With no known site anywhere, keep one deterministic Worker as a
+            # bounded resource scout.  The other Workers fall through to the
+            # local patrol ring instead of walking in lockstep.
+            scout = min(turn.workers, key=lambda worker: worker.id.bytes)
+            workers = {scout.id: scout} if scout.id in workers else {}
         assignments: dict[UUID, Position] = {}
         taken = set(resources)
-        outreach_only = outreach - fallback
-        if (
-            fallback
-            and len(fallback) >= len(workers)
-            and outreach_only
-            and not resources
-        ):
-            # Once fresh inner evidence is gone, a full inner recheck pool can
-            # starve the wider ring forever: every newly freed Worker takes
-            # another nearby site before it gets a chance to test an older
-            # outer one.  Keep existing claims in place, but let new claims
-            # sample the bounded outreach pool first in this one case.
-            pools = [resources, outreach_only, fallback - taken]
-        else:
-            pools = [resources, fallback - taken, outreach - taken - fallback]
+        pools = [resources, rechecks - taken]
         self._hold_existing_claims(workers, pools, assignments)
         for pool in pools:
-            # Nearest and freshest evidence first, so a shorter walk to a
-            # resting site never outbids one actually seen holding a resource,
-            # and nothing leaves the harvest ring while work remains inside it.
+            # Freshest evidence first, then nearest site, so a short walk to
+            # equally good evidence never outbids a long one.
             while workers and pool:
                 _, worker_id, resource = min(
                     (

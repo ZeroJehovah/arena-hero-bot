@@ -1286,8 +1286,8 @@ def test_idle_workers_reach_past_the_harvest_ring_only_when_it_is_swept() -> Non
     assert sorted(claim for claim in claims if claim) == [(20, 0), (40, 0)]
 
 
-def test_saturated_inner_rechecks_allow_new_outreach_claims() -> None:
-    """A full inner recheck pool must not starve the bounded outer ring."""
+def test_known_sites_are_claimed_nearest_first_in_one_unbounded_pool() -> None:
+    """A single unbounded recheck pool prefers the nearest known sites first."""
 
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
@@ -1312,10 +1312,29 @@ def test_saturated_inner_rechecks_allow_new_outreach_claims() -> None:
         if item.reason == "claim nearest unassigned known resource"
     ]
 
-    assert outer in claims
+    assert set(claims) == {(10, 0), (10, 1)}
 
 
-def test_live_workers_drop_persisted_remote_resource_goals() -> None:
+def test_known_site_far_beyond_old_outreach_radius_is_claimed() -> None:
+    """Removing the distance cap makes a far known site a normal target."""
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells[(60, 0)] = 100
+    strategy = AggressiveStrategy(memory, config)
+
+    turn = make_turn(
+        tick=200,
+        objects=[core(), unit(2, "WORKER", position=(0, 0))],
+    )
+    report = strategy.decide(turn)
+
+    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert decision.reason == "claim nearest unassigned known resource"
+    assert decision.target == (60, 0)
+
+
+def test_live_workers_keep_persisted_remote_resource_goals() -> None:
     memory = WorldMemory()
     memory.set_goal(
         object_id(3),
@@ -1341,8 +1360,8 @@ def test_live_workers_drop_persisted_remote_resource_goals() -> None:
     )
     goal = memory.goal_for(object_id(3))
     assert goal is not None
-    assert goal.purpose == "resource-patrol-v3"
-    assert worker_decision.reason == "patrol near the stationary Core for resources"
+    assert goal.purpose == "resource-claim-v1"
+    assert worker_decision.reason == "continue toward recently seen resource"
 
 
 def test_worker_vacates_core_and_core_spawns_second_worker() -> None:
