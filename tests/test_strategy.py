@@ -3792,16 +3792,17 @@ def test_combat_leash_still_allows_an_outside_unit_to_close_inwards() -> None:
     assert _walks_towards_core(turn, 3)
 
 
-def test_combat_leash_never_blocks_return_fire_from_the_boundary() -> None:
+def test_combat_leash_never_blocks_fire_past_the_boundary() -> None:
     # The leash gates movement goals only.  A Ranger standing on the boundary
-    # keeps its full three-cell reach into the ground beyond it.
+    # keeps its full three-cell reach into the ground beyond it, and may fire
+    # at a melee Vanguard there without being drawn into a 1-for-1 exchange.
     config = StrategyConfig(target_workers=0, max_population=None)
     turn = make_turn(
         resources=0,
         objects=[
             core(),
             unit(2, "RANGER", position=(20, 0)),
-            unit(31, "RANGER", controlled=False, position=(23, 0)),
+            unit(31, "VANGUARD", controlled=False, position=(23, 0)),
         ],
     )
 
@@ -4291,3 +4292,64 @@ def test_worker_drops_a_persisted_claim_no_route_can_reach() -> None:
     assert (5, 0) in strategy._unreachable_claims
     goal = memory.goal_for(object_id(2))
     assert goal is None or goal.position != (5, 0)
+
+
+def test_core_holds_when_local_force_outmatches_approaching_enemy() -> None:
+    strategy = AggressiveStrategy(WorldMemory())
+    guards = [
+        unit(number, "VANGUARD", position=(number % 5, number // 5))
+        for number in range(2, 9)
+    ]
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(position=(0, 0)),
+            *guards,
+            unit(20, "RANGER", controlled=False, position=(0, 20)),
+        ],
+    )
+    strategy.decide(first)
+
+    second = make_turn(
+        tick=101,
+        objects=[
+            core(position=(0, 0)),
+            *guards,
+            unit(20, "RANGER", controlled=False, position=(0, 19)),
+        ],
+    )
+    report = strategy.decide(second)
+
+    assert report.threat_level == "PRE_EVADE"
+    assert second.plan.core_action is None
+
+
+def test_lone_ranger_declines_solo_duel_with_enemy_ranger() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "RANGER", position=(0, 6)),
+            unit(3, "RANGER", controlled=False, position=(0, 9)),
+        ],
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+    assert any("killing volley" in item.reason for item in report.decisions)
+
+
+def test_ranger_shoots_enemy_ranger_threatening_core() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "RANGER", position=(0, 6)),
+            unit(3, "RANGER", controlled=False, position=(0, 3)),
+        ],
+    )
+
+    decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "SHOOT"

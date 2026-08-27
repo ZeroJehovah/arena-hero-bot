@@ -390,6 +390,8 @@ class AggressiveStrategy:
             if target is None or shot_cell is None:
                 shootable = []
             else:
+                if self._decline_ranger_duel(ranger, target, context):
+                    return
                 if (
                     isinstance(target, UnitView)
                     and target.unit_type is not UnitType.WORKER
@@ -2325,7 +2327,18 @@ class AggressiveStrategy:
             # instead of waiting for pursuit memory or the first hit.
             return True
         if threat is not None and threat.should_evacuate_core:
-            return True
+            # ``should_evacuate_core`` also fires on a lone fighter merely
+            # entering the preemptive horizon.  When the local combat guard
+            # already outmatches the approaching enemy, moving the Core
+            # trades four Ticks of production and healing for a fight the
+            # guards should win in place.  Only stand down while the enemy
+            # has not yet reached attack range or landed a hit.
+            outmatched = (
+                not threat.recent_core_attack
+                and not threat.threatening_core_enemy_ids
+                and self._local_combat_guard_count(turn) >= 2 * len(enemies)
+            )
+            return not outmatched
         # A group already inside the pre-evade ring is dangerous even when it
         # has not crossed attack range yet. Waiting for the first hit leaves a
         # four-Tick Core migration too late against a melee group.
@@ -2432,6 +2445,19 @@ class AggressiveStrategy:
             for unit in (*turn.vanguards, *turn.rangers)
         )
 
+    def _local_combat_guard_count(self, turn: Turn) -> int:
+        """Count combat Units close enough to defend a standing Core."""
+
+        core = turn.core
+        if core is None:
+            return 0
+        return sum(
+            1
+            for unit in (*turn.vanguards, *turn.rangers)
+            if manhattan(core.position, unit.position)
+            <= self.config.combat_alert_radius
+        )
+
     def _needs_preemptive_ranger_evasion(
         self,
         turn: Turn,
@@ -2497,6 +2523,73 @@ class AggressiveStrategy:
             and manhattan(core.position, enemy.position) <= 12
         )
         return len(nearby_combat) >= 3
+
+    def _decline_ranger_duel(
+        self,
+        ranger: Ranger,
+        target: CoreView | UnitView,
+        context: _TurnContext,
+    ) -> bool:
+        """Avoid a one-for-one trade with a lone enemy Ranger.
+
+        Two full-health Rangers at range 1-3 exchange equal damage, so a solo
+        Ranger firing first dies with its target.  At max range a single step
+        can break contact and buy time for a wingman to form a killing volley.
+        """
+
+        if not isinstance(target, UnitView) or target.unit_type is not UnitType.RANGER:
+            return False
+        if ranger.hp < 2 or target.hp < 2:
+            return False
+        if str(target.id) in context.threat.threatening_core_enemy_ids:
+            return False
+        if self._ranger_volley_count(target, context) >= 2:
+            return False
+        if self._ranger_range(ranger.position, target.position) < RANGER_STANDOFF_RANGE:
+            return False
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        candidates = [
+            position
+            for position in adjacent_positions(ranger.position)
+            if position not in obstacles
+            and position not in context.enemy_positions
+            and position not in context.occupied | context.reserved
+        ]
+        if not candidates:
+            return False
+        goal = max(
+            candidates,
+            key=lambda position: (
+                self._ranger_range(position, target.position),
+                -manhattan(ranger.position, position),
+                position,
+            ),
+        )
+        if self._ranger_range(goal, target.position) <= self._ranger_range(
+            ranger.position, target.position
+        ):
+            return False
+        return self._move_within_leash(
+            ranger,
+            goal,
+            context,
+            offensive=False,
+            reason=f"hold for a killing volley on {self._enemy_label(target)}",
+        )
+
+    def _ranger_volley_count(
+        self,
+        target: CoreView | UnitView,
+        context: _TurnContext,
+    ) -> int:
+        """Count friendly Rangers already in range to volley ``target``."""
+
+        return sum(
+            1
+            for ranger in context.turn.rangers
+            if self._ranger_range(ranger.position, target.position)
+            <= RANGER_STANDOFF_RANGE
+        )
 
     def _ranger_shot_cell(
         self,
