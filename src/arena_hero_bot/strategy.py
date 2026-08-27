@@ -74,6 +74,7 @@ EARLY_COMBAT_GUARD_WORKERS = 4
 GARRISON_MIN_GUARDS = 3
 GARRISON_ROSTER_SHARE = 4
 RAID_ABORT_SCAN_RADIUS = 6
+NORMAL_GROWTH_COOLDOWN_TICKS = 675
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +183,11 @@ class AggressiveStrategy:
         # the raid state below: a restart forgets it and the next Tick simply
         # re-matches every Worker once.
         self._claim_stalls: dict[UUID, int] = {}
+        # High-tier normal production is deliberately slower than emergency
+        # production.  The live Core earned 75 resources but spent about 90
+        # on two normal Rangers in one 675-Tick window, so a short production
+        # cadence would keep the stockpile trending down.
+        self._last_normal_growth_tick: int | None = None
         # Cells a Worker could not route to, kept off ``WorldMemory`` for the
         # same reason: reachability is a property of the current obstacle and
         # threat picture, so a restart should re-ask the question rather than
@@ -1402,9 +1408,15 @@ class AggressiveStrategy:
             return
 
         if self._core_can_spawn(context):
-            unit_type = self._choose_spawn(context.turn, context.remaining_resources)
+            unit_type = (
+                None
+                if self._normal_growth_on_cooldown(context)
+                else self._choose_spawn(context.turn, context.remaining_resources)
+            )
             if unit_type is not None:
                 core.spawn(unit_type)
+                if self._growth_slowdown_active(context.turn) and not context.emergency:
+                    self._last_normal_growth_tick = context.turn.tick
                 context.report.add(
                     actor_id=str(core.id),
                     actor_kind="CORE",
@@ -4123,6 +4135,20 @@ class AggressiveStrategy:
             resources,
             candidates,
             strict_preference=not emergency,
+        )
+
+    def _normal_growth_on_cooldown(self, context: _TurnContext) -> bool:
+        """Throttle routine high-tier growth while leaving emergency spend free."""
+
+        if (
+            context.emergency
+            or not self._growth_slowdown_active(context.turn)
+            or self._last_normal_growth_tick is None
+        ):
+            return False
+        return (
+            context.turn.tick - self._last_normal_growth_tick
+            < NORMAL_GROWTH_COOLDOWN_TICKS
         )
 
     def _affordable_spawn(

@@ -3456,6 +3456,37 @@ def test_growth_slowdown_banks_income_instead_of_buying_a_pricier_roster() -> No
     assert banked.plan.core_action.type == "SPAWN"
 
 
+def test_high_tier_normal_growth_waits_between_spawns() -> None:
+    roster = [
+        unit(number, "VANGUARD", position=(number % 9, number // 9))
+        for number in range(2, 42)
+    ]
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+
+    first = make_turn(tick=100, resources=200, objects=[core(), *roster])
+    strategy.decide(first)
+    assert first.plan.core_action is not None
+    assert first.plan.core_action.type == "SPAWN"
+
+    during_cooldown = make_turn(
+        tick=101,
+        resources=200,
+        objects=[core(), *roster],
+    )
+    strategy.decide(during_cooldown)
+    assert during_cooldown.plan.core_action is None
+
+    after_cooldown = make_turn(
+        tick=100 + 675,
+        resources=200,
+        objects=[core(), *roster],
+    )
+    strategy.decide(after_cooldown)
+    assert after_cooldown.plan.core_action is not None
+    assert after_cooldown.plan.core_action.type == "SPAWN"
+
+
 def test_growth_slowdown_banks_before_crossing_the_threshold() -> None:
     roster = [
         unit(number, "VANGUARD", position=(number % 9, number // 9))
