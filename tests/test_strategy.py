@@ -2,7 +2,13 @@
 
 from itertools import pairwise
 
-from arena_hero import Direction, SpawnAction, UnitType, unit_cost
+from arena_hero import (
+    Direction,
+    SpawnAction,
+    UnitType,
+    core_resource_capacity,
+    unit_cost,
+)
 
 from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
@@ -2049,7 +2055,7 @@ def test_unbounded_growth_sends_a_minority_of_combat_units_on_patrol() -> None:
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
         for number in range(2, 10)
     ]
-    turn = make_turn(resources=15, objects=[core(), *combat_units])
+    turn = make_turn(resources=30, objects=[core(), *combat_units])
 
     report = decide(
         turn,
@@ -2165,21 +2171,31 @@ def test_unbounded_growth_establishes_guard_before_second_worker() -> None:
     assert guarded.plan.core_action.unit_type is UnitType.VANGUARD
 
 
-def test_unbounded_growth_keeps_offensive_minority_when_core_reserve_is_low() -> None:
+def test_unbounded_growth_pauses_patrol_below_previous_tier_ranger_floor() -> None:
     combat_units = [
         unit(number, "VANGUARD" if number % 2 else "RANGER", position=(number, 1))
         for number in range(2, 10)
     ]
-    turn = make_turn(resources=2, objects=[core(), *combat_units])
-
-    report = decide(
-        turn,
-        config=StrategyConfig(
-            target_workers=0,
-            max_population=None,
-            resource_target=0,
-        ),
+    config = StrategyConfig(
+        target_workers=0,
+        max_population=None,
+        resource_target=0,
     )
+    previous_population = len(combat_units) - 1
+    floor = core_resource_capacity(previous_population) - unit_cost(
+        UnitType.RANGER,
+        previous_population,
+    )
+
+    below = make_turn(resources=floor - 1, objects=[core(), *combat_units])
+    below_report = decide(below, config=config)
+    assert not any(
+        item.reason == "search outward for enemy units and Cores"
+        for item in below_report.decisions
+    )
+
+    at_floor = make_turn(resources=floor, objects=[core(), *combat_units])
+    report = decide(at_floor, config=config)
 
     assert (
         sum(
@@ -2195,6 +2211,47 @@ def test_unbounded_growth_keeps_offensive_minority_when_core_reserve_is_low() ->
         )
         == 5
     )
+
+
+def test_patrol_reserve_floor_uses_previous_tier_capacity_minus_ranger_cost() -> None:
+    def floor_for_population(population: int) -> int:
+        workers = [
+            unit(number, "WORKER", position=(number, 2))
+            for number in range(2, population + 2)
+        ]
+        turn = make_turn(objects=[core(), *workers])
+        strategy = AggressiveStrategy(
+            WorldMemory(),
+            StrategyConfig(target_workers=0, max_population=None),
+        )
+        return strategy._patrol_reserve_floor(turn)
+
+    # Capacity(7)=35, Ranger(7)=12; capacity(37)=185, Ranger(37)=34.
+    assert floor_for_population(8) == 23
+    assert floor_for_population(38) == 151
+
+
+def test_full_capacity_ranger_spawn_lands_on_next_patrol_floor() -> None:
+    """Routine production at capacity leaves exactly the next population's floor."""
+
+    def floor_for_population(population: int) -> int:
+        workers = [
+            unit(number, "WORKER", position=(number, 2))
+            for number in range(2, population + 2)
+        ]
+        turn = make_turn(objects=[core(), *workers])
+        strategy = AggressiveStrategy(
+            WorldMemory(),
+            StrategyConfig(target_workers=0, max_population=None),
+        )
+        return strategy._patrol_reserve_floor(turn)
+
+    for population in (8, 20, 38, 40):
+        post_spawn = core_resource_capacity(population) - unit_cost(
+            UnitType.RANGER,
+            population,
+        )
+        assert post_spawn == floor_for_population(population + 1)
 
 
 def test_unbounded_growth_pauses_remote_patrol_below_large_core_reserve() -> None:
@@ -2230,7 +2287,7 @@ def test_defensive_guards_hold_when_patrol_group_sees_a_distant_enemy() -> None:
         for number in range(2, 10)
     ]
     turn = make_turn(
-        resources=2,
+        resources=30,
         objects=[
             core(),
             *combat_units,
@@ -2565,7 +2622,7 @@ def test_offensive_patrol_drops_stale_enemy_unit_memory() -> None:
     )
     observed = make_turn(
         tick=100,
-        resources=15,
+        resources=30,
         objects=[
             core(),
             *combat_units,
@@ -2576,7 +2633,7 @@ def test_offensive_patrol_drops_stale_enemy_unit_memory() -> None:
 
     hidden = make_turn(
         tick=133,
-        resources=15,
+        resources=30,
         objects=[core(), *combat_units],
     )
     report = strategy.decide(hidden)
@@ -3780,7 +3837,7 @@ def _raid_turn(
     places = AWAY_POSITIONS if away else HOME_POSITIONS
     return make_turn(
         tick=tick,
-        resources=0,
+        resources=40,
         events=events,
         objects=[
             core(hp=core_hp),
@@ -3945,7 +4002,7 @@ def test_raid_launches_on_the_bearing_of_a_destroyed_enemy_fleet() -> None:
     ]
     sighted = make_turn(
         tick=100,
-        resources=0,
+        resources=40,
         objects=[
             core(),
             unit(3, "RANGER", position=(0, 1)),
@@ -3964,7 +4021,7 @@ def test_raid_launches_on_the_bearing_of_a_destroyed_enemy_fleet() -> None:
 
     destroyed = make_turn(
         tick=101,
-        resources=0,
+        resources=40,
         objects=[
             core(),
             unit(3, "RANGER", position=(0, 1)),

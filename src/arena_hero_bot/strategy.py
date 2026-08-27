@@ -19,6 +19,7 @@ from arena_hero import (
     UnitView,
     Vanguard,
     Worker,
+    core_resource_capacity,
     unit_cost,
 )
 
@@ -2613,12 +2614,13 @@ class AggressiveStrategy:
     def _offensive_patrol_enabled(self, turn: Turn) -> bool:
         """Keep a minority roaming while the Core itself remains safe.
 
-        Core stockpile tiers govern production and high-capacity patrol safety.
-        Small Cores still retain the original minority patrol while they are
-        in the fast-expansion tier, but a large Core below its reserve should
-        not leave combat units exposed far from the recovery point.  The
-        patrol is also suspended when the Core is damaged or the combat roster
-        is too small to leave a meaningful guard.
+        Patrol is the standing posture whenever the Core is intact and the
+        combat roster can spare a roaming squad.  The resource floor is set
+        to the previous population tier's full capacity minus the cost of one
+        Ranger at that tier, so a normal full-capacity production lands
+        exactly on the floor and keeps the patrol running.  Emergency combat
+        spending falls below the floor and recalls the squad; an intact Core
+        and a combat roster below the minimum keep everyone home as before.
         """
 
         core = turn.core
@@ -2629,7 +2631,26 @@ class AggressiveStrategy:
             >= self.config.offensive_min_combat_units
             and core.hp >= 5
             and core.shield >= 5
-            and turn.resources >= self._stockpile_target(turn)
+            and turn.resources >= self._patrol_reserve_floor(turn)
+        )
+
+    def _patrol_reserve_floor(self, turn: Turn) -> int:
+        """Return the resource level below which the roaming squad recalls.
+
+        The floor is ``previous_population``'s Core capacity minus one Ranger
+        price at that same tier.  The previous tier is used because production
+        first raises population and then capacity by five, while a full-capacity
+        normal production spends exactly one Ranger: the post-spawn balance
+        equals this floor, so routine growth does not toggle patrol off.
+        Emergency combat spending, which can occur below full capacity, drops
+        resources under the floor and thus pulls the roaming squad home.
+        """
+
+        previous_population = max(0, turn.state.population - 1)
+        return max(
+            0,
+            core_resource_capacity(previous_population)
+            - unit_cost(UnitType.RANGER, previous_population),
         )
 
     def _offensive_enemies(
