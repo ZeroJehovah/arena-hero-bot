@@ -354,6 +354,23 @@ class AggressiveStrategy:
                 )
             )
         ]
+        # A one-HP Ranger can still trade a shot safely when the engagement is
+        # remote, but it must not spend its last Tick firing while the Core is
+        # already in a pre-evacuation or engaged posture.  Combat resolves
+        # after movement, so the incoming shot lands before the next decision;
+        # at the Core's edge that used to turn a defensive Ranger's final shot
+        # into a preventable death during Core migration.
+        if (
+            ranger.hp <= 1
+            and context.threat.level
+            in {ThreatLevel.PRE_EVADE, ThreatLevel.ENGAGED, ThreatLevel.BREAKOUT}
+            and self._recover_if_critical(
+                ranger,
+                maximum_hp=2,
+                context=context,
+            )
+        ):
+            return
         if shootable:
             focused = self._preferred_target(context.focus_target, firing_pool)
             target = context.damage_ledger.select(
@@ -425,9 +442,10 @@ class AggressiveStrategy:
                 )
                 return
 
-        # A Ranger at one HP is still a live firing platform.  Let it take a
-        # legal shot before withdrawing; otherwise a whole damaged fireteam
-        # can collapse into the Core while an enemy remains in range.
+        # Away from a local Core threat, a Ranger at one HP is still a live
+        # firing platform.  Let it take a legal shot before withdrawing;
+        # otherwise a whole damaged fireteam can collapse into the Core while
+        # an enemy remains in range.
         if self._recover_if_critical(ranger, maximum_hp=2, context=context):
             return
 
