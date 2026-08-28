@@ -89,6 +89,11 @@ class WorldMemory:
     contested_positions: dict[Position, int] = field(default_factory=dict)
     resource_cells: dict[Position, int] = field(default_factory=dict)
     resource_absences: dict[Position, int] = field(default_factory=dict)
+    # Normal high-tier production is deliberately throttled.  Keep its
+    # payback marker with the rest of the durable strategy observations so a
+    # service restart cannot immediately spend the same bank again.
+    last_normal_growth_tick: int | None = None
+    last_normal_growth_resources: int | None = None
     last_tick: int = 0
 
     def observe(self, turn: Turn) -> None:
@@ -411,6 +416,8 @@ class WorldMemory:
                 {"position": list(position), "tick": absent_tick}
                 for position, absent_tick in sorted(self.resource_absences.items())
             ],
+            "last_normal_growth_tick": self.last_normal_growth_tick,
+            "last_normal_growth_resources": self.last_normal_growth_resources,
         }
 
     @classmethod
@@ -474,6 +481,12 @@ class WorldMemory:
                 _position(value["position"]): int(value["tick"])
                 for value in raw.get("resource_absences", [])
             },
+            last_normal_growth_tick=_optional_integer(
+                raw.get("last_normal_growth_tick")
+            ),
+            last_normal_growth_resources=_optional_integer(
+                raw.get("last_normal_growth_resources")
+            ),
             last_tick=int(raw.get("last_tick", 0)),
         )
 

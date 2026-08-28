@@ -3524,7 +3524,9 @@ def test_high_tier_normal_growth_waits_between_spawns() -> None:
     assert after_cooldown.plan.core_action.type == "SPAWN"
 
 
-def test_high_tier_normal_growth_waits_until_the_next_ranger_is_paid_back() -> None:
+def test_high_tier_normal_growth_waits_until_the_next_ranger_is_paid_back(
+    tmp_path,
+) -> None:
     roster = [
         unit(number, "VANGUARD", position=(number % 9, number // 9))
         for number in range(2, 46)
@@ -3536,6 +3538,8 @@ def test_high_tier_normal_growth_waits_until_the_next_ranger_is_paid_back() -> N
     strategy.decide(first)
     assert first.plan.core_action is not None
     assert first.plan.core_action.type == "SPAWN"
+    memory_path = tmp_path / "memory.json"
+    strategy.memory.save(memory_path)
 
     # The previous production consumed 45 resources.  Fifty resources of
     # income over the next 675 Ticks does not yet cover the next population
@@ -3545,8 +3549,28 @@ def test_high_tier_normal_growth_waits_until_the_next_ranger_is_paid_back() -> N
         resources=225,
         objects=[core(), unit(46, "RANGER", position=(46, 3)), *roster],
     )
-    strategy.decide(one_tier_later)
+    restarted = AggressiveStrategy(WorldMemory.load(memory_path), config)
+    restarted.decide(one_tier_later)
     assert one_tier_later.plan.core_action is None
+
+
+def test_high_tier_normal_growth_migrates_legacy_memory_safely() -> None:
+    roster = [
+        unit(number, "VANGUARD", position=(number % 9, number // 9))
+        for number in range(2, 42)
+    ]
+    memory = WorldMemory(last_tick=99)
+    turn = make_turn(tick=100, resources=200, objects=[core(), *roster])
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    strategy.decide(turn)
+
+    assert turn.plan.core_action is None
+    assert memory.last_normal_growth_tick == 100
+    assert memory.last_normal_growth_resources == 200
 
 
 def test_growth_slowdown_banks_before_crossing_the_threshold() -> None:

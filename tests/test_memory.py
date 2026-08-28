@@ -30,6 +30,8 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
     memory = WorldMemory()
     memory.observe(turn)
     memory.set_goal("worker", UnitGoal((9, 9), 50, "explore"))
+    memory.last_normal_growth_tick = 40
+    memory.last_normal_growth_resources = 17
     path = tmp_path / "memory.json"
     memory.save(path)
 
@@ -41,6 +43,8 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
         "rival_one",
     }
     assert loaded.goal_for("worker") == UnitGoal((9, 9), 50, "explore")
+    assert loaded.last_normal_growth_tick == 40
+    assert loaded.last_normal_growth_resources == 17
     assert loaded.recent_positions(str(turn.workers[0].id)) == ()
     assert turn.core is not None
     assert loaded.recent_positions(str(turn.core.id)) == ()

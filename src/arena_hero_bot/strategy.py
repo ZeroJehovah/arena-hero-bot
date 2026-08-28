@@ -183,16 +183,14 @@ class AggressiveStrategy:
         # the raid state below: a restart forgets it and the next Tick simply
         # re-matches every Worker once.
         self._claim_stalls: dict[UUID, int] = {}
-        # High-tier normal production is deliberately slower than emergency
-        # production.  The live Core earned 75 resources but spent about 90
-        # on two normal Rangers in one 675-Tick window, so a short production
-        # cadence would keep the stockpile trending down.
-        self._last_normal_growth_tick: int | None = None
-        # A fixed cadence is not enough once the next Ranger costs more than
-        # one window of observed income.  Keep the estimated post-spawn
-        # stockpile so routine growth can wait for the next unit to be paid
-        # back instead of turning a healthy bank negative.
-        self._last_normal_growth_resources: int | None = None
+        # Older memory files have no production marker.  On the first
+        # high-tier live Tick, conservatively start the marker at the observed
+        # bank so a deployment cannot immediately repeat the last spend; the
+        # marker is then durable for all later restarts.
+        self._needs_growth_marker_migration = self.memory.last_tick > 0 and (
+            self.memory.last_normal_growth_tick is None
+            or self.memory.last_normal_growth_resources is None
+        )
         # Cells a Worker could not route to, kept off ``WorldMemory`` for the
         # same reason: reachability is a property of the current obstacle and
         # threat picture, so a restart should re-ask the question rather than
@@ -1421,8 +1419,8 @@ class AggressiveStrategy:
             if unit_type is not None:
                 core.spawn(unit_type)
                 if self._growth_slowdown_active(context.turn) and not context.emergency:
-                    self._last_normal_growth_tick = context.turn.tick
-                    self._last_normal_growth_resources = (
+                    self.memory.last_normal_growth_tick = context.turn.tick
+                    self.memory.last_normal_growth_resources = (
                         context.remaining_resources
                         - unit_cost(unit_type, context.turn.state.population)
                     )
@@ -4154,21 +4152,24 @@ class AggressiveStrategy:
     def _normal_growth_on_cooldown(self, context: _TurnContext) -> bool:
         """Throttle routine high-tier growth while leaving emergency spend free."""
 
-        if (
-            context.emergency
-            or not self._growth_slowdown_active(context.turn)
-            or self._last_normal_growth_tick is None
-        ):
+        if context.emergency or not self._growth_slowdown_active(context.turn):
+            return False
+        if self._needs_growth_marker_migration:
+            self.memory.last_normal_growth_tick = context.turn.tick
+            self.memory.last_normal_growth_resources = context.turn.resources
+            self._needs_growth_marker_migration = False
+            return True
+        if self.memory.last_normal_growth_tick is None:
             return False
         if (
-            context.turn.tick - self._last_normal_growth_tick
+            context.turn.tick - self.memory.last_normal_growth_tick
             < NORMAL_GROWTH_COOLDOWN_TICKS
         ):
             return True
-        if self._last_normal_growth_resources is None:
+        if self.memory.last_normal_growth_resources is None:
             return False
         next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
-        recovered = context.turn.resources - self._last_normal_growth_resources
+        recovered = context.turn.resources - self.memory.last_normal_growth_resources
         return recovered < next_ranger_cost
 
     def _affordable_spawn(
