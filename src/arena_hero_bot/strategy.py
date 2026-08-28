@@ -74,8 +74,6 @@ EARLY_COMBAT_GUARD_WORKERS = 4
 GARRISON_MIN_GUARDS = 3
 GARRISON_ROSTER_SHARE = 4
 RAID_ABORT_SCAN_RADIUS = 6
-NORMAL_GROWTH_COOLDOWN_TICKS = 675
-NORMAL_GROWTH_FULL_CAP_RELEASE_TICKS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -4185,6 +4183,25 @@ class AggressiveStrategy:
     def _normal_growth_on_cooldown(self, context: _TurnContext) -> bool:
         """Throttle routine high-tier growth while leaving emergency spend free.
 
+        The throttle is a payback gate only: routine growth waits until the
+        bank has re-earned what the previous spawn spent.  There is
+        deliberately no wall-clock cooldown beside it.  One used to sit here
+        (675 Tick) and it could only ever fire while the bank was already
+        pinned at capacity, because banking-tier production is affordable
+        exactly at a full Core -- ``_spawn_safety_reserve`` clamps the 90%
+        reserve to ``capacity - cost``, so ``cost + reserve`` is identically
+        ``capacity``.  Waiting out a timer on a full bank buys nothing: the
+        bank cannot grow, the reserve is already ~18x a full Core recovery,
+        and enemy pressure bypasses this gate anyway.  It also costs real
+        income, because a full Core refuses loaded Workers the single deposit
+        cell and harvesting stalls (live delivery rate fell from 2.22 to 1.47
+        per Worker-hour in the Tick 180699-181373 window).  The timer's stated
+        win -- net resources going from -17 to +33 across Tick 178621-179973 --
+        was the arithmetic of buying one Ranger fewer, not a healthier economy:
+        income was 0.108 vs 0.116 per Tick across those two windows.  Cap
+        population instead if roster growth needs a limit; that is what
+        ``max_population`` is for.
+
         The payback target must stay inside the Core, or the throttle stops
         being a delay and becomes a deadlock: a full Core cannot bank one more
         resource, and because it also refuses loaded Workers the single deposit
@@ -4207,33 +4224,14 @@ class AggressiveStrategy:
         # baseline is a stored absolute balance, not a running income counter,
         # so any baseline above ``capacity - cost`` demands a balance the Core
         # can never reach and freezes production for good.  A restart writes
-        # exactly such a baseline:the migration stamps the balance that
+        # exactly such a baseline: the migration stamps the balance that
         # happens to be in the bank, not a post-production one.  Live Tick
         # 182024 stamped 201 against a 235 capacity and a 58-resource Ranger,
         # so the Core needed 259 to grow again and stopped producing forever.
-
         target = min(
             self.memory.last_normal_growth_resources + next_ranger_cost,
             context.turn.resource_capacity,
         )
-        # A full Core cannot bank, so release the spend once the previous spawn has
-        # vacated the Core cell instead of idling an unbounded cooldown the bank can
-        # never repay at full capacity.
-
-        if (
-            context.remaining_resource_space <= 0
-            and context.turn.tick - self.memory.last_normal_growth_tick
-            >= NORMAL_GROWTH_FULL_CAP_RELEASE_TICKS
-        ):
-            return False
-        # The bank still has room, so keep throttling to a slow cadence until
-        # eitherthe cooldown elapses or the stored stockpile covers the next Unit,
-        # and then release the spend (see the payback check below).
-        if (
-            context.turn.tick - self.memory.last_normal_growth_tick
-            < NORMAL_GROWTH_COOLDOWN_TICKS
-        ):
-            return True
         return context.turn.resources < target
 
     def _affordable_spawn(

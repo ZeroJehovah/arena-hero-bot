@@ -3513,7 +3513,17 @@ def test_growth_slowdown_banks_income_instead_of_buying_a_pricier_roster() -> No
     assert banked.plan.core_action.type == "SPAWN"
 
 
-def test_high_tier_normal_growth_waits_between_spawns() -> None:
+def test_high_tier_normal_growth_gates_on_payback_not_a_wall_clock() -> None:
+    """Routine growth waits for income, never for a timer.
+
+    A wall-clock cooldown used to sit beside the payback gate.  It could only
+    ever fire on a bank already pinned at capacity -- banking-tier production
+    is affordable exactly at a full Core -- so it bought nothing and stalled
+    harvesting, because a full Core refuses loaded Workers the deposit cell.
+    Elapsed Ticks must not release production, and reaching the payback target
+    must not have to wait for any.
+    """
+
     roster = [
         unit(number, "VANGUARD", position=(number % 9, number // 9))
         for number in range(2, 42)
@@ -3525,23 +3535,33 @@ def test_high_tier_normal_growth_waits_between_spawns() -> None:
     strategy.decide(first)
     assert first.plan.core_action is not None
     assert first.plan.core_action.type == "SPAWN"
+    # A 45-resource Ranger off a full 200 Core leaves 155, so the next routine
+    # spawn is paid back at 200 again.
+    assert strategy.memory.last_normal_growth_resources == 155
 
-    during_cooldown = make_turn(
-        tick=101,
-        resources=200,
-        objects=[core(), *roster],
-    )
-    strategy.decide(during_cooldown)
-    assert during_cooldown.plan.core_action is None
+    def probe(tick, resources):
+        turn = make_turn(tick=tick, resources=resources, objects=[core(), *roster])
+        AggressiveStrategy(
+            WorldMemory(
+                last_tick=100,
+                last_normal_growth_tick=100,
+                last_normal_growth_resources=155,
+            ),
+            config,
+        ).decide(turn)
+        return turn
 
-    after_cooldown = make_turn(
-        tick=100 + 675,
-        resources=200,
-        objects=[core(), *roster],
-    )
-    strategy.decide(after_cooldown)
-    assert after_cooldown.plan.core_action is not None
-    assert after_cooldown.plan.core_action.type == "SPAWN"
+    # One Tick later and still short of payback: held, as before.
+    assert probe(tick=101, resources=199).plan.core_action is None
+
+    # Far past the old 675-Tick cooldown and still short: time alone releases
+    # nothing.  This is the assertion the removed timer would have failed.
+    assert probe(tick=100 + 675 * 4, resources=199).plan.core_action is None
+
+    # Paid back one Tick after the last spawn: released at once, no timer.
+    paid_back = probe(tick=101, resources=200)
+    assert paid_back.plan.core_action is not None
+    assert paid_back.plan.core_action.type == "SPAWN"
 
 
 def test_high_tier_normal_growth_waits_until_the_next_ranger_is_paid_back(
