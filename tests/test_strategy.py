@@ -3524,6 +3524,31 @@ def test_high_tier_normal_growth_waits_between_spawns() -> None:
     assert after_cooldown.plan.core_action.type == "SPAWN"
 
 
+def test_high_tier_normal_growth_waits_until_the_next_ranger_is_paid_back() -> None:
+    roster = [
+        unit(number, "VANGUARD", position=(number % 9, number // 9))
+        for number in range(2, 46)
+    ]
+    config = StrategyConfig(target_workers=0, max_population=None)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+
+    first = make_turn(tick=100, resources=220, objects=[core(), *roster])
+    strategy.decide(first)
+    assert first.plan.core_action is not None
+    assert first.plan.core_action.type == "SPAWN"
+
+    # The previous production consumed 45 resources.  Fifty resources of
+    # income over the next 675 Ticks does not yet cover the next population
+    # tier's 58-resource Ranger.
+    one_tier_later = make_turn(
+        tick=100 + 675,
+        resources=225,
+        objects=[core(), unit(46, "RANGER", position=(46, 3)), *roster],
+    )
+    strategy.decide(one_tier_later)
+    assert one_tier_later.plan.core_action is None
+
+
 def test_growth_slowdown_banks_before_crossing_the_threshold() -> None:
     roster = [
         unit(number, "VANGUARD", position=(number % 9, number // 9))

@@ -188,6 +188,11 @@ class AggressiveStrategy:
         # on two normal Rangers in one 675-Tick window, so a short production
         # cadence would keep the stockpile trending down.
         self._last_normal_growth_tick: int | None = None
+        # A fixed cadence is not enough once the next Ranger costs more than
+        # one window of observed income.  Keep the estimated post-spawn
+        # stockpile so routine growth can wait for the next unit to be paid
+        # back instead of turning a healthy bank negative.
+        self._last_normal_growth_resources: int | None = None
         # Cells a Worker could not route to, kept off ``WorldMemory`` for the
         # same reason: reachability is a property of the current obstacle and
         # threat picture, so a restart should re-ask the question rather than
@@ -1417,6 +1422,10 @@ class AggressiveStrategy:
                 core.spawn(unit_type)
                 if self._growth_slowdown_active(context.turn) and not context.emergency:
                     self._last_normal_growth_tick = context.turn.tick
+                    self._last_normal_growth_resources = (
+                        context.remaining_resources
+                        - unit_cost(unit_type, context.turn.state.population)
+                    )
                 context.report.add(
                     actor_id=str(core.id),
                     actor_kind="CORE",
@@ -4151,10 +4160,16 @@ class AggressiveStrategy:
             or self._last_normal_growth_tick is None
         ):
             return False
-        return (
+        if (
             context.turn.tick - self._last_normal_growth_tick
             < NORMAL_GROWTH_COOLDOWN_TICKS
-        )
+        ):
+            return True
+        if self._last_normal_growth_resources is None:
+            return False
+        next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
+        recovered = context.turn.resources - self._last_normal_growth_resources
+        return recovered < next_ranger_cost
 
     def _affordable_spawn(
         self,
