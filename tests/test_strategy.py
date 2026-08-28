@@ -3540,18 +3540,80 @@ def test_high_tier_normal_growth_waits_until_the_next_ranger_is_paid_back(
     assert first.plan.core_action.type == "SPAWN"
     memory_path = tmp_path / "memory.json"
     strategy.memory.save(memory_path)
+    assert strategy.memory.last_normal_growth_resources == 175
 
-    # The previous production consumed 45 resources.  Fifty resources of
-    # income over the next 675 Ticks does not yet cover the next population
-    # tier's 58-resource Ranger.
-    one_tier_later = make_turn(
+    # The previous production left 175 in the bank, so the next population
+    # tier's 58-resource Ranger is paid back at 233.  A 235-capacity Core can
+    # still reach that, and 225 has not reached it yet.
+    grown = [unit(number, "RANGER", position=(number, 3)) for number in range(46, 49)]
+    before_payback = make_turn(
         tick=100 + 675,
         resources=225,
-        objects=[core(), unit(46, "RANGER", position=(46, 3)), *roster],
+        objects=[core(), *grown, *roster],
+    )
+    assert before_payback.resource_capacity == 235
+    restarted = AggressiveStrategy(WorldMemory.load(memory_path), config)
+    restarted.decide(before_payback)
+    assert before_payback.plan.core_action is None
+
+    # ... and the throttle is a delay, not a wall: the payback target is
+    # inside the Core, so income eventually releases production.  Banking-tier
+    # production is only affordable on a full bank, which is past 233 anyway.
+    after_payback = make_turn(
+        tick=100 + 675,
+        resources=235,
+        objects=[core(), *grown, *roster],
     )
     restarted = AggressiveStrategy(WorldMemory.load(memory_path), config)
-    restarted.decide(one_tier_later)
-    assert one_tier_later.plan.core_action is None
+    restarted.decide(after_payback)
+    assert after_payback.plan.core_action is not None
+    assert after_payback.plan.core_action.type == "SPAWN"
+
+
+def test_high_tier_normal_growth_never_demands_more_than_the_core_holds() -> None:
+    """A payback target above capacity must delay growth, never freeze it.
+
+    The stored baseline is an absolute balance, so a restart that stamps the
+    balance it happens to find can demand more than the Core can ever hold.
+    Live Tick 182024 stamped 201 against a 235-capacity Core and a
+    58-resource Ranger: the Core needed 259 to grow again, stopped producing
+    for good, and every Worker filled up and jammed the one deposit cell.
+    """
+
+    roster = (
+        [
+            unit(number, "VANGUARD", position=(number % 9, number // 9))
+            for number in range(2, 22)
+        ]
+        + [
+            unit(number, "RANGER", position=(number % 9, 3 + number // 9))
+            for number in range(22, 37)
+        ]
+        + [
+            unit(number, "WORKER", position=(number % 9, 8 + number // 9))
+            for number in range(37, 49)
+        ]
+    )
+    memory = WorldMemory(
+        last_tick=182590,
+        last_normal_growth_tick=182024,
+        last_normal_growth_resources=201,
+    )
+    turn = make_turn(tick=182591 + 675, resources=235, objects=[core(), *roster])
+
+    assert turn.state.population == 47
+    assert turn.resource_capacity == 235
+    # 201 + a 58-resource Ranger is 259, which no 235-capacity Core can reach.
+    assert unit_cost(UnitType.RANGER, turn.state.population) == 58
+
+    decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
 
 
 def test_high_tier_normal_growth_migrates_legacy_memory_safely() -> None:

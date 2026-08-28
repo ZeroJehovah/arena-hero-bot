@@ -4150,7 +4150,13 @@ class AggressiveStrategy:
         )
 
     def _normal_growth_on_cooldown(self, context: _TurnContext) -> bool:
-        """Throttle routine high-tier growth while leaving emergency spend free."""
+        """Throttle routine high-tier growth while leaving emergency spend free.
+
+        The payback target must stay inside the Core, or the throttle stops
+        being a delay and becomes a deadlock: a full Core cannot bank one more
+        resource, and because it also refuses loaded Workers the single deposit
+        cell, the whole team fills up and jams the Core neighbourhood instead.
+        """
 
         if context.emergency or not self._growth_slowdown_active(context.turn):
             return False
@@ -4169,8 +4175,19 @@ class AggressiveStrategy:
         if self.memory.last_normal_growth_resources is None:
             return False
         next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
-        recovered = context.turn.resources - self.memory.last_normal_growth_resources
-        return recovered < next_ranger_cost
+        # Clamp the payback target to what the Core can physically hold.  The
+        # baseline is a stored absolute balance, not a running income counter,
+        # so any baseline above ``capacity - cost`` demands a balance the Core
+        # can never reach and freezes production for good.  A restart writes
+        # exactly such a baseline: the migration stamps the balance that
+        # happens to be in the bank, not a post-production one.  Live Tick
+        # 182024 stamped 201 against a 235 capacity and a 58-resource Ranger,
+        # so the Core needed 259 to grow again and stopped producing forever.
+        target = min(
+            self.memory.last_normal_growth_resources + next_ranger_cost,
+            context.turn.resource_capacity,
+        )
+        return context.turn.resources < target
 
     def _affordable_spawn(
         self,
