@@ -75,6 +75,7 @@ GARRISON_MIN_GUARDS = 3
 GARRISON_ROSTER_SHARE = 4
 RAID_ABORT_SCAN_RADIUS = 6
 NORMAL_GROWTH_COOLDOWN_TICKS = 675
+NORMAL_GROWTH_FULL_CAP_RELEASE_TICKS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -4167,11 +4168,6 @@ class AggressiveStrategy:
             return True
         if self.memory.last_normal_growth_tick is None:
             return False
-        if (
-            context.turn.tick - self.memory.last_normal_growth_tick
-            < NORMAL_GROWTH_COOLDOWN_TICKS
-        ):
-            return True
         if self.memory.last_normal_growth_resources is None:
             return False
         next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
@@ -4179,14 +4175,35 @@ class AggressiveStrategy:
         # baseline is a stored absolute balance, not a running income counter,
         # so any baseline above ``capacity - cost`` demands a balance the Core
         # can never reach and freezes production for good.  A restart writes
-        # exactly such a baseline: the migration stamps the balance that
+        # exactly such a baseline:the migration stamps the balance that
         # happens to be in the bank, not a post-production one.  Live Tick
         # 182024 stamped 201 against a 235 capacity and a 58-resource Ranger,
         # so the Core needed 259 to grow again and stopped producing forever.
+
         target = min(
             self.memory.last_normal_growth_resources + next_ranger_cost,
             context.turn.resource_capacity,
         )
+        # A full Core cannot bank, so release the spend once the previous spawn has
+        # vacated the Core cell instead of idling an unbounded cooldown the bank can
+        # never repay at full capacity.
+
+
+
+        if (
+            context.remaining_resource_space <= 0
+            and context.turn.tick - self.memory.last_normal_growth_tick
+            >= NORMAL_GROWTH_FULL_CAP_RELEASE_TICKS
+        ):
+            return False
+        # The bank still has room, so keep throttling to a slow cadence until
+        # eitherthe cooldown elapses or the stored stockpile covers the next Unit,
+        # and then release the spend (see the payback check below).
+        if (
+            context.turn.tick - self.memory.last_normal_growth_tick
+            < NORMAL_GROWTH_COOLDOWN_TICKS
+        ):
+            return True
         return context.turn.resources < target
 
     def _affordable_spawn(
