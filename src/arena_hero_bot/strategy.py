@@ -403,6 +403,20 @@ class AggressiveStrategy:
                 if self._decline_ranger_duel(ranger, target, context):
                     return
                 if (
+                    ranger.hp <= 1
+                    and self._ranger_would_take_return_fire(
+                        ranger,
+                        target,
+                        obstacles,
+                    )
+                    and self._recover_if_critical(
+                        ranger,
+                        maximum_hp=2,
+                        context=context,
+                    )
+                ):
+                    return
+                if (
                     isinstance(target, UnitView)
                     and target.unit_type is not UnitType.WORKER
                 ):
@@ -2601,6 +2615,24 @@ class AggressiveStrategy:
             <= RANGER_STANDOFF_RANGE
         )
 
+    @staticmethod
+    def _ranger_would_take_return_fire(
+        ranger: Ranger,
+        target: CoreView | UnitView,
+        obstacles: set[Position] | frozenset[Position],
+    ) -> bool:
+        """Return whether a last-HP Ranger is inside the target's attack."""
+
+        if not isinstance(target, UnitView):
+            return False
+        if target.unit_type is UnitType.VANGUARD:
+            return manhattan(target.position, ranger.position) == 1
+        return target.unit_type is UnitType.RANGER and line_of_fire(
+            target.position,
+            ranger.position,
+            obstacles,
+        )
+
     def _ranger_shot_cell(
         self,
         ranger: Ranger,
@@ -4187,8 +4219,6 @@ class AggressiveStrategy:
         # A full Core cannot bank, so release the spend once the previous spawn has
         # vacated the Core cell instead of idling an unbounded cooldown the bank can
         # never repay at full capacity.
-
-
 
         if (
             context.remaining_resource_space <= 0

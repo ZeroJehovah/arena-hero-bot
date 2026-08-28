@@ -1533,6 +1533,26 @@ def test_critical_ranger_takes_legal_shot_before_withdrawing() -> None:
     assert turn.plan.unit_actions[turn.rangers[0].id].type == "SHOOT"
 
 
+def test_critical_ranger_within_return_fire_withdraws_before_shooting() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 0), hp=1),
+            unit(3, "RANGER", controlled=False, position=(0, 3)),
+        ],
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+    assert any(
+        item.actor_id == object_id(2)
+        and item.reason == "return critical unit to Core for healing"
+        for item in report.decisions
+    )
+
+
 def test_critical_ranger_with_local_threat_withdraws_before_shooting() -> None:
     turn = make_turn(
         objects=[
