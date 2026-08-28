@@ -1376,6 +1376,35 @@ def test_known_sites_are_claimed_nearest_first_in_one_unbounded_pool() -> None:
     assert set(claims) == {(10, 0), (10, 1)}
 
 
+def test_known_sites_prefer_core_outreach_before_remote_fallback() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (10, 0): 100,
+        (80, 0): 100,
+        (81, 0): 100,
+    }
+    strategy = AggressiveStrategy(memory, config)
+
+    turn = make_turn(
+        tick=200,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(60, 1)),
+            unit(3, "WORKER", position=(61, 1)),
+        ],
+    )
+    report = strategy.decide(turn)
+    claims = {
+        item.target
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned known resource"
+    }
+
+    assert (10, 0) in claims
+    assert len(claims) == 2
+
+
 def test_known_site_far_beyond_old_outreach_radius_is_claimed() -> None:
     """Removing the distance cap makes a far known site a normal target."""
 

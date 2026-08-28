@@ -3222,14 +3222,31 @@ class AggressiveStrategy:
         assignments: dict[UUID, Position] = {}
         # A currently visible resource is confirmed live; prefer it over a
         # remembered site even when the latter happens to be a few cells
-        # nearer.  Keep the remembered and recheck pools separate so the
-        # unbounded remote-resource policy still offers every known site, but
-        # does not send all Workers past fresh income to stale coordinates.
-        pools = [visible_resources, remembered_resources, rechecks]
+        # nearer.  Within each evidence tier, prefer the Core's local
+        # outreach ring before remote sites.  Keep the remote half in the
+        # same tier as a fallback: this is a priority, not a distance cap, so
+        # every known site remains eligible for an empty Worker.
+        core_position = turn.core.position if turn.core is not None else None
+        pools: list[set[Position]] = []
+        for pool in (visible_resources, remembered_resources, rechecks):
+            if core_position is None:
+                pools.append(pool)
+                continue
+            local = {
+                resource
+                for resource in pool
+                if manhattan(core_position, resource)
+                <= self.config.resource_outreach_radius
+            }
+            if local:
+                pools.append(local)
+            remote = pool - local
+            if remote:
+                pools.append(remote)
         self._hold_existing_claims(workers, pools, assignments)
         for pool in pools:
-            # Freshest evidence first, then nearest site, so a short walk to
-            # equally good evidence never outbids a long one.
+            # Freshest evidence and local range come first; within one pool,
+            # nearest Worker still wins so the fleet does not cross itself.
             while workers and pool:
                 _, worker_id, resource = min(
                     (
