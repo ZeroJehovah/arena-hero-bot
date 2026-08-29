@@ -4424,7 +4424,13 @@ class AggressiveStrategy:
         cell, the whole team fills up and jams the Core neighbourhood instead.
         """
 
-        if context.emergency or not self._growth_slowdown_active(context.turn):
+        # ``context.emergency`` also covers a recent attack on a remote
+        # combat unit so the fleet can coordinate.  That is not, by itself,
+        # a reason to spend the high-tier stockpile: only a damaged Core or
+        # an enemy in its local alert ring should bypass this reserve floor.
+        if self._emergency_combat_mode(
+            context.turn
+        ) or not self._growth_slowdown_active(context.turn):
             return False
         next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
         minimum_post_growth_resources = (

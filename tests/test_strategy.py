@@ -3781,6 +3781,46 @@ def test_high_tier_growth_keeps_a_post_spawn_stockpile_floor() -> None:
     assert turn.plan.core_action is None
 
 
+def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None:
+    roster = (
+        [unit(number, "VANGUARD", position=(number, 5)) for number in range(2, 21)]
+        + [unit(number, "RANGER", position=(number, 6)) for number in range(21, 48)]
+        + [unit(number, "WORKER", position=(number, 7)) for number in range(48, 60)]
+    )
+    turn = make_turn(
+        tick=100,
+        resources=290,
+        objects=[
+            core(),
+            *roster,
+            unit(90, "RANGER", controlled=False, position=(22, 0), hp=1),
+        ],
+        events=[
+            {
+                "event_id": object_id(91),
+                "tick": 100,
+                "event_type": "UNIT_DAMAGED",
+                "reason_code": "ATTACK",
+                "actor_id": object_id(90),
+                "target_id": object_id(21),
+                "position": [22, 0],
+                "values": {"damage": 1, "hp": 1},
+            }
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    # The fleet is coordinating against a remote attack, but the intact Core
+    # is not in a local emergency.  Routine growth must keep the 70% floor.
+    assert report.threat_reason == "FLEET_ATTACK"
+    assert report.projected_core_damage == 0
+    assert turn.plan.core_action is None
+
+
 def test_growth_slowdown_banks_before_replacing_lost_high_cost_unit() -> None:
     roster = (
         [unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 21)]
