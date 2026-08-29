@@ -1631,7 +1631,10 @@ class AggressiveStrategy:
     ) -> None:
         if unit.position == goal:
             self._record_wait(unit, context, reason)
-            if wait_at_goal:
+            # ``_record_wait`` may have replaced the fallback with a safe
+            # Core-cell evacuation.  Do not overwrite that queued MOVE with
+            # the explicit WAIT used when a unit really reached its goal.
+            if wait_at_goal and unit.id not in context.turn.plan.unit_actions:
                 unit.wait()
             return
         if not self._move(
@@ -1642,7 +1645,11 @@ class AggressiveStrategy:
             allow_goal=allow_goal,
         ):
             self._record_wait(unit, context, f"no safe path for: {reason}")
-            if wait_at_goal and unit.position == goal:
+            if (
+                wait_at_goal
+                and unit.position == goal
+                and unit.id not in context.turn.plan.unit_actions
+            ):
                 unit.wait()
 
     def _retreat_worker(

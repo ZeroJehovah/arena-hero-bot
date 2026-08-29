@@ -1761,6 +1761,33 @@ def test_boxed_in_core_occupant_nudges_a_neighbour_aside() -> None:
     )
 
 
+def test_core_screen_vacate_move_is_not_overwritten_by_wait() -> None:
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "WORKER", position=(0, 1), cargo=1),
+            unit(4, "WORKER", position=(-1, 0), cargo=1),
+            unit(10, "VANGUARD", position=(3, 3)),
+            unit(11, "VANGUARD", position=(3, 4)),
+            unit(12, "VANGUARD", position=(4, 3)),
+            unit(13, "VANGUARD", position=(4, 4)),
+            unit(20, "VANGUARD", controlled=False, position=(6, 2)),
+            unit(21, "VANGUARD", controlled=False, position=(5, 3)),
+        ],
+        obstacles=[(0, -1), (1, 0)],
+    )
+
+    report = decide(turn)
+
+    occupant = next(vanguard for vanguard in turn.vanguards if vanguard.id.int == 2)
+    vacated = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert vacated.action == "MOVE"
+    assert vacated.reason.startswith("free the Core cell instead of: ")
+    assert turn.plan.unit_actions[occupant.id].type == "MOVE"
+
+
 def test_unhealable_unit_vacates_the_core_cell() -> None:
     turn = make_turn(
         resources=0,
