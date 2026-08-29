@@ -6,6 +6,7 @@ from uuid import UUID
 from arena_hero import (
     Direction,
     SpawnAction,
+    Turn,
     UnitType,
     core_resource_capacity,
     unit_cost,
@@ -4172,7 +4173,7 @@ def _raid_turn(
     rival: tuple[int, int] = (25, 0),
     extra=(),
     events=(),
-) -> object:
+) -> Turn:
     places = AWAY_POSITIONS if away else HOME_POSITIONS
     return make_turn(
         tick=tick,
@@ -4563,7 +4564,9 @@ def test_worker_claim_skips_resource_inside_enemy_core_exclusion() -> None:
     assert claim is not None
     assert claim.purpose == "resource-claim-v1"
     assert claim.position == (-4, 0)
-    assert hidden.plan.unit_actions[hidden.workers[0].id].direction is Direction.LEFT
+    hidden_action = hidden.plan.unit_actions[hidden.workers[0].id]
+    assert hidden_action.type == "MOVE"
+    assert hidden_action.direction is Direction.LEFT
 
 
 def test_worker_rests_a_resource_no_route_can_reach() -> None:
@@ -4592,7 +4595,9 @@ def test_worker_rests_a_resource_no_route_can_reach() -> None:
     assert claim is not None
     assert claim.purpose == "resource-claim-v1"
     assert claim.position == (-4, 0)
-    assert retry.plan.unit_actions[retry.workers[0].id].direction is Direction.LEFT
+    retry_action = retry.plan.unit_actions[retry.workers[0].id]
+    assert retry_action.type == "MOVE"
+    assert retry_action.direction is Direction.LEFT
 
 
 def test_worker_drops_a_persisted_claim_no_route_can_reach() -> None:

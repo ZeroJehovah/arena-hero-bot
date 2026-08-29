@@ -60,6 +60,9 @@ CORE_ESCAPE_MIN_ENEMIES = 3
 MAX_VANGUARD_ATTACKERS = 4
 CORE_WORKER_INTERCEPT_RADIUS = 4
 CORE_INTRUDER_INTERCEPTORS = 4
+PERIMETER_INTERCEPTORS = 6
+PERIMETER_INTERCEPT_MEMORY_TICKS = 8
+PERIMETER_INTERCEPT_MAX_ENEMIES = 2
 INTRUDER_LEAD_STEPS = 2
 SWEEP_STAY_WEIGHT = 1
 SWEEP_LIKELY_WEIGHT = 3
@@ -142,6 +145,8 @@ class _TurnContext:
     damage_ledger: CombatTargetLedger = field(default_factory=CombatTargetLedger)
     squad_return_ids: frozenset[UUID] = field(default_factory=frozenset)
     intruder_intercept_ids: frozenset[UUID] = field(default_factory=frozenset)
+    perimeter_intercept_ids: frozenset[UUID] = field(default_factory=frozenset)
+    perimeter_intercept_anchor: Position | None = None
     emergency: bool = False
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
@@ -178,6 +183,9 @@ class AggressiveStrategy:
         self._intruder_hunt_id: str | None = None
         self._combat_policy = CombatPolicy()
         self._squad_return_until: dict[UUID, int] = {}
+        # The last cell a lone fighter was seen in inside the defensive zone,
+        # kept so the converging squad does not disband on the first dark Tick.
+        self._perimeter_intercept: tuple[str, Position, int] | None = None
         # Claim hysteresis, kept off ``WorldMemory`` for the same reason as
         # the raid state below: a restart forgets it and the next Tick simply
         # re-matches every Worker once.
@@ -237,8 +245,20 @@ class AggressiveStrategy:
             occupied.add(turn.core.position)
         focus_target = self._focus_target(turn)
         raid_ids = self._update_raid(turn, threat)
-        squad_return_ids = self._update_squad_returns(turn, threat, raid_ids)
         garrison_ids = self._garrison_ids(turn, raid_ids)
+        perimeter_anchor = self._perimeter_intercept_anchor(turn, emergency)
+        perimeter_intercept_ids = self._perimeter_intercept_ids(
+            turn,
+            perimeter_anchor,
+            garrison_ids,
+            raid_ids,
+        )
+        squad_return_ids = self._update_squad_returns(
+            turn,
+            threat,
+            raid_ids,
+            perimeter_intercept_ids,
+        )
         context = _TurnContext(
             turn=turn,
             report=report,
@@ -259,6 +279,8 @@ class AggressiveStrategy:
                 turn,
                 self._intruder_anchor(turn, focus_target, recent_enemies),
             ),
+            perimeter_intercept_ids=perimeter_intercept_ids,
+            perimeter_intercept_anchor=perimeter_anchor,
             emergency=emergency,
             garrison_ids=garrison_ids,
             raid_ids=raid_ids,
@@ -339,6 +361,7 @@ class AggressiveStrategy:
             fleet_wide=(context.emergency and ranger.id not in context.garrison_ids)
             or ranger.id in context.raid_ids,
             intercept_ids=context.intruder_intercept_ids,
+            converge_ids=context.perimeter_intercept_ids,
         )
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
         # A Ranger outranges a Worker by three cells and is the cheapest way
@@ -562,6 +585,7 @@ class AggressiveStrategy:
             fleet_wide=(context.emergency and vanguard.id not in context.garrison_ids)
             or vanguard.id in context.raid_ids,
             intercept_ids=context.intruder_intercept_ids,
+            converge_ids=context.perimeter_intercept_ids,
         )
         if context.combat_assault and vanguard.id not in context.vanguard_attack_ids:
             self._decide_vanguard_screen(vanguard, context, visible_enemies)
@@ -934,7 +958,7 @@ class AggressiveStrategy:
         ]
         if not slots:
             return None
-        escort = context.intruder_intercept_ids
+        escort = context.intruder_intercept_ids or context.perimeter_intercept_ids
         ordered_vanguards = sorted(
             (
                 unit
@@ -2074,6 +2098,7 @@ class AggressiveStrategy:
         *,
         fleet_wide: bool = False,
         intercept_ids: frozenset[UUID] = frozenset(),
+        converge_ids: frozenset[UUID] = frozenset(),
     ) -> tuple[CoreView | UnitView, ...]:
         """Limit reactions to enemies in that unit's own local area.
 
@@ -2086,11 +2111,18 @@ class AggressiveStrategy:
         to the roaming squad too, which meant a single Worker sighting forty
         cells out pulled the whole roaming third onto it -- exactly the
         open-ended commitment the movement leash exists to prevent.
+
+        ``converge_ids`` is the same narrow grant for a lone fighter already
+        inside the defensive leash.  Surrounding an equal-speed target needs
+        the squad aimed at where it stands now rather than at the cell it left,
+        and one Vanguard's four-cell vision is not enough to organise that.
         """
 
         if fleet_wide:
             return turn.visible_enemies
         escorting = unit.id in intercept_ids
+        converging = unit.id in converge_ids
+        core = turn.core
         return tuple(
             enemy
             for enemy in turn.visible_enemies
@@ -2099,9 +2131,17 @@ class AggressiveStrategy:
                 escorting
                 and isinstance(enemy, UnitView)
                 and enemy.unit_type is UnitType.WORKER
-                and turn.core is not None
-                and manhattan(turn.core.position, enemy.position)
+                and core is not None
+                and manhattan(core.position, enemy.position)
                 <= self.config.core_intruder_radius
+            )
+            or (
+                converging
+                and isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and core is not None
+                and manhattan(core.position, enemy.position)
+                <= self.config.combat_pursuit_radius
             )
         )
 
@@ -2209,6 +2249,116 @@ class AggressiveStrategy:
             ),
         )
         return frozenset(unit.id for unit in ordered[:CORE_INTRUDER_INTERCEPTORS])
+
+    def _perimeter_intercept_anchor(
+        self,
+        turn: Turn,
+        emergency: bool,
+    ) -> Position | None:
+        """Return the cell a lone fighter inside the defensive zone occupies.
+
+        A single enemy fighter walking through the defensive zone is the one
+        case the rest of the combat logic used to answer with nothing at all.
+        It raises the threat to ``ALERT``, which demotes the whole roaming
+        third to ring guards; it sits beyond ``worker_threat_radius * 2``, so
+        no guard is handed it as a memory target; and the one unit that does
+        make contact is recalled home as an intercepted expedition.  The three
+        rules cancel each other and the intruder strolls past a stationary
+        army.
+
+        Evidence is deliberately Core-local, exactly as ``_raid_recall_needed``
+        requires of the mirrored decision: only a fighter already inside
+        ``combat_pursuit_radius`` counts, so this can never reach past the
+        defensive leash.  A real attack is left alone: an emergency, a damaged
+        Core or a roster too small to spare a squad all cancel the convergence,
+        and so does a third fighter, because past two the answer is a defence
+        rather than a chase.  The last known cell is held for a few Ticks
+        because vision over a mover flickers and the squad must not restart its
+        convergence every other Tick.
+        """
+
+        core = turn.core
+        if core is None or emergency or not self._offensive_patrol_enabled(turn):
+            self._perimeter_intercept = None
+            return None
+        radius = self.config.combat_pursuit_radius
+        inside = tuple(
+            enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(core.position, enemy.position) <= radius
+        )
+        if len(inside) > PERIMETER_INTERCEPT_MAX_ENEMIES:
+            self._perimeter_intercept = None
+            return None
+        if inside:
+            target = min(
+                inside,
+                key=lambda enemy: (
+                    manhattan(core.position, enemy.position),
+                    str(enemy.id),
+                ),
+            )
+            self._perimeter_intercept = (
+                str(target.id),
+                target.position,
+                turn.tick,
+            )
+            return target.position
+        remembered = self._perimeter_intercept
+        if remembered is None:
+            return None
+        _, position, tick = remembered
+        arrived = any(
+            manhattan(unit.position, position) <= 1
+            for unit in (*turn.vanguards, *turn.rangers)
+        )
+        if (
+            arrived
+            or turn.tick - tick > PERIMETER_INTERCEPT_MEMORY_TICKS
+            or manhattan(core.position, position) > radius
+        ):
+            # Standing on the cell with nothing in sight ends the hunt: the
+            # target broke contact, and a squad that keeps walking at an empty
+            # cell is the open-ended pursuit the leash exists to prevent.
+            self._perimeter_intercept = None
+            return None
+        return position
+
+    def _perimeter_intercept_ids(
+        self,
+        turn: Turn,
+        anchor: Position | None,
+        garrison_ids: frozenset[UUID],
+        raid_ids: frozenset[UUID],
+    ) -> frozenset[UUID]:
+        """Reserve the nearest bounded squad to surround a lone fighter.
+
+        An equal-speed target cannot be run down by a single chaser, so the
+        squad has to be large enough to cover the escape cells; it is still
+        capped, and the garrison and raid detachment are excluded, so the ring
+        keeps its cover on the other seven bearings while this happens.
+        """
+
+        if anchor is None:
+            return frozenset()
+        candidates = sorted(
+            (
+                unit
+                for unit in (*turn.vanguards, *turn.rangers)
+                if unit.id not in garrison_ids
+                and unit.id not in raid_ids
+                and manhattan(unit.position, anchor)
+                <= self.config.combat_pursuit_radius
+            ),
+            key=lambda unit: (
+                manhattan(unit.position, anchor),
+                unit.hp <= 2,
+                unit.id.bytes,
+            ),
+        )
+        return frozenset(unit.id for unit in candidates[:PERIMETER_INTERCEPTORS])
 
     def _focus_target(self, turn: Turn) -> CoreView | UnitView | None:
         enemies: list[CoreView | UnitView] = [
@@ -2692,11 +2842,17 @@ class AggressiveStrategy:
 
         core = context.turn.core
         escorting = unit.id in context.intruder_intercept_ids
+        converging = unit.id in context.perimeter_intercept_ids
         radius = self.config.core_intruder_radius
+        pursuit_radius = self.config.combat_pursuit_radius
         targets: list[EnemySighting] = []
         for enemy in recent_enemies:
             if self._is_combat_memory_target(enemy):
-                if self._combat_target_is_local(unit, enemy.position):
+                if self._combat_target_is_local(unit, enemy.position) or (
+                    converging
+                    and core is not None
+                    and manhattan(core.position, enemy.position) <= pursuit_radius
+                ):
                     targets.append(enemy)
                 continue
             if (
@@ -2739,15 +2895,33 @@ class AggressiveStrategy:
         turn: Turn,
         enemies: tuple[EnemySighting, ...],
     ) -> tuple[EnemySighting, ...]:
-        """Keep goal-oriented defenders near the Core instead of roaming away."""
+        """Keep goal-oriented defenders near the Core instead of roaming away.
 
-        if not self._preserves_resources() or turn.core is None:
+        A hostile that can shoot is kept while it stays inside the defensive
+        leash rather than inside the tighter economy ring.  The old single
+        radius was twelve cells, so a fighter loitering at eighteen or twenty
+        was erased from every defender's target list before the per-unit rules
+        ever saw it: the ring had nothing to react to and the roaming third,
+        already demoted by the raised threat level, had nothing either.
+        Twenty is the distance a guard can still walk to and come home from,
+        so admitting it here cannot widen the engagement zone.  Everything
+        that cannot shoot back keeps the economy radius.
+        """
+
+        core = turn.core
+        if not self._preserves_resources() or core is None:
             return enemies
+        economy_radius = self.config.worker_threat_radius * 2
+        pursuit_radius = self.config.combat_pursuit_radius
         return tuple(
             enemy
             for enemy in enemies
-            if manhattan(turn.core.position, enemy.position)
-            <= self.config.worker_threat_radius * 2
+            if manhattan(core.position, enemy.position)
+            <= (
+                pursuit_radius
+                if self._is_combat_memory_target(enemy)
+                else economy_radius
+            )
         )
 
     def _is_offensive_combat_unit(
@@ -2862,6 +3036,15 @@ class AggressiveStrategy:
             return (
                 self._raid_target,
                 "raid the enemy Core along the attack bearing",
+            )
+        if (
+            context is not None
+            and context.perimeter_intercept_anchor is not None
+            and unit.id in context.perimeter_intercept_ids
+        ):
+            return (
+                context.perimeter_intercept_anchor,
+                "converge on the intruder inside the defensive perimeter",
             )
         if offensive and self._offensive_patrol_enabled(turn):
             return self._combat_patrol_goal(unit, turn)
@@ -3886,12 +4069,17 @@ class AggressiveStrategy:
         turn: Turn,
         threat: ThreatAssessment,
         raid_ids: frozenset[UUID] = frozenset(),
+        perimeter_intercept_ids: frozenset[UUID] = frozenset(),
     ) -> frozenset[UUID]:
         """Recall an intercepted roaming pair for a bounded return window.
 
         The raid detachment is exempt: making contact is the point of the
         raid, so the generic intercept recall would cancel it on arrival.
-        ``_update_raid`` owns that decision instead.
+        ``_update_raid`` owns that decision instead.  The squad converging on a
+        lone fighter inside the defensive zone is exempt for the same reason:
+        it was detached precisely because that contact has to be finished, and
+        recalling the only unit in touch with the target is what let single
+        intruders walk through a stationary army.
         """
 
         live_ids = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
@@ -3915,7 +4103,11 @@ class AggressiveStrategy:
                 # Keep the deterministic one-third expedition identity used by
                 # the existing patrol, but recall it as soon as it is locally
                 # intercepted instead of chasing through the contact.
-                if unit.id.int % 3 != 0 or unit.id in raid_ids:
+                if (
+                    unit.id.int % 3 != 0
+                    or unit.id in raid_ids
+                    or unit.id in perimeter_intercept_ids
+                ):
                     continue
                 if any(
                     manhattan(unit.position, enemy.position) <= 5
