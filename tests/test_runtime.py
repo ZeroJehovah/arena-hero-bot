@@ -166,6 +166,44 @@ def test_run_bot_persists_memory_and_turn_telemetry(tmp_path, monkeypatch) -> No
     assert "test-key" not in (tmp_path / "turns.jsonl").read_text()
 
 
+def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> None:
+    WorldMemory(last_tick=100).save(tmp_path / "memory.json")
+    turns = [
+        make_turn(tick=100, objects=[core(), unit(2, "WORKER", position=(1, 0))]),
+        make_turn(tick=101, objects=[core(), unit(2, "WORKER", position=(2, 0))]),
+    ]
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def turns(self):
+            yield from turns
+
+    monkeypatch.setattr(runtime, "ArenaHeroClient", FakeClient)
+    count = runtime.run_bot(
+        RuntimeConfig(
+            api_key="test-key",
+            data_dir=tmp_path,
+            observe_only=True,
+            max_turns=2,
+        )
+    )
+
+    assert count == 2
+    records = [
+        json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()
+    ]
+    assert [record["tick"] for record in records] == [101]
+    assert WorldMemory.load(tmp_path / "memory.json").last_tick == 101
+
+
 def test_cli_requires_key_and_builds_runtime(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("ARENA_HERO_API_KEY", raising=False)
     with pytest.raises(SystemExit, match="ARENA_HERO_API_KEY is required"):

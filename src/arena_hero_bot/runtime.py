@@ -66,6 +66,18 @@ def run_bot(
     ) as game:
         for turn in game.turns():
             turns_seen += 1
+            # A reconnect commonly replays the latest snapshot.  The prior
+            # process has already submitted that Tick, so sending it again
+            # only produces COMMAND_WINDOW_CLOSED and cannot change the game.
+            if turn.tick <= memory.last_tick:
+                LOGGER.info(
+                    "skipping already processed tick=%d last_tick=%d",
+                    turn.tick,
+                    memory.last_tick,
+                )
+                if config.max_turns is not None and turns_seen >= config.max_turns:
+                    break
+                continue
             started = monotonic()
             report, planning_error = _plan_turn(strategy, turn)
             planning_seconds = monotonic() - started
