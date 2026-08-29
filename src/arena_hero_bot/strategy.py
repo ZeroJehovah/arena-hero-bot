@@ -4426,6 +4426,18 @@ class AggressiveStrategy:
 
         if context.emergency or not self._growth_slowdown_active(context.turn):
             return False
+        next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
+        minimum_post_growth_resources = (
+            context.turn.resource_capacity * CORE_STOCKPILE_CAPACITY_PERCENT // 100
+        )
+        # Payback alone can release a full-bank Ranger even when the spend
+        # drops the Core below the ordinary 70% stockpile floor.  At the live
+        # high-cost tier that turns every income cycle into another expensive
+        # replacement and keeps the bank near its post-spawn low.  Preserve a
+        # durable stockpile floor for routine growth; the emergency path above
+        # still spends the bank when real enemy pressure requires defenders.
+        if context.turn.resources - next_ranger_cost < minimum_post_growth_resources:
+            return True
         if self._needs_growth_marker_migration:
             self.memory.last_normal_growth_tick = context.turn.tick
             self.memory.last_normal_growth_resources = context.turn.resources
@@ -4435,7 +4447,6 @@ class AggressiveStrategy:
             return False
         if self.memory.last_normal_growth_resources is None:
             return False
-        next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
         # Clamp the payback target to what the Core can physically hold.  The
         # baseline is a stored absolute balance, not a running income counter,
         # so any baseline above ``capacity - cost`` demands a balance the Core

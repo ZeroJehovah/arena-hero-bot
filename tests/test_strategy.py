@@ -3764,6 +3764,23 @@ def test_growth_slowdown_banks_before_high_cost_live_growth() -> None:
     assert turn.plan.core_action is None
 
 
+def test_high_tier_growth_keeps_a_post_spawn_stockpile_floor() -> None:
+    roster = [
+        unit(number, "RANGER", position=(number % 9, number // 9))
+        for number in range(2, 59)
+    ]
+    turn = make_turn(resources=285, objects=[core(), *roster])
+
+    decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    # A population-57 Ranger costs 98.  Spending from a full 285-capacity
+    # Core would leave 187, below the 70% routine stockpile floor of 199.
+    assert turn.plan.core_action is None
+
+
 def test_growth_slowdown_banks_before_replacing_lost_high_cost_unit() -> None:
     roster = (
         [unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 21)]
