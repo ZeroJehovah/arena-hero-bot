@@ -55,6 +55,7 @@ DEFENSIVE_PERIMETER_MIN_RADIUS = 2
 VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
 RANGER_STANDOFF_RANGE = 3
+RANGER_RETURN_THREAT_RADIUS = 5
 COMBAT_SCREEN_RADIUS = 3
 CORE_ESCAPE_MIN_ENEMIES = 3
 MAX_VANGUARD_ATTACKERS = 4
@@ -409,12 +410,10 @@ class AggressiveStrategy:
         if (
             ranger.id in context.squad_return_ids
             and context.turn.core is not None
-            and self._move(
+            and self._move_ranger_toward_core(
                 ranger,
-                context.turn.core.position,
                 context,
                 reason="return intercepted expedition Ranger to Core",
-                allow_goal=True,
             )
         ):
             return
@@ -1629,14 +1628,20 @@ class AggressiveStrategy:
         if unit.position == core.position:
             self._record_wait(unit, context, "wait at Core for healing resources")
             return True
-        if self._core_has_room_for(unit, context) and self._move(
-            unit,
-            core.position,
-            context,
-            reason=reason,
-            allow_goal=True,
-        ):
-            return True
+        if self._core_has_room_for(unit, context):
+            moved = (
+                self._move_ranger_toward_core(unit, context, reason=reason)
+                if isinstance(unit, Ranger)
+                else self._move(
+                    unit,
+                    core.position,
+                    context,
+                    reason=reason,
+                    allow_goal=True,
+                )
+            )
+            if moved:
+                return True
 
         staging_cells = [
             position
@@ -1654,6 +1659,111 @@ class AggressiveStrategy:
                 return True
         self._record_wait(unit, context, f"no safe path for: {reason}")
         return True
+
+    def _move_ranger_toward_core(
+        self,
+        ranger: Ranger,
+        context: _TurnContext,
+        *,
+        reason: str,
+    ) -> bool:
+        """Return a Ranger home without stepping closer into enemy fire."""
+
+        core = context.turn.core
+        if core is None or ranger.position == core.position:
+            return False
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        threats = tuple(
+            enemy
+            for enemy in context.turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(ranger.position, enemy.position)
+            <= RANGER_RETURN_THREAT_RADIUS
+        )
+        if not threats:
+            return self._move(
+                ranger,
+                core.position,
+                context,
+                reason=reason,
+                allow_goal=True,
+            )
+
+        blocked = self._static_blockers(ranger, context)
+        blocked.update(context.occupied)
+        blocked.update(context.reserved)
+        blocked.discard(ranger.position)
+        blocked.discard(core.position)
+        candidates = [
+            position
+            for position in adjacent_positions(ranger.position)
+            if position not in blocked and position not in context.enemy_positions
+        ]
+        if not candidates:
+            return self._move(
+                ranger,
+                core.position,
+                context,
+                reason=reason,
+                allow_goal=True,
+            )
+
+        def attack_distance(enemy: UnitView, position: Position) -> int:
+            if enemy.unit_type is UnitType.VANGUARD:
+                return manhattan(enemy.position, position)
+            return self._ranger_range(enemy.position, position)
+
+        current_distance = min(
+            attack_distance(enemy, ranger.position) for enemy in threats
+        )
+        non_closing = [
+            position
+            for position in candidates
+            if min(attack_distance(enemy, position) for enemy in threats)
+            >= current_distance
+        ]
+        protected = [
+            position
+            for position in non_closing
+            if not any(
+                self._enemy_can_attack_position(enemy, position, obstacles)
+                for enemy in threats
+            )
+        ]
+        preferred = protected or non_closing
+        if not preferred:
+            return self._move(
+                ranger,
+                core.position,
+                context,
+                reason=reason,
+                allow_goal=True,
+            )
+        goal = min(
+            preferred,
+            key=lambda position: (
+                manhattan(position, core.position),
+                -min(attack_distance(enemy, position) for enemy in threats),
+                position,
+            ),
+        )
+        direction = direction_between(ranger.position, goal)
+        if direction is None:
+            return self._move(
+                ranger,
+                core.position,
+                context,
+                reason=reason,
+                allow_goal=True,
+            )
+        return self._queue_move(
+            ranger,
+            direction,
+            context,
+            reason=reason,
+            target=core.position,
+        )
 
     def _move_or_wait(
         self,
@@ -2792,11 +2902,23 @@ class AggressiveStrategy:
 
         if not isinstance(target, UnitView):
             return False
-        if target.unit_type is UnitType.VANGUARD:
-            return manhattan(target.position, ranger.position) == 1
-        return target.unit_type is UnitType.RANGER and line_of_fire(
-            target.position,
+        return AggressiveStrategy._enemy_can_attack_position(
+            target,
             ranger.position,
+            obstacles,
+        )
+
+    @staticmethod
+    def _enemy_can_attack_position(
+        enemy: UnitView,
+        position: Position,
+        obstacles: set[Position] | frozenset[Position],
+    ) -> bool:
+        if enemy.unit_type is UnitType.VANGUARD:
+            return manhattan(enemy.position, position) == 1
+        return enemy.unit_type is UnitType.RANGER and line_of_fire(
+            enemy.position,
+            position,
             obstacles,
         )
 

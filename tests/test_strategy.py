@@ -1628,6 +1628,27 @@ def test_intercepted_ranger_returns_before_reengaging_a_remote_target() -> None:
     )
 
 
+def test_returning_ranger_does_not_close_on_nearby_enemy_fire() -> None:
+    strategy = AggressiveStrategy(
+        WorldMemory(),
+        StrategyConfig(target_workers=0, max_population=None),
+    )
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(3, "RANGER", position=(0, 33)),
+            unit(4, "RANGER", controlled=False, position=(0, 30)),
+        ],
+    )
+    strategy._squad_return_until[turn.rangers[0].id] = turn.tick + 8
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is not Direction.UP
+
+
 def test_ranger_disengages_to_max_range_against_enemy_unit() -> None:
     turn = make_turn(
         objects=[
