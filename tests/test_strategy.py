@@ -3387,6 +3387,33 @@ def test_strategy_avoids_recently_contested_resource_patrol_cell() -> None:
     assert second_action.direction != first_action.direction
 
 
+def test_resource_patrol_replaces_a_static_unreachable_goal() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(resource_target=95, resource_patrol_radius=10)
+    strategy = AggressiveStrategy(memory, config)
+    first = make_turn(
+        tick=160,
+        objects=[core(position=(100, 100)), unit(2, "WORKER", position=(100, 100))],
+    )
+    strategy.decide(first)
+    first_goal = memory.goal_for(object_id(2))
+    assert first_goal is not None
+
+    x, y = first_goal.position
+    blocked_goal = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+    second = make_turn(
+        tick=161,
+        objects=[core(position=(100, 100)), unit(2, "WORKER", position=(100, 100))],
+        obstacles=blocked_goal,
+    )
+    strategy.decide(second)
+
+    replacement = memory.goal_for(object_id(2))
+    assert replacement is not None
+    assert replacement.position != first_goal.position
+    assert second.plan.unit_actions[second.workers[0].id].type == "MOVE"
+
+
 def test_worker_retreats_from_recently_contested_area() -> None:
     memory = WorldMemory(contested_positions={(6, 0): 160})
     turn = make_turn(
@@ -4259,6 +4286,7 @@ def test_combat_patrol_route_stays_inside_the_nominal_patrol_radius() -> None:
         item.target
         for item in strategy.decide(turn).decisions
         if item.reason == "search outward for enemy units and Cores"
+        and item.target is not None
     ]
     assert patrol_targets
     assert all(

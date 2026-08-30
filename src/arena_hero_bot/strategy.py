@@ -1130,6 +1130,7 @@ class AggressiveStrategy:
                         departure_goal = self._resource_patrol_goal(
                             worker,
                             context.turn,
+                            context,
                         )
                         if departure_goal != worker.position and self._move(
                             worker,
@@ -1321,7 +1322,7 @@ class AggressiveStrategy:
                 goal = self._exploration_goal(worker, context.turn.tick)
                 reason = "scout beyond the local patrol ring for resources"
             else:
-                goal = self._resource_patrol_goal(worker, context.turn)
+                goal = self._resource_patrol_goal(worker, context.turn, context)
                 reason = "patrol near the stationary Core for resources"
         else:
             goal = self._exploration_goal(worker, context.turn.tick)
@@ -4465,12 +4466,25 @@ class AggressiveStrategy:
         self.memory.set_goal(unit_id, goal)
         return goal.position
 
-    def _resource_patrol_goal(self, worker: Worker, turn: Turn) -> Position:
-        """Assign a stable patrol point close enough for efficient deposits."""
+    def _resource_patrol_goal(
+        self,
+        worker: Worker,
+        turn: Turn,
+        context: _TurnContext,
+    ) -> Position:
+        """Assign a stable, statically reachable patrol point.
+
+        A patrol point can remain a perfectly valid coordinate while every
+        route to it is sealed by the remembered obstacle map.  Reusing that
+        goal then turns a Worker into a stationary WAIT stream until its goal
+        TTL expires.  Check static reachability before holding or creating a
+        goal; dynamic unit traffic is intentionally left to ``_move``.
+        """
 
         core = turn.core
         if core is None:
             return worker.position
+        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         unit_id = str(worker.id)
         current = self.memory.goal_for(unit_id)
         claimed_positions = {
@@ -4484,11 +4498,17 @@ class AggressiveStrategy:
             current is not None
             and current.purpose == RESOURCE_PATROL_PURPOSE
             and worker.position != current.position
-            and current.position not in self.memory.obstacles
+            and current.position not in obstacles
             and current.position not in claimed_positions
             and not self._near_remembered_worker_danger(current.position, turn)
             and manhattan(core.position, current.position)
             <= self.config.resource_patrol_radius * 2
+            and self._has_static_route(
+                worker,
+                current.position,
+                context,
+                allow_goal=True,
+            )
         ):
             if current.last_progress_position is None:
                 current = UnitGoal(
@@ -4541,8 +4561,15 @@ class AggressiveStrategy:
             candidate = core.position[0] + dx, core.position[1] + dy
             if (
                 candidate != worker.position
+                and candidate not in obstacles
                 and candidate not in claimed_positions
                 and not self._near_remembered_worker_danger(candidate, turn)
+                and self._has_static_route(
+                    worker,
+                    candidate,
+                    context,
+                    allow_goal=True,
+                )
             ):
                 patrol_position = candidate
                 break
