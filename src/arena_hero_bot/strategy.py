@@ -1001,8 +1001,17 @@ class AggressiveStrategy:
         # further out dragged distant economy Units back toward the fight and
         # abandoned resources they were about to claim, so only Workers inside
         # the contested zone are pulled out of it.
-        if context.combat_assault and (
-            manhattan(worker.position, core.position) <= self.config.core_assault_radius
+        local_core_assault = context.threat.recent_core_attack or any(
+            manhattan(core.position, enemy.position) <= self.config.core_assault_radius
+            for enemy in context.assault_enemies
+        )
+        if (
+            context.combat_assault
+            and local_core_assault
+            and (
+                manhattan(worker.position, core.position)
+                <= self.config.core_assault_radius
+            )
         ):
             goal = self._emergency_worker_goal(worker, context)
             if goal == worker.position:

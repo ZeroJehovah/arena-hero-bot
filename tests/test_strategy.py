@@ -3856,6 +3856,42 @@ def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None
     assert turn.plan.core_action is None
 
 
+def test_remote_fleet_coordination_does_not_pull_local_worker_from_economy() -> None:
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 4)),
+            unit(3, "RANGER", position=(0, 1)),
+            unit(90, "RANGER", controlled=False, position=(22, 0)),
+        ],
+        events=[
+            {
+                "event_id": object_id(91),
+                "tick": 100,
+                "event_type": "UNIT_DAMAGED",
+                "reason_code": "ATTACK",
+                "actor_id": object_id(90),
+                "target_id": object_id(3),
+                "position": [22, 0],
+                "values": {"damage": 1, "hp": 1},
+            }
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    assert report.threat_reason == "FLEET_ATTACK"
+    assert report.projected_core_damage == 0
+    assert "assault zone" not in worker_decision.reason
+
+
 def test_growth_slowdown_banks_before_replacing_lost_high_cost_unit() -> None:
     roster = (
         [unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 21)]
