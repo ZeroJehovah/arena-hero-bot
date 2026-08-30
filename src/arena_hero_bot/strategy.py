@@ -402,6 +402,22 @@ class AggressiveStrategy:
             )
         ):
             return
+        # A roaming Ranger marked for recall has already been intercepted by
+        # the local threat policy.  Return it before the firing/standoff
+        # branch can pull it back into the same remote duel and make it
+        # oscillate between disengaging and heading home.
+        if (
+            ranger.id in context.squad_return_ids
+            and context.turn.core is not None
+            and self._move(
+                ranger,
+                context.turn.core.position,
+                context,
+                reason="return intercepted expedition Ranger to Core",
+                allow_goal=True,
+            )
+        ):
+            return
         if shootable:
             focused = self._preferred_target(context.focus_target, firing_pool)
             target = context.damage_ledger.select(
@@ -494,19 +510,6 @@ class AggressiveStrategy:
         # otherwise a whole damaged fireteam can collapse into the Core while
         # an enemy remains in range.
         if self._recover_if_critical(ranger, maximum_hp=2, context=context):
-            return
-
-        if (
-            ranger.id in context.squad_return_ids
-            and context.turn.core is not None
-            and self._move(
-                ranger,
-                context.turn.core.position,
-                context,
-                reason="return intercepted expedition Ranger to Core",
-                allow_goal=True,
-            )
-        ):
             return
 
         if self._pickup_beacon(ranger, context):

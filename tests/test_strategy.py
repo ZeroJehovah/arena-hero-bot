@@ -1603,6 +1603,31 @@ def test_critical_ranger_with_local_threat_withdraws_before_shooting() -> None:
     )
 
 
+def test_intercepted_ranger_returns_before_reengaging_a_remote_target() -> None:
+    strategy = AggressiveStrategy(
+        WorldMemory(),
+        StrategyConfig(target_workers=0, max_population=None),
+    )
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(3, "RANGER", position=(0, 6)),
+            unit(4, "RANGER", controlled=False, position=(0, 8)),
+        ],
+    )
+    strategy._squad_return_until[turn.rangers[0].id] = turn.tick + 8
+
+    report = strategy.decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+    assert any(
+        item.actor_id == object_id(3)
+        and item.reason == "return intercepted expedition Ranger to Core"
+        for item in report.decisions
+    )
+
+
 def test_ranger_disengages_to_max_range_against_enemy_unit() -> None:
     turn = make_turn(
         objects=[
