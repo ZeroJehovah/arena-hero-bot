@@ -52,6 +52,16 @@ UNREACHABLE_CLAIM_COOLDOWN = 128
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
+# Guards sit three cells apart along a ring and the rings themselves are three
+# cells apart, so a Ranger (vision 5) still sees both neighbours and the next
+# ring inward.  One slot per cell used to push the whole roster onto a single
+# circle: 34 of 49 live combat units stood at exactly Manhattan 12 with nothing
+# behind them, so anything that slipped through the circle met an empty
+# interior.
+DEFENSIVE_RING_SPACING = 3
+# The Core cell is the only DEPOSIT/SPAWN cell, so its four neighbours stay
+# clear of standing guards or loaded Workers queue outside the drop-off.
+DEFENSIVE_CORE_CLEARANCE = 1
 VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
 RANGER_STANDOFF_RANGE = 3
@@ -97,6 +107,7 @@ class StrategyConfig:
     resource_patrol_radius: int = 14
     resource_outreach_radius: int = 48
     offensive_patrol_radius: int = 60
+    offensive_squad_size: int = 8
     offensive_patrol_goal_ttl: int = 160
     offensive_core_memory_ttl: int = 512
     offensive_unit_memory_ttl: int = 32
@@ -180,6 +191,9 @@ class AggressiveStrategy:
         # obstacle/occupancy cells made guards oscillate between adjacent
         # radii even when there was no enemy to react to.
         self._defensive_layout: _DefensiveLayout | None = None
+        # The roaming squad, cached against the roster it was drawn from so
+        # membership only changes when a combat unit is built or dies.
+        self._offensive_squad: tuple[frozenset[UUID], frozenset[UUID]] | None = None
         self._combat_focus_id: str | None = None
         self._intruder_hunt_id: str | None = None
         self._combat_policy = CombatPolicy()
@@ -3072,10 +3086,32 @@ class AggressiveStrategy:
             or (threat is not None and threat.level is not ThreatLevel.NORMAL)
         ):
             return False
-        # UUID assignment keeps roles stable across ticks without adding
-        # private state.  With the live roster this sends roughly one third
-        # of Rangers/Vanguards away while leaving a substantial Core guard.
-        return unit.id.int % 3 == 0
+        return unit.id in self._offensive_ids(turn)
+
+    def _offensive_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return the capped, stable roaming squad.
+
+        The share used to be an open-ended UUID third, which grows with the
+        roster: at 49 combat units that sent 15 of them out, and because the
+        patrol route is a bounding box they stood a median 60 and up to 87
+        cells from the Core -- far past any radius they could be recalled
+        across.  A fixed squad keeps scouting coverage while every further
+        unit built adds to the defence instead of the expedition.  UUID
+        membership still decides *who* goes, so roles stay stable between
+        Ticks without extra state.
+        """
+
+        cache = self._offensive_squad
+        roster = frozenset(unit.id for unit in (*turn.rangers, *turn.vanguards))
+        if cache is not None and cache[0] == roster:
+            return cache[1]
+        preferred = sorted(
+            (unit_id for unit_id in roster if unit_id.int % 3 == 0),
+            key=lambda unit_id: unit_id.bytes,
+        )
+        squad = frozenset(preferred[: max(0, self.config.offensive_squad_size)])
+        self._offensive_squad = (roster, squad)
+        return squad
 
     def _offensive_patrol_enabled(self, turn: Turn) -> bool:
         """Keep a minority roaming while the Core itself remains safe.
@@ -3256,6 +3292,13 @@ class AggressiveStrategy:
         # the radius and cardinal anchors depend on traffic at one Tick.
         unavailable = set(context.enemy_positions)
         unavailable.add(core.position)
+        # The Core cell is the only DEPOSIT and SPAWN cell, so a guard parked
+        # on one of its four neighbours narrows the queue for loaded Workers.
+        # Inner rings start outside that clearance.
+        unavailable.update(
+            (core_position[0] + dx, core_position[1] + dy)
+            for dx, dy in _defensive_ring_offsets(DEFENSIVE_CORE_CLEARANCE)
+        )
         visions = {unit.id: _combat_vision_radius(unit) for unit in guards}
         # The count-and-vision radius grows linearly with the army, so a
         # 29-guard fleet parked its whole perimeter 30 cells out and left the
@@ -3271,28 +3314,125 @@ class AggressiveStrategy:
             ),
         )
 
+        ring_cache: dict[int, tuple[Position, ...]] = {}
+        free_cache: dict[int, list[Position]] = {}
+
         def ring_for(radius: int) -> tuple[Position, ...]:
-            return tuple(
-                (core_position[0] + dx, core_position[1] + dy)
-                for dx, dy in _defensive_ring_offsets(radius)
-                if (core_position[0] + dx, core_position[1] + dy) not in obstacles
+            if radius not in ring_cache:
+                ring_cache[radius] = tuple(
+                    (core_position[0] + dx, core_position[1] + dy)
+                    for dx, dy in _defensive_ring_offsets(radius)
+                    if (core_position[0] + dx, core_position[1] + dy) not in obstacles
+                )
+            return ring_cache[radius]
+
+        def free_cells(radius: int) -> list[Position]:
+            if radius not in free_cache:
+                free_cache[radius] = [
+                    position
+                    for position in ring_for(radius)
+                    if position not in unavailable
+                ]
+            return free_cache[radius]
+
+        def ring_plan(outer: int) -> tuple[tuple[tuple[int, int], ...], int]:
+            """Spread the guards over rings from ``outer`` inward.
+
+            Guards beyond the outer ring's spaced slots fill the interior
+            instead of pushing the perimeter further out.  Each ring first
+            takes only its spaced slots, so neighbours stay
+            ``DEFENSIVE_RING_SPACING`` apart and every guard still sees the
+            next ring inward; if the whole roster still does not fit, the
+            rings tighten from the outside in.  The second return value is
+            how many guards found no legal cell at all.
+            """
+
+            radii = [
+                radius
+                for radius in range(
+                    outer,
+                    DEFENSIVE_CORE_CLEARANCE,
+                    -DEFENSIVE_RING_SPACING,
+                )
+                if free_cells(radius)
+            ]
+            counts: dict[int, int] = {}
+            remaining = len(guards)
+            # First pass: every ring takes only its spaced slots, outermost
+            # first, so the ring that has to see an approach coming is filled
+            # before the depth behind it.
+            for radius in radii:
+                if remaining <= 0:
+                    break
+                room = min(
+                    len(free_cells(radius)),
+                    max(1, len(free_cells(radius)) // DEFENSIVE_RING_SPACING),
+                )
+                share = min(remaining, room)
+                if share > 0:
+                    counts[radius] = counts.get(radius, 0) + share
+                    remaining -= share
+            # Second pass: a roster too large for spaced slots tightens every
+            # ring together instead of packing the outer one wall-to-wall,
+            # which would spend the surplus on overlapping vision rather than
+            # on depth.
+            while remaining > 0:
+                seated = 0
+                for radius in radii:
+                    if remaining <= 0:
+                        break
+                    if counts.get(radius, 0) >= len(free_cells(radius)):
+                        continue
+                    counts[radius] = counts.get(radius, 0) + 1
+                    remaining -= 1
+                    seated += 1
+                if not seated:
+                    break
+            plan = tuple(
+                (radius, counts[radius]) for radius in radii if radius in counts
             )
+            return plan, remaining
 
         # A Worker or a recently observed hostile can temporarily occupy a
-        # ring cell.  Expand the ring until every guard still has a unique
-        # legal slot, while keeping the count/vision radius as the primary
-        # choice.
+        # ring cell.  Expand only while the layered rings cannot seat the
+        # whole roster, keeping the count/vision radius as the primary choice.
         max_radius = base_radius
         search_limit = base_radius + max(8, len(guards) * 2)
-        while max_radius < search_limit:
-            available = [
-                position
-                for position in ring_for(max_radius)
-                if position not in unavailable
-            ]
-            if len(available) >= len(guards):
-                break
+        while max_radius < search_limit and ring_plan(max_radius)[1]:
             max_radius += 1
+
+        plan, _ = ring_plan(max_radius)
+        if len(plan) > 1:
+            # More guards than the outer ring's spaced slots: the surplus goes
+            # inward.  Depth is what a single circle cannot buy -- an intruder
+            # that crosses it can only be chased from behind, and an
+            # equal-speed runner is uncatchable that way.
+            outer_radius = plan[0][0]
+            assignments = _assign_layered_ring_slots(
+                plan,
+                {radius: free_cells(radius) for radius, _ in plan},
+                guards,
+                visions,
+                ring_for(outer_radius),
+                core_position,
+            )
+            assignments = _repair_layered_outer_ring(
+                assignments,
+                ring_for(outer_radius),
+                free_cells(outer_radius),
+                visions,
+                obstacles,
+                core_position,
+                outer_radius,
+            )
+            self._defensive_layout = _DefensiveLayout(
+                core_id=core.id,
+                core_position=core_position,
+                guard_ids=ordered_guard_ids,
+                radius=plan[0][0],
+                assignments=dict(assignments),
+            )
+            return dict(assignments)
 
         best: dict[UUID, Position] = {}
         best_radius = max_radius
@@ -3386,16 +3526,25 @@ class AggressiveStrategy:
             and current.position not in self.memory.obstacles
             and current.position not in claimed_positions
             and manhattan(core.position, current.position)
-            <= self.config.offensive_patrol_radius * 2
+            <= self.config.offensive_patrol_radius
             and turn.tick - current.assigned_tick
             <= self.config.offensive_patrol_goal_ttl
         ):
             return current.position, "search outward for enemy units and Cores"
 
-        offsets = _resource_patrol_offsets(
-            self.config.offensive_patrol_radius,
-            COMBAT_PATROL_SPACING,
-        )
+        # ``_resource_patrol_offsets`` sweeps a bounding box, so its corners
+        # sit at twice the nominal radius in Manhattan terms.  Keeping only
+        # the offsets inside the leash makes the route mean what the config
+        # name says: the roaming squad searches out to
+        # ``offensive_patrol_radius`` and can still be recalled from there.
+        offsets = tuple(
+            offset
+            for offset in _resource_patrol_offsets(
+                self.config.offensive_patrol_radius,
+                COMBAT_PATROL_SPACING,
+            )
+            if abs(offset[0]) + abs(offset[1]) <= self.config.offensive_patrol_radius
+        ) or _defensive_ring_offsets(max(1, self.config.offensive_patrol_radius))
         combat_units = sorted(
             (*turn.rangers, *turn.vanguards),
             key=lambda item: item.id.bytes,
@@ -3930,11 +4079,12 @@ class AggressiveStrategy:
         between Ticks, and it never overlaps the roaming/raid third.
         """
 
+        offensive_ids = self._offensive_ids(turn)
         guards = sorted(
             (
                 unit
                 for unit in (*turn.rangers, *turn.vanguards)
-                if unit.id.int % 3 != 0 and unit.id not in raid_ids
+                if unit.id not in offensive_ids and unit.id not in raid_ids
             ),
             key=lambda unit: unit.id.bytes,
         )
@@ -4519,7 +4669,14 @@ class AggressiveStrategy:
             candidates = (UnitType.WORKER,)
         elif not turn.vanguards:
             candidates = (UnitType.VANGUARD, UnitType.RANGER)
-        elif len(turn.rangers) < len(turn.vanguards) * 2:
+        elif len(turn.rangers) < len(turn.vanguards):
+            # Even Vanguard/Ranger expansion, and Workers deliberately stay
+            # out of the ratio once ``target_workers`` is met.  Every unit
+            # built raises the price of all later ones, so a Worker added at
+            # this population tier is paid for twice: once in its own cost and
+            # again in the inflation it puts on the combat units after it.
+            # Income scales as the square root of the Worker count anyway,
+            # because reaching more concurrent sites needs a wider radius.
             candidates = (UnitType.RANGER, UnitType.VANGUARD)
         else:
             candidates = (UnitType.VANGUARD, UnitType.RANGER)
@@ -5013,6 +5170,163 @@ def _assign_defensive_ring_slots(
         center = cursor + (end - cursor - 1) // 2
         assignments[unit.id] = cells[center]
         cursor = end
+    return assignments
+
+
+def _assign_layered_ring_slots(
+    plan: tuple[tuple[int, int], ...],
+    cells_by_radius: dict[int, list[Position]],
+    guards: tuple[Ranger | Vanguard, ...],
+    visions: dict[UUID, int],
+    outer_cells: tuple[Position, ...],
+    core_position: Position,
+) -> dict[UUID, Position]:
+    """Seat guards on several concentric rings, outermost ring first.
+
+    ``plan`` gives ``(radius, count)`` from the outside in.  The outer ring is
+    filled first and with the longest-sighted guards, because it is the ring
+    that has to see an approach coming; the inner rings are the depth that
+    stops whatever crosses it.  Slots inside one ring are spread evenly in
+    angular order so neighbours stay roughly ``DEFENSIVE_RING_SPACING`` apart,
+    and each ring is rotated off the one outside it so an inner guard does not
+    hide directly behind an outer one.
+    """
+
+    ordered = sorted(guards, key=lambda unit: (-visions[unit.id], unit.id.bytes))
+    assignments: dict[UUID, Position] = {}
+    cursor = 0
+    for depth, (radius, count) in enumerate(plan):
+        cells = cells_by_radius[radius]
+        if not cells or count <= 0:
+            continue
+        picks: list[Position] = []
+        if count >= len(cells):
+            picks = list(cells)
+        else:
+            # Half-step rotation per ring keeps successive rings staggered.
+            offset = (depth * len(cells)) // (2 * count) if count else 0
+            for index in range(count):
+                picks.append(
+                    cells[(offset + (index * len(cells)) // count) % len(cells)]
+                )
+        if radius == plan[0][0]:
+            # Anchoring the outer ring's cardinals keeps the four axes covered
+            # even when sector rounding lands every centre on a diagonal.
+            anchors = [
+                position
+                for dx, dy in ((0, -radius), (0, radius), (radius, 0), (-radius, 0))
+                for position in ((core_position[0] + dx, core_position[1] + dy),)
+                if position in cells
+            ]
+            index = {position: order for order, position in enumerate(cells)}
+            chosen = set(picks)
+            for anchor in anchors:
+                if anchor in chosen:
+                    continue
+                replaceable = [
+                    position for position in picks if position not in set(anchors)
+                ]
+                if not replaceable:
+                    break
+                nearest = min(
+                    replaceable,
+                    key=lambda position: min(
+                        (index[position] - index[anchor]) % len(cells),
+                        (index[anchor] - index[position]) % len(cells),
+                    ),
+                )
+                picks[picks.index(nearest)] = anchor
+                chosen = set(picks)
+        for position in picks:
+            if cursor >= len(ordered):
+                break
+            assignments[ordered[cursor].id] = position
+            cursor += 1
+    for unit in ordered[cursor:]:
+        # No legal cell left anywhere: hold whatever ring cell is still free
+        # rather than crowd the Core.
+        spare = next(
+            (
+                position
+                for position in outer_cells
+                if position not in set(assignments.values())
+            ),
+            None,
+        )
+        if spare is None:
+            break
+        assignments[unit.id] = spare
+    return assignments
+
+
+def _repair_layered_outer_ring(
+    assignments: dict[UUID, Position],
+    outer_cells: tuple[Position, ...],
+    outer_free: list[Position],
+    visions: dict[UUID, int],
+    obstacles: set[Position],
+    core_position: Position,
+    radius: int,
+) -> dict[UUID, Position]:
+    """Slide outer-ring guards until the outer ring has no blind cell.
+
+    Even spacing can leave one ring cell unseen when obstacles thin the ring
+    unevenly.  Only guards standing on the outer ring are moved, and only to
+    other free outer-ring cells, so the inner rings keep their depth.  The
+    four cardinals are pinned: they are the cells an approach along an axis
+    crosses first.
+    """
+
+    outer_ids = [
+        unit_id
+        for unit_id, position in assignments.items()
+        if manhattan(core_position, position) == radius
+    ]
+    if not outer_ids:
+        return assignments
+    anchors = {
+        (core_position[0] + dx, core_position[1] + dy)
+        for dx, dy in ((0, -radius), (0, radius), (radius, 0), (-radius, 0))
+    }
+    cache: dict[tuple[Position, int], set[Position]] = {}
+
+    def seen(position: Position, vision: int) -> set[Position]:
+        key = position, vision
+        if key not in cache:
+            cache[key] = {
+                cell
+                for cell in outer_cells
+                if manhattan(position, cell) <= vision
+                and _clear_manhattan_path(position, cell, obstacles)
+            }
+        return cache[key]
+
+    def covered(layout: dict[UUID, Position]) -> int:
+        cells: set[Position] = set()
+        for unit_id, position in layout.items():
+            cells.update(seen(position, visions[unit_id]))
+        return len(cells)
+
+    current = covered(assignments)
+    while current < len(outer_cells):
+        used = set(assignments.values())
+        best: tuple[int, Position, UUID] | None = None
+        for unit_id in outer_ids:
+            if assignments[unit_id] in anchors:
+                continue
+            for candidate in outer_free:
+                if candidate in used:
+                    continue
+                trial = dict(assignments)
+                trial[unit_id] = candidate
+                score = covered(trial)
+                choice = (score, candidate, unit_id)
+                if best is None or choice > best:
+                    best = choice
+        if best is None or best[0] <= current:
+            break
+        current, candidate, unit_id = best
+        assignments[unit_id] = candidate
     return assignments
 
 

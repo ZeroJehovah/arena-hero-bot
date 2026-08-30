@@ -15,9 +15,11 @@ from arena_hero import (
 from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
+    RANGER_VISION_RADIUS,
     AggressiveStrategy,
     StrategyConfig,
     _clear_manhattan_path,
+    _defensive_ring_offsets,
     _resource_patrol_offsets,
 )
 
@@ -3828,12 +3830,14 @@ def test_high_tier_growth_uses_an_attainable_post_spawn_floor() -> None:
     # At population 59 a Ranger costs 98.  The nominal 70% floor is 206,
     # but a full 295-capacity Core can retain only 197 after that spend.  The
     # attainable floor therefore releases exactly at full capacity, while a
-    # one-resource-short bank remains protected.
+    # one-resource-short bank remains protected.  The gate is priced off a
+    # Ranger either way, so which unit the 1:1 expansion picks -- a Vanguard
+    # here, with 28 Rangers already behind 19 Vanguards -- does not move it.
     assert full.state.population == 59
     assert full.resource_capacity == 295
     assert full.plan.core_action is not None
     assert full.plan.core_action.type == "SPAWN"
-    assert full.plan.core_action.unit_type is UnitType.RANGER
+    assert full.plan.core_action.unit_type is UnitType.VANGUARD
 
 
 def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None:
@@ -4147,6 +4151,119 @@ def test_defensive_perimeter_stops_growing_with_the_army() -> None:
     assert all(
         manhattan((0, 0), slot) <= StrategyConfig().defensive_perimeter_max_radius
         for slot in layout.assignments.values()
+    )
+
+
+def test_surplus_guards_fill_inward_rings_instead_of_one_packed_circle() -> None:
+    """Guards past the outer ring's spaced slots become depth, not overlap.
+
+    One slot per cell put 34 of 49 live combat units on the same Manhattan-12
+    circle with nothing behind it, so anything that crossed the circle met an
+    empty interior and could only be chased from behind.
+    """
+
+    config = StrategyConfig(target_workers=0, max_population=None)
+    guards = [unit(10 + index, "RANGER", position=(0, 40)) for index in range(41)]
+    turn = make_turn(objects=[core(position=(0, 0)), *guards], resources=0)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(turn)
+
+    layout = strategy._defensive_layout
+    assert layout is not None
+    slots = layout.assignments
+    assert len(slots) == len(guards)
+    assert len(set(slots.values())) == len(guards)
+    radii = {manhattan((0, 0), slot) for slot in slots.values()}
+    assert radii == {12, 9, 6, 3}
+    assert max(radii) <= config.defensive_perimeter_max_radius
+    # The Core cell is the only DEPOSIT/SPAWN cell and its neighbours are the
+    # queue into it, so no guard may stand there.
+    assert all(manhattan((0, 0), slot) > 1 for slot in slots.values())
+
+
+def test_defensive_outer_ring_keeps_full_vision_coverage_when_layered() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    guards = [unit(10 + index, "RANGER", position=(0, 40)) for index in range(20)]
+    turn = make_turn(objects=[core(position=(0, 0)), *guards], resources=0)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(turn)
+
+    layout = strategy._defensive_layout
+    assert layout is not None
+    radius = layout.radius
+    outer = [
+        slot
+        for slot in layout.assignments.values()
+        if manhattan((0, 0), slot) == radius
+    ]
+    ring = [(dx, dy) for dx, dy in _defensive_ring_offsets(radius) if abs(dx) + abs(dy)]
+    assert all(
+        any(manhattan(cell, slot) <= RANGER_VISION_RADIUS for slot in outer)
+        for cell in ring
+    )
+
+
+def test_roaming_squad_is_capped_instead_of_growing_with_the_roster() -> None:
+    """A UUID third sent 15 of 49 units out to a median 60 cells and rising.
+
+    The patrol route is a bounding-box sweep, so an open-ended share put a
+    growing part of the army past any radius it could be recalled across.
+    """
+
+    config = StrategyConfig(target_workers=0, max_population=None)
+    sizes = {}
+    for count in (12, 34, 60):
+        units = [
+            unit(10 + index, "RANGER" if index % 3 else "VANGUARD", position=(0, 3))
+            for index in range(count)
+        ]
+        turn = make_turn(resources=10_000, objects=[core(position=(0, 0)), *units])
+        strategy = AggressiveStrategy(WorldMemory(), config)
+        sizes[count] = len(strategy._offensive_ids(turn))
+
+    assert sizes[60] == config.offensive_squad_size
+    assert sizes[34] == config.offensive_squad_size
+    assert sizes[12] < config.offensive_squad_size
+    # Membership must not flicker between Ticks or roles would reshuffle.
+    units = [
+        unit(10 + index, "RANGER" if index % 3 else "VANGUARD", position=(0, 3))
+        for index in range(49)
+    ]
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    memberships = {
+        strategy._offensive_ids(
+            make_turn(tick=tick, resources=10_000, objects=[core(), *units])
+        )
+        for tick in (100, 101, 250)
+    }
+    assert len(memberships) == 1
+
+
+def test_combat_patrol_route_stays_inside_the_nominal_patrol_radius() -> None:
+    """The sweep is a bounding box, so its corners sat at twice the radius.
+
+    Half of the 120 route points exceeded Manhattan 60, which is how live
+    units ended up 87 cells from the Core with a 60-cell leash.
+    """
+
+    config = StrategyConfig(target_workers=0, max_population=None)
+    units = [
+        unit(10 + index, "RANGER" if index % 3 else "VANGUARD", position=(0, 3))
+        for index in range(20)
+    ]
+    turn = make_turn(resources=10_000, objects=[core(position=(0, 0)), *units])
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(turn)
+
+    patrol_targets = [
+        item.target
+        for item in strategy.decide(turn).decisions
+        if item.reason == "search outward for enemy units and Cores"
+    ]
+    assert patrol_targets
+    assert all(
+        manhattan((0, 0), target) <= config.offensive_patrol_radius
+        for target in patrol_targets
     )
 
 
