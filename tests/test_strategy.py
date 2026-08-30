@@ -3764,21 +3764,30 @@ def test_growth_slowdown_banks_before_high_cost_live_growth() -> None:
     assert turn.plan.core_action is None
 
 
-def test_high_tier_growth_keeps_a_post_spawn_stockpile_floor() -> None:
-    roster = [
-        unit(number, "RANGER", position=(number % 9, number // 9))
-        for number in range(2, 59)
-    ]
-    turn = make_turn(resources=285, objects=[core(), *roster])
-
-    decide(
-        turn,
-        config=StrategyConfig(target_workers=0, max_population=None),
+def test_high_tier_growth_uses_an_attainable_post_spawn_floor() -> None:
+    roster = (
+        [unit(number, "VANGUARD", position=(number, 5)) for number in range(2, 21)]
+        + [unit(number, "RANGER", position=(number, 6)) for number in range(21, 49)]
+        + [unit(number, "WORKER", position=(number, 7)) for number in range(49, 61)]
     )
+    config = StrategyConfig(target_workers=12, max_population=None)
 
-    # A population-57 Ranger costs 98.  Spending from a full 285-capacity
-    # Core would leave 187, below the 70% routine stockpile floor of 199.
-    assert turn.plan.core_action is None
+    one_short = make_turn(resources=294, objects=[core(), *roster])
+    decide(one_short, config=config)
+    assert one_short.plan.core_action is None
+
+    full = make_turn(resources=295, objects=[core(), *roster])
+    decide(full, config=config)
+
+    # At population 59 a Ranger costs 98.  The nominal 70% floor is 206,
+    # but a full 295-capacity Core can retain only 197 after that spend.  The
+    # attainable floor therefore releases exactly at full capacity, while a
+    # one-resource-short bank remains protected.
+    assert full.state.population == 59
+    assert full.resource_capacity == 295
+    assert full.plan.core_action is not None
+    assert full.plan.core_action.type == "SPAWN"
+    assert full.plan.core_action.unit_type is UnitType.RANGER
 
 
 def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None:
@@ -3789,7 +3798,7 @@ def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None
     )
     turn = make_turn(
         tick=100,
-        resources=290,
+        resources=289,
         objects=[
             core(),
             *roster,
@@ -3815,7 +3824,8 @@ def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None
     )
 
     # The fleet is coordinating against a remote attack, but the intact Core
-    # is not in a local emergency.  Routine growth must keep the 70% floor.
+    # is not in a local emergency.  Routine growth must still wait for the
+    # full-capacity attainable floor rather than bypassing the gate.
     assert report.threat_reason == "FLEET_ATTACK"
     assert report.projected_core_damage == 0
     assert turn.plan.core_action is None

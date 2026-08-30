@@ -4433,8 +4433,17 @@ class AggressiveStrategy:
         ) or not self._growth_slowdown_active(context.turn):
             return False
         next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
-        minimum_post_growth_resources = (
+        stockpile_floor = (
             context.turn.resource_capacity * CORE_STOCKPILE_CAPACITY_PERCENT // 100
+        )
+        # A high-cost Ranger can make the nominal percentage floor physically
+        # unreachable: at population 59, a 295-capacity Core can spend 98 and
+        # retain at most 197, while 70% asks for 206.  Keep the strongest
+        # attainable post-spawn balance in that case instead of turning the
+        # banking gate into a permanent population-growth wall.
+        minimum_post_growth_resources = min(
+            stockpile_floor,
+            max(0, context.turn.resource_capacity - next_ranger_cost),
         )
         # Payback alone can release a full-bank Ranger even when the spend
         # drops the Core below the ordinary 70% stockpile floor.  At the live
