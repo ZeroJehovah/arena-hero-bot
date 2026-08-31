@@ -3735,7 +3735,59 @@ class AggressiveStrategy:
                 workers.pop(worker_id)
                 pool.remove(resource)
         self._uncross_claims(turn, assignments)
+        self._prioritize_underfoot_resource_claims(
+            turn,
+            visible_resources,
+            assignments,
+        )
         return assignments
+
+    def _prioritize_underfoot_resource_claims(
+        self,
+        turn: Turn,
+        visible_resources: set[Position],
+        assignments: dict[UUID, Position],
+    ) -> None:
+        """Swap a live underfoot resource with its current claimant.
+
+        A Worker can pass over a visible resource while its retained claim
+        points elsewhere.  When another Worker already owns the underfoot
+        cell, exchanging the two claims harvests the confirmed opportunity
+        without abandoning either cell.  If nobody owns that cell, keep the
+        original claim: the hysteresis is specifically meant to prevent a
+        Worker from dropping an approach that no other Worker will finish.
+        """
+
+        workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
+        for resource in sorted(visible_resources):
+            underfoot = sorted(
+                (worker for worker in workers.values() if worker.position == resource),
+                key=lambda worker: worker.id.bytes,
+            )
+            if not underfoot:
+                continue
+            harvester = underfoot[0]
+            current_claim = assignments.get(harvester.id)
+            if current_claim == resource:
+                continue
+            owner = next(
+                (
+                    worker_id
+                    for worker_id, target in assignments.items()
+                    if worker_id != harvester.id and target == resource
+                ),
+                None,
+            )
+            if owner is None:
+                continue
+            if current_claim is None:
+                assignments[harvester.id] = resource
+                assignments.pop(owner)
+            else:
+                assignments[harvester.id], assignments[owner] = (
+                    resource,
+                    current_claim,
+                )
 
     def _release_unreachable_claim(
         self,

@@ -1065,6 +1065,37 @@ def test_only_lowest_uuid_worker_harvests_contested_resource() -> None:
     )
 
 
+def test_worker_harvests_underfoot_resource_before_honouring_old_claim() -> None:
+    memory = WorldMemory()
+    memory.set_goal(
+        object_id(2),
+        UnitGoal(
+            position=(10, 0),
+            assigned_tick=100,
+            purpose="resource-claim-v1",
+        ),
+    )
+    turn = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "WORKER", position=(0, 1)),
+        ],
+        resource_cells=[(1, 0), (10, 0)],
+    )
+
+    decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(target_workers=12, max_population=None),
+    )
+
+    assert turn.plan.unit_actions[turn.workers[0].id].type == "HARVEST"
+    assert turn.plan.unit_actions[turn.workers[1].id].type == "MOVE"
+    assert memory.goal_for(object_id(2)) is None
+
+
 def test_nearest_worker_is_assigned_visible_resource() -> None:
     turn = make_turn(
         objects=[
