@@ -40,6 +40,7 @@ from .geometry import (
     next_step,
 )
 from .memory import (
+    RESOURCE_MEMORY_LIMIT,
     RESOURCE_RECHECK_FLOOR,
     EnemySighting,
     UnitGoal,
@@ -210,6 +211,11 @@ class AggressiveStrategy:
         # the raid state below: a restart forgets it and the next Tick simply
         # re-matches every Worker once.
         self._claim_stalls: dict[UUID, int] = {}
+        # Set for the current Tick only by ``_assign_resources`` when a
+        # Worker is deliberately left out of known-site pairing.  Keeping the
+        # identity here lets the selected Worker be non-minimal without
+        # turning an ordinary remote-resource fallback into a scout.
+        self._resource_scout_id: UUID | None = None
         # Older memory files have no production marker.  On the first
         # high-tier live Tick, conservatively start the marker at the observed
         # bank so a deployment cannot immediately repeat the last spend; the
@@ -3657,6 +3663,7 @@ class AggressiveStrategy:
         into a known threat or a walled-off route.
         """
 
+        self._resource_scout_id = None
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
         self._unreachable_claims = {
             cell: seen_tick
@@ -3696,27 +3703,39 @@ class AggressiveStrategy:
             # With no known site anywhere, keep one deterministic Worker as a
             # bounded resource scout.  The other Workers fall through to the
             # local patrol ring instead of walking in lockstep.
-            scout = min(turn.workers, key=lambda worker: worker.id.bytes)
-            workers = {scout.id: scout} if scout.id in workers else {}
+            scout = self._resource_scout(workers)
+            if scout is not None:
+                self._resource_scout_id = scout.id
+                workers = {scout.id: scout}
+            else:
+                workers = {}
         stale_candidates = resources | rechecks
         if (
             self._unbounded_growth()
             and len(workers) > 1
             and not visible_resources
             and stale_candidates
-            and all(
-                turn.tick - self.memory.resource_cells.get(resource, turn.tick)
-                >= RESOURCE_RECHECK_FLOOR
-                for resource in stale_candidates
+            and (
+                all(
+                    turn.tick - self.memory.resource_cells.get(resource, turn.tick)
+                    >= RESOURCE_RECHECK_FLOOR
+                    for resource in stale_candidates
+                )
+                or len(self.memory.resource_cells) >= RESOURCE_MEMORY_LIMIT
             )
         ):
             # A durable resource map eventually contains enough old sites to
             # give every Worker a claim forever, which suppresses the scout
             # branch even when the live view has gone quiet.  Keep every held
             # claim above intact and leave one otherwise-unassigned Worker to
-            # refresh the map; visible resources still pre-empt this fallback.
-            scout = min(workers.values(), key=lambda worker: worker.id.bytes)
-            workers.pop(scout.id)
+            # refresh the map.  A full map is also treated as stale enough for
+            # this fallback: its 2,048 retained cells otherwise keep a recent
+            # timestamp somewhere forever and suppress discovery indefinitely.
+            # Visible resources still pre-empt this fallback.
+            scout = self._resource_scout(workers)
+            if scout is not None:
+                self._resource_scout_id = scout.id
+                workers.pop(scout.id)
         assignments: dict[UUID, Position] = {}
         # A currently visible resource is confirmed live; prefer it over a
         # remembered site even when the latter happens to be a few cells
@@ -3925,13 +3944,28 @@ class AggressiveStrategy:
             # Drops both released claims and Workers that no longer exist.
             del stalls[worker_id]
 
+    def _resource_scout(
+        self,
+        workers: dict[UUID, Worker],
+    ) -> Worker | None:
+        """Choose the stable unclaimed Worker reserved for map refreshes."""
+
+        candidates = [
+            worker
+            for worker in workers.values()
+            if (
+                (goal := self.memory.goal_for(str(worker.id))) is None
+                or goal.purpose != RESOURCE_CLAIM_PURPOSE
+            )
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda worker: worker.id.bytes)
+
     def _is_resource_scout(self, worker: Worker, turn: Turn) -> bool:
         """Return whether this Worker is the sole long-range economy scout."""
 
-        if not self._unbounded_growth() or not turn.workers:
-            return False
-        scout = min(turn.workers, key=lambda item: item.id.bytes)
-        return worker.id == scout.id
+        return self._unbounded_growth() and worker.id == self._resource_scout_id
 
     def _has_local_resource_cells(self, turn: Turn) -> bool:
         """Return whether a visible, non-hostile resource is inside the loop."""

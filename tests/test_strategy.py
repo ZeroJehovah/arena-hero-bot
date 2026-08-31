@@ -1268,6 +1268,61 @@ def test_stale_resource_pool_leaves_one_worker_to_refresh_the_map() -> None:
     assert claim.target == (20, 0)
 
 
+def test_saturated_recent_resource_pool_still_leaves_one_scout() -> None:
+    from arena_hero_bot.memory import RESOURCE_MEMORY_LIMIT
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (20, 0): 199,
+        **{(100 + index, 0): 199 for index in range(RESOURCE_MEMORY_LIMIT - 1)},
+    }
+
+    turn = make_turn(
+        tick=200,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
+    )
+
+    report = decide(turn, memory=memory, config=config)
+
+    scout = next(item for item in report.decisions if item.actor_id == object_id(2))
+    claim = next(item for item in report.decisions if item.actor_id == object_id(3))
+    assert scout.reason == "scout beyond the local patrol ring for resources"
+    assert claim.reason == "claim nearest unassigned known resource"
+    assert claim.target == (20, 0)
+
+
+def test_resource_scout_does_not_steal_an_existing_resource_claim() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells[(20, 0)] = 0
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((20, 0), 190, "resource-claim-v1"),
+    )
+
+    turn = make_turn(
+        tick=200,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
+    )
+
+    report = decide(turn, memory=memory, config=config)
+
+    scout = next(item for item in report.decisions if item.actor_id == object_id(3))
+    claim = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert scout.reason == "scout beyond the local patrol ring for resources"
+    assert claim.reason == "claim nearest unassigned known resource"
+    assert claim.target == (20, 0)
+
+
 def test_whole_crew_returns_to_a_remembered_cell_inside_the_harvest_radius() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
