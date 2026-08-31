@@ -39,7 +39,12 @@ from .geometry import (
     manhattan,
     next_step,
 )
-from .memory import EnemySighting, UnitGoal, WorldMemory
+from .memory import (
+    RESOURCE_RECHECK_FLOOR,
+    EnemySighting,
+    UnitGoal,
+    WorldMemory,
+)
 from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
@@ -3693,6 +3698,25 @@ class AggressiveStrategy:
             # local patrol ring instead of walking in lockstep.
             scout = min(turn.workers, key=lambda worker: worker.id.bytes)
             workers = {scout.id: scout} if scout.id in workers else {}
+        stale_candidates = resources | rechecks
+        if (
+            self._unbounded_growth()
+            and len(workers) > 1
+            and not visible_resources
+            and stale_candidates
+            and all(
+                turn.tick - self.memory.resource_cells.get(resource, turn.tick)
+                >= RESOURCE_RECHECK_FLOOR
+                for resource in stale_candidates
+            )
+        ):
+            # A durable resource map eventually contains enough old sites to
+            # give every Worker a claim forever, which suppresses the scout
+            # branch even when the live view has gone quiet.  Keep every held
+            # claim above intact and leave one otherwise-unassigned Worker to
+            # refresh the map; visible resources still pre-empt this fallback.
+            scout = min(workers.values(), key=lambda worker: worker.id.bytes)
+            workers.pop(scout.id)
         assignments: dict[UUID, Position] = {}
         # A currently visible resource is confirmed live; prefer it over a
         # remembered site even when the latter happens to be a few cells

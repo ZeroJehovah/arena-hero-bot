@@ -1243,6 +1243,31 @@ def test_live_scout_returns_to_a_resource_cell_it_can_no_longer_see() -> None:
     assert claims[0].action == "MOVE"
 
 
+def test_stale_resource_pool_leaves_one_worker_to_refresh_the_map() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells[(20, 0)] = 0
+
+    turn = make_turn(
+        tick=200,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
+    )
+
+    report = decide(turn, memory=memory, config=config)
+
+    scout = next(item for item in report.decisions if item.actor_id == object_id(2))
+    claim = next(item for item in report.decisions if item.actor_id == object_id(3))
+    assert scout.action == "MOVE"
+    assert scout.reason == "scout beyond the local patrol ring for resources"
+    assert claim.action == "MOVE"
+    assert claim.reason == "claim nearest unassigned known resource"
+    assert claim.target == (20, 0)
+
+
 def test_whole_crew_returns_to_a_remembered_cell_inside_the_harvest_radius() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
