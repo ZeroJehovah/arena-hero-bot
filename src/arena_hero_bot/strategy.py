@@ -3713,13 +3713,15 @@ class AggressiveStrategy:
         if (
             self._unbounded_growth()
             and len(workers) > 1
-            and not visible_resources
             and stale_candidates
             and (
-                all(
-                    turn.tick - self.memory.resource_cells.get(resource, turn.tick)
-                    >= RESOURCE_RECHECK_FLOOR
-                    for resource in stale_candidates
+                (
+                    not visible_resources
+                    and all(
+                        turn.tick - self.memory.resource_cells.get(resource, turn.tick)
+                        >= RESOURCE_RECHECK_FLOOR
+                        for resource in stale_candidates
+                    )
                 )
                 or len(self.memory.resource_cells) >= RESOURCE_MEMORY_LIMIT
             )
@@ -3731,8 +3733,13 @@ class AggressiveStrategy:
             # refresh the map.  A full map is also treated as stale enough for
             # this fallback: its 2,048 retained cells otherwise keep a recent
             # timestamp somewhere forever and suppress discovery indefinitely.
-            # Visible resources still pre-empt this fallback.
-            scout = self._resource_scout(workers)
+            # Keep one refresh Worker even when another Worker currently sees
+            # a resource; the fresh site remains first in the pairing pool,
+            # and a Worker standing on it is never selected as the scout.
+            scout = self._resource_scout(
+                workers,
+                avoid_positions=visible_resources,
+            )
             if scout is not None:
                 self._resource_scout_id = scout.id
                 workers.pop(scout.id)
@@ -3947,6 +3954,8 @@ class AggressiveStrategy:
     def _resource_scout(
         self,
         workers: dict[UUID, Worker],
+        *,
+        avoid_positions: set[Position] | frozenset[Position] = frozenset(),
     ) -> Worker | None:
         """Choose the stable unclaimed Worker reserved for map refreshes."""
 
@@ -3957,6 +3966,7 @@ class AggressiveStrategy:
                 (goal := self.memory.goal_for(str(worker.id))) is None
                 or goal.purpose != RESOURCE_CLAIM_PURPOSE
             )
+            and worker.position not in avoid_positions
         ]
         if not candidates:
             return None
