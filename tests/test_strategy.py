@@ -1337,7 +1337,7 @@ def test_saturated_resource_pool_rejoins_known_sites_between_refresh_ticks() -> 
     }
 
     turn = make_turn(
-        tick=201,
+        tick=204,
         objects=[
             core(),
             unit(2, "WORKER", position=(0, 0)),
