@@ -3255,6 +3255,43 @@ class AggressiveStrategy:
             "hold a defensive perimeter around the resource Core",
         )
 
+    def _worker_corridor_cells(
+        self,
+        core_position: Position,
+        obstacles: set[Position],
+    ) -> set[Position]:
+        """Return pocket exits that a stationary guard must never occupy.
+
+        A resource cell can sit in a dead-end pocket whose only open exits are
+        ring cells.  A single guard parked on a 1-exit pocket, or two guards
+        closing a 2-exit pocket, permanently seal in whatever Worker harvests
+        it.  Guard rings never need to sit on the last lane a Worker drives
+        home through, so every open exit of every tight pocket inside the
+        defensive band is taken off the seating table.
+        """
+
+        max_radius = self.config.defensive_perimeter_max_radius
+        corridors: set[Position] = set()
+        for x in range(
+            core_position[0] - max_radius, core_position[0] + max_radius + 1
+        ):
+            for y in range(
+                core_position[1] - max_radius, core_position[1] + max_radius + 1
+            ):
+                pocket = (x, y)
+                if pocket == core_position or pocket in obstacles:
+                    continue
+                if manhattan(core_position, pocket) > max_radius:
+                    continue
+                exits = [
+                    neighbour
+                    for neighbour in adjacent_positions(pocket)
+                    if neighbour != core_position and neighbour not in obstacles
+                ]
+                if 1 <= len(exits) <= 2:
+                    corridors.update(exits)
+        return corridors
+
     def _defensive_perimeter_assignments(
         self,
         context: _TurnContext,
@@ -3292,6 +3329,16 @@ class AggressiveStrategy:
         obstacles = set(self.memory.obstacles)
         obstacles.update(context.turn.obstacle_cells)
         ordered_guard_ids = tuple(unit.id for unit in guards)
+        # A resource pocket hugging the Core can be walled in by obstacles
+        # until only one or two free neighbours remain, and those can coincide
+        # with the innermost guard ring.  Guards are stationary, so every exit
+        # they sit on is sealed forever: the Worker that harvests the pocket
+        # carries cargo it can never deliver (live Tick 206201-206899: a
+        # Worker sat on the Core's NE corner cell for the whole window because
+        # two ring-3 Vanguards held its only exits).  Worker traffic is
+        # transient while a guard seat is not, so the ring yields inside the
+        # defensive band: never take the last open exit of a tight pocket.
+        corridors = self._worker_corridor_cells(core_position, obstacles)
         cached = self._defensive_layout
         if (
             cached is not None
@@ -3299,6 +3346,7 @@ class AggressiveStrategy:
             and cached.core_position == core_position
             and cached.guard_ids == ordered_guard_ids
             and not any(slot in obstacles for slot in cached.assignments.values())
+            and not any(slot in corridors for slot in cached.assignments.values())
         ):
             return dict(cached.assignments)
 
@@ -3310,11 +3358,13 @@ class AggressiveStrategy:
         unavailable.add(core.position)
         # The Core cell is the only DEPOSIT and SPAWN cell, so a guard parked
         # on one of its four neighbours narrows the queue for loaded Workers.
-        # Inner rings start outside that clearance.
+        # Inner rings start outside that clearance.  Pocket exits get the same
+        # protection below: a guard on the last one strands a loaded Worker.
         unavailable.update(
             (core_position[0] + dx, core_position[1] + dy)
             for dx, dy in _defensive_ring_offsets(DEFENSIVE_CORE_CLEARANCE)
         )
+        unavailable.update(corridors)
         visions = {unit.id: _combat_vision_radius(unit) for unit in guards}
         # The count-and-vision radius grows linearly with the army, so a
         # 29-guard fleet parked its whole perimeter 30 cells out and left the
@@ -3429,7 +3479,7 @@ class AggressiveStrategy:
                 {radius: free_cells(radius) for radius, _ in plan},
                 guards,
                 visions,
-                ring_for(outer_radius),
+                tuple(free_cells(outer_radius)),
                 core_position,
             )
             assignments = _repair_layered_outer_ring(

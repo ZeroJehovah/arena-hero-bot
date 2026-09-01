@@ -3011,6 +3011,66 @@ def test_defensive_ring_ignores_obstacle_cells_and_keeps_unique_slots() -> None:
     assert all(manhattan((0, 0), target) == 4 for target in targets)
 
 
+def test_defensive_ring_keeps_the_last_exit_of_a_core_pocket_free() -> None:
+    """A stationary guard must never close the only open exits of a pocket.
+
+    Live Ticks 206201-206899: the Core sat at (-411,660) and its NE corner
+    cell (-410,659) was a resource pocket whose only two free neighbours were
+    ring-3 cells, the other two being obstacles.  The defensive ring parked a
+    Vanguard on each of them permanently, so the Worker that harvested the
+    pocket carried cargo it could never deliver for the whole window.  The
+    ring has to leave those lanes to Worker traffic instead.
+    """
+
+    config = StrategyConfig(target_workers=0, max_population=None)
+    obstacles = [(1, 0), (0, -1)]
+    guards = [unit(10 + index, "VANGUARD", position=(0, 40)) for index in range(41)]
+    turn = make_turn(
+        objects=[core(position=(0, 0)), *guards],
+        resources=0,
+        obstacles=obstacles,
+    )
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy.decide(turn)
+
+    corridors = strategy._worker_corridor_cells((0, 0), set(obstacles))
+    assert (2, -1) in corridors
+    assert (1, -2) in corridors
+
+    layout = strategy._defensive_layout
+    assert layout is not None
+    assert (2, -1) not in set(layout.assignments.values())
+    assert (1, -2) not in set(layout.assignments.values())
+
+
+def test_loaded_worker_drives_out_of_an_open_core_pocket() -> None:
+    """A Worker harvesting the Core-side pocket can still drive home.
+
+    The pocket at (1,-1) is a dead-end with only two exits; both must stay
+    open for cargo traffic rather than being parked on by the guard ring.
+    """
+
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "WORKER", position=(1, -1), cargo=1),
+            *[unit(10 + index, "VANGUARD", position=(0, 40)) for index in range(41)],
+        ],
+        obstacles=[(1, 0), (0, -1)],
+        resource_cells=[(1, -1)],
+    )
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    assert worker_decision.action == "MOVE"
+    assert "Core cell is not currently reachable" not in worker_decision.reason
+
+
 def test_clear_manhattan_path_allows_detour_but_rejects_complete_wall() -> None:
     assert _clear_manhattan_path((0, 0), (2, 1), {(1, 0)})
     assert not _clear_manhattan_path((0, 0), (2, 0), {(1, -1), (1, 0), (1, 1)})
