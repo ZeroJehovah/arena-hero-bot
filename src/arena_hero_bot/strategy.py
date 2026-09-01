@@ -55,6 +55,11 @@ COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
 CLAIM_STALL_BUDGET = 3
 UNREACHABLE_CLAIM_COOLDOWN = 128
+# Resource replenishment resolves every four Ticks.  On a saturated map,
+# reserve one Worker for a refresh on that cadence; between refreshes it can
+# service the known resource pool instead of paying a full Worker of income
+# for continuous long-range scouting.
+RESOURCE_SCOUT_INTERVAL = 4
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -3714,6 +3719,7 @@ class AggressiveStrategy:
             self._unbounded_growth()
             and len(workers) > 1
             and stale_candidates
+            and turn.tick % RESOURCE_SCOUT_INTERVAL == 0
             and (
                 (
                     not visible_resources
@@ -3733,9 +3739,11 @@ class AggressiveStrategy:
             # refresh the map.  A full map is also treated as stale enough for
             # this fallback: its 2,048 retained cells otherwise keep a recent
             # timestamp somewhere forever and suppress discovery indefinitely.
-            # Keep one refresh Worker even when another Worker currently sees
-            # a resource; the fresh site remains first in the pairing pool,
-            # and a Worker standing on it is never selected as the scout.
+            # The four-Tick cadence keeps that refresh alive while the same
+            # Worker rejoins known-site pairing between refreshes.  Keep one
+            # refresh Worker even when another Worker currently sees a
+            # resource; the fresh site remains first in the pairing pool, and
+            # a Worker standing on it is never selected as the scout.
             scout = self._resource_scout(
                 workers,
                 avoid_positions=visible_resources,

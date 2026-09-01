@@ -1326,6 +1326,46 @@ def test_saturated_resource_pool_keeps_scout_while_remote_site_is_visible() -> N
     assert harvester.target == (40, 0)
 
 
+def test_saturated_resource_pool_rejoins_known_sites_between_refresh_ticks() -> None:
+    from arena_hero_bot.memory import RESOURCE_MEMORY_LIMIT
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (20, 0): 199,
+        **{(100 + index, 0): 199 for index in range(RESOURCE_MEMORY_LIMIT - 1)},
+    }
+
+    turn = make_turn(
+        tick=201,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "WORKER", position=(1, 0)),
+        ],
+    )
+
+    report = decide(turn, memory=memory, config=config)
+
+    worker_decisions = [
+        item for item in report.decisions if item.actor_kind == "WORKER"
+    ]
+    assert (
+        len(
+            [
+                item
+                for item in worker_decisions
+                if item.reason == "claim nearest unassigned known resource"
+            ]
+        )
+        == 2
+    )
+    assert not any(
+        item.reason == "scout beyond the local patrol ring for resources"
+        for item in worker_decisions
+    )
+
+
 def test_resource_scout_does_not_steal_an_existing_resource_claim() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
