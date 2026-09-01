@@ -1333,7 +1333,6 @@ class AggressiveStrategy:
             if (
                 self._is_resource_scout(worker, context.turn)
                 and context.threat.level is ThreatLevel.NORMAL
-                and not self._has_local_resource_cells(context.turn)
             ):
                 goal = self._exploration_goal(worker, context.turn.tick)
                 reason = "scout beyond the local patrol ring for resources"
