@@ -16,6 +16,7 @@ from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
     RANGER_VISION_RADIUS,
+    RESOURCE_SCOUT_INTERVAL,
     AggressiveStrategy,
     StrategyConfig,
     _clear_manhattan_path,
@@ -1249,7 +1250,7 @@ def test_stale_resource_pool_leaves_one_worker_to_refresh_the_map() -> None:
     memory.resource_cells[(20, 0)] = 0
 
     turn = make_turn(
-        tick=200,
+        tick=RESOURCE_SCOUT_INTERVAL * 20,
         objects=[
             core(),
             unit(2, "WORKER", position=(0, 0)),
@@ -1279,7 +1280,7 @@ def test_saturated_recent_resource_pool_still_leaves_one_scout() -> None:
     }
 
     turn = make_turn(
-        tick=200,
+        tick=RESOURCE_SCOUT_INTERVAL * 20,
         objects=[
             core(),
             unit(2, "WORKER", position=(0, 0)),
@@ -1307,7 +1308,7 @@ def test_saturated_resource_pool_keeps_scout_while_remote_site_is_visible() -> N
     }
 
     turn = make_turn(
-        tick=200,
+        tick=RESOURCE_SCOUT_INTERVAL * 20,
         objects=[
             core(),
             unit(2, "WORKER", position=(0, 0)),
@@ -1337,7 +1338,7 @@ def test_saturated_resource_pool_scouts_even_with_local_site_visible() -> None:
     }
 
     turn = make_turn(
-        tick=200,
+        tick=RESOURCE_SCOUT_INTERVAL * 20,
         objects=[
             core(),
             unit(2, "WORKER", position=(0, 0)),
@@ -1368,7 +1369,7 @@ def test_saturated_resource_pool_rejoins_known_sites_between_refresh_ticks() -> 
     }
 
     turn = make_turn(
-        tick=204,
+        tick=RESOURCE_SCOUT_INTERVAL * 20 + 1,
         objects=[
             core(),
             unit(2, "WORKER", position=(0, 0)),
@@ -1407,7 +1408,7 @@ def test_resource_scout_does_not_steal_an_existing_resource_claim() -> None:
     )
 
     turn = make_turn(
-        tick=200,
+        tick=RESOURCE_SCOUT_INTERVAL * 20,
         objects=[
             core(),
             unit(2, "WORKER", position=(0, 0)),
