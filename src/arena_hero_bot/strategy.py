@@ -3831,20 +3831,23 @@ class AggressiveStrategy:
             resource: Position,
         ) -> tuple[int, int, UUID, Position]:
             approach = manhattan(worker.position, resource)
+            core_distance = (
+                0 if core_position is None else manhattan(core_position, resource)
+            )
             if (
                 core_position is None
-                or manhattan(core_position, resource)
-                <= self.config.resource_outreach_radius
+                or core_distance <= self.config.resource_patrol_radius * 2
             ):
                 # Keep the established nearest-Worker pairing for the local
-                # harvest ring and its 28-48 cell outer band.
+                # harvest ring, where short approach distance is the useful
+                # signal and the loaded return is already short.
                 return approach, approach, worker.id, resource
-            # A remote fallback target costs both the approach and the loaded
-            # return to Core.  Keep every known site eligible, but avoid
-            # choosing a slightly nearer far site when its return leg is much
-            # longer than another remote candidate.
+            # An outer-band or remote target costs both the approach and the
+            # loaded return to Core.  Keep every known site eligible, but
+            # avoid choosing a slightly nearer target when its return leg is
+            # much longer than another candidate in the same evidence pool.
             return (
-                approach + manhattan(core_position, resource),
+                approach + core_distance,
                 approach,
                 worker.id,
                 resource,
