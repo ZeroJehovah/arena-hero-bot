@@ -59,55 +59,70 @@ def run_bot(
         config.base_url,
     )
 
-    with ArenaHeroClient(
-        api_key=config.api_key,
-        base_url=config.base_url,
-        websocket_url=config.websocket_url,
-    ) as game:
-        for turn in game.turns():
-            turns_seen += 1
-            # A reconnect commonly replays the latest snapshot.  The prior
-            # process has already submitted that Tick, so sending it again
-            # only produces COMMAND_WINDOW_CLOSED and cannot change the game.
-            if turn.tick <= memory.last_tick:
-                LOGGER.info(
-                    "skipping already processed tick=%d last_tick=%d",
-                    turn.tick,
-                    memory.last_tick,
-                )
-                if config.max_turns is not None and turns_seen >= config.max_turns:
-                    break
-                continue
-            started = monotonic()
-            report, planning_error = _plan_turn(strategy, turn)
-            planning_seconds = monotonic() - started
-            submission = _submit_turn(turn, observe_only=config.observe_only)
+    reconnect_after_tick_mismatch = True
+    while reconnect_after_tick_mismatch:
+        reconnect_after_tick_mismatch = False
+        with ArenaHeroClient(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            websocket_url=config.websocket_url,
+        ) as game:
+            for turn in game.turns():
+                turns_seen += 1
+                # A reconnect commonly replays the latest snapshot.  The prior
+                # process has already submitted that Tick, so sending it again
+                # only produces COMMAND_WINDOW_CLOSED and cannot change the game.
+                if turn.tick <= memory.last_tick:
+                    LOGGER.info(
+                        "skipping already processed tick=%d last_tick=%d",
+                        turn.tick,
+                        memory.last_tick,
+                    )
+                    if config.max_turns is not None and turns_seen >= config.max_turns:
+                        break
+                    continue
+                started = monotonic()
+                report, planning_error = _plan_turn(strategy, turn)
+                planning_seconds = monotonic() - started
+                submission = _submit_turn(turn, observe_only=config.observe_only)
 
-            memory.save(memory_path)
-            telemetry.append(
-                _turn_record(
-                    turn=turn,
-                    report=report,
-                    planning_seconds=planning_seconds,
-                    planning_error=planning_error,
-                    submission=submission,
-                    observe_only=config.observe_only,
+                memory.save(memory_path)
+                telemetry.append(
+                    _turn_record(
+                        turn=turn,
+                        report=report,
+                        planning_seconds=planning_seconds,
+                        planning_error=planning_error,
+                        submission=submission,
+                        observe_only=config.observe_only,
+                    )
                 )
-            )
-            LOGGER.info(
-                "tick=%d resources=%d/%d population=%d enemies=%d actions=%d "
-                "planning_ms=%.1f submit=%s",
-                turn.tick,
-                turn.resources,
-                turn.resource_capacity,
-                turn.state.population,
-                len(turn.visible_enemies),
-                len(report.decisions),
-                planning_seconds * 1000,
-                submission["status"],
-            )
-            if config.max_turns is not None and turns_seen >= config.max_turns:
-                break
+                LOGGER.info(
+                    "tick=%d resources=%d/%d population=%d enemies=%d actions=%d "
+                    "planning_ms=%.1f submit=%s",
+                    turn.tick,
+                    turn.resources,
+                    turn.resource_capacity,
+                    turn.state.population,
+                    len(turn.visible_enemies),
+                    len(report.decisions),
+                    planning_seconds * 1000,
+                    submission["status"],
+                )
+                if (
+                    submission.get("status") == "rejected"
+                    and submission.get("error") == "TICK_MISMATCH"
+                ):
+                    LOGGER.warning(
+                        "reconnecting after stale Tick submission tick=%d",
+                        turn.tick,
+                    )
+                    reconnect_after_tick_mismatch = True
+                if config.max_turns is not None and turns_seen >= config.max_turns:
+                    reconnect_after_tick_mismatch = False
+                    break
+                if reconnect_after_tick_mismatch:
+                    break
 
     return turns_seen
 

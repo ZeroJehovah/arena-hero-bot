@@ -204,6 +204,55 @@ def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> Non
     assert WorldMemory.load(tmp_path / "memory.json").last_tick == 101
 
 
+def test_run_bot_reconnects_after_tick_mismatch(tmp_path, monkeypatch) -> None:
+    stale_source = make_turn(tick=100, objects=[core()])
+    stale_turn = Turn(
+        tick=stale_source.tick,
+        state=stale_source.state,
+        submitter=lambda _plan, _key: _raise(
+            APIError(status_code=409, error="TICK_MISMATCH")
+        ),
+    )
+    current_turn = make_turn(tick=101, objects=[core()])
+    clients = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            clients.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def turns(self):
+            if len(clients) == 1:
+                yield stale_turn
+            else:
+                yield current_turn
+
+    monkeypatch.setattr(runtime, "ArenaHeroClient", FakeClient)
+    count = runtime.run_bot(
+        RuntimeConfig(
+            api_key="test-key",
+            data_dir=tmp_path,
+            max_turns=2,
+        )
+    )
+
+    assert count == 2
+    assert len(clients) == 2
+    records = [
+        json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()
+    ]
+    assert [record["tick"] for record in records] == [100, 101]
+    assert [record["submission"]["status"] for record in records] == [
+        "rejected",
+        "accepted",
+    ]
+
+
 def test_cli_requires_key_and_builds_runtime(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("ARENA_HERO_API_KEY", raising=False)
     with pytest.raises(SystemExit, match="ARENA_HERO_API_KEY is required"):
