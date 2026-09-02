@@ -1640,6 +1640,25 @@ def test_known_site_far_beyond_old_outreach_radius_is_claimed() -> None:
     assert decision.target == (60, 0)
 
 
+def test_remote_known_sites_prefer_shorter_loaded_return() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (49, 0): 199,
+        (61, 0): 199,
+    }
+    strategy = AggressiveStrategy(memory, config)
+
+    turn = make_turn(
+        objects=[core(), unit(2, "WORKER", position=(60, 0))],
+    )
+    report = strategy.decide(turn)
+
+    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert decision.action == "MOVE"
+    assert decision.target == (49, 0)
+
+
 def test_live_workers_keep_persisted_remote_resource_goals() -> None:
     memory = WorldMemory()
     memory.set_goal(

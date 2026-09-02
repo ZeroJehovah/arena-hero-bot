@@ -3825,18 +3825,42 @@ class AggressiveStrategy:
             if remote:
                 pools.append(remote)
         self._hold_existing_claims(workers, pools, assignments)
+
+        def assignment_key(
+            worker: Worker,
+            resource: Position,
+        ) -> tuple[int, int, UUID, Position]:
+            approach = manhattan(worker.position, resource)
+            if (
+                core_position is None
+                or manhattan(core_position, resource)
+                <= self.config.resource_outreach_radius
+            ):
+                # Keep the established nearest-Worker pairing for the local
+                # harvest ring and its 28-48 cell outer band.
+                return approach, approach, worker.id, resource
+            # A remote fallback target costs both the approach and the loaded
+            # return to Core.  Keep every known site eligible, but avoid
+            # choosing a slightly nearer far site when its return leg is much
+            # longer than another remote candidate.
+            return (
+                approach + manhattan(core_position, resource),
+                approach,
+                worker.id,
+                resource,
+            )
+
         for pool in pools:
             # Freshest evidence and local range come first; within one pool,
-            # nearest Worker still wins so the fleet does not cross itself.
+            # the nearest/shortest-round-trip Worker pairing still wins so the
+            # fleet does not cross itself or overpay for a remote return.
             while workers and pool:
-                _, worker_id, resource = min(
+                _, _, worker_id, resource = min(
                     (
-                        manhattan(worker.position, resource),
-                        worker.id,
-                        resource,
-                    )
-                    for worker in workers.values()
-                    for resource in pool
+                        assignment_key(worker, resource)
+                        for worker in workers.values()
+                        for resource in pool
+                    ),
                 )
                 assignments[worker_id] = resource
                 workers.pop(worker_id)
