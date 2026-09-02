@@ -4165,17 +4165,32 @@ def test_high_tier_growth_uses_an_attainable_post_spawn_floor() -> None:
     full = make_turn(resources=295, objects=[core(), *roster])
     decide(full, config=config)
 
-    # At population 59 a Ranger costs 98.  The nominal 70% floor is 206,
-    # but a full 295-capacity Core can retain only 197 after that spend.  The
-    # attainable floor therefore releases exactly at full capacity, while a
-    # one-resource-short bank remains protected.  The gate is priced off a
-    # Ranger either way, so which unit the 1:1 expansion picks -- a Vanguard
-    # here, with 28 Rangers already behind 19 Vanguards -- does not move it.
+    # The next 300-capacity Core's 70% floor is 210.  The preferred Vanguard
+    # leaves 213, so a full bank releases the spend while a one-resource-short
+    # bank remains protected.
     assert full.state.population == 59
     assert full.resource_capacity == 295
     assert full.plan.core_action is not None
     assert full.plan.core_action.type == "SPAWN"
     assert full.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_high_cost_growth_waits_for_a_healthy_post_spawn_stockpile() -> None:
+    roster = (
+        [unit(number, "VANGUARD", position=(number, 5)) for number in range(2, 21)]
+        + [unit(number, "RANGER", position=(number, 6)) for number in range(21, 50)]
+        + [unit(number, "WORKER", position=(number, 7)) for number in range(50, 62)]
+    )
+    turn = make_turn(resources=300, objects=[core(), *roster])
+
+    decide(turn, config=StrategyConfig(target_workers=12, max_population=None))
+
+    # At population 60 the preferred Vanguard costs 106.  Spending it from
+    # the full 300-capacity Core would leave 194, below 70% of the next
+    # 305-capacity Core, so routine growth must bank instead.
+    assert turn.state.population == 60
+    assert turn.resource_capacity == 300
+    assert turn.plan.core_action is None
 
 
 def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None:

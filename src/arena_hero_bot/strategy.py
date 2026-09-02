@@ -4921,8 +4921,9 @@ class AggressiveStrategy:
     def _normal_growth_on_cooldown(self, context: _TurnContext) -> bool:
         """Throttle routine high-tier growth while leaving emergency spend free.
 
-        The throttle is a payback gate only: routine growth waits until the
-        bank has re-earned what the previous spawn spent.  There is
+        The throttle is a payback gate with a post-growth stockpile floor:
+        routine growth waits until the bank has re-earned what the previous
+        spawn spent and the next Core can retain a healthy reserve.  There is
         deliberately no wall-clock cooldown beside it.  One used to sit here
         (675 Tick) and it could only ever fire while the bank was already
         pinned at capacity, because banking-tier production is affordable
@@ -4955,25 +4956,21 @@ class AggressiveStrategy:
         ) or not self._growth_slowdown_active(context.turn):
             return False
         next_ranger_cost = unit_cost(UnitType.RANGER, context.turn.state.population)
-        stockpile_floor = (
-            context.turn.resource_capacity * CORE_STOCKPILE_CAPACITY_PERCENT // 100
+        next_unit = self._choose_spawn(context.turn, context.remaining_resources)
+        next_unit_cost = (
+            unit_cost(next_unit, context.turn.state.population)
+            if next_unit is not None
+            else next_ranger_cost
         )
-        # A high-cost Ranger can make the nominal percentage floor physically
-        # unreachable: at population 59, a 295-capacity Core can spend 98 and
-        # retain at most 197, while 70% asks for 206.  Keep the strongest
-        # attainable post-spawn balance in that case instead of turning the
-        # banking gate into a permanent population-growth wall.
-        minimum_post_growth_resources = min(
-            stockpile_floor,
-            max(0, context.turn.resource_capacity - next_ranger_cost),
+        # A high-cost unit can be affordable at a full current Core while
+        # still dropping the newly enlarged Core below a healthy stockpile.
+        # Price the actual preferred candidate so a cheaper Vanguard at the
+        # edge of the tier is not rejected merely because a Ranger costs more.
+        next_capacity = core_resource_capacity(context.turn.state.population + 1)
+        minimum_post_growth_resources = (
+            next_capacity * CORE_STOCKPILE_CAPACITY_PERCENT // 100
         )
-        # Payback alone can release a full-bank Ranger even when the spend
-        # drops the Core below the ordinary 70% stockpile floor.  At the live
-        # high-cost tier that turns every income cycle into another expensive
-        # replacement and keeps the bank near its post-spawn low.  Preserve a
-        # durable stockpile floor for routine growth; the emergency path above
-        # still spends the bank when real enemy pressure requires defenders.
-        if context.turn.resources - next_ranger_cost < minimum_post_growth_resources:
+        if context.remaining_resources - next_unit_cost < minimum_post_growth_resources:
             return True
         if self._needs_growth_marker_migration:
             self.memory.last_normal_growth_tick = context.turn.tick
