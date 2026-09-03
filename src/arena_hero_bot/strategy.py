@@ -585,44 +585,46 @@ class AggressiveStrategy:
 
         if self._pickup_beacon(ranger, context):
             return
-        visible_target = self._preferred_target(context.focus_target, visible_enemies)
-        if visible_target is None:
-            visible_target = self._best_visible_target(
-                ranger.position,
-                context.turn,
-                visible_enemies,
+        expedition_member = self._is_expedition_member(ranger, context.turn)
+        if not expedition_member:
+            visible_target = self._preferred_target(context.focus_target, visible_enemies)
+            if visible_target is None:
+                visible_target = self._best_visible_target(
+                    ranger.position,
+                    context.turn,
+                    visible_enemies,
+                )
+            if visible_target is not None:
+                goal = self._ranger_approach_goal(ranger, visible_target, context)
+                if goal is not None and self._move_within_leash(
+                    ranger,
+                    goal,
+                    context,
+                    offensive=offensive,
+                    reason=f"close firing angle on {self._enemy_label(visible_target)}",
+                ):
+                    return
+
+            remembered_enemies = (
+                self._offensive_enemies(
+                    context.turn,
+                    raiding=ranger.id in context.raid_ids,
+                )
+                if offensive
+                else self._defensive_memory_targets(ranger, context, recent_enemies)
             )
-        if visible_target is not None:
-            goal = self._ranger_approach_goal(ranger, visible_target, context)
-            if goal is not None and self._move_within_leash(
+            remembered = self._best_remembered_target(
+                ranger.position,
+                remembered_enemies,
+            )
+            if remembered is not None and self._move_within_leash(
                 ranger,
-                goal,
+                remembered.position,
                 context,
                 offensive=offensive,
-                reason=f"close firing angle on {self._enemy_label(visible_target)}",
+                reason=f"hunt last seen {remembered.kind.lower()}",
             ):
                 return
-
-        remembered_enemies = (
-            self._offensive_enemies(
-                context.turn,
-                raiding=ranger.id in context.raid_ids,
-            )
-            if offensive
-            else self._defensive_memory_targets(ranger, context, recent_enemies)
-        )
-        remembered = self._best_remembered_target(
-            ranger.position,
-            remembered_enemies,
-        )
-        if remembered is not None and self._move_within_leash(
-            ranger,
-            remembered.position,
-            context,
-            offensive=offensive,
-            reason=f"hunt last seen {remembered.kind.lower()}",
-        ):
-            return
 
         goal, reason = self._idle_combat_goal(
             ranger,
@@ -661,7 +663,11 @@ class AggressiveStrategy:
             intercept_ids=context.intruder_intercept_ids,
             converge_ids=context.perimeter_intercept_ids,
         )
-        if context.combat_assault and vanguard.id not in context.vanguard_attack_ids:
+        if (
+            context.combat_assault
+            and vanguard.id not in context.vanguard_attack_ids
+            and not self._is_expedition_member(vanguard, context.turn)
+        ):
             self._decide_vanguard_screen(vanguard, context, visible_enemies)
             return
         sweep_groups = self._sweep_groups(vanguard, context, visible_enemies)
@@ -719,93 +725,95 @@ class AggressiveStrategy:
 
         if self._pickup_beacon(vanguard, context):
             return
-        visible_target = self._preferred_target(context.focus_target, visible_enemies)
-        if visible_target is None:
-            visible_target = self._best_visible_target(
-                vanguard.position,
-                context.turn,
-                visible_enemies,
-            )
-        if visible_target is not None:
-            if (
-                context.focus_target is not None
-                and visible_target.id == context.focus_target.id
-            ):
-                goal = self._vanguard_block_goal(vanguard, visible_target, context)
-                if goal is not None and self._move_within_leash(
-                    vanguard,
-                    goal,
-                    context,
-                    offensive=offensive,
-                    reason=(
-                        f"close escape routes around "
-                        f"{self._enemy_label(visible_target)}"
-                    ),
-                ):
-                    return
-            # Stepping into a cell next to where the target stands *now*
-            # lands the chaser exactly where the target just was, so an
-            # equal-speed runner keeps a permanent two-cell gap.  Aim at the
-            # cell its recent drift leads to instead and the gap can close.
-            intercept = self._intercept_cell(visible_target, context)
-            for anchor in dict.fromkeys((intercept, visible_target.position)):
-                candidates = [
-                    position
-                    for position in adjacent_positions(anchor)
-                    if position not in self.memory.obstacles
-                    and position not in context.enemy_positions
-                    and (
-                        position == vanguard.position
-                        or position not in context.occupied | context.reserved
-                    )
-                ]
-                if not candidates:
-                    continue
-                goal = min(
-                    candidates,
-                    key=lambda position: (
-                        manhattan(vanguard.position, position),
-                        manhattan(intercept, position),
-                        position,
-                    ),
+        expedition_member = self._is_expedition_member(vanguard, context.turn)
+        if not expedition_member:
+            visible_target = self._preferred_target(context.focus_target, visible_enemies)
+            if visible_target is None:
+                visible_target = self._best_visible_target(
+                    vanguard.position,
+                    context.turn,
+                    visible_enemies,
                 )
-                if self._move_within_leash(
-                    vanguard,
-                    goal,
-                    context,
-                    offensive=offensive,
-                    reason=f"rush {self._enemy_label(visible_target)}",
+            if visible_target is not None:
+                if (
+                    context.focus_target is not None
+                    and visible_target.id == context.focus_target.id
                 ):
-                    return
+                    goal = self._vanguard_block_goal(vanguard, visible_target, context)
+                    if goal is not None and self._move_within_leash(
+                        vanguard,
+                        goal,
+                        context,
+                        offensive=offensive,
+                        reason=(
+                            f"close escape routes around "
+                            f"{self._enemy_label(visible_target)}"
+                        ),
+                    ):
+                        return
+                # Stepping into a cell next to where the target stands *now*
+                # lands the chaser exactly where the target just was, so an
+                # equal-speed runner keeps a permanent two-cell gap.  Aim at the
+                # cell its recent drift leads to instead and the gap can close.
+                intercept = self._intercept_cell(visible_target, context)
+                for anchor in dict.fromkeys((intercept, visible_target.position)):
+                    candidates = [
+                        position
+                        for position in adjacent_positions(anchor)
+                        if position not in self.memory.obstacles
+                        and position not in context.enemy_positions
+                        and (
+                            position == vanguard.position
+                            or position not in context.occupied | context.reserved
+                        )
+                    ]
+                    if not candidates:
+                        continue
+                    goal = min(
+                        candidates,
+                        key=lambda position: (
+                            manhattan(vanguard.position, position),
+                            manhattan(intercept, position),
+                            position,
+                        ),
+                    )
+                    if self._move_within_leash(
+                        vanguard,
+                        goal,
+                        context,
+                        offensive=offensive,
+                        reason=f"rush {self._enemy_label(visible_target)}",
+                    ):
+                        return
 
-        if context.combat_assault and self._recover_if_critical(
-            vanguard,
-            maximum_hp=4,
-            critical_hp=3,
-            context=context,
-        ):
-            return
+            if context.combat_assault and self._recover_if_critical(
+                vanguard,
+                maximum_hp=4,
+                critical_hp=3,
+                context=context,
+            ):
+                return
 
-        remembered_enemies = (
-            self._offensive_enemies(
-                context.turn,
-                raiding=vanguard.id in context.raid_ids,
+            remembered_enemies = (
+                self._offensive_enemies(
+                    context.turn,
+                    raiding=vanguard.id in context.raid_ids,
+                )
+                if offensive
+                else self._defensive_memory_targets(vanguard, context, recent_enemies)
             )
-            if offensive
-            else self._defensive_memory_targets(vanguard, context, recent_enemies)
-        )
-        remembered = self._best_remembered_target(
-            vanguard.position,
-            remembered_enemies,
-        )
-        if remembered is not None and self._move_within_leash(
-            vanguard,
-            remembered.position,
-            context,
-            offensive=offensive,
-            reason=f"hunt last seen {remembered.kind.lower()}",
-        ):
-            return
+            remembered = self._best_remembered_target(
+                vanguard.position,
+                remembered_enemies,
+            )
+            if remembered is not None and self._move_within_leash(
+                vanguard,
+                remembered.position,
+                context,
+                offensive=offensive,
+                reason=f"hunt last seen {remembered.kind.lower()}",
+            ):
+                return
 
         goal, reason = self._idle_combat_goal(
             vanguard,
@@ -3170,6 +3178,14 @@ class AggressiveStrategy:
             if unit_id in live
         )
 
+    def _is_expedition_member(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+    ) -> bool:
+        """True when the unit fights as part of an expedition squad."""
+        return self.config.expedition_mode and unit.id in self._expedition_member_ids(turn)
+
     def _patrol_ids(self, turn: Turn) -> frozenset[UUID]:
         """Return the 3-Vanguard/6-Ranger patrol contingent of the formation."""
         vanguards = sorted(turn.vanguards, key=lambda unit: unit.id.bytes)[
@@ -3363,6 +3379,55 @@ class AggressiveStrategy:
             return leader
         return None
 
+    def _expedition_shared_target(
+        self,
+        turn: Turn,
+        squad_members: frozenset[UUID],
+    ) -> Position | None:
+        """Return the single enemy cell the whole squad should converge on.
+
+        A squad fights as one body: members never scatter after different
+        targets.  The best enemy visible to any member becomes the shared
+        target that pulls the entire squad forward together, and when only a
+        memory remains the nearest remembered hostile is followed so the squad
+        advances on one heading instead of splitting.
+        """
+
+        alive = {
+            member.id: member for member in (*turn.vanguards, *turn.rangers)
+        }
+        members = [
+            member for member_id in squad_members if (member := alive.get(member_id))
+        ]
+        if not members:
+            return None
+        centroid = (
+            sum(member.position[0] for member in members) // len(members),
+            sum(member.position[1] for member in members) // len(members),
+        )
+        best: tuple[tuple[int, int, int, str], CoreView | UnitView] | None = None
+        for member in members:
+            visible = self._visible_combat_targets(member, turn)
+            for enemy in visible:
+                score = (
+                    self._combat_target_priority(enemy),
+                    self._enemy_score(enemy, centroid, turn),
+                    0,
+                    str(enemy.id),
+                )
+                if best is None or score > best[0]:
+                    best = (score, enemy)
+        if best is not None:
+            return best[1].position
+        remembered = (
+            self._offensive_enemies(turn) if self._offensive_patrol_enabled(turn) else ()
+        )
+        if remembered:
+            target = self._best_remembered_target(centroid, remembered)
+            if target is not None:
+                return target.position
+        return None
+
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
         """Hold a surplus unit just outside the defensive ring's outer edge."""
         core = turn.core
@@ -3527,6 +3592,15 @@ class AggressiveStrategy:
                         rendezvous,
                         "close up so the expedition's line of sight stays connected",
                     )
+                squad = self._expedition_squad_for(unit.id)
+                if squad is not None:
+                    members, _ = squad
+                    shared = self._expedition_shared_target(turn, members)
+                    if shared is not None:
+                        return (
+                            shared,
+                            "advance together on the squad's enemy target",
+                        )
                 return (
                     self._expedition_goal(unit, turn),
                     "explore outward on this expedition bearing",

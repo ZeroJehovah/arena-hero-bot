@@ -5505,6 +5505,66 @@ def test_expedition_idle_goal_points_outward() -> None:
     assert manhattan(turn.core.position, goal) > 100
 
 
+def test_expedition_squad_shares_one_enemy_target() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "RANGER", position=(6, 5)),
+            unit(90, "VANGUARD", controlled=False, position=(8, 5)),
+        ],
+    )
+    squad_members = frozenset({UUID(int=2), UUID(int=3)})
+
+    shared = strategy._expedition_shared_target(turn, squad_members)
+    assert shared == (8, 5)
+
+    # The idle goal hands the whole squad the same cell so they advance as one
+    # body instead of scattering after different targets.
+    vanguard_goal, vanguard_reason = strategy._idle_combat_goal(
+        turn.vanguards[0], turn, context=None
+    )
+    ranger_goal, ranger_reason = strategy._idle_combat_goal(
+        turn.rangers[0], turn, context=None
+    )
+    assert vanguard_goal == ranger_goal == (8, 5)
+    assert vanguard_reason == ranger_reason == "advance together on the squad's enemy target"
+
+
+def test_expedition_squad_shares_target_seen_by_one_member() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "RANGER", position=(6, 5)),
+            unit(90, "VANGUARD", controlled=False, position=(10, 5)),
+        ],
+    )
+    squad_members = frozenset({UUID(int=2), UUID(int=3)})
+
+    shared = strategy._expedition_shared_target(turn, squad_members)
+    assert shared == (10, 5)
+
+    # Even the member that cannot see the enemy converges on the same cell.
+    ranger_goal, ranger_reason = strategy._idle_combat_goal(
+        turn.rangers[0], turn, context=None
+    )
+    assert ranger_goal == (10, 5)
+    assert ranger_reason == "advance together on the squad's enemy target"
+
+
 def test_expedition_members_regroup_when_detached() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=number) for number in range(2, 8)})
