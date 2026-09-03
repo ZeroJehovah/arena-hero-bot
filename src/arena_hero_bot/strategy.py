@@ -3390,9 +3390,11 @@ class AggressiveStrategy:
         Aiming at the leader's own cell is a trap: that cell is occupied by the
         leader, so ``_move`` treats it as blocked and ``next_step`` falls back
         to the neighbour "closest to the goal", which orbits the nearest wall
-        forever when the member stands in an obstacle pocket.  Aim at the
-        nearest *reachable* free neighbour of the leader instead so the member
-        can actually walk back inside the link radius.
+        forever when the member stands in an obstacle pocket.  Aim instead at
+        the leader's most *forward* reachable free neighbour, so a lagging
+        member converges on the front-side cells of the chain instead of piling
+        up behind the leader and drifting back toward the Core when walls get
+        in the way.
         """
 
         static = (
@@ -3405,7 +3407,7 @@ class AggressiveStrategy:
             for member in (*turn.vanguards, *turn.rangers)
         }
         squad = self._expedition_squad_for(unit.id)
-        members = squad[0] if squad is not None else frozenset()
+        members, bearing = squad if squad is not None else (frozenset(), (0, 0))
         occupied_by_team = {
             teammates[mid] for mid in members if mid in teammates
         }
@@ -3430,9 +3432,15 @@ class AggressiveStrategy:
             is not None
         ]
         pool = reachable if reachable else candidates
+        bear_x, bear_y = bearing
+
+        def forward(cell: Position) -> int:
+            return cell[0] * bear_x + cell[1] * bear_y
+
         return min(
             pool,
             key=lambda cell: (
+                -forward(cell),
                 manhattan(unit.position, cell),
                 manhattan(cell, leader),
                 cell,

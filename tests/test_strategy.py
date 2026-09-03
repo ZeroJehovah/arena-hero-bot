@@ -5596,7 +5596,7 @@ def test_expedition_members_regroup_when_detached() -> None:
     # leader, so aiming at it directly would make the member orbit a wall).
     front = by_id[UUID(int=6)]
     goal = strategy._expedition_rendezvous_goal(front, turn)
-    assert goal == (29, 0)
+    assert goal == (31, 0)
     assert manhattan(goal, (30, 0)) == 1
 
     # The leader itself sees the gap behind it and holds in place.
@@ -5624,7 +5624,7 @@ def test_expedition_laggard_catches_up_without_leader_turning_back() -> None:
 
     # The laggard (left) closes onto the leader (right), which itself stays put.
     laggard = by_id[UUID(int=3)]
-    assert strategy._expedition_rendezvous_goal(laggard, turn) == (29, 0)
+    assert strategy._expedition_rendezvous_goal(laggard, turn) == (31, 0)
     leader = by_id[UUID(int=2)]
     assert strategy._expedition_rendezvous_goal(leader, turn) == (30, 0)
 
