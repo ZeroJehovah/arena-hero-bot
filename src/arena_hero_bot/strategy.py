@@ -3311,15 +3311,36 @@ class AggressiveStrategy:
         )
 
     def _expedition_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
-        """Return the far exploration point along this squad's bearing."""
+        """Return the far exploration point ahead of this squad's front.
+
+        Anchoring the point on the Core made it a fixed cell: once the squad
+        marched past it, every member was pulled *back* toward the Core on the
+        next Tick and the whole squad orbited the horizon forever.  Anchor on
+        the squad's own front-most member instead so the far point keeps
+        moving forward with the squad and the expedition never has to turn
+        back.
+        """
         squad = self._expedition_squad_for(unit.id)
         if squad is None:
             return unit.position
-        _, (bear_x, bear_y) = squad
-        anchor = turn.core.position if turn.core is not None else unit.position
+        members, (bear_x, bear_y) = squad
+        alive = {
+            member.id: member.position for member in (*turn.vanguards, *turn.rangers)
+        }
+        progress = {
+            member_id: (
+                alive[member_id][0] * bear_x + alive[member_id][1] * bear_y
+            )
+            for member_id in members
+            if member_id in alive
+        }
+        if not progress:
+            return unit.position
+        front_id = max(progress, key=lambda mid: (progress[mid], mid))
+        front = alive[front_id]
         return (
-            anchor[0] + bear_x * EXPEDITION_HORIZON,
-            anchor[1] + bear_y * EXPEDITION_HORIZON,
+            front[0] + bear_x * EXPEDITION_LINK_RADIUS,
+            front[1] + bear_y * EXPEDITION_LINK_RADIUS,
         )
 
     def _expedition_rendezvous_goal(

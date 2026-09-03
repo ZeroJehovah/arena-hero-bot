@@ -5501,8 +5501,19 @@ def test_expedition_idle_goal_points_outward() -> None:
     member_view = turn.vanguards[0]
     goal, reason = strategy._idle_combat_goal(member_view, turn, context=None)
     assert reason == "explore outward on this expedition bearing"
-    assert turn.core is not None
-    assert manhattan(turn.core.position, goal) > 100
+    # The far point tracks the squad's front-most member forward along the
+    # bearing, not a fixed Core-anchored cell.  A fixed target made every
+    # member turn back the moment it crossed the horizon (observed live:
+    # the rearmost expedition member drifting back toward the Core).
+    front = max(
+        (
+            unit_view.position
+            for unit_view in (*turn.vanguards, *turn.rangers)
+        ),
+        key=lambda position: position[0],
+    )
+    assert manhattan(front, goal) == 4
+    assert goal[0] > front[0]
 
 
 def test_expedition_squad_shares_one_enemy_target() -> None:
