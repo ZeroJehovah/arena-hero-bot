@@ -5489,3 +5489,61 @@ def test_expedition_idle_goal_points_outward() -> None:
     assert reason == "explore outward on this expedition bearing"
     assert turn.core is not None
     assert manhattan(turn.core.position, goal) > 100
+
+
+def test_expedition_manual_launch_dispatches_full_vanguard_squads() -> None:
+    strategy = AggressiveStrategy(
+        WorldMemory(),
+        expedition_config(
+            launch_expeditions=((6, UnitType.VANGUARD), (6, UnitType.VANGUARD))
+        ),
+    )
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 31)
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 32)
+    ]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+    strategy._update_expeditions(turn)
+
+    assert len(strategy._expedition_squads) == 2
+    sizes = sorted(len(members) for members, _ in strategy._expedition_squads)
+    assert sizes == [6, 6]
+    assert strategy._pending_launch == []
+    assert len(strategy._staged_ids) == 31 - 16 - 12
+
+
+def test_expedition_manual_launch_waits_until_units_are_available() -> None:
+    strategy = AggressiveStrategy(
+        WorldMemory(),
+        expedition_config(launch_expeditions=((6, UnitType.VANGUARD),)),
+    )
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 19)
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 32)
+    ]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+    strategy._update_expeditions(turn)
+
+    assert len(strategy._expedition_squads) == 0
+    assert strategy._pending_launch == [(6, UnitType.VANGUARD)]
+    assert len(strategy._staged_ids) == 3

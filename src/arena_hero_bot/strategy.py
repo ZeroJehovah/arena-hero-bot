@@ -158,6 +158,7 @@ class StrategyConfig:
     raid_trigger_kills: int = 3
     raid_kill_window: int = 24
     expedition_mode: bool = False
+    launch_expeditions: tuple[tuple[int, UnitType], ...] = ()
 
 
 @dataclass(slots=True)
@@ -265,6 +266,12 @@ class AggressiveStrategy:
         self._staged_ids: frozenset[UUID] = frozenset()
         self._expedition_squads: list[tuple[frozenset[UUID], Position]] = []
         self._expedition_serial: int = 0
+        # One-off manual expeditions requested at startup, consumed on the
+        # first live Tick.  Each entry is the remaining units of that type a
+        # squad still needs to draw from surplus combat units.
+        self._pending_launch: list[tuple[int, UnitType]] = list(
+            self.config.launch_expeditions
+        )
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
@@ -3205,6 +3212,29 @@ class AggressiveStrategy:
             ),
             key=lambda unit_id: unit_id.bytes,
         )
+
+        # One-off manual launches are fulfilled first, drawing their full squad
+        # from the surplus of the requested type; any squad that cannot fill
+        # yet stays pending for a later Tick rather than departing short.
+        remaining_launch: list[tuple[int, UnitType]] = []
+        for count, unit_type in self._pending_launch:
+            if unit_type is UnitType.VANGUARD and len(staged_vanguards) >= count:
+                members = frozenset(staged_vanguards[:count])
+                del staged_vanguards[:count]
+                self._expedition_squads.append(
+                    (members, self._expedition_bearing(core))
+                )
+                self._expedition_serial += 1
+            elif unit_type is UnitType.RANGER and len(staged_rangers) >= count:
+                members = frozenset(staged_rangers[:count])
+                del staged_rangers[:count]
+                self._expedition_squads.append(
+                    (members, self._expedition_bearing(core))
+                )
+                self._expedition_serial += 1
+            else:
+                remaining_launch.append((count, unit_type))
+        self._pending_launch = remaining_launch
 
         while (
             len(staged_vanguards) >= EXPEDITION_SQUAD_VANGUARDS

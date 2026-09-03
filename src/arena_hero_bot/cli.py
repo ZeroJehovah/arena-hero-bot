@@ -8,7 +8,7 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 
-from arena_hero import core_resource_capacity
+from arena_hero import UnitType, core_resource_capacity
 from dotenv import load_dotenv
 
 from .runtime import RuntimeConfig, run_bot
@@ -85,6 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--launch-expeditions",
+        metavar="6V,6V",
+        help=(
+            "one-off manual expeditions at startup, comma-separated; each token "
+            "is a count with an optional unit type (V/Vanguard or R/Ranger, "
+            "default Vanguard), e.g. '6V,6V' launches two 6-Vanguard squads"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -130,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_population=max_population,
         resource_target=args.resource_target,
         expedition_mode=args.expedition_mode,
+        launch_expeditions=_parse_launch_expeditions(args.launch_expeditions),
     )
     try:
         run_bot(runtime, strategy_config=strategy)
@@ -149,3 +159,30 @@ def _non_negative_integer(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be zero or greater")
     return parsed
+
+
+def _parse_launch_expeditions(
+    value: str | None,
+) -> tuple[tuple[int, UnitType], ...]:
+    """Parse a comma-separated list of manual expedition squad sizes.
+
+    Each token is ``<count>[V|R]``; the unit type defaults to Vanguard.  The
+    result is one ``(count, unit_type)`` entry per squad, ready for the
+    strategy to consume at startup.
+    """
+
+    if not value:
+        return ()
+    squads: list[tuple[int, UnitType]] = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token[-1] in {"V", "R"}:
+            count_text, type_text = token[:-1], token[-1]
+        else:
+            count_text, type_text = token, "V"
+        count = _positive_integer(count_text)
+        unit_type = UnitType.VANGUARD if type_text == "V" else UnitType.RANGER
+        squads.append((count, unit_type))
+    return tuple(squads)
