@@ -61,6 +61,11 @@ UNREACHABLE_CLAIM_COOLDOWN = 128
 # service the known resource pool instead of paying a full Worker of income
 # for continuous long-range scouting.
 RESOURCE_SCOUT_INTERVAL = 12
+# A remote claim is still valid, but its loaded return to the Core is the
+# limiting leg of a refill cycle.  Count that leg twice when choosing among
+# otherwise equivalent known sites; this remains a soft preference and never
+# removes a far site from the candidate pool.
+REMOTE_RETURN_WEIGHT = 2
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -4153,7 +4158,7 @@ class AggressiveStrategy:
             # avoid choosing a slightly nearer target when its return leg is
             # much longer than another candidate in the same evidence pool.
             return (
-                approach + core_distance,
+                approach + REMOTE_RETURN_WEIGHT * core_distance,
                 approach,
                 worker.id,
                 resource,

@@ -1661,6 +1661,25 @@ def test_remote_known_sites_prefer_shorter_loaded_return() -> None:
     assert decision.target == (49, 0)
 
 
+def test_remote_known_sites_penalize_a_long_loaded_return() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (40, 0): 199,
+        (59, 0): 199,
+    }
+    strategy = AggressiveStrategy(memory, config)
+
+    turn = make_turn(
+        objects=[core(), unit(2, "WORKER", position=(60, 0))],
+    )
+    report = strategy.decide(turn)
+
+    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert decision.action == "MOVE"
+    assert decision.target == (40, 0)
+
+
 def test_outer_band_known_sites_prefer_shorter_loaded_return() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
