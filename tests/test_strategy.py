@@ -14,6 +14,7 @@ from arena_hero import (
 
 from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
+from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
     RANGER_VISION_RADIUS,
     RESOURCE_SCOUT_INTERVAL,
@@ -22,6 +23,7 @@ from arena_hero_bot.strategy import (
     _clear_manhattan_path,
     _defensive_ring_offsets,
     _resource_patrol_offsets,
+    _TurnContext,
 )
 
 from .factories import core, make_turn, object_id, unit
@@ -5321,3 +5323,169 @@ def test_ranger_shoots_enemy_ranger_threatening_core() -> None:
 
     action = turn.plan.unit_actions[turn.rangers[0].id]
     assert action.type == "SHOOT"
+
+
+def expedition_config(**overrides) -> StrategyConfig:
+    return StrategyConfig(
+        target_workers=12,
+        max_population=None,
+        resource_target=0,
+        expedition_mode=True,
+        **overrides,
+    )
+
+
+def _expedition_strategy(config=None) -> AggressiveStrategy:
+    return AggressiveStrategy(WorldMemory(), config or expedition_config())
+
+
+def test_expedition_spawn_fills_formation_gap_with_ranger() -> None:
+    strategy = _expedition_strategy()
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 18)
+    ]
+    rangers = [unit(number, "RANGER", position=(number, 3)) for number in range(30, 61)]
+    workers = [unit(number, "WORKER", position=(number, 4)) for number in range(20, 32)]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+
+    assert strategy._choose_spawn(turn, turn.resources) is UnitType.RANGER
+
+
+def test_expedition_spawn_alternates_surplus_when_formation_full() -> None:
+    strategy = _expedition_strategy()
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 16)
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 32)
+    ]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    ]
+
+    balanced = make_turn(
+        resources=10000,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+    assert strategy._choose_spawn(balanced, balanced.resources) is UnitType.VANGUARD
+
+    extra_vanguard = [*vanguards, unit(200, "VANGUARD", position=(200, 2))]
+    surplus_turn = make_turn(
+        resources=10000,
+        objects=[core(), *extra_vanguard, *rangers, *workers],
+    )
+    assert (
+        strategy._choose_spawn(surplus_turn, surplus_turn.resources) is UnitType.RANGER
+    )
+
+
+def test_expedition_stages_surplus_units_at_ring_edge() -> None:
+    strategy = _expedition_strategy()
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 18)
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 32)
+    ]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+    strategy._update_expeditions(turn)
+
+    assert len(strategy._staged_ids) == 2
+    assert not strategy._expedition_squads
+
+
+def test_expedition_forms_squad_of_four_when_surplus_ready() -> None:
+    strategy = _expedition_strategy()
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 18)
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 34)
+    ]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+    strategy._update_expeditions(turn)
+
+    assert len(strategy._expedition_squads) == 1
+    members, _ = strategy._expedition_squads[0]
+    assert len(members) == 4
+    assert not strategy._staged_ids
+
+
+def test_expedition_members_never_heal_or_retreat() -> None:
+    strategy = _expedition_strategy()
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 18)
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 33)
+    ] + [unit(90, "RANGER", position=(90, 3), hp=1)]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    ]
+
+    turn = make_turn(
+        resources=100,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+    strategy._update_expeditions(turn)
+
+    assert len(strategy._expedition_squads) == 1
+    members, _ = strategy._expedition_squads[0]
+    ranger_view = next(r for r in turn.rangers if r.id in members and r.hp == 1)
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions=set(),
+    )
+    assert not strategy._recover_if_critical(ranger_view, maximum_hp=2, context=context)
+
+
+def test_expedition_idle_goal_points_outward() -> None:
+    strategy = _expedition_strategy()
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 18)
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 34)
+    ]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[core(), *vanguards, *rangers, *workers],
+    )
+    strategy._update_expeditions(turn)
+    members, _ = strategy._expedition_squads[0]
+    member_view = next(v for v in turn.vanguards if v.id in members)
+
+    goal, reason = strategy._idle_combat_goal(member_view, turn, context=None)
+    assert reason == "explore outward on this expedition bearing"
+    assert turn.core is not None
+    assert manhattan(turn.core.position, goal) > 100

@@ -8,6 +8,7 @@ from uuid import UUID
 
 from arena_hero import (
     BeaconStatus,
+    Core,
     CoreState,
     CoreView,
     Direction,
@@ -99,6 +100,19 @@ EARLY_COMBAT_GUARD_WORKERS = 4
 GARRISON_MIN_GUARDS = 3
 GARRISON_ROSTER_SHARE = 4
 RAID_ABORT_SCAN_RADIUS = 6
+# Active-offense ("expedition") posture: a fixed formation saturates the Core
+# neighbourhood while everything built beyond it is sent out on independent,
+# non-returning expeditions.  Formation target is 12 Workers / 16 Vanguards /
+# 32 Rangers; 13 Vanguards + 26 Rangers hold the defensive ring, the remaining
+# 3 Vanguards + 6 Rangers patrol just outside it, and any surplus is staged at
+# the ring edge until a full expedition (2 Vanguards + 2 Rangers) can depart.
+EXPEDITION_FORMATION_VANGUARDS = 16
+EXPEDITION_FORMATION_RANGERS = 32
+EXPEDITION_SQUAD_VANGUARDS = 2
+EXPEDITION_SQUAD_RANGERS = 2
+EXPEDITION_HORIZON = 256
+# Staging cells sit just outside the defensive ring's maximum radius.
+EXPEDITION_STAGING_RADIUS = 13
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +157,7 @@ class StrategyConfig:
     raid_max_ticks: int = 160
     raid_trigger_kills: int = 3
     raid_kill_window: int = 24
+    expedition_mode: bool = False
 
 
 @dataclass(slots=True)
@@ -242,6 +257,14 @@ class AggressiveStrategy:
         self._raid_target: Position | None = None
         self._raid_until_tick: int = -1
         self._raid_cooldown_until: int = -1
+        # Expedition posture state.  Surplus combat units are staged at the
+        # defensive ring edge until a full expedition can depart.  Each
+        # expedition is a fixed 2-Vanguard/2-Ranger squad bound to a stable
+        # bearing; it never returns, heals, or recalls, so membership and the
+        # chosen direction are the only durable facts.
+        self._staged_ids: frozenset[UUID] = frozenset()
+        self._expedition_squads: list[tuple[frozenset[UUID], Position]] = []
+        self._expedition_serial: int = 0
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
@@ -251,6 +274,8 @@ class AggressiveStrategy:
         # record of what they were with them, so log the kills first.
         self._record_combat_kills(turn)
         self.memory.observe(turn)
+        if self.config.expedition_mode:
+            self._update_expeditions(turn)
         obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         threat = self._combat_policy.assess(turn, obstacles)
         recent_enemies = self.memory.recent_enemies(
@@ -1640,6 +1665,14 @@ class AggressiveStrategy:
         critical_hp: int | None = None,
         context: _TurnContext,
     ) -> bool:
+        if (
+            self.config.expedition_mode
+            and isinstance(unit, (Ranger, Vanguard))
+            and unit.id in self._expedition_member_ids(context.turn)
+        ):
+            # Expedition squads fight on regardless of damage: no healing,
+            # no retreat, no return.
+            return False
         retreat_threshold = maximum_hp // 2 if critical_hp is None else critical_hp
         if unit.hp > retreat_threshold:
             return False
@@ -3088,6 +3121,160 @@ class AggressiveStrategy:
             )
         )
 
+    def _formation_vanguard_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return the deterministic Vanguard half of the core formation."""
+        return frozenset(
+            unit.id
+            for unit in sorted(turn.vanguards, key=lambda unit: unit.id.bytes)[
+                :EXPEDITION_FORMATION_VANGUARDS
+            ]
+        )
+
+    def _formation_ranger_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return the deterministic Ranger half of the core formation."""
+        return frozenset(
+            unit.id
+            for unit in sorted(turn.rangers, key=lambda unit: unit.id.bytes)[
+                :EXPEDITION_FORMATION_RANGERS
+            ]
+        )
+
+    def _formation_combat_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return the full 16-Vanguard/32-Ranger formation membership."""
+        return self._formation_vanguard_ids(turn) | self._formation_ranger_ids(turn)
+
+    def _expedition_member_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return every live combat unit already bound to an expedition."""
+        live = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
+        return frozenset(
+            unit_id
+            for members, _ in self._expedition_squads
+            for unit_id in members
+            if unit_id in live
+        )
+
+    def _patrol_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return the 3-Vanguard/6-Ranger patrol contingent of the formation."""
+        vanguards = sorted(turn.vanguards, key=lambda unit: unit.id.bytes)[
+            :EXPEDITION_FORMATION_VANGUARDS
+        ]
+        rangers = sorted(turn.rangers, key=lambda unit: unit.id.bytes)[
+            :EXPEDITION_FORMATION_RANGERS
+        ]
+        return frozenset(unit.id for unit in vanguards[-3:]) | frozenset(
+            unit.id for unit in rangers[-6:]
+        )
+
+    def _update_expeditions(self, turn: Turn) -> None:
+        """Maintain staging and expedition squads for the active-offense mode.
+
+        Surplus combat units (anything beyond the 16/32 formation) are staged
+        at the ring edge as soon as they are built.  Once a full expedition
+        (2 Vanguards + 2 Rangers) is available it departs on a stable,
+        randomly chosen bearing and is never recalled.  Formation membership
+        is derived from UUID order each Tick, so a dead formation member is
+        backfilled by the next-surplus unit of the same type before any new
+        build is counted as surplus.
+        """
+
+        core = turn.core
+        live = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
+        self._expedition_squads = [
+            (members & live, bearing)
+            for members, bearing in self._expedition_squads
+            if members & live
+        ]
+        expedition_members = self._expedition_member_ids(turn)
+        formation = self._formation_combat_ids(turn)
+
+        vanguard_ids = {unit.id for unit in turn.vanguards}
+        ranger_ids = {unit.id for unit in turn.rangers}
+        staged_vanguards = sorted(
+            (
+                unit_id
+                for unit_id in vanguard_ids
+                if unit_id not in formation and unit_id not in expedition_members
+            ),
+            key=lambda unit_id: unit_id.bytes,
+        )
+        staged_rangers = sorted(
+            (
+                unit_id
+                for unit_id in ranger_ids
+                if unit_id not in formation and unit_id not in expedition_members
+            ),
+            key=lambda unit_id: unit_id.bytes,
+        )
+
+        while (
+            len(staged_vanguards) >= EXPEDITION_SQUAD_VANGUARDS
+            and len(staged_rangers) >= EXPEDITION_SQUAD_RANGERS
+        ):
+            members = frozenset(
+                staged_vanguards[:EXPEDITION_SQUAD_VANGUARDS]
+                + staged_rangers[:EXPEDITION_SQUAD_RANGERS]
+            )
+            bearing = self._expedition_bearing(core)
+            self._expedition_squads.append((members, bearing))
+            self._expedition_serial += 1
+            del staged_vanguards[:EXPEDITION_SQUAD_VANGUARDS]
+            del staged_rangers[:EXPEDITION_SQUAD_RANGERS]
+        self._staged_ids = frozenset(staged_vanguards) | frozenset(staged_rangers)
+
+    def _expedition_bearing(self, core: Core | None) -> Position:
+        """Choose a stable pseudo-random compass bearing for one expedition.
+
+        The bearing is derived from the Core identity and a running squad
+        serial so that two expeditions rarely share a direction, which keeps
+        them exploring disjoint regions of the map.
+        """
+
+        offsets = (
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        )
+        seed = (core.id.int if core is not None else 0) + self._expedition_serial * 7
+        return offsets[seed % len(offsets)]
+
+    def _expedition_squad_for(
+        self, unit_id: UUID
+    ) -> tuple[frozenset[UUID], Position] | None:
+        return next(
+            (
+                (members, bearing)
+                for members, bearing in self._expedition_squads
+                if unit_id in members
+            ),
+            None,
+        )
+
+    def _expedition_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
+        """Return the far exploration point along this squad's bearing."""
+        squad = self._expedition_squad_for(unit.id)
+        if squad is None:
+            return unit.position
+        _, (bear_x, bear_y) = squad
+        anchor = turn.core.position if turn.core is not None else unit.position
+        return (
+            anchor[0] + bear_x * EXPEDITION_HORIZON,
+            anchor[1] + bear_y * EXPEDITION_HORIZON,
+        )
+
+    def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
+        """Hold a surplus unit just outside the defensive ring's outer edge."""
+        core = turn.core
+        if core is None:
+            return unit.position
+        offsets = _defensive_ring_offsets(EXPEDITION_STAGING_RADIUS)
+        dx, dy = offsets[unit.id.int % len(offsets)]
+        return core.position[0] + dx, core.position[1] + dy
+
     def _is_offensive_combat_unit(
         self,
         unit: Ranger | Vanguard,
@@ -3095,6 +3282,19 @@ class AggressiveStrategy:
         threat: ThreatAssessment | None = None,
     ) -> bool:
         """Assign a stable minority of combat units to the roaming squad."""
+        if self.config.expedition_mode:
+            # Expedition members never return; patrol members roam outside the
+            # ring.  Everything else (formation defenders and staged surplus)
+            # holds station.
+            if unit.id in self._expedition_member_ids(turn):
+                return True
+            if unit.id in self._patrol_ids(turn):
+                return not (
+                    self._emergency_combat_mode(turn)
+                    or not self._offensive_patrol_enabled(turn)
+                    or (threat is not None and threat.level is not ThreatLevel.NORMAL)
+                )
+            return False
 
         if (
             self._emergency_combat_mode(turn)
@@ -3116,6 +3316,9 @@ class AggressiveStrategy:
         membership still decides *who* goes, so roles stay stable between
         Ticks without extra state.
         """
+
+        if self.config.expedition_mode:
+            return self._patrol_ids(turn) | self._expedition_member_ids(turn)
 
         cache = self._offensive_squad
         roster = frozenset(unit.id for unit in (*turn.rangers, *turn.vanguards))
@@ -3214,6 +3417,17 @@ class AggressiveStrategy:
         offensive: bool = False,
         context: _TurnContext | None = None,
     ) -> tuple[Position, str]:
+        if self.config.expedition_mode:
+            if unit.id in self._expedition_member_ids(turn):
+                return (
+                    self._expedition_goal(unit, turn),
+                    "explore outward on this expedition bearing",
+                )
+            if unit.id in self._staged_ids:
+                return (
+                    self._staging_goal(unit, turn),
+                    "hold at the defensive ring edge awaiting expedition",
+                )
         if (
             context is not None
             and self._raid_target is not None
@@ -4214,6 +4428,11 @@ class AggressiveStrategy:
     ) -> int:
         """Return how far from the Core this unit may walk to reach a target."""
 
+        if self.config.expedition_mode and unit.id in self._expedition_member_ids(
+            context.turn
+        ):
+            # Expeditions have no distance limit.
+            return EXPEDITION_HORIZON
         if unit.id in context.raid_ids:
             return self.config.raid_radius
         if offensive:
@@ -4313,6 +4532,14 @@ class AggressiveStrategy:
         (``raid_max_ticks``), and it turns around rather than fight a
         garrison it cannot eat.
         """
+
+        if self.config.expedition_mode:
+            # The bounded raid is superseded by the non-returning expedition
+            # squads, which already seek and destroy every hostile they see.
+            self._raid_ids = frozenset()
+            self._raid_target = None
+            self._raid_until_tick = -1
+            return frozenset()
 
         core = turn.core
         live = frozenset(unit.id for unit in (*turn.vanguards, *turn.rangers))
@@ -4577,6 +4804,15 @@ class AggressiveStrategy:
             for unit_id, until in self._squad_return_until.items()
             if unit_id in live_ids and until >= turn.tick
         }
+        if self.config.expedition_mode:
+            # Expedition members never return; the generic intercept recall
+            # must not pull them back into the defensive zone.
+            self._squad_return_until = {
+                unit_id: until
+                for unit_id, until in self._squad_return_until.items()
+                if unit_id not in self._expedition_member_ids(turn)
+            }
+            return frozenset(self._squad_return_until)
         if turn.core is None:
             self._squad_return_until.clear()
             return frozenset()
@@ -4878,6 +5114,8 @@ class AggressiveStrategy:
         growth_target = self._growth_population_target()
         if growth_target is not None and turn.state.population >= growth_target:
             return None
+        if self.config.expedition_mode:
+            return self._expedition_spawn(turn, resources)
         emergency = self._emergency_combat_mode(turn)
         if emergency:
             candidates = (
@@ -4916,6 +5154,70 @@ class AggressiveStrategy:
             resources,
             candidates,
             strict_preference=not emergency,
+        )
+
+    def _expedition_spawn(self, turn: Turn, resources: int) -> UnitType | None:
+        """Choose the next Unit for the active-offense formation.
+
+        The formation fills 12 Workers, 16 Vanguards and 32 Rangers first,
+        then spends surplus production on an alternating 1:1 Vanguard/Ranger
+        stream whose units are staged at the ring edge.  Emergency combat
+        decided by the existing threat logic still buys the type that best
+        balances the local roster, and the early resource-guard sequence is
+        preserved so a freshly respawned Core always establishes its first
+        combat unit before widening the economy.
+        """
+
+        if self._emergency_combat_mode(turn):
+            candidates = (
+                (UnitType.RANGER, UnitType.VANGUARD)
+                if len(turn.rangers) * 2 < len(turn.vanguards)
+                else (UnitType.VANGUARD, UnitType.RANGER)
+            )
+            return self._affordable_spawn(
+                turn, resources, candidates, strict_preference=False
+            )
+        if self._needs_resource_guard(turn):
+            if not turn.vanguards:
+                candidates = (UnitType.VANGUARD,)
+            elif not turn.rangers:
+                candidates = (UnitType.RANGER, UnitType.VANGUARD)
+            else:
+                candidates = (UnitType.VANGUARD, UnitType.RANGER)
+            return self._affordable_spawn(
+                turn, resources, candidates, strict_preference=True
+            )
+        vanguards = len(turn.vanguards)
+        rangers = len(turn.rangers)
+        if len(turn.workers) < self.config.target_workers:
+            candidates = (UnitType.WORKER,)
+        elif vanguards < EXPEDITION_FORMATION_VANGUARDS or rangers < (
+            EXPEDITION_FORMATION_RANGERS
+        ):
+            # Fill the formation gaps first, preferring the type whose
+            # formation quota is furthest behind (targets a 1:2 V:R split).
+            vanguard_short = max(0, EXPEDITION_FORMATION_VANGUARDS - vanguards)
+            ranger_short = max(0, EXPEDITION_FORMATION_RANGERS - rangers)
+            if vanguard_short <= 0:
+                candidates = (UnitType.RANGER,)
+            elif ranger_short <= 0:
+                candidates = (UnitType.VANGUARD,)
+            elif ranger_short >= 2 * vanguard_short:
+                candidates = (UnitType.RANGER, UnitType.VANGUARD)
+            else:
+                candidates = (UnitType.VANGUARD, UnitType.RANGER)
+        else:
+            # Formation full: surplus built 1:1, balancing the two quotas so
+            # staged units can pair off into full expeditions.
+            surplus_vanguards = vanguards - EXPEDITION_FORMATION_VANGUARDS
+            surplus_rangers = rangers - EXPEDITION_FORMATION_RANGERS
+            candidates = (
+                (UnitType.RANGER, UnitType.VANGUARD)
+                if surplus_rangers < surplus_vanguards
+                else (UnitType.VANGUARD, UnitType.RANGER)
+            )
+        return self._affordable_spawn(
+            turn, resources, candidates, strict_preference=True
         )
 
     def _normal_growth_on_cooldown(self, context: _TurnContext) -> bool:
@@ -5255,6 +5557,8 @@ class AggressiveStrategy:
         return self.config.max_population is None and self.config.resource_target <= 0
 
     def _spawn_reason(self, unit_type: UnitType) -> str:
+        if self.config.expedition_mode:
+            return f"build active-offense {unit_type.value.lower()} roster"
         if self._unbounded_growth():
             return (
                 "expand storage with the next available Core resources "

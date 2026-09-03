@@ -77,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--expedition-mode",
+        action="store_true",
+        help=(
+            "active-offense posture: saturate a fixed defensive formation, then "
+            "send surplus units out on independent non-returning expeditions"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -121,6 +129,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         target_workers=args.target_workers,
         max_population=max_population,
         resource_target=args.resource_target,
+        expedition_mode=args.expedition_mode,
     )
     try:
         run_bot(runtime, strategy_config=strategy)
