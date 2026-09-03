@@ -5466,29 +5466,49 @@ def test_expedition_members_never_heal_or_retreat() -> None:
 
 def test_expedition_idle_goal_points_outward() -> None:
     strategy = _expedition_strategy()
-
-    vanguards = [
-        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 18)
-    ]
-    rangers = [
-        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 34)
-    ]
-    workers = [
-        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
     ]
 
     turn = make_turn(
         resources=10000,
-        objects=[core(), *vanguards, *rangers, *workers],
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "RANGER", position=(6, 5)),
+        ],
     )
-    strategy._update_expeditions(turn)
-    members, _ = strategy._expedition_squads[0]
-    member_view = next(v for v in turn.vanguards if v.id in members)
 
+    member_view = turn.vanguards[0]
     goal, reason = strategy._idle_combat_goal(member_view, turn, context=None)
     assert reason == "explore outward on this expedition bearing"
     assert turn.core is not None
     assert manhattan(turn.core.position, goal) > 100
+
+
+def test_expedition_members_regroup_when_detached() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(30, 5)),
+            unit(3, "RANGER", position=(5, 5)),
+        ],
+    )
+
+    leader = turn.vanguards[0]
+    assert strategy._expedition_rendezvous_goal(leader, turn) == (5, 5)
+    goal, reason = strategy._idle_combat_goal(leader, turn, context=None)
+    assert reason == "close up so the expedition's line of sight stays connected"
+    assert goal == (5, 5)
+
+    rear = turn.rangers[0]
+    assert strategy._expedition_rendezvous_goal(rear, turn) is None
 
 
 def test_expedition_manual_launch_dispatches_full_vanguard_squads() -> None:

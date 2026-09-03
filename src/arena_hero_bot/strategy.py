@@ -113,6 +113,11 @@ EXPEDITION_SQUAD_RANGERS = 2
 EXPEDITION_HORIZON = 256
 # Staging cells sit just outside the defensive ring's maximum radius.
 EXPEDITION_STAGING_RADIUS = 13
+# Maximum Manhattan distance a member may drift from its squad's rearmost
+# member before it stops to let the line close up.  Kept tight enough that a
+# 6-unit squad stays on a connected sight line (Vanguard vision is 4, Ranger
+# vision is 5) rather than stretching into a scattered chain.
+EXPEDITION_LINK_RADIUS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -3296,6 +3301,39 @@ class AggressiveStrategy:
             anchor[1] + bear_y * EXPEDITION_HORIZON,
         )
 
+    def _expedition_rendezvous_goal(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+    ) -> Position | None:
+        """Return the cell a detached member must fall back to, or ``None``.
+
+        Every squad keeps a single connected line of sight: the rearmost
+        member (projected along the bearing) is the anchor, and any other
+        member that has drifted more than ``EXPEDITION_LINK_RADIUS`` away
+        turns back toward that anchor until the gap closes.  This stops the
+        squad from stretching into a string of isolated fighters while the
+        fastest members race ahead.
+        """
+
+        squad = self._expedition_squad_for(unit.id)
+        if squad is None:
+            return None
+        members, (bear_x, bear_y) = squad
+        alive = {
+            member.id: member.position for member in (*turn.vanguards, *turn.rangers)
+        }
+        positions = [alive[member_id] for member_id in members if member_id in alive]
+        if len(positions) <= 1:
+            return None
+        rear = min(
+            sorted(positions),
+            key=lambda position: position[0] * bear_x + position[1] * bear_y,
+        )
+        if manhattan(unit.position, rear) <= EXPEDITION_LINK_RADIUS:
+            return None
+        return rear
+
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
         """Hold a surplus unit just outside the defensive ring's outer edge."""
         core = turn.core
@@ -3449,6 +3487,12 @@ class AggressiveStrategy:
     ) -> tuple[Position, str]:
         if self.config.expedition_mode:
             if unit.id in self._expedition_member_ids(turn):
+                rendezvous = self._expedition_rendezvous_goal(unit, turn)
+                if rendezvous is not None:
+                    return (
+                        rendezvous,
+                        "close up so the expedition's line of sight stays connected",
+                    )
                 return (
                     self._expedition_goal(unit, turn),
                     "explore outward on this expedition bearing",
