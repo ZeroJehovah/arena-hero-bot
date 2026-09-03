@@ -113,11 +113,11 @@ EXPEDITION_SQUAD_RANGERS = 2
 EXPEDITION_HORIZON = 256
 # Staging cells sit just outside the defensive ring's maximum radius.
 EXPEDITION_STAGING_RADIUS = 13
-# Maximum Manhattan distance a member may drift from its squad's rearmost
-# member before it stops to let the line close up.  Kept tight enough that a
-# 6-unit squad stays on a connected sight line (Vanguard vision is 4, Ranger
-# vision is 5) rather than stretching into a scattered chain.
-EXPEDITION_LINK_RADIUS = 6
+# Maximum Manhattan distance between a member and its nearest teammate before
+# the member stops to let the gap close.  This keeps *adjacent* members within
+# sight (Vanguard vision is 4, Ranger vision is 5) so the squad stays a
+# connected chain, without collapsing the whole squad onto one cell.
+EXPEDITION_LINK_RADIUS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -3306,14 +3306,15 @@ class AggressiveStrategy:
         unit: Ranger | Vanguard,
         turn: Turn,
     ) -> Position | None:
-        """Return the cell a detached member must fall back to, or ``None``.
+        """Return where a member must move to keep the squad connected.
 
-        Every squad keeps a single connected line of sight: the rearmost
-        member (projected along the bearing) is the anchor, and any other
-        member that has drifted more than ``EXPEDITION_LINK_RADIUS`` away
-        turns back toward that anchor until the gap closes.  This stops the
-        squad from stretching into a string of isolated fighters while the
-        fastest members race ahead.
+        A member is detached only when even its *nearest* teammate sits farther
+        than ``EXPEDITION_LINK_RADIUS`` away.  The correction is always
+        forward: the lagging member (projected behind along the bearing) walks
+        toward its neighbour, while a leader that is already ahead holds its
+        ground instead of turning back.  ``None`` means the member is still
+        connected and should keep exploring; otherwise the returned cell is
+        either the neighbour to catch up to, or its own cell to wait in.
         """
 
         squad = self._expedition_squad_for(unit.id)
@@ -3323,16 +3324,29 @@ class AggressiveStrategy:
         alive = {
             member.id: member.position for member in (*turn.vanguards, *turn.rangers)
         }
-        positions = [alive[member_id] for member_id in members if member_id in alive]
-        if len(positions) <= 1:
+        teammates = [
+            alive[member_id]
+            for member_id in members
+            if member_id in alive and member_id != unit.id
+        ]
+        if not teammates:
             return None
-        rear = min(
-            sorted(positions),
-            key=lambda position: position[0] * bear_x + position[1] * bear_y,
+        nearest = min(
+            teammates,
+            key=lambda position: (manhattan(unit.position, position), position),
         )
-        if manhattan(unit.position, rear) <= EXPEDITION_LINK_RADIUS:
+        if manhattan(unit.position, nearest) <= EXPEDITION_LINK_RADIUS:
             return None
-        return rear
+
+        def progress(position: Position) -> int:
+            return position[0] * bear_x + position[1] * bear_y
+
+        if progress(unit.position) < progress(nearest):
+            # The laggard closes forward onto its neighbour.
+            return nearest
+        # The member is already on the leading side of the gap: hold in place
+        # so the lagging neighbour can catch up, never fall back.
+        return unit.position
 
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
         """Hold a surplus unit just outside the defensive ring's outer edge."""
@@ -3489,6 +3503,11 @@ class AggressiveStrategy:
             if unit.id in self._expedition_member_ids(turn):
                 rendezvous = self._expedition_rendezvous_goal(unit, turn)
                 if rendezvous is not None:
+                    if rendezvous == unit.position:
+                        return (
+                            unit.position,
+                            "hold for the expedition's laggards to close up",
+                        )
                     return (
                         rendezvous,
                         "close up so the expedition's line of sight stays connected",

@@ -5488,27 +5488,59 @@ def test_expedition_idle_goal_points_outward() -> None:
 
 def test_expedition_members_regroup_when_detached() -> None:
     strategy = _expedition_strategy()
-    strategy._expedition_squads = [
-        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
-    ]
+    squad = frozenset({UUID(int=number) for number in range(2, 8)})
+    strategy._expedition_squads = [(squad, (1, 0))]
 
     turn = make_turn(
         resources=10000,
         objects=[
             core(),
-            unit(2, "VANGUARD", position=(30, 5)),
-            unit(3, "RANGER", position=(5, 5)),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "VANGUARD", position=(1, 0)),
+            unit(4, "VANGUARD", position=(2, 0)),
+            unit(5, "VANGUARD", position=(3, 0)),
+            unit(6, "VANGUARD", position=(4, 0)),
+            unit(7, "VANGUARD", position=(30, 0)),
         ],
     )
+    by_id = {unit_view.id: unit_view for unit_view in turn.vanguards}
 
-    leader = turn.vanguards[0]
-    assert strategy._expedition_rendezvous_goal(leader, turn) == (5, 5)
+    # The five clustered members each have a nearby teammate, so none detaches
+    # and all keep exploring instead of collapsing onto one cell.
+    for number in (2, 3, 4, 5, 6):
+        assert (
+            strategy._expedition_rendezvous_goal(by_id[UUID(int=number)], turn) is None
+        )
+
+    # The lone member on the far right is already ahead of the gap, so it holds
+    # in place rather than turning back to collect the laggards.
+    leader = by_id[UUID(int=7)]
+    assert strategy._expedition_rendezvous_goal(leader, turn) == (30, 0)
     goal, reason = strategy._idle_combat_goal(leader, turn, context=None)
-    assert reason == "close up so the expedition's line of sight stays connected"
-    assert goal == (5, 5)
+    assert reason == "hold for the expedition's laggards to close up"
+    assert goal == (30, 0)
 
-    rear = turn.rangers[0]
-    assert strategy._expedition_rendezvous_goal(rear, turn) is None
+
+def test_expedition_laggard_catches_up_without_leader_turning_back() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(30, 0)),
+            unit(3, "VANGUARD", position=(4, 0)),
+        ],
+    )
+    by_id = {unit_view.id: unit_view for unit_view in turn.vanguards}
+
+    # The laggard (left) closes onto the leader (right), which itself stays put.
+    laggard = by_id[UUID(int=3)]
+    assert strategy._expedition_rendezvous_goal(laggard, turn) == (30, 0)
+    leader = by_id[UUID(int=2)]
+    assert strategy._expedition_rendezvous_goal(leader, turn) == (30, 0)
 
 
 def test_expedition_manual_launch_dispatches_full_vanguard_squads() -> None:
