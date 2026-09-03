@@ -3308,13 +3308,16 @@ class AggressiveStrategy:
     ) -> Position | None:
         """Return where a member must move to keep the squad connected.
 
-        A member is detached only when even its *nearest* teammate sits farther
-        than ``EXPEDITION_LINK_RADIUS`` away.  The correction is always
-        forward: the lagging member (projected behind along the bearing) walks
-        toward its neighbour, while a leader that is already ahead holds its
-        ground instead of turning back.  ``None`` means the member is still
-        connected and should keep exploring; otherwise the returned cell is
-        either the neighbour to catch up to, or its own cell to wait in.
+        Squad members are ordered by their projection along the bearing into a
+        chain, and each member only enforces the gap to its two *adjacent*
+        neighbours in that chain.  When its gap to the neighbour behind it
+        exceeds ``EXPEDITION_LINK_RADIUS`` the member has raced ahead and
+        holds in place; when its gap to the neighbour ahead exceeds the radius
+        it closes forward.  A leader therefore stops to wait the moment the
+        rearmost links fall out of sight, instead of sprinting on unaware.
+        ``None`` means the member is still connected and should keep
+        exploring; otherwise the returned cell is the neighbour to close on, or
+        its own cell to wait in.
         """
 
         squad = self._expedition_squad_for(unit.id)
@@ -3331,22 +3334,29 @@ class AggressiveStrategy:
         ]
         if not teammates:
             return None
-        nearest = min(
-            teammates,
-            key=lambda position: (manhattan(unit.position, position), position),
-        )
-        if manhattan(unit.position, nearest) <= EXPEDITION_LINK_RADIUS:
-            return None
 
         def progress(position: Position) -> int:
             return position[0] * bear_x + position[1] * bear_y
 
-        if progress(unit.position) < progress(nearest):
-            # The laggard closes forward onto its neighbour.
-            return nearest
-        # The member is already on the leading side of the gap: hold in place
-        # so the lagging neighbour can catch up, never fall back.
-        return unit.position
+        own_progress = progress(unit.position)
+        laggards = [p for p in teammates if progress(p) < own_progress]
+        leaders = [p for p in teammates if progress(p) > own_progress]
+
+        laggard = max(laggards, key=lambda p: (progress(p), p)) if laggards else None
+        leader = min(leaders, key=lambda p: (progress(p), p)) if leaders else None
+
+        # A gap opened behind us: the member raced ahead, so it stops and lets
+        # the tail close up rather than sprinting away from it.
+        if laggard is not None and (
+            manhattan(unit.position, laggard) > EXPEDITION_LINK_RADIUS
+        ):
+            return unit.position
+        # A gap opened ahead of us: the member lags and must close forward.
+        if leader is not None and (
+            manhattan(unit.position, leader) > EXPEDITION_LINK_RADIUS
+        ):
+            return leader
+        return None
 
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
         """Hold a surplus unit just outside the defensive ring's outer edge."""

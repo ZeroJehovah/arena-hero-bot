@@ -5505,15 +5505,18 @@ def test_expedition_members_regroup_when_detached() -> None:
     )
     by_id = {unit_view.id: unit_view for unit_view in turn.vanguards}
 
-    # The five clustered members each have a nearby teammate, so none detaches
-    # and all keep exploring instead of collapsing onto one cell.
-    for number in (2, 3, 4, 5, 6):
+    # Members inside the connected block have both neighbours within range, so
+    # they keep exploring instead of collapsing onto one cell.
+    for number in (2, 3, 4, 5):
         assert (
             strategy._expedition_rendezvous_goal(by_id[UUID(int=number)], turn) is None
         )
 
-    # The lone member on the far right is already ahead of the gap, so it holds
-    # in place rather than turning back to collect the laggards.
+    # The front of the block sees the gap to the lone leader and closes forward.
+    front = by_id[UUID(int=6)]
+    assert strategy._expedition_rendezvous_goal(front, turn) == (30, 0)
+
+    # The leader itself sees the gap behind it and holds in place.
     leader = by_id[UUID(int=7)]
     assert strategy._expedition_rendezvous_goal(leader, turn) == (30, 0)
     goal, reason = strategy._idle_combat_goal(leader, turn, context=None)
