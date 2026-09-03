@@ -62,10 +62,10 @@ UNREACHABLE_CLAIM_COOLDOWN = 128
 # for continuous long-range scouting.
 RESOURCE_SCOUT_INTERVAL = 12
 # A remote claim is still valid, but its loaded return to the Core is the
-# limiting leg of a refill cycle.  Count that leg three times when choosing
-# among otherwise equivalent known sites; this remains a soft preference and never
-# removes a far site from the candidate pool.
-REMOTE_RETURN_WEIGHT = 3
+# limiting leg of a refill cycle.  Count that leg four times for sites outside
+# the local patrol ring; this remains a soft preference and never removes a
+# far site from the candidate pool.
+REMOTE_RETURN_WEIGHT = 4
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -4323,7 +4323,13 @@ class AggressiveStrategy:
             # every known site eligible and let the same soft round-trip cost
             # cover local, outer-band, and remote targets.
             return (
-                approach + REMOTE_RETURN_WEIGHT * core_distance,
+                approach
+                + (
+                    REMOTE_RETURN_WEIGHT
+                    if core_distance > self.config.resource_patrol_radius * 2
+                    else REMOTE_RETURN_WEIGHT - 1
+                )
+                * core_distance,
                 approach,
                 worker.id,
                 resource,
