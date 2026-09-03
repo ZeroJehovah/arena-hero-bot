@@ -587,7 +587,9 @@ class AggressiveStrategy:
             return
         expedition_member = self._is_expedition_member(ranger, context.turn)
         if not expedition_member:
-            visible_target = self._preferred_target(context.focus_target, visible_enemies)
+            visible_target = self._preferred_target(
+                context.focus_target, visible_enemies
+            )
             if visible_target is None:
                 visible_target = self._best_visible_target(
                     ranger.position,
@@ -727,7 +729,9 @@ class AggressiveStrategy:
             return
         expedition_member = self._is_expedition_member(vanguard, context.turn)
         if not expedition_member:
-            visible_target = self._preferred_target(context.focus_target, visible_enemies)
+            visible_target = self._preferred_target(
+                context.focus_target, visible_enemies
+            )
             if visible_target is None:
                 visible_target = self._best_visible_target(
                     vanguard.position,
@@ -3184,7 +3188,9 @@ class AggressiveStrategy:
         turn: Turn,
     ) -> bool:
         """True when the unit fights as part of an expedition squad."""
-        return self.config.expedition_mode and unit.id in self._expedition_member_ids(turn)
+        return self.config.expedition_mode and unit.id in self._expedition_member_ids(
+            turn
+        )
 
     def _patrol_ids(self, turn: Turn) -> frozenset[UUID]:
         """Return the 3-Vanguard/6-Ranger patrol contingent of the formation."""
@@ -3328,9 +3334,7 @@ class AggressiveStrategy:
             member.id: member.position for member in (*turn.vanguards, *turn.rangers)
         }
         progress = {
-            member_id: (
-                alive[member_id][0] * bear_x + alive[member_id][1] * bear_y
-            )
+            member_id: (alive[member_id][0] * bear_x + alive[member_id][1] * bear_y)
             for member_id in members
             if member_id in alive
         }
@@ -3424,14 +3428,11 @@ class AggressiveStrategy:
             | set(turn.obstacle_cells)
         )
         teammates = {
-            member.id: member.position
-            for member in (*turn.vanguards, *turn.rangers)
+            member.id: member.position for member in (*turn.vanguards, *turn.rangers)
         }
         squad = self._expedition_squad_for(unit.id)
         members, bearing = squad if squad is not None else (frozenset(), (0, 0))
-        occupied_by_team = {
-            teammates[mid] for mid in members if mid in teammates
-        }
+        occupied_by_team = {teammates[mid] for mid in members if mid in teammates}
         candidates = [
             cell
             for cell in adjacent_positions(leader)
@@ -3482,9 +3483,7 @@ class AggressiveStrategy:
         advances on one heading instead of splitting.
         """
 
-        alive = {
-            member.id: member for member in (*turn.vanguards, *turn.rangers)
-        }
+        alive = {member.id: member for member in (*turn.vanguards, *turn.rangers)}
         members = [
             member for member_id in squad_members if (member := alive.get(member_id))
         ]
@@ -3509,7 +3508,9 @@ class AggressiveStrategy:
         if best is not None:
             return best[1].position
         remembered = (
-            self._offensive_enemies(turn) if self._offensive_patrol_enabled(turn) else ()
+            self._offensive_enemies(turn)
+            if self._offensive_patrol_enabled(turn)
+            else ()
         )
         if remembered:
             target = self._best_remembered_target(centroid, remembered)
@@ -4308,18 +4309,13 @@ class AggressiveStrategy:
             core_distance = (
                 0 if core_position is None else manhattan(core_position, resource)
             )
-            if (
-                core_position is None
-                or core_distance <= self.config.resource_patrol_radius * 2
-            ):
-                # Keep the established nearest-Worker pairing for the local
-                # harvest ring, where short approach distance is the useful
-                # signal and the loaded return is already short.
-                return approach, approach, worker.id, resource
-            # An outer-band or remote target costs both the approach and the
-            # loaded return to Core.  Keep every known site eligible, but
-            # avoid choosing a slightly nearer target when its return leg is
-            # much longer than another candidate in the same evidence pool.
+            # Every known target costs an unloaded approach and a loaded
+            # return to Core.  The return is short in the inner ring, but it
+            # still decides close alternatives there; ignoring it made a
+            # Worker walk to the farther side of the ring for a small approach
+            # saving and then pay the whole distance again with cargo.  Keep
+            # every known site eligible and let the same soft round-trip cost
+            # cover local, outer-band, and remote targets.
             return (
                 approach + REMOTE_RETURN_WEIGHT * core_distance,
                 approach,

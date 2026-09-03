@@ -1594,6 +1594,26 @@ def test_known_sites_are_claimed_nearest_first_in_one_unbounded_pool() -> None:
     assert set(claims) == {(10, 0), (10, 1)}
 
 
+def test_local_known_sites_include_the_loaded_return_in_pairing_cost() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (0, 10): 100,
+        (0, 4): 100,
+    }
+    strategy = AggressiveStrategy(memory, config)
+
+    turn = make_turn(
+        tick=200,
+        objects=[core(), unit(2, "WORKER", position=(0, 8))],
+    )
+    report = strategy.decide(turn)
+
+    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert decision.action == "MOVE"
+    assert decision.target == (0, 4)
+
+
 def test_known_sites_prefer_core_outreach_before_remote_fallback() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
@@ -5506,10 +5526,7 @@ def test_expedition_idle_goal_points_outward() -> None:
     # member turn back the moment it crossed the horizon (observed live:
     # the rearmost expedition member drifting back toward the Core).
     front = max(
-        (
-            unit_view.position
-            for unit_view in (*turn.vanguards, *turn.rangers)
-        ),
+        (unit_view.position for unit_view in (*turn.vanguards, *turn.rangers)),
         key=lambda position: position[0],
     )
     assert manhattan(front, goal) == 4
@@ -5545,7 +5562,11 @@ def test_expedition_squad_shares_one_enemy_target() -> None:
         turn.rangers[0], turn, context=None
     )
     assert vanguard_goal == ranger_goal == (8, 5)
-    assert vanguard_reason == ranger_reason == "advance together on the squad's enemy target"
+    assert (
+        vanguard_reason
+        == ranger_reason
+        == "advance together on the squad's enemy target"
+    )
 
 
 def test_expedition_squad_shares_target_seen_by_one_member() -> None:
