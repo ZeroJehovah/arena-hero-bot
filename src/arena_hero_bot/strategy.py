@@ -4962,6 +4962,15 @@ class AggressiveStrategy:
             if next_unit is not None
             else next_ranger_cost
         )
+        # A full Core refuses a loaded Worker's deposit cell, so the nominal
+        # post-growth floor can become self-defeating: once every Worker has
+        # cargo, no income can be banked to change the decision.  Spend one
+        # affordable growth action to reopen the storage path, while keeping
+        # the floor for a full but otherwise idle Core.
+        if context.remaining_resources >= context.turn.resource_capacity and any(
+            worker.cargo > 0 for worker in context.turn.workers
+        ):
+            return False
         # A high-cost unit can be affordable at a full current Core while
         # still dropping the newly enlarged Core below a healthy stockpile.
         # Price the actual preferred candidate so a cheaper Vanguard at the

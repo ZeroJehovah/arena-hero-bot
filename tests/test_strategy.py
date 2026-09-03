@@ -4193,6 +4193,31 @@ def test_high_cost_growth_waits_for_a_healthy_post_spawn_stockpile() -> None:
     assert turn.plan.core_action is None
 
 
+def test_full_core_with_loaded_worker_reopens_the_deposit_path() -> None:
+    roster = (
+        [unit(number, "VANGUARD", position=(number, 5)) for number in range(2, 21)]
+        + [unit(number, "RANGER", position=(number, 6)) for number in range(21, 50)]
+        + [
+            unit(
+                number,
+                "WORKER",
+                position=(number, 7),
+                cargo=1 if number == 50 else 0,
+            )
+            for number in range(50, 62)
+        ]
+    )
+    turn = make_turn(resources=300, objects=[core(), *roster])
+
+    decide(turn, config=StrategyConfig(target_workers=12, max_population=None))
+
+    # A full Core with a loaded Worker cannot deposit until production raises
+    # capacity; the escape hatch must not turn the high-tier gate into a
+    # permanent income deadlock.
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+
+
 def test_remote_fleet_attack_does_not_bypass_high_tier_stockpile_floor() -> None:
     roster = (
         [unit(number, "VANGUARD", position=(number, 5)) for number in range(2, 21)]
