@@ -16,6 +16,7 @@ from .strategy import AggressiveStrategy, StrategyConfig
 from .telemetry import JsonlTelemetry
 
 LOGGER = logging.getLogger(__name__)
+RECONNECTABLE_SUBMISSION_ERRORS = frozenset({"COMMAND_WINDOW_CLOSED", "TICK_MISMATCH"})
 
 
 class Tactic(Protocol):
@@ -59,9 +60,9 @@ def run_bot(
         config.base_url,
     )
 
-    reconnect_after_tick_mismatch = True
-    while reconnect_after_tick_mismatch:
-        reconnect_after_tick_mismatch = False
+    reconnect_after_stale_submission = True
+    while reconnect_after_stale_submission:
+        reconnect_after_stale_submission = False
         with ArenaHeroClient(
             api_key=config.api_key,
             base_url=config.base_url,
@@ -111,17 +112,18 @@ def run_bot(
                 )
                 if (
                     submission.get("status") == "rejected"
-                    and submission.get("error") == "TICK_MISMATCH"
+                    and submission.get("error") in RECONNECTABLE_SUBMISSION_ERRORS
                 ):
                     LOGGER.warning(
-                        "reconnecting after stale Tick submission tick=%d",
+                        "reconnecting after stale command submission tick=%d error=%s",
                         turn.tick,
+                        submission.get("error"),
                     )
-                    reconnect_after_tick_mismatch = True
+                    reconnect_after_stale_submission = True
                 if config.max_turns is not None and turns_seen >= config.max_turns:
-                    reconnect_after_tick_mismatch = False
+                    reconnect_after_stale_submission = False
                     break
-                if reconnect_after_tick_mismatch:
+                if reconnect_after_stale_submission:
                     break
 
     return turns_seen

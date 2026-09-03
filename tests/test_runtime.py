@@ -204,14 +204,15 @@ def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> Non
     assert WorldMemory.load(tmp_path / "memory.json").last_tick == 101
 
 
-def test_run_bot_reconnects_after_tick_mismatch(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("error", ("TICK_MISMATCH", "COMMAND_WINDOW_CLOSED"))
+def test_run_bot_reconnects_after_stale_command_rejection(
+    tmp_path, monkeypatch, error
+) -> None:
     stale_source = make_turn(tick=100, objects=[core()])
     stale_turn = Turn(
         tick=stale_source.tick,
         state=stale_source.state,
-        submitter=lambda _plan, _key: _raise(
-            APIError(status_code=409, error="TICK_MISMATCH")
-        ),
+        submitter=lambda _plan, _key: _raise(APIError(status_code=409, error=error)),
     )
     current_turn = make_turn(tick=101, objects=[core()])
     clients = []
