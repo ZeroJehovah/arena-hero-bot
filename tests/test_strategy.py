@@ -12,7 +12,7 @@ from arena_hero import (
     unit_cost,
 )
 
-from arena_hero_bot.geometry import add, manhattan
+from arena_hero_bot.geometry import add, adjacent_positions, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
@@ -5591,9 +5591,13 @@ def test_expedition_members_regroup_when_detached() -> None:
             strategy._expedition_rendezvous_goal(by_id[UUID(int=number)], turn) is None
         )
 
-    # The front of the block sees the gap to the lone leader and closes forward.
+    # The front of the block sees the gap to the lone leader and closes on a
+    # standable cell beside it (the leader's own cell is occupied by the
+    # leader, so aiming at it directly would make the member orbit a wall).
     front = by_id[UUID(int=6)]
-    assert strategy._expedition_rendezvous_goal(front, turn) == (30, 0)
+    goal = strategy._expedition_rendezvous_goal(front, turn)
+    assert goal == (29, 0)
+    assert manhattan(goal, (30, 0)) == 1
 
     # The leader itself sees the gap behind it and holds in place.
     leader = by_id[UUID(int=7)]
@@ -5620,9 +5624,40 @@ def test_expedition_laggard_catches_up_without_leader_turning_back() -> None:
 
     # The laggard (left) closes onto the leader (right), which itself stays put.
     laggard = by_id[UUID(int=3)]
-    assert strategy._expedition_rendezvous_goal(laggard, turn) == (30, 0)
+    assert strategy._expedition_rendezvous_goal(laggard, turn) == (29, 0)
     leader = by_id[UUID(int=2)]
     assert strategy._expedition_rendezvous_goal(leader, turn) == (30, 0)
+
+
+def test_expedition_close_cell_avoids_leader_occupied_cell() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(10, 0)),
+            unit(3, "VANGUARD", position=(4, 0)),
+        ],
+    )
+    laggard = next(u for u in turn.vanguards if u.id == UUID(int=3))
+
+    # The leader's own cell is occupied, so the close-up goal must be a
+    # reachable *empty* cell beside the leader instead.  Aiming at the leader
+    # cell itself would make ``_move`` treat it as blocked and the laggard
+    # orbit the nearest wall forever (observed live: a squad member pacing a
+    # 4-cell loop in an obstacle pocket, unable to rejoin).
+    goal = strategy._expedition_close_cell(laggard, (10, 0), turn)
+    assert goal != (10, 0)
+    assert goal in adjacent_positions((10, 0))
+    assert goal not in {
+        cell
+        for cell in adjacent_positions((10, 0))
+        if cell in {u.position for u in (*turn.vanguards, *turn.rangers)}
+    }
+    assert strategy._expedition_rendezvous_goal(laggard, turn) == goal
 
 
 def test_expedition_manual_launch_dispatches_full_vanguard_squads() -> None:

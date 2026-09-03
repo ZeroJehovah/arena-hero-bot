@@ -3376,8 +3376,68 @@ class AggressiveStrategy:
         if leader is not None and (
             manhattan(unit.position, leader) > EXPEDITION_LINK_RADIUS
         ):
-            return leader
+            return self._expedition_close_cell(unit, leader, turn)
         return None
+
+    def _expedition_close_cell(
+        self,
+        unit: Ranger | Vanguard,
+        leader: Position,
+        turn: Turn,
+    ) -> Position:
+        """Return a standable cell beside ``leader`` for a member to close on.
+
+        Aiming at the leader's own cell is a trap: that cell is occupied by the
+        leader, so ``_move`` treats it as blocked and ``next_step`` falls back
+        to the neighbour "closest to the goal", which orbits the nearest wall
+        forever when the member stands in an obstacle pocket.  Aim at the
+        nearest *reachable* free neighbour of the leader instead so the member
+        can actually walk back inside the link radius.
+        """
+
+        static = (
+            self.memory.obstacles
+            | set(self.memory.contested_positions)
+            | set(turn.obstacle_cells)
+        )
+        teammates = {
+            member.id: member.position
+            for member in (*turn.vanguards, *turn.rangers)
+        }
+        squad = self._expedition_squad_for(unit.id)
+        members = squad[0] if squad is not None else frozenset()
+        occupied_by_team = {
+            teammates[mid] for mid in members if mid in teammates
+        }
+        candidates = [
+            cell
+            for cell in adjacent_positions(leader)
+            if cell not in static
+            and cell not in occupied_by_team
+            and cell != unit.position
+        ]
+        if not candidates:
+            return leader
+        reachable = [
+            cell
+            for cell in candidates
+            if next_step(
+                unit.position,
+                cell,
+                blocked=static,
+                require_path=True,
+            )
+            is not None
+        ]
+        pool = reachable if reachable else candidates
+        return min(
+            pool,
+            key=lambda cell: (
+                manhattan(unit.position, cell),
+                manhattan(cell, leader),
+                cell,
+            ),
+        )
 
     def _expedition_shared_target(
         self,
