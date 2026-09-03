@@ -4118,29 +4118,18 @@ class AggressiveStrategy:
                 self._resource_scout_id = scout.id
                 workers.pop(scout.id)
         assignments: dict[UUID, Position] = {}
-        # A currently visible resource is confirmed live; prefer it over a
-        # remembered site even when the latter happens to be a few cells
-        # nearer.  Within each evidence tier, prefer the Core's local
-        # outreach ring before remote sites.  Keep the remote half in the
-        # same tier as a fallback: this is a priority, not a distance cap, so
-        # every known site remains eligible for an empty Worker.
+        # Live view and durable memory are equally trustworthy: a remembered
+        # site is as good a target as one still in view, so both share one
+        # candidate pool and the nearest pairings win.  The outreach band is no
+        # longer a separate priority tier; it is simply the natural result of
+        # ordering every known site by approach (and loaded-return) cost.
         core_position = turn.core.position if turn.core is not None else None
         pools: list[set[Position]] = []
-        for pool in (visible_resources, remembered_resources, rechecks):
-            if core_position is None:
-                pools.append(pool)
-                continue
-            local = {
-                resource
-                for resource in pool
-                if manhattan(core_position, resource)
-                <= self.config.resource_outreach_radius
-            }
-            if local:
-                pools.append(local)
-            remote = pool - local
-            if remote:
-                pools.append(remote)
+        known = visible_resources | remembered_resources
+        if known:
+            pools.append(known)
+        if rechecks:
+            pools.append(rechecks)
         self._hold_existing_claims(workers, pools, assignments)
 
         def assignment_key(
@@ -4230,6 +4219,20 @@ class AggressiveStrategy:
                 None,
             )
             if owner is None:
+                held = self.memory.goal_for(str(harvester.id))
+                if (
+                    held is not None
+                    and held.purpose == RESOURCE_CLAIM_PURPOSE
+                    and current_claim == held.position
+                ):
+                    # The Worker is committed to an active claim it is still
+                    # progressing toward; the hysteresis pins who walks to
+                    # what, so a live cell underfoot must not steal that route.
+                    continue
+                # Nobody else owns the live cell underfoot, so the Worker
+                # harvests the confirmed resource instead of walking away; its
+                # prior approach falls back to the pool for another Worker.
+                assignments[harvester.id] = resource
                 continue
             if current_claim is None:
                 assignments[harvester.id] = resource

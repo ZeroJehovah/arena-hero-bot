@@ -1124,7 +1124,7 @@ def test_nearest_worker_is_assigned_visible_resource() -> None:
     ]
 
 
-def test_visible_resource_preempts_nearer_remembered_site() -> None:
+def test_visible_resource_does_not_preempt_nearer_remembered_site() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
     memory.resource_cells[(2, 0)] = 100
@@ -1145,7 +1145,7 @@ def test_visible_resource_preempts_nearer_remembered_site() -> None:
         for item in report.decisions
         if item.reason == "claim nearest unassigned known resource"
     )
-    assert claim.target == (10, 0)
+    assert claim.target == (2, 0)
 
 
 def test_live_workers_use_one_scout_for_remote_visible_resources() -> None:
