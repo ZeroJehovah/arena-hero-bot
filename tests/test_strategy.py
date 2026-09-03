@@ -1978,6 +1978,38 @@ def test_critical_vanguard_fights_before_withdrawing_during_core_assault() -> No
     )
 
 
+def test_remote_critical_vanguard_withdraws_during_fleet_assault() -> None:
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(20, 0), hp=3),
+            unit(90, "RANGER", controlled=False, position=(21, 0)),
+        ],
+        events=[
+            {
+                "event_id": object_id(91),
+                "tick": 100,
+                "event_type": "UNIT_DAMAGED",
+                "reason_code": "ATTACK",
+                "actor_id": object_id(90),
+                "target_id": object_id(2),
+                "position": [20, 0],
+                "values": {"damage": 1, "hp": 3},
+            }
+        ],
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert action.type == "MOVE"
+    assert any(
+        item.actor_id == object_id(2)
+        and item.reason == "return critical unit to Core for healing"
+        for item in report.decisions
+    )
+
+
 def test_wounded_vanguard_withdraws_before_reaching_half_health() -> None:
     turn = make_turn(
         objects=[

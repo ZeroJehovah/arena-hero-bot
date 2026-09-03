@@ -650,7 +650,13 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
-        if not context.combat_assault and self._recover_if_critical(
+        remote_assault = (
+            context.combat_assault
+            and context.turn.core is not None
+            and manhattan(vanguard.position, context.turn.core.position)
+            > self.config.core_assault_radius
+        )
+        if (not context.combat_assault or remote_assault) and self._recover_if_critical(
             vanguard,
             maximum_hp=4,
             critical_hp=3,
