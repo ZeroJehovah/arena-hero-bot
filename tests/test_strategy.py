@@ -1,6 +1,7 @@
 """Representative aggressive tactic scenarios."""
 
 from itertools import pairwise
+from unittest.mock import patch
 from uuid import UUID
 
 from arena_hero import (
@@ -16,6 +17,7 @@ from arena_hero_bot.geometry import add, adjacent_positions, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
+    EXPEDITION_STAGING_PATH_EXPANSIONS,
     EXPEDITION_STAGING_RADIUS,
     RANGER_VISION_RADIUS,
     RESOURCE_SCOUT_INTERVAL,
@@ -5540,6 +5542,34 @@ def test_expedition_staging_resolves_duplicate_ring_targets() -> None:
     assert all(
         manhattan(turn.core.position, goal) == EXPEDITION_STAGING_RADIUS
         for goal in goals.values()
+    )
+
+
+def test_expedition_staging_uses_extended_path_search() -> None:
+    strategy = _expedition_strategy()
+    turn = make_turn(objects=[core(), unit(2, "VANGUARD", position=(0, 100))])
+    staged = turn.vanguards[0]
+    strategy._staged_ids = frozenset({staged.id})
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={staged.position},
+        enemy_positions=set(),
+    )
+
+    with patch(
+        "arena_hero_bot.strategy.next_step",
+        return_value=Direction.DOWN,
+    ) as route:
+        assert strategy._move(
+            staged,
+            (0, 0),
+            context,
+            reason="return staged unit",
+        )
+
+    assert route.call_args.kwargs["max_expansions"] == (
+        EXPEDITION_STAGING_PATH_EXPANSIONS
     )
 
 

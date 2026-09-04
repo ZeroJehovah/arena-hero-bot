@@ -118,6 +118,12 @@ EXPEDITION_SQUAD_RANGERS = 2
 EXPEDITION_HORIZON = 256
 # Staging cells sit just outside the defensive ring's maximum radius.
 EXPEDITION_STAGING_RADIUS = 13
+# A legacy expedition member can be hundreds of cells away when it rejoins the
+# staging pool.  The default 4,096-node A* budget was measured stopping inside
+# a six-cell loop on such a return, while 8,192 found the real route in about
+# 50 ms.  Apply the larger budget only to staged Units so normal fleet planning
+# keeps its existing bound.
+EXPEDITION_STAGING_PATH_EXPANSIONS = 8192
 # Maximum Manhattan distance between a member and its nearest teammate before
 # the member stops to let the gap close.  This keeps *adjacent* members within
 # sight (Vanguard vision is 4, Ranger vision is 5) so the squad stays a
@@ -2105,12 +2111,18 @@ class AggressiveStrategy:
         blocked = self._static_blockers(unit, context)
         blocked.update(context.occupied)
         blocked.update(context.reserved)
+        max_expansions = (
+            EXPEDITION_STAGING_PATH_EXPANSIONS
+            if self.config.expedition_mode and unit.id in self._staged_ids
+            else 4096
+        )
         direction = next_step(
             unit.position,
             goal,
             blocked=blocked,
             recent=self.memory.recent_positions(str(unit.id)),
             direction_offset=self._direction_offset(unit.id),
+            max_expansions=max_expansions,
             allow_goal=allow_goal,
         )
         if direction is None:
