@@ -3632,13 +3632,66 @@ class AggressiveStrategy:
         )
 
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
-        """Hold a surplus unit just outside the defensive ring's outer edge."""
+        """Hold a surplus unit at a unique cell outside the defensive ring.
+
+        Hashing every Unit directly onto the ring can give two staged Units the
+        same cell.  Once one arrives, the other treats that permanently occupied
+        goal as unreachable and ``next_step``'s local fallback can make it orbit
+        a distant obstacle forever.  Preserve Units that have already reached
+        any valid staging cell, then resolve the remaining hash collisions in a
+        stable order so every staged Unit has somewhere it can actually stand.
+        """
         core = turn.core
         if core is None:
             return unit.position
         offsets = _defensive_ring_offsets(EXPEDITION_STAGING_RADIUS)
-        dx, dy = offsets[unit.id.int % len(offsets)]
-        return core.position[0] + dx, core.position[1] + dy
+        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        cells = tuple(
+            (core.position[0] + dx, core.position[1] + dy)
+            for dx, dy in offsets
+            if (core.position[0] + dx, core.position[1] + dy) not in obstacles
+        )
+        if not cells:
+            return unit.position
+
+        staged = sorted(
+            (
+                candidate
+                for candidate in (*turn.vanguards, *turn.rangers)
+                if candidate.id in self._staged_ids
+            ),
+            key=lambda candidate: candidate.id.bytes,
+        )
+        assignments: dict[UUID, Position] = {}
+        claimed: set[Position] = set()
+
+        # A Unit already on the staging ring has finished the journey.  Let it
+        # keep that cell before assigning hashed preferences to Units in transit.
+        valid_cells = set(cells)
+        for candidate in staged:
+            if candidate.position in valid_cells and candidate.position not in claimed:
+                assignments[candidate.id] = candidate.position
+                claimed.add(candidate.position)
+
+        for candidate in staged:
+            if candidate.id in assignments:
+                continue
+            preferred = candidate.id.int % len(cells)
+            goal = next(
+                (
+                    cells[index % len(cells)]
+                    for index in range(preferred, preferred + len(cells))
+                    if cells[index % len(cells)] not in claimed
+                ),
+                None,
+            )
+            if goal is None:
+                assignments[candidate.id] = candidate.position
+                continue
+            assignments[candidate.id] = goal
+            claimed.add(goal)
+
+        return assignments.get(unit.id, unit.position)
 
     def _is_offensive_combat_unit(
         self,

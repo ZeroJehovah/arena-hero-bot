@@ -16,6 +16,7 @@ from arena_hero_bot.geometry import add, adjacent_positions, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
+    EXPEDITION_STAGING_RADIUS,
     RANGER_VISION_RADIUS,
     RESOURCE_SCOUT_INTERVAL,
     AggressiveStrategy,
@@ -5501,6 +5502,45 @@ def test_expedition_stages_surplus_units_at_ring_edge() -> None:
 
     assert len(strategy._staged_ids) == 2
     assert not strategy._expedition_squads
+
+
+def test_expedition_staging_resolves_duplicate_ring_targets() -> None:
+    strategy = _expedition_strategy()
+    offsets = _defensive_ring_offsets(EXPEDITION_STAGING_RADIUS)
+    first_staged = 18
+    second_staged = first_staged + len(offsets)
+    shared_preference = offsets[first_staged % len(offsets)]
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number + 100, 2)) for number in range(2, 18)
+    ] + [
+        unit(first_staged, "VANGUARD", position=shared_preference),
+        unit(second_staged, "VANGUARD", position=(0, 100)),
+    ]
+    rangers = [
+        unit(number, "RANGER", position=(number + 100, 3)) for number in range(100, 132)
+    ]
+    turn = make_turn(resources=10000, objects=[core(), *vanguards, *rangers])
+    assert turn.core is not None
+
+    strategy._update_expeditions(turn)
+    staged = {
+        candidate.id: candidate
+        for candidate in turn.vanguards
+        if candidate.id in strategy._staged_ids
+    }
+    goals = {
+        unit_id: strategy._staging_goal(candidate, turn)
+        for unit_id, candidate in staged.items()
+    }
+
+    assert goals[UUID(int=first_staged)] == shared_preference
+    assert goals[UUID(int=second_staged)] != shared_preference
+    assert len(set(goals.values())) == len(goals)
+    assert all(
+        manhattan(turn.core.position, goal) == EXPEDITION_STAGING_RADIUS
+        for goal in goals.values()
+    )
 
 
 def test_expedition_forms_squad_of_four_when_surplus_ready() -> None:
