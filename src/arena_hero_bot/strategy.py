@@ -4417,11 +4417,15 @@ class AggressiveStrategy:
         # ordering every known site by approach (and loaded-return) cost.
         core_position = turn.core.position if turn.core is not None else None
         pools: list[set[Position]] = []
-        known = visible_resources | remembered_resources
-        if known:
-            pools.append(known)
-        if rechecks:
-            pools.append(rechecks)
+        # A rested site is weaker evidence than a currently visible or
+        # remembered site, but it is still a known coordinate.  Keep all
+        # candidates in the same costed pool: when the remembered map is
+        # saturated with distant cells, a nearby site due for recheck should
+        # win on round-trip cost instead of leaving every Worker on a remote
+        # approach.
+        candidates = visible_resources | remembered_resources | rechecks
+        if candidates:
+            pools.append(candidates)
         self._hold_existing_claims(workers, pools, assignments)
 
         def assignment_key(

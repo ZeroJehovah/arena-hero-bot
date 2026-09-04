@@ -1594,6 +1594,30 @@ def test_known_sites_are_claimed_nearest_first_in_one_unbounded_pool() -> None:
     assert set(claims) == {(10, 0), (10, 1)}
 
 
+def test_recheck_site_competes_with_far_remembered_site_by_round_trip_cost() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (60, 0): 100,
+        (10, 0): 100,
+    }
+    memory.resource_absences[(10, 0)] = 0
+    strategy = AggressiveStrategy(memory, config)
+
+    turn = make_turn(
+        tick=200,
+        objects=[core(), unit(2, "WORKER", position=(0, 1))],
+    )
+    report = strategy.decide(turn)
+
+    claim = next(
+        item
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned known resource"
+    )
+    assert claim.target == (10, 0)
+
+
 def test_local_known_sites_include_the_loaded_return_in_pairing_cost() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
