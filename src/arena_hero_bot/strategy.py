@@ -123,6 +123,14 @@ EXPEDITION_STAGING_RADIUS = 13
 # sight (Vanguard vision is 4, Ranger vision is 5) so the squad stays a
 # connected chain, without collapsing the whole squad onto one cell.
 EXPEDITION_LINK_RADIUS = 4
+# An expedition member under fire closes on a hostile that close (inside the
+# squad's own sight line) instead of standing still for cohesion; when the
+# attacker stays beyond sweep reach and keeps firing, the member breaks
+# contact instead of absorbing shots.  A 1HP enemy Ranger kiting a
+# full-HP Vanguard from range 2-3 used to kill it in place because expedition
+# members skipped all the visible-target combat logic.  This radius is the
+# window a member may still close on to answer that fire.
+EXPEDITION_COUNTER_RADIUS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +176,6 @@ class StrategyConfig:
     raid_trigger_kills: int = 3
     raid_kill_window: int = 24
     expedition_mode: bool = False
-    launch_expeditions: tuple[tuple[int, UnitType], ...] = ()
 
 
 @dataclass(slots=True)
@@ -276,12 +283,6 @@ class AggressiveStrategy:
         self._staged_ids: frozenset[UUID] = frozenset()
         self._expedition_squads: list[tuple[frozenset[UUID], Position]] = []
         self._expedition_serial: int = 0
-        # One-off manual expeditions requested at startup, consumed on the
-        # first live Tick.  Each entry is the remaining units of that type a
-        # squad still needs to draw from surplus combat units.
-        self._pending_launch: list[tuple[int, UnitType]] = list(
-            self.config.launch_expeditions
-        )
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
@@ -824,6 +825,13 @@ class AggressiveStrategy:
                 reason=f"hunt last seen {remembered.kind.lower()}",
             ):
                 return
+        elif self._expedition_under_fire(
+            vanguard,
+            context,
+            visible_enemies,
+            offensive=offensive,
+        ):
+            return
 
         goal, reason = self._idle_combat_goal(
             vanguard,
@@ -3251,29 +3259,6 @@ class AggressiveStrategy:
             key=lambda unit_id: unit_id.bytes,
         )
 
-        # One-off manual launches are fulfilled first, drawing their full squad
-        # from the surplus of the requested type; any squad that cannot fill
-        # yet stays pending for a later Tick rather than departing short.
-        remaining_launch: list[tuple[int, UnitType]] = []
-        for count, unit_type in self._pending_launch:
-            if unit_type is UnitType.VANGUARD and len(staged_vanguards) >= count:
-                members = frozenset(staged_vanguards[:count])
-                del staged_vanguards[:count]
-                self._expedition_squads.append(
-                    (members, self._expedition_bearing(core))
-                )
-                self._expedition_serial += 1
-            elif unit_type is UnitType.RANGER and len(staged_rangers) >= count:
-                members = frozenset(staged_rangers[:count])
-                del staged_rangers[:count]
-                self._expedition_squads.append(
-                    (members, self._expedition_bearing(core))
-                )
-                self._expedition_serial += 1
-            else:
-                remaining_launch.append((count, unit_type))
-        self._pending_launch = remaining_launch
-
         while (
             len(staged_vanguards) >= EXPEDITION_SQUAD_VANGUARDS
             and len(staged_rangers) >= EXPEDITION_SQUAD_RANGERS
@@ -3479,6 +3464,8 @@ class AggressiveStrategy:
         self,
         turn: Turn,
         squad_members: frozenset[UUID],
+        *,
+        include_remembered: bool = True,
     ) -> Position | None:
         """Return the single enemy cell the whole squad should converge on.
 
@@ -3513,6 +3500,8 @@ class AggressiveStrategy:
                     best = (score, enemy)
         if best is not None:
             return best[1].position
+        if not include_remembered:
+            return None
         remembered = (
             self._offensive_enemies(turn)
             if self._offensive_patrol_enabled(turn)
@@ -3523,6 +3512,129 @@ class AggressiveStrategy:
             if target is not None:
                 return target.position
         return None
+
+    def _expedition_under_fire(
+        self,
+        vanguard: Vanguard,
+        context: _TurnContext,
+        visible_enemies: tuple[CoreView | UnitView, ...],
+        *,
+        offensive: bool,
+    ) -> bool:
+        """Answer ranged fire instead of waiting for the cohesion chain to close.
+
+        A 1HP enemy Ranger kiting a full-HP Vanguard from range 2-3 used
+        to kill it in place because the dying member only ever got the cohesion goal
+        ("hold for the expedition's laggards to close up") and never closed the
+        distance nor broke away.  When a visible hostile is close enough to
+        engage, advance onto it exactly like the normal rush (counter); when
+        the attacker stays out of melee reach and we have already been hit, step
+        out of its line of fire instead of absorbing another volley (disengage).
+        The survival/attack answer overrides the cohesion hold when under fire.
+        """
+
+        if not visible_enemies:
+            return False
+
+        target = self._preferred_target(context.focus_target, visible_enemies)
+        if target is None:
+            target = self._best_visible_target(
+                vanguard.position, context.turn, visible_enemies
+            )
+        if target is None:
+            return False
+
+        distance = manhattan(vanguard.position, target.position)
+        # Counter: a hostile inside the squad's short engagement window is worth
+        # closing on; override the cohesion hold that used to park members next to
+        # each other while a single Ranger shot them one by one.
+        if distance <= EXPEDITION_COUNTER_RADIUS:
+            return self._expedition_close_to_engage(
+                vanguard, target, context, offensive=offensive
+            )
+        # Disengage: the attacker stays beyond melee reach and we are already
+        # damaged: break contact instead of standing still for the next hit.
+        if vanguard.hp < 4:
+            return self._expedition_break_contact(vanguard, target, context)
+        return False
+
+
+    def _expedition_close_to_engage(
+        self,
+        vanguard: Vanguard,
+        target: CoreView | UnitView,
+        context: _TurnContext,
+        *,
+        offensive: bool,
+    ) -> bool:
+        """Advance onto ``target`` like the non-expedition rush, overriding cohesion."""
+        intercept = self._intercept_cell(target, context)
+        for anchor in dict.fromkeys((intercept, target.position)):
+            candidates = [
+                position
+                for position in adjacent_positions(anchor)
+                if position not in self.memory.obstacles
+                and position not in context.enemy_positions
+                and (
+                    position == vanguard.position
+                    or position not in context.occupied | context.reserved
+                )
+            ]
+            if not candidates:
+                continue
+            goal = min(
+                candidates,
+                key=lambda position: (
+                    manhattan(vanguard.position, position),
+                    manhattan(intercept, position),
+                    position,
+                ),
+            )
+            if self._move_within_leash(
+                vanguard,
+                goal,
+                context,
+                offensive=offensive,
+                reason="close on the ranged attacker instead of waiting",
+            ):
+                return True
+            return False
+        return False
+
+
+    def _expedition_break_contact(
+        self,
+        vanguard: Vanguard,
+        attacker: CoreView | UnitView,
+        context: _TurnContext,
+    ) -> bool:
+        """Step out of ``attacker``'s line of fire to stop absorbing hits."""
+        blocked = set(self.memory.obstacles)
+        blocked.update(context.turn.obstacle_cells)
+        blocked.update(context.occupied)
+        blocked.update(context.reserved)
+        blocked.discard(vanguard.position)
+        candidates = [
+            position
+            for position in adjacent_positions(vanguard.position)
+            if position not in blocked
+            and position not in context.enemy_positions
+        ]
+        if not candidates:
+            return False
+        current = manhattan(vanguard.position, attacker.position)
+        goal = max(
+            candidates,
+            key=lambda position: (manhattan(position, attacker.position), position),
+        )
+        if manhattan(goal, attacker.position) < current:
+            return False
+        return self._move(
+            vanguard,
+            goal,
+            context,
+            reason="break contact with the ranged attacker",
+        )
 
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
         """Hold a surplus unit just outside the defensive ring's outer edge."""
@@ -3677,6 +3789,17 @@ class AggressiveStrategy:
     ) -> tuple[Position, str]:
         if self.config.expedition_mode:
             if unit.id in self._expedition_member_ids(turn):
+                squad = self._expedition_squad_for(unit.id)
+                if squad is not None:
+                    members, _ = squad
+                    visible_shared = self._expedition_shared_target(
+                        turn, members, include_remembered=False
+                    )
+                    if visible_shared is not None:
+                        return (
+                            visible_shared,
+                            "advance together on the squad's enemy target",
+                        )
                 rendezvous = self._expedition_rendezvous_goal(unit, turn)
                 if rendezvous is not None:
                     if rendezvous == unit.position:
@@ -3688,7 +3811,6 @@ class AggressiveStrategy:
                         rendezvous,
                         "close up so the expedition's line of sight stays connected",
                     )
-                squad = self._expedition_squad_for(unit.id)
                 if squad is not None:
                     members, _ = squad
                     shared = self._expedition_shared_target(turn, members)

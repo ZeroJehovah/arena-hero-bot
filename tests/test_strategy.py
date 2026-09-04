@@ -5724,16 +5724,13 @@ def test_expedition_close_cell_avoids_leader_occupied_cell() -> None:
     assert strategy._expedition_rendezvous_goal(laggard, turn) == goal
 
 
-def test_expedition_manual_launch_dispatches_full_vanguard_squads() -> None:
-    strategy = AggressiveStrategy(
-        WorldMemory(),
-        expedition_config(
-            launch_expeditions=((6, UnitType.VANGUARD), (6, UnitType.VANGUARD))
-        ),
-    )
+def test_expedition_never_forms_pure_vanguard_squad() -> None:
+    # Pure-Vanguard expeditions are banned: a squad needs both types.  A
+    # surplus of Vanguards alone stays staged at the ring edge forever.
+    strategy = AggressiveStrategy(WorldMemory(), expedition_config())
 
     vanguards = [
-        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 31)
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 20)
     ]
     rangers = [
         unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 32)
@@ -5748,35 +5745,99 @@ def test_expedition_manual_launch_dispatches_full_vanguard_squads() -> None:
     )
     strategy._update_expeditions(turn)
 
-    assert len(strategy._expedition_squads) == 2
-    sizes = sorted(len(members) for members, _ in strategy._expedition_squads)
-    assert sizes == [6, 6]
-    assert strategy._pending_launch == []
-    assert len(strategy._staged_ids) == 31 - 16 - 12
+    assert not strategy._expedition_squads
+    assert len(strategy._staged_ids) == 4
+    for members, _ in strategy._expedition_squads:
+        assert len(members) == 4
 
 
-def test_expedition_manual_launch_waits_until_units_are_available() -> None:
-    strategy = AggressiveStrategy(
-        WorldMemory(),
-        expedition_config(launch_expeditions=((6, UnitType.VANGUARD),)),
-    )
-
-    vanguards = [
-        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 2 + 19)
-    ]
-    rangers = [
-        unit(number, "RANGER", position=(number, 3)) for number in range(50, 50 + 32)
-    ]
-    workers = [
-        unit(number, "WORKER", position=(number, 4)) for number in range(100, 112)
+def test_expedition_vanguard_closes_on_ranged_attacker() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
     ]
 
     turn = make_turn(
         resources=10000,
-        objects=[core(), *vanguards, *rangers, *workers],
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "RANGER", position=(6, 5)),
+            unit(90, "RANGER", controlled=False, position=(8, 5)),
+        ],
     )
-    strategy._update_expeditions(turn)
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+    vanguard = turn.vanguards[0]
 
-    assert len(strategy._expedition_squads) == 0
-    assert strategy._pending_launch == [(6, UnitType.VANGUARD)]
-    assert len(strategy._staged_ids) == 3
+    assert strategy._expedition_under_fire(
+        vanguard, context, turn.visible_enemies, offensive=True
+    )
+    action = turn.plan.unit_actions[vanguard.id]
+    assert action.type == "MOVE"
+    assert any(
+        item.action == "MOVE" and "close on the ranged attacker" in item.reason
+        for item in context.report.decisions
+    )
+
+
+def test_expedition_vanguard_breaks_contact_when_damaged_and_outranged() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5), hp=2),
+            unit(3, "RANGER", position=(6, 5)),
+            unit(90, "RANGER", controlled=False, position=(9, 5)),
+        ],
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+    vanguard = turn.vanguards[0]
+
+    assert strategy._expedition_under_fire(
+        vanguard, context, turn.visible_enemies, offensive=True
+    )
+    action = turn.plan.unit_actions[vanguard.id]
+    assert action.type == "MOVE"
+    moved = add(vanguard.position, action.direction)
+    assert manhattan(moved, (9, 5)) > manhattan(vanguard.position, (9, 5))
+
+
+def test_expedition_detached_member_advances_on_visible_enemy() -> None:
+    # A member that would otherwise hold cohesion for the laggards still
+    # advances on an enemy currently in the squad's sight: attack priority
+    # overrides the rendezvous WAIT that used to leave members standing under
+    # ranged fire.
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "RANGER", position=(10, 5)),
+            unit(90, "RANGER", controlled=False, position=(12, 5)),
+        ],
+    )
+
+    member_view = turn.rangers[0]
+    goal, reason = strategy._idle_combat_goal(member_view, turn, context=None)
+    assert goal == (12, 5)
+    assert reason == "advance together on the squad's enemy target"
