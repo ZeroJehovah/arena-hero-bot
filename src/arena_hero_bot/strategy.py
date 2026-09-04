@@ -62,10 +62,10 @@ UNREACHABLE_CLAIM_COOLDOWN = 128
 # for continuous long-range scouting.
 RESOURCE_SCOUT_INTERVAL = 12
 # A remote claim is still valid, but its loaded return to the Core is the
-# limiting leg of a refill cycle.  Count that leg four times for sites outside
+# limiting leg of a refill cycle.  Count that leg three times for sites outside
 # the local patrol ring; this remains a soft preference and never removes a
 # far site from the candidate pool.
-REMOTE_RETURN_WEIGHT = 4
+REMOTE_RETURN_WEIGHT = 3
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
