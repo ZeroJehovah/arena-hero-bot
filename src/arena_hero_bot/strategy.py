@@ -3558,7 +3558,6 @@ class AggressiveStrategy:
             return self._expedition_break_contact(vanguard, target, context)
         return False
 
-
     def _expedition_close_to_engage(
         self,
         vanguard: Vanguard,
@@ -3590,17 +3589,14 @@ class AggressiveStrategy:
                     position,
                 ),
             )
-            if self._move_within_leash(
+            return self._move_within_leash(
                 vanguard,
                 goal,
                 context,
                 offensive=offensive,
                 reason="close on the ranged attacker instead of waiting",
-            ):
-                return True
-            return False
+            )
         return False
-
 
     def _expedition_break_contact(
         self,
@@ -3617,8 +3613,7 @@ class AggressiveStrategy:
         candidates = [
             position
             for position in adjacent_positions(vanguard.position)
-            if position not in blocked
-            and position not in context.enemy_positions
+            if position not in blocked and position not in context.enemy_positions
         ]
         if not candidates:
             return False
