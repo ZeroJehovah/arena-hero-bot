@@ -65,8 +65,11 @@ For a long-running local instance that restarts after an unexpected process exit
 ./scripts/run-live.sh
 ```
 
-The supervisor uses the live defaults `--target-workers 12 --no-max-population`
-when no arguments are supplied. Pass normal CLI arguments to override them.
+The supervisor uses the live defaults `--target-workers 16 --no-max-population
+--expedition-mode` when no arguments are supplied. Pass normal CLI arguments to
+override them. The live expedition posture reserves 8 Vanguards and 16 Rangers
+for a symmetric eight-direction perimeter, assigns four 3-unit quadrant patrol
+teams, and grows the Worker economy to 16 units.
 
 For a persistent systemd deployment, install the supplied service after creating
 the virtual environment and `.env` file:
