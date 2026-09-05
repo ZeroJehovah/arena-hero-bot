@@ -102,6 +102,10 @@ class WorldMemory:
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
     # ``patrol-1`` .. ``patrol-3``, ``staged`` or ``expedition-N``.
     unit_roles: dict[str, str] = field(default_factory=dict)
+    # Legacy memory files predate durable role assignment.  The strategy uses
+    # this marker to run one spatial sanity pass, then never reclassifies live
+    # UUIDs merely because their positions change.
+    unit_roles_initialized: bool = False
     expedition_squads: list[ExpeditionSquad] = field(default_factory=list)
     next_expedition_serial: int = 0
     # Normal high-tier production is deliberately throttled.  Keep its
@@ -432,6 +436,7 @@ class WorldMemory:
                 for position, absent_tick in sorted(self.resource_absences.items())
             ],
             "unit_roles": dict(sorted(self.unit_roles.items())),
+            "unit_roles_initialized": self.unit_roles_initialized,
             "expedition_squads": [
                 {
                     "serial": squad.serial,
@@ -510,6 +515,7 @@ class WorldMemory:
                 str(unit_id): str(role)
                 for unit_id, role in raw.get("unit_roles", {}).items()
             },
+            unit_roles_initialized=bool(raw.get("unit_roles_initialized", False)),
             expedition_squads=[
                 ExpeditionSquad(
                     serial=int(value.get("serial", index + 1)),

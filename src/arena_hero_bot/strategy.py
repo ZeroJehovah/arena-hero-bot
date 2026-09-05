@@ -3257,6 +3257,7 @@ class AggressiveStrategy:
 
         live_units = {str(unit.id): unit for unit in (*turn.vanguards, *turn.rangers)}
         live_ids = set(live_units)
+        legacy_migration = not self.memory.unit_roles_initialized
         roles = {
             unit_id: role
             for unit_id, role in self.memory.unit_roles.items()
@@ -3279,6 +3280,22 @@ class AggressiveStrategy:
                     roles[unit_id] = f"{EXPEDITION_ROLE_PREFIX}{serial}"
                     expedition_ids.add(unit_id)
 
+        migration_excluded_ids: set[str] = set()
+        if legacy_migration and turn.core is not None:
+            # The previous in-memory tactic called every outer UUID a patrol
+            # member.  A restart could therefore leave an old expedition
+            # remnant hundreds of cells away while it still carried a patrol
+            # label.  Keep such remnants staged during this one migration;
+            # the normal vacancy pass below supplies a nearby replacement.
+            for unit_id, role in tuple(roles.items()):
+                if (
+                    self._patrol_team_from_role(role) is not None
+                    and manhattan(turn.core.position, live_units[unit_id].position)
+                    > self.config.offensive_patrol_radius
+                ):
+                    roles[unit_id] = STAGED_ROLE
+                    migration_excluded_ids.add(unit_id)
+
         def candidate_key(unit_id: str) -> tuple[object, ...]:
             return (roles.get(unit_id) != STAGED_ROLE, UUID(unit_id).bytes)
 
@@ -3296,6 +3313,7 @@ class AggressiveStrategy:
                     for unit_id, unit in live_units.items()
                     if unit.unit_type is unit_type
                     and unit_id not in expedition_ids
+                    and unit_id not in migration_excluded_ids
                     and (unit_id not in roles or roles[unit_id] == STAGED_ROLE)
                 ),
                 # A staged Unit is eligible to replace a dead formation
@@ -3322,6 +3340,7 @@ class AggressiveStrategy:
         ):
             roles[unit_id] = STAGED_ROLE
         self.memory.unit_roles = roles
+        self.memory.unit_roles_initialized = True
         self._staged_ids = frozenset(
             UUID(unit_id) for unit_id, role in roles.items() if role == STAGED_ROLE
         )

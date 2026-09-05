@@ -53,6 +53,7 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
 def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
     memory = WorldMemory(
         unit_roles={object_id(2): "defense", object_id(3): "patrol-2"},
+        unit_roles_initialized=True,
         expedition_squads=[
             ExpeditionSquad(
                 serial=4,
@@ -67,6 +68,7 @@ def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
 
     loaded = WorldMemory.load(path)
     assert loaded.unit_roles == memory.unit_roles
+    assert loaded.unit_roles_initialized is True
     assert loaded.expedition_squads == memory.expedition_squads
     assert loaded.next_expedition_serial == 4
 

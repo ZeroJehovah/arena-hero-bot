@@ -5500,6 +5500,56 @@ def test_expedition_roles_are_stable_and_patrol_is_three_teams() -> None:
     assert strategy.memory.unit_roles[str(new_ranger["id"])] == "staged"
 
 
+def test_legacy_remote_patrol_remnant_is_staged_once() -> None:
+    strategy = _expedition_strategy()
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(0, 3)) for number in range(16)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(0, 3)) for number in range(33)]
+    first = make_turn(resources=10_000, objects=[core(), *vanguards, *rangers])
+    strategy._reconcile_unit_roles(first)
+    before = dict(strategy.memory.unit_roles)
+    remote_id = next(
+        item["id"] for item in rangers if before[str(item["id"])] == "patrol-3"
+    )
+    staged_id = next(
+        item["id"] for item in rangers if before[str(item["id"])] == STAGED_ROLE
+    )
+    strategy.memory.unit_roles_initialized = False
+    migrated_rangers = [
+        unit(
+            UUID(item["id"]).int,
+            "RANGER",
+            position=(500, 500) if item["id"] == remote_id else (0, 3),
+        )
+        for item in rangers
+    ]
+    turn = make_turn(
+        tick=101,
+        resources=10_000,
+        objects=[core(), *vanguards, *migrated_rangers],
+    )
+
+    strategy._reconcile_unit_roles(turn)
+
+    assert strategy.memory.unit_roles[str(remote_id)] == STAGED_ROLE
+    assert strategy.memory.unit_roles[str(staged_id)] == "patrol-3"
+    assert strategy.memory.unit_roles_initialized is True
+    for team in range(1, 4):
+        members = strategy._patrol_team_members(team, turn)
+        assert len(members) == 3
+        assert sum(member.unit_type is UnitType.VANGUARD for member in members) == 1
+        assert sum(member.unit_type is UnitType.RANGER for member in members) == 2
+
+    remote_again = make_turn(
+        tick=102,
+        resources=10_000,
+        objects=[core(), *vanguards, *rangers],
+    )
+    strategy._reconcile_unit_roles(remote_again)
+    assert strategy.memory.unit_roles[str(remote_id)] == STAGED_ROLE
+
+
 def test_expedition_role_vacancy_promotes_staged_unit_without_reshuffle() -> None:
     strategy = _expedition_strategy()
     vanguards = [
