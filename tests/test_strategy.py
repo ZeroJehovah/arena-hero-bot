@@ -13,6 +13,7 @@ from arena_hero import (
     unit_cost,
 )
 
+from arena_hero_bot.combat_policy import ThreatAssessment
 from arena_hero_bot.geometry import add, adjacent_positions, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
@@ -5657,6 +5658,29 @@ def test_expedition_members_never_heal_or_retreat() -> None:
         enemy_positions=set(),
     )
     assert not strategy._recover_if_critical(ranger_view, maximum_hp=2, context=context)
+
+
+def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> None:
+    strategy = _expedition_strategy()
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 100)) for number in range(2, 19)
+    ]
+    vanguards[-2] = unit(17, "VANGUARD", position=(0, 6))
+    turn = make_turn(
+        objects=[
+            core(),
+            *vanguards,
+            unit(90, "RANGER", controlled=False, position=(0, 10)),
+        ]
+    )
+
+    patrol_id = UUID(int=17)
+    returns = strategy._update_squad_returns(turn, ThreatAssessment())
+    assert patrol_id in returns
+
+    strategy._expedition_squads = [(frozenset({patrol_id}), (1, 0))]
+    returns = strategy._update_squad_returns(turn, ThreatAssessment())
+    assert patrol_id not in returns
 
 
 def test_expedition_idle_goal_points_outward() -> None:

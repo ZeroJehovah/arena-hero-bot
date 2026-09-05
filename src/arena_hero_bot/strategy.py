@@ -5288,12 +5288,61 @@ class AggressiveStrategy:
         }
         if self.config.expedition_mode:
             # Expedition members never return; the generic intercept recall
-            # must not pull them back into the defensive zone.
+            # must not pull them back into the defensive zone.  The patrol
+            # contingent is different: it is only a bounded scouting screen,
+            # so a local fighter contact should send it home before it gets
+            # trapped far outside the Core.  The old early return protected
+            # the expedition but accidentally left those patrol members in
+            # the normal chase branch, which cost two remote patrol deaths in
+            # one hostile contact.
             self._squad_return_until = {
                 unit_id: until
                 for unit_id, until in self._squad_return_until.items()
                 if unit_id not in self._expedition_member_ids(turn)
             }
+            if turn.core is None:
+                self._squad_return_until.clear()
+                return frozenset()
+
+            visible_combat = tuple(
+                enemy
+                for enemy in turn.visible_enemies
+                if isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            )
+            patrol_ids = self._patrol_ids(turn)
+            expedition_members = self._expedition_member_ids(turn)
+            for unit in (*turn.vanguards, *turn.rangers):
+                if (
+                    unit.id not in patrol_ids
+                    or unit.id in expedition_members
+                    or unit.id in raid_ids
+                    or unit.id in perimeter_intercept_ids
+                ):
+                    continue
+                if any(
+                    manhattan(unit.position, enemy.position) <= 5
+                    for enemy in visible_combat
+                ):
+                    self._squad_return_until[unit.id] = max(
+                        self._squad_return_until.get(unit.id, 0),
+                        turn.tick + 8,
+                    )
+
+            for unit_id in tuple(self._squad_return_until):
+                unit = next(
+                    (
+                        candidate
+                        for candidate in (*turn.vanguards, *turn.rangers)
+                        if candidate.id == unit_id
+                    ),
+                    None,
+                )
+                if (
+                    unit is not None
+                    and manhattan(unit.position, turn.core.position) <= 3
+                ):
+                    self._squad_return_until.pop(unit_id, None)
             return frozenset(self._squad_return_until)
         if turn.core is None:
             self._squad_return_until.clear()
