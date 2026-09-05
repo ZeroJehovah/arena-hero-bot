@@ -6257,6 +6257,37 @@ def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None
     )
 
 
+def test_symmetric_posture_demotes_excess_legacy_defenders() -> None:
+    memory = WorldMemory()
+    old_strategy = AggressiveStrategy(memory, expedition_config())
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(20, 20)) for number in range(16)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(20, 20)) for number in range(32)]
+    turn = make_turn(resources=10000, objects=[core(), *vanguards, *rangers])
+    old_strategy._reconcile_unit_roles(turn)
+
+    strategy = AggressiveStrategy(memory, expedition_config(target_workers=16))
+    strategy._reconcile_unit_roles(turn)
+
+    role_by_type = {
+        unit_type: [
+            role
+            for unit_id, role in memory.unit_roles.items()
+            if next(
+                item.unit_type
+                for item in (*turn.vanguards, *turn.rangers)
+                if str(item.id) == unit_id
+            )
+            is unit_type
+        ]
+        for unit_type in (UnitType.VANGUARD, UnitType.RANGER)
+    }
+    assert role_by_type[UnitType.VANGUARD].count(DEFENSE_ROLE) == 8
+    assert role_by_type[UnitType.RANGER].count(DEFENSE_ROLE) == 16
+    assert len(strategy._patrol_ids(turn)) == 12
+
+
 def test_symmetric_patrol_teams_stay_in_separate_quadrants() -> None:
     strategy = _expedition_strategy(
         expedition_config(target_workers=16, offensive_patrol_radius=20)

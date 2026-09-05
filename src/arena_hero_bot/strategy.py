@@ -3378,6 +3378,30 @@ class AggressiveStrategy:
                     roles[unit_id] = STAGED_ROLE
                     migration_excluded_ids.add(unit_id)
 
+        if self._symmetric_posture():
+            # The revised formation deliberately shrinks the old 13V+26R
+            # garrison.  Stable roles normally never displace a survivor, but
+            # that rule cannot preserve an explicitly superseded formation:
+            # retain a deterministic 8V+16R core and release every excess
+            # defender into staging, where normal expedition assembly can use
+            # it without losing the UUID's identity.
+            _, _, defense_vanguards, defense_rangers = self._formation_quota()
+            for unit_type, quota in (
+                (UnitType.VANGUARD, defense_vanguards),
+                (UnitType.RANGER, defense_rangers),
+            ):
+                assigned = sorted(
+                    (
+                        unit_id
+                        for unit_id, role in roles.items()
+                        if role == DEFENSE_ROLE
+                        and live_units[unit_id].unit_type is unit_type
+                    ),
+                    key=lambda unit_id: UUID(unit_id).bytes,
+                )
+                for unit_id in assigned[quota:]:
+                    roles[unit_id] = STAGED_ROLE
+
         def candidate_key(unit_id: str) -> tuple[object, ...]:
             return (roles.get(unit_id) != STAGED_ROLE, UUID(unit_id).bytes)
 
