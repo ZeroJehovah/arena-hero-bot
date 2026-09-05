@@ -3859,13 +3859,32 @@ class AggressiveStrategy:
 
     def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
         pursuit = self._expedition_pursuit_for(ranger)
+        visible = self._visible_combat_targets(ranger, context.turn)
+        target = None
+        if pursuit is not None and pursuit.target_id is not None:
+            target = next(
+                (enemy for enemy in visible if str(enemy.id) == pursuit.target_id),
+                None,
+            )
+        if target is None:
+            target = self._best_visible_target(ranger.position, context.turn, visible)
+        if (
+            target is not None
+            and ranger.hp <= 1
+            and self._ranger_would_take_return_fire(
+                ranger,
+                target,
+                self.memory.obstacles | set(context.turn.obstacle_cells),
+            )
+            and self._expedition_break_contact(ranger, target, context)
+        ):
+            return True
         if pursuit is None or pursuit.target_id is None:
             return False
         squad = self._expedition_squad_for(ranger.id)
         alive_vanguard = squad is not None and any(
             unit.id in squad[0] for unit in context.turn.vanguards
         )
-        visible = self._visible_combat_targets(ranger, context.turn)
         target = next(
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
@@ -3915,6 +3934,13 @@ class AggressiveStrategy:
         if pursuit is None or pursuit.target_id is None:
             return False
         visible = self._visible_combat_targets(vanguard, context.turn)
+        if self._expedition_under_fire(
+            vanguard,
+            context,
+            visible,
+            offensive=True,
+        ):
+            return True
         target = next(
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
@@ -4141,9 +4167,16 @@ class AggressiveStrategy:
         # closing on; override the cohesion hold that used to park members next to
         # each other while a single Ranger shot them one by one.
         if distance <= EXPEDITION_COUNTER_RADIUS:
-            return self._expedition_close_to_engage(
+            if self._expedition_close_to_engage(
                 vanguard, target, context, offensive=offensive
-            )
+            ):
+                return True
+            # A blocked counter route must not turn the damage response into
+            # a stationary pursuit.  If the member is already wounded, use
+            # the same break-contact fallback as an outranged attacker.
+            if vanguard.hp < 4:
+                return self._expedition_break_contact(vanguard, target, context)
+            return False
         # Disengage: the attacker stays beyond melee reach and we are already
         # damaged: break contact instead of standing still for the next hit.
         if vanguard.hp < 4:
@@ -4192,7 +4225,7 @@ class AggressiveStrategy:
 
     def _expedition_break_contact(
         self,
-        vanguard: Vanguard,
+        unit: Ranger | Vanguard,
         attacker: CoreView | UnitView,
         context: _TurnContext,
     ) -> bool:
@@ -4201,15 +4234,15 @@ class AggressiveStrategy:
         blocked.update(context.turn.obstacle_cells)
         blocked.update(context.occupied)
         blocked.update(context.reserved)
-        blocked.discard(vanguard.position)
+        blocked.discard(unit.position)
         candidates = [
             position
-            for position in adjacent_positions(vanguard.position)
+            for position in adjacent_positions(unit.position)
             if position not in blocked and position not in context.enemy_positions
         ]
         if not candidates:
             return False
-        current = manhattan(vanguard.position, attacker.position)
+        current = manhattan(unit.position, attacker.position)
         goal = max(
             candidates,
             key=lambda position: (manhattan(position, attacker.position), position),
@@ -4217,7 +4250,7 @@ class AggressiveStrategy:
         if manhattan(goal, attacker.position) < current:
             return False
         return self._move(
-            vanguard,
+            unit,
             goal,
             context,
             reason="break contact with the ranged attacker",
