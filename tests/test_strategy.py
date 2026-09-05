@@ -18,10 +18,12 @@ from arena_hero_bot.geometry import add, adjacent_positions, manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
+    DEFENSE_ROLE,
     EXPEDITION_STAGING_PATH_EXPANSIONS,
     EXPEDITION_STAGING_RADIUS,
     RANGER_VISION_RADIUS,
     RESOURCE_SCOUT_INTERVAL,
+    STAGED_ROLE,
     AggressiveStrategy,
     StrategyConfig,
     _clear_manhattan_path,
@@ -5496,6 +5498,34 @@ def test_expedition_roles_are_stable_and_patrol_is_three_teams() -> None:
     for item in (*vanguards, *rangers):
         assert strategy.memory.unit_roles[item["id"]] == before[item["id"]]
     assert strategy.memory.unit_roles[str(new_ranger["id"])] == "staged"
+
+
+def test_expedition_role_vacancy_promotes_staged_unit_without_reshuffle() -> None:
+    strategy = _expedition_strategy()
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(0, 3)) for number in range(18)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(0, 3)) for number in range(32)]
+    first = make_turn(resources=10_000, objects=[core(), *vanguards, *rangers])
+    strategy._reconcile_unit_roles(first)
+    before = dict(strategy.memory.unit_roles)
+    dead_defender = next(
+        item for item in vanguards if before[str(item["id"])] == DEFENSE_ROLE
+    )
+    staged_vanguard = next(
+        item for item in vanguards if before[str(item["id"])] == STAGED_ROLE
+    )
+    survivors = [item for item in vanguards if item["id"] != dead_defender["id"]]
+    second = make_turn(
+        tick=101, resources=10_000, objects=[core(), *survivors, *rangers]
+    )
+
+    strategy._reconcile_unit_roles(second)
+
+    assert strategy.memory.unit_roles[str(staged_vanguard["id"])] == DEFENSE_ROLE
+    for item in (*survivors, *rangers):
+        if item["id"] != staged_vanguard["id"]:
+            assert strategy.memory.unit_roles[item["id"]] == before[item["id"]]
 
 
 def test_patrol_team_routes_are_independent() -> None:

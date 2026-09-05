@@ -3279,6 +3279,9 @@ class AggressiveStrategy:
                     roles[unit_id] = f"{EXPEDITION_ROLE_PREFIX}{serial}"
                     expedition_ids.add(unit_id)
 
+        def candidate_key(unit_id: str) -> tuple[object, ...]:
+            return (roles.get(unit_id) != STAGED_ROLE, UUID(unit_id).bytes)
+
         def assign_available(unit_type: UnitType, role: str, quota: int) -> None:
             assigned = sum(
                 1
@@ -3292,10 +3295,14 @@ class AggressiveStrategy:
                     unit_id
                     for unit_id, unit in live_units.items()
                     if unit.unit_type is unit_type
-                    and unit_id not in roles
                     and unit_id not in expedition_ids
+                    and (unit_id not in roles or roles[unit_id] == STAGED_ROLE)
                 ),
-                key=lambda unit_id: UUID(unit_id).bytes,
+                # A staged Unit is eligible to replace a dead formation
+                # member.  Prefer that already-built reserve before assigning
+                # a never-seen UUID, while leaving every surviving fixed role
+                # untouched.
+                key=candidate_key,
             )
             for unit_id in candidates[: quota - assigned]:
                 roles[unit_id] = role
