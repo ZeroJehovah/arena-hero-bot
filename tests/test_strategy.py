@@ -28,6 +28,7 @@ from arena_hero_bot.strategy import (
     StrategyConfig,
     _clear_manhattan_path,
     _defensive_ring_offsets,
+    _ExpeditionPursuit,
     _resource_patrol_offsets,
     _TurnContext,
 )
@@ -6126,3 +6127,66 @@ def test_expedition_detached_member_advances_on_visible_enemy() -> None:
     goal, reason = strategy._idle_combat_goal(member_view, turn, context=None)
     assert goal == (12, 5)
     assert reason == "advance together on the squad's enemy target"
+
+
+def test_expedition_pursuit_keeps_last_enemy_direction_after_lost_sight() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3), UUID(int=4), UUID(int=5)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    first = make_turn(
+        tick=10,
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "VANGUARD", position=(5, 6)),
+            unit(4, "RANGER", position=(6, 5)),
+            unit(5, "RANGER", position=(6, 6)),
+            unit(90, "RANGER", controlled=False, position=(8, 5)),
+        ],
+    )
+    strategy.memory.observe(first)
+    strategy._refresh_expedition_pursuits(first)
+    second = make_turn(
+        tick=11,
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(6, 5)),
+            unit(3, "VANGUARD", position=(6, 6)),
+            unit(4, "RANGER", position=(7, 5)),
+            unit(5, "RANGER", position=(7, 6)),
+        ],
+    )
+    strategy.memory.observe(second)
+    strategy._refresh_expedition_pursuits(second)
+    pursuit = strategy._expedition_pursuits[squad]
+    assert pursuit.position == (8, 5)
+    assert pursuit.direction == (1, 0)
+
+
+def test_expedition_pursuit_only_expires_after_one_hundred_cells() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3), UUID(int=4), UUID(int=5)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    pursuit = strategy._expedition_pursuits.setdefault(squad, _ExpeditionPursuit())
+    pursuit.target_id = "90"
+    pursuit.position = (100, 0)
+    pursuit.direction = (1, 0)
+    pursuit.distance = 99
+    turn = make_turn(
+        tick=20,
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "VANGUARD", position=(0, 1)),
+            unit(4, "RANGER", position=(0, 2)),
+            unit(5, "RANGER", position=(0, 3)),
+        ],
+    )
+    strategy._refresh_expedition_pursuits(turn)
+    assert strategy._expedition_pursuits[squad].target_id == "90"
+    strategy._expedition_pursuits[squad].distance = 100
+    strategy._refresh_expedition_pursuits(turn)
+    assert strategy._expedition_pursuits[squad].target_id is None

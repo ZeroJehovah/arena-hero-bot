@@ -135,6 +135,7 @@ STAGED_ROLE = "staged"
 PATROL_ROLE_PREFIX = "patrol-"
 EXPEDITION_ROLE_PREFIX = "expedition-"
 EXPEDITION_HORIZON = 256
+EXPEDITION_PURSUIT_MIN_DISTANCE = 100
 # Staging cells sit just outside the defensive ring's maximum radius.
 EXPEDITION_STAGING_RADIUS = 13
 # A legacy expedition member can be hundreds of cells away when it rejoins the
@@ -234,6 +235,15 @@ class _TurnContext:
     preplanned_ids: set[UUID] = field(default_factory=set)
 
 
+@dataclass(slots=True)
+class _ExpeditionPursuit:
+    target_id: str | None = None
+    position: Position | None = None
+    direction: Position = (0, 0)
+    distance: int = 0
+    last_positions: dict[UUID, Position] = field(default_factory=dict)
+
+
 @dataclass(frozen=True, slots=True)
 class _DefensiveLayout:
     """A defensive ring layout kept stable while the roster and Core stay put."""
@@ -308,6 +318,7 @@ class AggressiveStrategy:
         self._staged_ids: frozenset[UUID] = frozenset()
         self._expedition_squads: list[tuple[frozenset[UUID], Position]] = []
         self._expedition_serial_by_members: dict[frozenset[UUID], int] = {}
+        self._expedition_pursuits: dict[frozenset[UUID], _ExpeditionPursuit] = {}
         self._expedition_serial: int = self.memory.next_expedition_serial
         for persisted in self.memory.expedition_squads:
             try:
@@ -317,6 +328,12 @@ class AggressiveStrategy:
             if members:
                 self._expedition_squads.append((members, persisted.bearing))
                 self._expedition_serial_by_members[members] = persisted.serial
+                self._expedition_pursuits[members] = _ExpeditionPursuit(
+                    target_id=persisted.pursuit_target_id,
+                    position=persisted.pursuit_position,
+                    direction=persisted.pursuit_direction,
+                    distance=persisted.pursuit_distance,
+                )
         self._expedition_serial = max(
             self._expedition_serial,
             max((squad.serial for squad in self.memory.expedition_squads), default=0),
@@ -333,6 +350,7 @@ class AggressiveStrategy:
         if self.config.expedition_mode:
             self._reconcile_unit_roles(turn)
             self._update_expeditions(turn)
+            self._refresh_expedition_pursuits(turn)
         obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         threat = self._combat_policy.assess(turn, obstacles)
         recent_enemies = self.memory.recent_enemies(
@@ -468,6 +486,10 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
+        if self._is_expedition_member(
+            ranger, context.turn
+        ) and self._decide_expedition_ranger(ranger, context):
+            return
         visible_enemies = self._visible_combat_targets(
             ranger,
             context.turn,
@@ -690,6 +712,10 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
+        if self._is_expedition_member(
+            vanguard, context.turn
+        ) and self._decide_expedition_vanguard(vanguard, context):
+            return
         remote_assault = (
             context.combat_assault
             and context.turn.core is not None
@@ -3469,6 +3495,10 @@ class AggressiveStrategy:
             for members, bearing in self._expedition_squads
             if members & live
         ]
+        self._expedition_pursuits = {
+            members: self._expedition_pursuits.get(members, _ExpeditionPursuit())
+            for members, _bearing in self._expedition_squads
+        }
         self._expedition_serial_by_members = {
             members: self._expedition_serial_by_members.get(members, index + 1)
             for index, (members, _bearing) in enumerate(self._expedition_squads)
@@ -3500,6 +3530,7 @@ class AggressiveStrategy:
             )
             bearing = self._expedition_bearing(core)
             self._expedition_squads.append((members, bearing))
+            self._expedition_pursuits[members] = _ExpeditionPursuit()
             self._expedition_serial += 1
             self._expedition_serial_by_members[members] = self._expedition_serial
             role = f"{EXPEDITION_ROLE_PREFIX}{self._expedition_serial}"
@@ -3516,6 +3547,18 @@ class AggressiveStrategy:
                     for member_id in sorted(members, key=lambda value: value.bytes)
                 ),
                 bearing=bearing,
+                pursuit_target_id=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).target_id,
+                pursuit_position=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).position,
+                pursuit_direction=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).direction,
+                pursuit_distance=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).distance,
             )
             for index, (members, bearing) in enumerate(self._expedition_squads)
         ]
@@ -3583,6 +3626,227 @@ class AggressiveStrategy:
         return (
             front[0] + bear_x * EXPEDITION_LINK_RADIUS,
             front[1] + bear_y * EXPEDITION_LINK_RADIUS,
+        )
+
+    def _refresh_expedition_pursuits(self, turn: Turn) -> None:
+        """Update each squad's durable target without allowing silent disengage."""
+
+        alive = {unit.id: unit for unit in (*turn.vanguards, *turn.rangers)}
+        visible_by_squad: dict[frozenset[UUID], dict[str, CoreView | UnitView]] = {}
+        for members, _bearing in self._expedition_squads:
+            pursuit = self._expedition_pursuits.setdefault(
+                members, _ExpeditionPursuit()
+            )
+            live_members = [
+                alive[member_id] for member_id in members if member_id in alive
+            ]
+            visible: dict[str, CoreView | UnitView] = {}
+            for member in live_members:
+                visible.update(
+                    {
+                        str(enemy.id): enemy
+                        for enemy in self._visible_combat_targets(member, turn)
+                    }
+                )
+            visible_by_squad[members] = visible
+            previous_positions = pursuit.last_positions
+            if previous_positions:
+                pursuit.distance += max(
+                    (
+                        manhattan(unit.position, previous_positions[unit.id])
+                        for unit in live_members
+                        if unit.id in previous_positions
+                    ),
+                    default=0,
+                )
+            pursuit.last_positions = {unit.id: unit.position for unit in live_members}
+            current = pursuit.target_id
+            new_target_ids = [
+                target_id for target_id in visible if target_id != current
+            ]
+            if current is None or new_target_ids:
+                candidates = tuple(visible.values())
+                if candidates:
+                    chosen = max(
+                        candidates,
+                        key=lambda enemy: (
+                            self._combat_target_priority(enemy),
+                            self._enemy_score(enemy, live_members[0].position, turn),
+                            str(enemy.id),
+                        ),
+                    )
+                    pursuit.target_id = str(chosen.id)
+                    pursuit.position = chosen.position
+                    pursuit.direction = (0, 0)
+                    pursuit.distance = 0
+            elif current in visible:
+                current_view = visible[current]
+                if pursuit.position is not None:
+                    delta = (
+                        current_view.position[0] - pursuit.position[0],
+                        current_view.position[1] - pursuit.position[1],
+                    )
+                    if delta != (0, 0):
+                        pursuit.direction = (
+                            0 if delta[0] == 0 else (1 if delta[0] > 0 else -1),
+                            0 if delta[1] == 0 else (1 if delta[1] > 0 else -1),
+                        )
+                pursuit.position = current_view.position
+            elif pursuit.position is not None and pursuit.direction != (0, 0):
+                pursuit.position = (
+                    pursuit.position[0] + pursuit.direction[0],
+                    pursuit.position[1] + pursuit.direction[1],
+                )
+            elif pursuit.position is not None:
+                history = self.memory.enemy_position_history.get(current or "", [])
+                if len(history) >= 2:
+                    previous = history[-2][1]
+                    latest = history[-1][1]
+                    delta = latest[0] - previous[0], latest[1] - previous[1]
+                    if delta != (0, 0):
+                        pursuit.direction = (
+                            0 if delta[0] == 0 else (1 if delta[0] > 0 else -1),
+                            0 if delta[1] == 0 else (1 if delta[1] > 0 else -1),
+                        )
+                if pursuit.direction == (0, 0) and live_members:
+                    centroid = (
+                        sum(unit.position[0] for unit in live_members)
+                        // len(live_members),
+                        sum(unit.position[1] for unit in live_members)
+                        // len(live_members),
+                    )
+                    delta = (
+                        pursuit.position[0] - centroid[0],
+                        pursuit.position[1] - centroid[1],
+                    )
+                    pursuit.direction = (
+                        0 if delta[0] == 0 else (1 if delta[0] > 0 else -1),
+                        0 if delta[1] == 0 else (1 if delta[1] > 0 else -1),
+                    )
+            if (
+                pursuit.target_id is not None
+                and pursuit.position is not None
+                and pursuit.distance >= EXPEDITION_PURSUIT_MIN_DISTANCE
+                and not visible
+            ):
+                pursuit.target_id = None
+                pursuit.position = None
+                pursuit.direction = (0, 0)
+                pursuit.distance = 0
+        self._persist_expedition_pursuits()
+
+    def _persist_expedition_pursuits(self) -> None:
+        """Copy in-memory pursuit state into the durable squad records."""
+
+        self.memory.expedition_squads = [
+            ExpeditionSquad(
+                serial=self._expedition_serial_by_members.get(members, index + 1),
+                members=tuple(
+                    str(member_id)
+                    for member_id in sorted(members, key=lambda value: value.bytes)
+                ),
+                bearing=bearing,
+                pursuit_target_id=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).target_id,
+                pursuit_position=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).position,
+                pursuit_direction=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).direction,
+                pursuit_distance=self._expedition_pursuits.get(
+                    members, _ExpeditionPursuit()
+                ).distance,
+            )
+            for index, (members, bearing) in enumerate(self._expedition_squads)
+        ]
+
+    def _expedition_pursuit_for(
+        self, unit: Ranger | Vanguard
+    ) -> _ExpeditionPursuit | None:
+        squad = self._expedition_squad_for(unit.id)
+        return self._expedition_pursuits.get(squad[0]) if squad is not None else None
+
+    def _expedition_chase_goal(
+        self, unit: Ranger | Vanguard, context: _TurnContext
+    ) -> Position | None:
+        pursuit = self._expedition_pursuit_for(unit)
+        if pursuit is None or pursuit.target_id is None or pursuit.position is None:
+            return None
+        return pursuit.position
+
+    def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
+        pursuit = self._expedition_pursuit_for(ranger)
+        if pursuit is None or pursuit.target_id is None:
+            return False
+        squad = self._expedition_squad_for(ranger.id)
+        alive_vanguard = squad is not None and any(
+            unit.id in squad[0] for unit in context.turn.vanguards
+        )
+        visible = self._visible_combat_targets(ranger, context.turn)
+        target = next(
+            (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
+        )
+        if target is not None:
+            shot_cell = self._ranger_shot_cell(
+                ranger, target, context.turn, self.memory.obstacles
+            )
+            if shot_cell is not None:
+                if (
+                    alive_vanguard
+                    and isinstance(target, UnitView)
+                    and self._decline_ranger_duel(ranger, target, context)
+                ):
+                    goal = self._ranger_approach_goal(ranger, target, context)
+                    if goal is None or goal == ranger.position:
+                        return True
+                    return self._move(
+                        ranger,
+                        goal,
+                        context,
+                        reason="reposition flexibly behind expedition Vanguard",
+                    )
+                ranger.shoot(target, expected_cell=shot_cell)
+                context.damage_ledger.record(target)
+                context.report.add(
+                    actor_id=str(ranger.id),
+                    actor_kind="RANGER",
+                    action="SHOOT",
+                    reason="aggressive expedition fire",
+                    target=shot_cell,
+                )
+                return True
+            goal = self._ranger_approach_goal(ranger, target, context)
+            if goal is not None and self._move(
+                ranger, goal, context, reason="pursue expedition target"
+            ):
+                return True
+        goal = self._expedition_chase_goal(ranger, context)
+        return goal is not None and self._move(
+            ranger, goal, context, reason="continue expedition pursuit after lost sight"
+        )
+
+    def _decide_expedition_vanguard(
+        self, vanguard: Vanguard, context: _TurnContext
+    ) -> bool:
+        pursuit = self._expedition_pursuit_for(vanguard)
+        if pursuit is None or pursuit.target_id is None:
+            return False
+        visible = self._visible_combat_targets(vanguard, context.turn)
+        target = next(
+            (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
+        )
+        if target is not None and self._expedition_close_to_engage(
+            vanguard, target, context, offensive=True
+        ):
+            return True
+        goal = self._expedition_chase_goal(vanguard, context)
+        return goal is not None and self._move(
+            vanguard,
+            goal,
+            context,
+            reason="continue expedition pursuit after lost sight",
         )
 
     def _expedition_rendezvous_goal(

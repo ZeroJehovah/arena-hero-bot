@@ -81,6 +81,10 @@ class ExpeditionSquad:
     serial: int
     members: tuple[str, ...]
     bearing: Position
+    pursuit_target_id: str | None = None
+    pursuit_position: Position | None = None
+    pursuit_direction: Position = (0, 0)
+    pursuit_distance: int = 0
 
 
 @dataclass(slots=True)
@@ -442,6 +446,14 @@ class WorldMemory:
                     "serial": squad.serial,
                     "members": list(squad.members),
                     "bearing": list(squad.bearing),
+                    "pursuit_target_id": squad.pursuit_target_id,
+                    "pursuit_position": (
+                        list(squad.pursuit_position)
+                        if squad.pursuit_position is not None
+                        else None
+                    ),
+                    "pursuit_direction": list(squad.pursuit_direction),
+                    "pursuit_distance": squad.pursuit_distance,
                 }
                 for squad in self.expedition_squads
             ],
@@ -521,6 +533,16 @@ class WorldMemory:
                     serial=int(value.get("serial", index + 1)),
                     members=tuple(str(member) for member in value.get("members", [])),
                     bearing=_position(value["bearing"]),
+                    pursuit_target_id=(
+                        str(value["pursuit_target_id"])
+                        if value.get("pursuit_target_id") is not None
+                        else None
+                    ),
+                    pursuit_position=(
+                        _optional_position(value.get("pursuit_position"))
+                    ),
+                    pursuit_direction=_position(value.get("pursuit_direction", [0, 0])),
+                    pursuit_distance=int(value.get("pursuit_distance", 0)),
                 )
                 for index, value in enumerate(raw.get("expedition_squads", []))
             ],
