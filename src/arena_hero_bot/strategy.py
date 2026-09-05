@@ -2249,21 +2249,34 @@ class AggressiveStrategy:
         if core is None:
             return False
         ring = set(adjacent_positions(core.position))
-        # A Unit that already has a decision this Tick is off limits: moving
-        # it now would leave a stale WAIT in the report or overwrite a plan
-        # action that the rest of the Turn already reasoned about.
-        decided = {item.actor_id for item in context.report.decisions}
+        # A Unit that already has a decision this Tick is normally off limits:
+        # moving it now would leave a stale WAIT in the report or overwrite a
+        # plan action that the rest of the Turn already reasoned about.  A
+        # critical unit that failed to reach the occupied Core is the one
+        # exception.  Its recovery WAIT is exactly what seals the last exit,
+        # so replace that unhelpful WAIT with one safe yielding step.
+        decisions = {item.actor_id: item for item in context.report.decisions}
         neighbours = sorted(
             (
                 unit
                 for unit in context.turn.units
                 if unit.position in ring
-                and str(unit.id) not in decided
-                and unit.id not in context.turn.plan.unit_actions
+                and (
+                    (decision := decisions.get(str(unit.id))) is None
+                    or (
+                        decision.action == "WAIT"
+                        and decision.reason.startswith(
+                            "no safe path for: return critical unit to Core for healing"
+                        )
+                    )
+                )
             ),
             key=lambda unit: unit.id.bytes,
         )
         for neighbour in neighbours:
+            previous = decisions.get(str(neighbour.id))
+            if previous is None and neighbour.id in context.turn.plan.unit_actions:
+                continue
             for direction in DIRECTIONS:
                 destination = add(neighbour.position, direction)
                 if (
@@ -2281,6 +2294,8 @@ class AggressiveStrategy:
                     reason="step aside so the Core cell can empty",
                     target=destination,
                 ):
+                    if previous is not None:
+                        context.report.decisions.remove(previous)
                     context.preplanned_ids.add(neighbour.id)
                     return True
         return False

@@ -2161,6 +2161,36 @@ def test_boxed_in_core_occupant_nudges_a_neighbour_aside() -> None:
     )
 
 
+def test_core_occupant_nudges_a_decided_critical_neighbour_aside() -> None:
+    """A failed critical return must not seal the Core cell indefinitely."""
+
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "WORKER", position=(0, 0)),
+            unit(3, "VANGUARD", position=(0, 1), hp=3),
+            unit(4, "RANGER", position=(-1, 0), hp=1),
+        ],
+        obstacles=[(0, -1), (1, 0)],
+    )
+
+    report = decide(turn)
+
+    stepped_aside = [
+        item
+        for item in report.decisions
+        if item.reason == "step aside so the Core cell can empty"
+    ]
+    assert len(stepped_aside) == 1
+    assert stepped_aside[0].actor_id == object_id(3)
+    assert turn.plan.unit_actions[UUID(object_id(3))].type == "MOVE"
+    occupant = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert occupant.action == "MOVE"
+    assert occupant.reason.startswith("free the Core cell instead of: ")
+    assert sum(item.actor_id == object_id(3) for item in report.decisions) == 1
+
+
 def test_core_screen_vacate_move_is_not_overwritten_by_wait() -> None:
     turn = make_turn(
         resources=0,
