@@ -104,7 +104,7 @@ class WorldMemory:
     resource_absences: dict[Position, int] = field(default_factory=dict)
     # Combat identities are durable: a live Unit keeps its assigned role when
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
-    # ``patrol-1`` .. ``patrol-3``, ``staged`` or ``expedition-N``.
+    # ``patrol-1`` .. ``patrol-4``, ``staged`` or ``expedition-N``.
     unit_roles: dict[str, str] = field(default_factory=dict)
     # Legacy memory files predate durable role assignment.  The strategy uses
     # this marker to run one spatial sanity pass, then never reclassifies live
@@ -117,6 +117,9 @@ class WorldMemory:
     # service restart cannot immediately spend the same bank again.
     last_normal_growth_tick: int | None = None
     last_normal_growth_resources: int | None = None
+    # Selected once for the new symmetric defensive posture and retained
+    # across restarts while the Core walks there.
+    core_home_position: Position | None = None
     last_tick: int = 0
 
     def observe(self, turn: Turn) -> None:
@@ -460,6 +463,11 @@ class WorldMemory:
             "next_expedition_serial": self.next_expedition_serial,
             "last_normal_growth_tick": self.last_normal_growth_tick,
             "last_normal_growth_resources": self.last_normal_growth_resources,
+            "core_home_position": (
+                list(self.core_home_position)
+                if self.core_home_position is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -553,6 +561,7 @@ class WorldMemory:
             last_normal_growth_resources=_optional_integer(
                 raw.get("last_normal_growth_resources")
             ),
+            core_home_position=_optional_position(raw.get("core_home_position")),
             last_tick=int(raw.get("last_tick", 0)),
         )
 

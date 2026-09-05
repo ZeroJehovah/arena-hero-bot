@@ -1,5 +1,6 @@
 """Representative aggressive tactic scenarios."""
 
+from dataclasses import replace
 from itertools import pairwise
 from unittest.mock import patch
 from uuid import UUID
@@ -5458,11 +5459,13 @@ def test_ranger_shoots_enemy_ranger_threatening_core() -> None:
 
 
 def expedition_config(**overrides) -> StrategyConfig:
-    return StrategyConfig(
-        target_workers=12,
-        max_population=None,
-        resource_target=0,
-        expedition_mode=True,
+    return replace(
+        StrategyConfig(
+            target_workers=12,
+            max_population=None,
+            resource_target=0,
+            expedition_mode=True,
+        ),
         **overrides,
     )
 
@@ -6190,3 +6193,84 @@ def test_expedition_pursuit_only_expires_after_one_hundred_cells() -> None:
     strategy._expedition_pursuits[squad].distance = 100
     strategy._refresh_expedition_pursuits(turn)
     assert strategy._expedition_pursuits[squad].target_id is None
+
+
+def test_symmetric_posture_selects_and_starts_migration_to_clear_home() -> None:
+    config = expedition_config(target_workers=16)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+    workers = [
+        unit(100 + number, "WORKER", position=(30 + number, 30)) for number in range(16)
+    ]
+    turn = make_turn(resources=0, objects=[core(), *workers])
+
+    report = strategy.decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert memory.core_home_position is not None
+    assert any("symmetric-defense home" in item.reason for item in report.decisions)
+    vanguards, rangers = strategy._symmetric_defense_offsets()
+    obstacles = set(turn.obstacle_cells)
+    assert all(
+        (memory.core_home_position[0] + dx, memory.core_home_position[1] + dy)
+        not in obstacles
+        for dx, dy in (*vanguards, *rangers)
+    )
+
+
+def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None:
+    config = expedition_config(target_workers=16)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(20, 20)) for number in range(12)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(20, 20)) for number in range(24)]
+    turn = make_turn(resources=10000, objects=[core(), *vanguards, *rangers])
+
+    strategy.decide(turn)
+
+    assert strategy._defensive_layout is not None
+    assignments = strategy._defensive_layout.assignments
+    defense_ids = {
+        unit_id
+        for unit_id, role in strategy.memory.unit_roles.items()
+        if role == DEFENSE_ROLE
+    }
+    assert len(defense_ids) == 24
+    assert set(assignments) == {UUID(unit_id) for unit_id in defense_ids}
+    vanguard_offsets, _ranger_offsets = strategy._symmetric_defense_offsets()
+    assert {
+        (assignments[UUID(unit["id"])][0], assignments[UUID(unit["id"])][1])
+        for unit in vanguards
+        if UUID(unit["id"]) in assignments
+    } == set(vanguard_offsets)
+    assert (
+        len(
+            {
+                assignments[UUID(unit["id"])]
+                for unit in rangers
+                if UUID(unit["id"]) in assignments
+            }
+        )
+        == 16
+    )
+
+
+def test_symmetric_patrol_teams_stay_in_separate_quadrants() -> None:
+    strategy = _expedition_strategy(
+        expedition_config(target_workers=16, offensive_patrol_radius=20)
+    )
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(0, 0)) for number in range(12)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(0, 0)) for number in range(24)]
+    turn = make_turn(resources=0, objects=[core(), *vanguards, *rangers])
+    strategy._reconcile_unit_roles(turn)
+
+    signs = {1: (1, -1), 2: (1, 1), 3: (-1, 1), 4: (-1, -1)}
+    for team, (sx, sy) in signs.items():
+        member = strategy._patrol_team_members(team, turn)[0]
+        goal, _ = strategy._combat_patrol_goal(member, turn)
+        assert goal[0] * sx >= 0
+        assert goal[1] * sy >= 0

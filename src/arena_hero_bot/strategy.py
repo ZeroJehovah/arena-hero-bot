@@ -112,8 +112,9 @@ RAID_ABORT_SCAN_RADIUS = 6
 # Active-offense ("expedition") posture: a fixed formation saturates the Core
 # neighbourhood while everything built beyond it is sent out on independent,
 # non-returning expeditions.  Formation target is 12 Workers / 16 Vanguards /
-# 32 Rangers; 13 Vanguards + 26 Rangers hold the defensive ring, and three
-# independent patrol teams (one Vanguard + two Rangers each) patrol just
+# Legacy posture: 32 Rangers; 13 Vanguards + 26 Rangers hold the defensive
+# ring, and three independent patrol teams (one Vanguard + two Rangers each)
+# patrol just
 # outside it.  Any surplus is staged at the ring edge until a full expedition
 # (2 Vanguards + 2 Rangers) can depart.
 EXPEDITION_FORMATION_VANGUARDS = 16
@@ -157,6 +158,16 @@ EXPEDITION_LINK_RADIUS = 4
 # members skipped all the visible-target combat logic.  This radius is the
 # window a member may still close on to answer that fire.
 EXPEDITION_COUNTER_RADIUS = 3
+
+# Revised live posture.  The legacy constants above remain available for
+# explicit small test configurations; ``target_workers >= 16`` selects this
+# formation and its four quadrant patrol teams.
+SYMMETRIC_FORMATION_VANGUARDS = 12
+SYMMETRIC_FORMATION_RANGERS = 24
+SYMMETRIC_PATROL_TEAM_COUNT = 4
+SYMMETRIC_DEFENSE_VANGUARDS = 8
+SYMMETRIC_DEFENSE_RANGERS = 16
+SYMMETRIC_CORE_RADIUS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -1643,6 +1654,24 @@ class AggressiveStrategy:
                     target=core.position,
                 )
                 return
+
+        if (
+            self._symmetric_posture()
+            and not nearby_enemy
+            and context.turn.workers
+            and all(worker.cargo == 0 for worker in context.turn.workers)
+        ):
+            direction = self._core_home_direction(context)
+            if direction is not None:
+                core.start_move(direction)
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="START_MOVE",
+                    reason="relocate Core to the selected symmetric-defense home",
+                    target=add(core.position, direction),
+                )
+            return
 
         preserving_resources = self._preserves_resources()
         if not preserving_resources and core.hp < 5 and context.remaining_resources > 0:
@@ -3260,7 +3289,7 @@ class AggressiveStrategy:
             team = int(role.removeprefix(PATROL_ROLE_PREFIX))
         except ValueError:
             return None
-        return team if 1 <= team <= PATROL_TEAM_COUNT else None
+        return team if 1 <= team <= SYMMETRIC_PATROL_TEAM_COUNT else None
 
     @staticmethod
     def _is_expedition_role(role: str | None) -> bool:
@@ -3272,6 +3301,33 @@ class AggressiveStrategy:
             return int(role.removeprefix(EXPEDITION_ROLE_PREFIX)) > 0
         except ValueError:
             return False
+
+    def _symmetric_posture(self) -> bool:
+        """Whether the revised 16-Worker live formation is active."""
+
+        return self.config.expedition_mode and self.config.target_workers >= 16
+
+    def _patrol_team_count(self) -> int:
+        return (
+            SYMMETRIC_PATROL_TEAM_COUNT
+            if self._symmetric_posture()
+            else PATROL_TEAM_COUNT
+        )
+
+    def _formation_quota(self) -> tuple[int, int, int, int]:
+        if self._symmetric_posture():
+            return (
+                SYMMETRIC_FORMATION_VANGUARDS,
+                SYMMETRIC_FORMATION_RANGERS,
+                SYMMETRIC_DEFENSE_VANGUARDS,
+                SYMMETRIC_DEFENSE_RANGERS,
+            )
+        return (
+            EXPEDITION_FORMATION_VANGUARDS,
+            EXPEDITION_FORMATION_RANGERS,
+            DEFENSE_VANGUARDS,
+            DEFENSE_RANGERS,
+        )
 
     def _reconcile_unit_roles(self, turn: Turn) -> None:
         """Assign stable combat identities without reshuffling live units.
@@ -3352,11 +3408,12 @@ class AggressiveStrategy:
                 roles[unit_id] = role
 
         # Keep the long-lived defensive ring identities first, then fill the
-        # three fixed patrol teams.  The quotas are intentionally separate so
+        # fixed patrol teams.  The quotas are intentionally separate so
         # a new Ranger never moves an existing patrol member into defence.
-        assign_available(UnitType.VANGUARD, DEFENSE_ROLE, DEFENSE_VANGUARDS)
-        assign_available(UnitType.RANGER, DEFENSE_ROLE, DEFENSE_RANGERS)
-        for team in range(1, PATROL_TEAM_COUNT + 1):
+        _, _, defense_vanguards, defense_rangers = self._formation_quota()
+        assign_available(UnitType.VANGUARD, DEFENSE_ROLE, defense_vanguards)
+        assign_available(UnitType.RANGER, DEFENSE_ROLE, defense_rangers)
+        for team in range(1, self._patrol_team_count() + 1):
             role = f"{PATROL_ROLE_PREFIX}{team}"
             assign_available(UnitType.VANGUARD, role, PATROL_TEAM_VANGUARDS)
             assign_available(UnitType.RANGER, role, PATROL_TEAM_RANGERS)
@@ -3440,7 +3497,7 @@ class AggressiveStrategy:
         if not self.config.expedition_mode:
             offensive = sorted(self._offensive_ids(turn), key=lambda value: value.bytes)
             if unit_id in offensive:
-                return offensive.index(unit_id) % PATROL_TEAM_COUNT + 1
+                return offensive.index(unit_id) % self._patrol_team_count() + 1
             return None
         self._ensure_unit_roles(turn)
         return self._patrol_team_from_role(self.memory.unit_roles.get(str(unit_id)))
@@ -3463,7 +3520,7 @@ class AggressiveStrategy:
             return tuple(
                 unit
                 for index, unit in enumerate(combat)
-                if index % PATROL_TEAM_COUNT + 1 == team
+                if index % self._patrol_team_count() + 1 == team
             )  # type: ignore[return-value]
         role = f"{PATROL_ROLE_PREFIX}{team}"
         return tuple(
@@ -4465,6 +4522,118 @@ class AggressiveStrategy:
                     corridors.update(exits)
         return corridors
 
+    @staticmethod
+    def _symmetric_defense_offsets() -> tuple[
+        tuple[Position, ...], tuple[Position, ...]
+    ]:
+        """Return eight mirrored Vanguard spokes and two Ranger posts each."""
+
+        vanguards = (
+            (0, -6),
+            (4, -4),
+            (6, 0),
+            (4, 4),
+            (0, 6),
+            (-4, 4),
+            (-6, 0),
+            (-4, -4),
+        )
+        rangers = (
+            (0, -8),
+            (0, -10),
+            (6, -6),
+            (8, -8),
+            (8, 0),
+            (10, 0),
+            (6, 6),
+            (8, 8),
+            (0, 8),
+            (0, 10),
+            (-6, 6),
+            (-8, 8),
+            (-8, 0),
+            (-10, 0),
+            (-6, -6),
+            (-8, -8),
+        )
+        return vanguards, rangers
+
+    def _symmetric_home_candidate(self, context: _TurnContext) -> Position | None:
+        """Pick the nearest clear center with the complete symmetric footprint."""
+
+        core = context.turn.core
+        if core is None:
+            return None
+        vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+        offsets = (*vanguard_offsets, *ranger_offsets)
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        resources = set(context.turn.resource_cells) | set(self.memory.resource_cells)
+        occupied = set(context.occupied) - {core.position}
+        candidates: list[tuple[int, int, int, Position]] = []
+        for dx in range(-24, 25):
+            for dy in range(-24, 25):
+                if not (dx or dy):
+                    continue
+                position = (core.position[0] + dx, core.position[1] + dy)
+                footprint = {(position[0] + ox, position[1] + oy) for ox, oy in offsets}
+                blocked = len(footprint & obstacles)
+                if blocked:
+                    continue
+                if (
+                    position in obstacles
+                    or position in resources
+                    or position in occupied
+                ):
+                    continue
+                local_obstacles = sum(
+                    (position[0] + ox, position[1] + oy) in obstacles
+                    for ox in range(-2, 3)
+                    for oy in range(-2, 3)
+                )
+                nearby_resources = sum(
+                    manhattan(position, resource)
+                    <= self.config.resource_outreach_radius
+                    for resource in resources
+                )
+                candidates.append(
+                    (local_obstacles, -nearby_resources, abs(dx) + abs(dy), position)
+                )
+        return min(candidates)[-1] if candidates else None
+
+    def _core_home_direction(self, context: _TurnContext) -> Direction | None:
+        """Walk the Core to the persisted clear center for the new formation."""
+
+        core = context.turn.core
+        if core is None:
+            return None
+        target = self.memory.core_home_position
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        footprint_offsets = (
+            *self._symmetric_defense_offsets()[0],
+            *self._symmetric_defense_offsets()[1],
+        )
+        if target is None or any(
+            (target[0] + dx, target[1] + dy) in obstacles
+            for dx, dy in footprint_offsets
+        ):
+            target = self._symmetric_home_candidate(context)
+            self.memory.core_home_position = target
+        if target is None or core.position == target:
+            return None
+        blocked = (
+            obstacles
+            | set(context.turn.resource_cells)
+            | set(context.occupied)
+            | context.reserved
+        ) - {core.position}
+        return next_step(
+            core.position,
+            target,
+            blocked=blocked,
+            recent=self.memory.recent_positions(str(core.id)),
+            direction_offset=self._direction_offset(core.id),
+        )
+
     def _defensive_perimeter_assignments(
         self,
         context: _TurnContext,
@@ -4498,10 +4667,50 @@ class AggressiveStrategy:
         if not guards:
             self._defensive_layout = None
             return {}
+        ordered_guard_ids = tuple(unit.id for unit in guards)
+
+        if self._symmetric_posture():
+            vanguard_guards = tuple(
+                unit for unit in guards if unit.unit_type is UnitType.VANGUARD
+            )
+            ranger_guards = tuple(
+                unit for unit in guards if unit.unit_type is UnitType.RANGER
+            )
+            vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+            obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+            if (
+                len(vanguard_guards) == len(vanguard_offsets)
+                and len(ranger_guards) == len(ranger_offsets)
+                and all(
+                    (core_position[0] + dx, core_position[1] + dy) not in obstacles
+                    for dx, dy in (*vanguard_offsets, *ranger_offsets)
+                )
+            ):
+                assignments = {
+                    unit.id: (core_position[0] + dx, core_position[1] + dy)
+                    for unit, (dx, dy) in zip(
+                        vanguard_guards, vanguard_offsets, strict=True
+                    )
+                }
+                assignments.update(
+                    {
+                        unit.id: (core_position[0] + dx, core_position[1] + dy)
+                        for unit, (dx, dy) in zip(
+                            ranger_guards, ranger_offsets, strict=True
+                        )
+                    }
+                )
+                self._defensive_layout = _DefensiveLayout(
+                    core_id=core.id,
+                    core_position=core_position,
+                    guard_ids=ordered_guard_ids,
+                    radius=SYMMETRIC_CORE_RADIUS,
+                    assignments=assignments,
+                )
+                return assignments
 
         obstacles = set(self.memory.obstacles)
         obstacles.update(context.turn.obstacle_cells)
-        ordered_guard_ids = tuple(unit.id for unit in guards)
         # A resource pocket hugging the Core can be walled in by obstacles
         # until only one or two free neighbours remain, and those can coincide
         # with the innermost guard ring.  Guards are stationary, so every exit
@@ -4796,8 +5005,29 @@ class AggressiveStrategy:
         local_offsets = ((0, 0), (0, 1), (1, 0))
         local_dx, local_dy = local_offsets[member_index % len(local_offsets)]
         phase = turn.tick // self.config.offensive_patrol_goal_ttl
-        team_spacing = max(1, len(offsets) // PATROL_TEAM_COUNT)
-        offset_index = ((team - 1) * team_spacing + phase) % len(offsets)
+        team_count = self._patrol_team_count()
+        if self._symmetric_posture():
+            # Each team owns one quadrant.  The route still advances through
+            # that quadrant over time, but never crosses into a neighbour's
+            # sector, keeping the four patrol responsibilities independent.
+            quadrant = {
+                1: (1, -1),  # NE
+                2: (1, 1),  # SE
+                3: (-1, 1),  # SW
+                4: (-1, -1),  # NW
+            }[team]
+            qx, qy = quadrant
+            quadrant_offsets = tuple(
+                offset
+                for offset in offsets
+                if (offset[0] * qx >= 0 and offset[1] * qy >= 0) and offset != (0, 0)
+            )
+            offsets = quadrant_offsets or offsets
+            team_spacing = max(1, len(offsets) // max(1, len(team_members)))
+            offset_index = (phase + member_index * team_spacing) % len(offsets)
+        else:
+            team_spacing = max(1, len(offsets) // team_count)
+            offset_index = ((team - 1) * team_spacing + phase) % len(offsets)
         if current is not None and current.purpose == purpose:
             current_offset = (
                 current.position[0] - core.position[0] - local_dx,
@@ -6219,15 +6449,14 @@ class AggressiveStrategy:
             )
         vanguards = len(turn.vanguards)
         rangers = len(turn.rangers)
+        formation_vanguards, formation_rangers, _, _ = self._formation_quota()
         if len(turn.workers) < self.config.target_workers:
             candidates = (UnitType.WORKER,)
-        elif vanguards < EXPEDITION_FORMATION_VANGUARDS or rangers < (
-            EXPEDITION_FORMATION_RANGERS
-        ):
+        elif vanguards < formation_vanguards or rangers < formation_rangers:
             # Fill the formation gaps first, preferring the type whose
             # formation quota is furthest behind (targets a 1:2 V:R split).
-            vanguard_short = max(0, EXPEDITION_FORMATION_VANGUARDS - vanguards)
-            ranger_short = max(0, EXPEDITION_FORMATION_RANGERS - rangers)
+            vanguard_short = max(0, formation_vanguards - vanguards)
+            ranger_short = max(0, formation_rangers - rangers)
             if vanguard_short <= 0:
                 candidates = (UnitType.RANGER,)
             elif ranger_short <= 0:
@@ -6239,8 +6468,8 @@ class AggressiveStrategy:
         else:
             # Formation full: surplus built 1:1, balancing the two quotas so
             # staged units can pair off into full expeditions.
-            surplus_vanguards = vanguards - EXPEDITION_FORMATION_VANGUARDS
-            surplus_rangers = rangers - EXPEDITION_FORMATION_RANGERS
+            surplus_vanguards = vanguards - formation_vanguards
+            surplus_rangers = rangers - formation_rangers
             candidates = (
                 (UnitType.RANGER, UnitType.VANGUARD)
                 if surplus_rangers < surplus_vanguards

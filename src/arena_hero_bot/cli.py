@@ -52,8 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-workers",
         type=_non_negative_integer,
-        default=2,
-        help="minimum Worker economy before combat production (default: 2)",
+        default=16,
+        help="minimum Worker economy before combat production (default: 16)",
     )
     population_group = parser.add_mutually_exclusive_group()
     population_group.add_argument(
