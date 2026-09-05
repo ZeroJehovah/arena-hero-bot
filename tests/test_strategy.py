@@ -5468,6 +5468,63 @@ def _expedition_strategy(config=None) -> AggressiveStrategy:
     return AggressiveStrategy(WorldMemory(), config or expedition_config())
 
 
+def test_expedition_roles_are_stable_and_patrol_is_three_teams() -> None:
+    strategy = _expedition_strategy()
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(0, 3)) for number in range(16)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(0, 3)) for number in range(32)]
+    first = make_turn(resources=10_000, objects=[core(), *vanguards, *rangers])
+    strategy._reconcile_unit_roles(first)
+    before = dict(strategy.memory.unit_roles)
+
+    assert len(strategy._patrol_ids(first)) == 9
+    for team in range(1, 4):
+        members = strategy._patrol_team_members(team, first)
+        assert len(members) == 3
+        assert sum(member.unit_type is UnitType.VANGUARD for member in members) == 1
+        assert sum(member.unit_type is UnitType.RANGER for member in members) == 2
+
+    new_ranger = unit(1, "RANGER", position=(0, 3))
+    second = make_turn(
+        tick=101,
+        resources=10_000,
+        objects=[core(), *vanguards, *rangers, new_ranger],
+    )
+    strategy._reconcile_unit_roles(second)
+
+    for item in (*vanguards, *rangers):
+        assert strategy.memory.unit_roles[item["id"]] == before[item["id"]]
+    assert strategy.memory.unit_roles[str(new_ranger["id"])] == "staged"
+
+
+def test_patrol_team_routes_are_independent() -> None:
+    strategy = _expedition_strategy()
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(0, 3)) for number in range(16)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(0, 3)) for number in range(32)]
+    turn = make_turn(
+        tick=100,
+        resources=10_000,
+        objects=[core(), *vanguards, *rangers],
+    )
+    strategy._reconcile_unit_roles(turn)
+
+    team_targets = {}
+    for team in range(1, 4):
+        for member in strategy._patrol_team_members(team, turn):
+            target, reason = strategy._combat_patrol_goal(member, turn)
+            assert reason == "search outward for enemy units and Cores"
+            goal = strategy.memory.goal_for(str(member.id))
+            assert goal is not None
+            assert goal.purpose == f"combat-patrol-v1-{team}"
+            team_targets.setdefault(team, set()).add(target)
+
+    assert set(team_targets) == {1, 2, 3}
+    assert len({next(iter(targets)) for targets in team_targets.values()}) == 3
+
+
 def test_expedition_spawn_fills_formation_gap_with_ranger() -> None:
     strategy = _expedition_strategy()
 

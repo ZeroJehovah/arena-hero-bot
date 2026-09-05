@@ -74,6 +74,15 @@ class UnitGoal:
     last_progress_position: Position | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ExpeditionSquad:
+    """A persisted expedition membership and its fixed travel bearing."""
+
+    serial: int
+    members: tuple[str, ...]
+    bearing: Position
+
+
 @dataclass(slots=True)
 class WorldMemory:
     """Durable obstacle, enemy, movement, and exploration observations."""
@@ -89,6 +98,12 @@ class WorldMemory:
     contested_positions: dict[Position, int] = field(default_factory=dict)
     resource_cells: dict[Position, int] = field(default_factory=dict)
     resource_absences: dict[Position, int] = field(default_factory=dict)
+    # Combat identities are durable: a live Unit keeps its assigned role when
+    # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
+    # ``patrol-1`` .. ``patrol-3``, ``staged`` or ``expedition-N``.
+    unit_roles: dict[str, str] = field(default_factory=dict)
+    expedition_squads: list[ExpeditionSquad] = field(default_factory=list)
+    next_expedition_serial: int = 0
     # Normal high-tier production is deliberately throttled.  Keep its
     # payback marker with the rest of the durable strategy observations so a
     # service restart cannot immediately spend the same bank again.
@@ -416,6 +431,16 @@ class WorldMemory:
                 {"position": list(position), "tick": absent_tick}
                 for position, absent_tick in sorted(self.resource_absences.items())
             ],
+            "unit_roles": dict(sorted(self.unit_roles.items())),
+            "expedition_squads": [
+                {
+                    "serial": squad.serial,
+                    "members": list(squad.members),
+                    "bearing": list(squad.bearing),
+                }
+                for squad in self.expedition_squads
+            ],
+            "next_expedition_serial": self.next_expedition_serial,
             "last_normal_growth_tick": self.last_normal_growth_tick,
             "last_normal_growth_resources": self.last_normal_growth_resources,
         }
@@ -481,6 +506,19 @@ class WorldMemory:
                 _position(value["position"]): int(value["tick"])
                 for value in raw.get("resource_absences", [])
             },
+            unit_roles={
+                str(unit_id): str(role)
+                for unit_id, role in raw.get("unit_roles", {}).items()
+            },
+            expedition_squads=[
+                ExpeditionSquad(
+                    serial=int(value.get("serial", index + 1)),
+                    members=tuple(str(member) for member in value.get("members", [])),
+                    bearing=_position(value["bearing"]),
+                )
+                for index, value in enumerate(raw.get("expedition_squads", []))
+            ],
+            next_expedition_serial=int(raw.get("next_expedition_serial", 0)),
             last_normal_growth_tick=_optional_integer(
                 raw.get("last_normal_growth_tick")
             ),

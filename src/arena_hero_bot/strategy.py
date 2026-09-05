@@ -44,6 +44,7 @@ from .memory import (
     RESOURCE_MEMORY_LIMIT,
     RESOURCE_RECHECK_FLOOR,
     EnemySighting,
+    ExpeditionSquad,
     UnitGoal,
     WorldMemory,
 )
@@ -111,13 +112,28 @@ RAID_ABORT_SCAN_RADIUS = 6
 # Active-offense ("expedition") posture: a fixed formation saturates the Core
 # neighbourhood while everything built beyond it is sent out on independent,
 # non-returning expeditions.  Formation target is 12 Workers / 16 Vanguards /
-# 32 Rangers; 13 Vanguards + 26 Rangers hold the defensive ring, the remaining
-# 3 Vanguards + 6 Rangers patrol just outside it, and any surplus is staged at
-# the ring edge until a full expedition (2 Vanguards + 2 Rangers) can depart.
+# 32 Rangers; 13 Vanguards + 26 Rangers hold the defensive ring, and three
+# independent patrol teams (one Vanguard + two Rangers each) patrol just
+# outside it.  Any surplus is staged at the ring edge until a full expedition
+# (2 Vanguards + 2 Rangers) can depart.
 EXPEDITION_FORMATION_VANGUARDS = 16
 EXPEDITION_FORMATION_RANGERS = 32
 EXPEDITION_SQUAD_VANGUARDS = 2
 EXPEDITION_SQUAD_RANGERS = 2
+PATROL_TEAM_COUNT = 3
+PATROL_TEAM_SIZE = 3
+PATROL_TEAM_VANGUARDS = 1
+PATROL_TEAM_RANGERS = 2
+DEFENSE_VANGUARDS = EXPEDITION_FORMATION_VANGUARDS - (
+    PATROL_TEAM_COUNT * PATROL_TEAM_VANGUARDS
+)
+DEFENSE_RANGERS = EXPEDITION_FORMATION_RANGERS - (
+    PATROL_TEAM_COUNT * PATROL_TEAM_RANGERS
+)
+DEFENSE_ROLE = "defense"
+STAGED_ROLE = "staged"
+PATROL_ROLE_PREFIX = "patrol-"
+EXPEDITION_ROLE_PREFIX = "expedition-"
 EXPEDITION_HORIZON = 256
 # Staging cells sit just outside the defensive ring's maximum radius.
 EXPEDITION_STAGING_RADIUS = 13
@@ -291,7 +307,20 @@ class AggressiveStrategy:
         # chosen direction are the only durable facts.
         self._staged_ids: frozenset[UUID] = frozenset()
         self._expedition_squads: list[tuple[frozenset[UUID], Position]] = []
-        self._expedition_serial: int = 0
+        self._expedition_serial_by_members: dict[frozenset[UUID], int] = {}
+        self._expedition_serial: int = self.memory.next_expedition_serial
+        for persisted in self.memory.expedition_squads:
+            try:
+                members = frozenset(UUID(member) for member in persisted.members)
+            except (TypeError, ValueError):
+                continue
+            if members:
+                self._expedition_squads.append((members, persisted.bearing))
+                self._expedition_serial_by_members[members] = persisted.serial
+        self._expedition_serial = max(
+            self._expedition_serial,
+            max((squad.serial for squad in self.memory.expedition_squads), default=0),
+        )
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
@@ -302,6 +331,7 @@ class AggressiveStrategy:
         self._record_combat_kills(turn)
         self.memory.observe(turn)
         if self.config.expedition_mode:
+            self._reconcile_unit_roles(turn)
             self._update_expeditions(turn)
         obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         threat = self._combat_policy.assess(turn, obstacles)
@@ -3194,26 +3224,131 @@ class AggressiveStrategy:
             )
         )
 
+    @staticmethod
+    def _patrol_team_from_role(role: str | None) -> int | None:
+        """Return a patrol team number encoded in a durable role."""
+
+        if role is None or not role.startswith(PATROL_ROLE_PREFIX):
+            return None
+        try:
+            team = int(role.removeprefix(PATROL_ROLE_PREFIX))
+        except ValueError:
+            return None
+        return team if 1 <= team <= PATROL_TEAM_COUNT else None
+
+    @staticmethod
+    def _is_expedition_role(role: str | None) -> bool:
+        """Whether a role is one of the persisted expedition labels."""
+
+        if role is None or not role.startswith(EXPEDITION_ROLE_PREFIX):
+            return False
+        try:
+            return int(role.removeprefix(EXPEDITION_ROLE_PREFIX)) > 0
+        except ValueError:
+            return False
+
+    def _reconcile_unit_roles(self, turn: Turn) -> None:
+        """Assign stable combat identities without reshuffling live units.
+
+        Roles are allocated only to previously unassigned UUIDs.  A new Unit
+        can fill a genuinely vacant slot, but it cannot displace a live
+        defender or patrol member merely because its UUID sorts earlier.
+        """
+
+        live_units = {str(unit.id): unit for unit in (*turn.vanguards, *turn.rangers)}
+        live_ids = set(live_units)
+        roles = {
+            unit_id: role
+            for unit_id, role in self.memory.unit_roles.items()
+            if unit_id in live_ids
+            and (
+                role in {DEFENSE_ROLE, STAGED_ROLE}
+                or self._patrol_team_from_role(role) is not None
+                or self._is_expedition_role(role)
+            )
+        }
+
+        # The squad list is authoritative for expedition members.  Reapply
+        # those roles before filling any defensive or patrol vacancy.
+        expedition_ids: set[str] = set()
+        for index, (members, _bearing) in enumerate(self._expedition_squads, 1):
+            serial = self._expedition_serial_by_members.get(members, index)
+            for member_id in members:
+                unit_id = str(member_id)
+                if unit_id in live_ids:
+                    roles[unit_id] = f"{EXPEDITION_ROLE_PREFIX}{serial}"
+                    expedition_ids.add(unit_id)
+
+        def assign_available(unit_type: UnitType, role: str, quota: int) -> None:
+            assigned = sum(
+                1
+                for unit_id, current_role in roles.items()
+                if current_role == role and live_units[unit_id].unit_type is unit_type
+            )
+            if assigned >= quota:
+                return
+            candidates = sorted(
+                (
+                    unit_id
+                    for unit_id, unit in live_units.items()
+                    if unit.unit_type is unit_type
+                    and unit_id not in roles
+                    and unit_id not in expedition_ids
+                ),
+                key=lambda unit_id: UUID(unit_id).bytes,
+            )
+            for unit_id in candidates[: quota - assigned]:
+                roles[unit_id] = role
+
+        # Keep the long-lived defensive ring identities first, then fill the
+        # three fixed patrol teams.  The quotas are intentionally separate so
+        # a new Ranger never moves an existing patrol member into defence.
+        assign_available(UnitType.VANGUARD, DEFENSE_ROLE, DEFENSE_VANGUARDS)
+        assign_available(UnitType.RANGER, DEFENSE_ROLE, DEFENSE_RANGERS)
+        for team in range(1, PATROL_TEAM_COUNT + 1):
+            role = f"{PATROL_ROLE_PREFIX}{team}"
+            assign_available(UnitType.VANGUARD, role, PATROL_TEAM_VANGUARDS)
+            assign_available(UnitType.RANGER, role, PATROL_TEAM_RANGERS)
+
+        for unit_id in sorted(
+            live_ids - set(roles), key=lambda value: UUID(value).bytes
+        ):
+            roles[unit_id] = STAGED_ROLE
+        self.memory.unit_roles = roles
+        self._staged_ids = frozenset(
+            UUID(unit_id) for unit_id, role in roles.items() if role == STAGED_ROLE
+        )
+
+    def _ensure_unit_roles(self, turn: Turn) -> None:
+        """Refresh role assignments when a Turn introduces or removes UUIDs."""
+
+        self._reconcile_unit_roles(turn)
+
     def _formation_vanguard_ids(self, turn: Turn) -> frozenset[UUID]:
-        """Return the deterministic Vanguard half of the core formation."""
+        """Return live Vanguards assigned to defence or a patrol team."""
+
+        self._ensure_unit_roles(turn)
         return frozenset(
-            unit.id
-            for unit in sorted(turn.vanguards, key=lambda unit: unit.id.bytes)[
-                :EXPEDITION_FORMATION_VANGUARDS
-            ]
+            UUID(unit_id)
+            for unit_id, role in self.memory.unit_roles.items()
+            if role == DEFENSE_ROLE or self._patrol_team_from_role(role) is not None
+            if unit_id in {str(unit.id) for unit in turn.vanguards}
         )
 
     def _formation_ranger_ids(self, turn: Turn) -> frozenset[UUID]:
-        """Return the deterministic Ranger half of the core formation."""
+        """Return live Rangers assigned to defence or a patrol team."""
+
+        self._ensure_unit_roles(turn)
         return frozenset(
-            unit.id
-            for unit in sorted(turn.rangers, key=lambda unit: unit.id.bytes)[
-                :EXPEDITION_FORMATION_RANGERS
-            ]
+            UUID(unit_id)
+            for unit_id, role in self.memory.unit_roles.items()
+            if role == DEFENSE_ROLE or self._patrol_team_from_role(role) is not None
+            if unit_id in {str(unit.id) for unit in turn.rangers}
         )
 
     def _formation_combat_ids(self, turn: Turn) -> frozenset[UUID]:
-        """Return the full 16-Vanguard/32-Ranger formation membership."""
+        """Return all live combat units assigned to the fixed formation."""
+
         return self._formation_vanguard_ids(turn) | self._formation_ranger_ids(turn)
 
     def _expedition_member_ids(self, turn: Turn) -> frozenset[UUID]:
@@ -3237,29 +3372,70 @@ class AggressiveStrategy:
         )
 
     def _patrol_ids(self, turn: Turn) -> frozenset[UUID]:
-        """Return the 3-Vanguard/6-Ranger patrol contingent of the formation."""
-        vanguards = sorted(turn.vanguards, key=lambda unit: unit.id.bytes)[
-            :EXPEDITION_FORMATION_VANGUARDS
-        ]
-        rangers = sorted(turn.rangers, key=lambda unit: unit.id.bytes)[
-            :EXPEDITION_FORMATION_RANGERS
-        ]
-        return frozenset(unit.id for unit in vanguards[-3:]) | frozenset(
-            unit.id for unit in rangers[-6:]
+        """Return the nine live members of the three fixed patrol teams."""
+
+        self._ensure_unit_roles(turn)
+        live_ids = {str(unit.id) for unit in (*turn.vanguards, *turn.rangers)}
+        return frozenset(
+            UUID(unit_id)
+            for unit_id, role in self.memory.unit_roles.items()
+            if unit_id in live_ids and self._patrol_team_from_role(role) is not None
         )
+
+    def _patrol_team_for(self, unit_id: UUID, turn: Turn) -> int | None:
+        """Return the stable patrol team owning ``unit_id``."""
+
+        if not self.config.expedition_mode:
+            offensive = sorted(self._offensive_ids(turn), key=lambda value: value.bytes)
+            if unit_id in offensive:
+                return offensive.index(unit_id) % PATROL_TEAM_COUNT + 1
+            return None
+        self._ensure_unit_roles(turn)
+        return self._patrol_team_from_role(self.memory.unit_roles.get(str(unit_id)))
+
+    def _patrol_team_members(
+        self, team: int, turn: Turn
+    ) -> tuple[Ranger | Vanguard, ...]:
+        """Return one patrol team's live members in stable UUID order."""
+
+        if not self.config.expedition_mode:
+            offensive = self._offensive_ids(turn)
+            combat = sorted(
+                (
+                    unit
+                    for unit in (*turn.vanguards, *turn.rangers)
+                    if unit.id in offensive
+                ),
+                key=lambda unit: unit.id.bytes,
+            )
+            return tuple(
+                unit
+                for index, unit in enumerate(combat)
+                if index % PATROL_TEAM_COUNT + 1 == team
+            )  # type: ignore[return-value]
+        role = f"{PATROL_ROLE_PREFIX}{team}"
+        return tuple(
+            sorted(
+                (
+                    unit
+                    for unit in (*turn.vanguards, *turn.rangers)
+                    if self.memory.unit_roles.get(str(unit.id)) == role
+                ),
+                key=lambda unit: unit.id.bytes,
+            )
+        )  # type: ignore[return-value]
 
     def _update_expeditions(self, turn: Turn) -> None:
         """Maintain staging and expedition squads for the active-offense mode.
 
-        Surplus combat units (anything beyond the 16/32 formation) are staged
-        at the ring edge as soon as they are built.  Once a full expedition
-        (2 Vanguards + 2 Rangers) is available it departs on a stable,
-        randomly chosen bearing and is never recalled.  Formation membership
-        is derived from UUID order each Tick, so a dead formation member is
-        backfilled by the next-surplus unit of the same type before any new
-        build is counted as surplus.
+        Surplus combat units are staged at the ring edge as soon as they are
+        built.  Once a full expedition (2 Vanguards + 2 Rangers) is available
+        it departs on a stable bearing and is never recalled.  Existing
+        defence, patrol, and expedition UUIDs are never reclassified merely
+        because another UUID sorts before them.
         """
 
+        self._reconcile_unit_roles(turn)
         core = turn.core
         live = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
         self._expedition_squads = [
@@ -3267,24 +3443,23 @@ class AggressiveStrategy:
             for members, bearing in self._expedition_squads
             if members & live
         ]
-        expedition_members = self._expedition_member_ids(turn)
-        formation = self._formation_combat_ids(turn)
-
-        vanguard_ids = {unit.id for unit in turn.vanguards}
-        ranger_ids = {unit.id for unit in turn.rangers}
+        self._expedition_serial_by_members = {
+            members: self._expedition_serial_by_members.get(members, index + 1)
+            for index, (members, _bearing) in enumerate(self._expedition_squads)
+        }
         staged_vanguards = sorted(
             (
-                unit_id
-                for unit_id in vanguard_ids
-                if unit_id not in formation and unit_id not in expedition_members
+                unit.id
+                for unit in turn.vanguards
+                if self.memory.unit_roles.get(str(unit.id)) == STAGED_ROLE
             ),
             key=lambda unit_id: unit_id.bytes,
         )
         staged_rangers = sorted(
             (
-                unit_id
-                for unit_id in ranger_ids
-                if unit_id not in formation and unit_id not in expedition_members
+                unit.id
+                for unit in turn.rangers
+                if self.memory.unit_roles.get(str(unit.id)) == STAGED_ROLE
             ),
             key=lambda unit_id: unit_id.bytes,
         )
@@ -3300,9 +3475,25 @@ class AggressiveStrategy:
             bearing = self._expedition_bearing(core)
             self._expedition_squads.append((members, bearing))
             self._expedition_serial += 1
+            self._expedition_serial_by_members[members] = self._expedition_serial
+            role = f"{EXPEDITION_ROLE_PREFIX}{self._expedition_serial}"
+            for member_id in members:
+                self.memory.unit_roles[str(member_id)] = role
             del staged_vanguards[:EXPEDITION_SQUAD_VANGUARDS]
             del staged_rangers[:EXPEDITION_SQUAD_RANGERS]
         self._staged_ids = frozenset(staged_vanguards) | frozenset(staged_rangers)
+        self.memory.expedition_squads = [
+            ExpeditionSquad(
+                serial=self._expedition_serial_by_members.get(members, index + 1),
+                members=tuple(
+                    str(member_id)
+                    for member_id in sorted(members, key=lambda value: value.bytes)
+                ),
+                bearing=bearing,
+            )
+            for index, (members, bearing) in enumerate(self._expedition_squads)
+        ]
+        self.memory.next_expedition_serial = self._expedition_serial
 
     def _expedition_bearing(self, core: Core | None) -> Position:
         """Choose a stable pseudo-random compass bearing for one expedition.
@@ -4263,23 +4454,28 @@ class AggressiveStrategy:
         unit: Ranger | Vanguard,
         turn: Turn,
     ) -> tuple[Position, str]:
-        """Choose a stable outward search point for one roaming combat unit."""
+        """Choose a waypoint for the Unit's independent three-member team."""
 
         core = turn.core
         if core is None:
             return unit.position, "no Core available for offensive patrol"
+        team = self._patrol_team_for(unit.id, turn)
+        if team is None:
+            return unit.position, "no patrol team assigned"
         unit_id = str(unit.id)
+        purpose = f"{COMBAT_PATROL_PURPOSE}-{team}"
         current = self.memory.goal_for(unit_id)
         claimed_positions = {
             goal.position
             for other in (*turn.rangers, *turn.vanguards)
             if other.id != unit.id
             if (goal := self.memory.goal_for(str(other.id))) is not None
-            and goal.purpose == COMBAT_PATROL_PURPOSE
+            and goal.purpose.startswith(COMBAT_PATROL_PURPOSE)
+            and self._patrol_team_for(other.id, turn) != team
         }
         if (
             current is not None
-            and current.purpose == COMBAT_PATROL_PURPOSE
+            and current.purpose == purpose
             and unit.position != current.position
             and current.position not in self.memory.obstacles
             and current.position not in claimed_positions
@@ -4303,41 +4499,54 @@ class AggressiveStrategy:
             )
             if abs(offset[0]) + abs(offset[1]) <= self.config.offensive_patrol_radius
         ) or _defensive_ring_offsets(max(1, self.config.offensive_patrol_radius))
-        combat_units = sorted(
-            (*turn.rangers, *turn.vanguards),
-            key=lambda item: item.id.bytes,
+        team_members = self._patrol_team_members(team, turn)
+        member_index = next(
+            index for index, item in enumerate(team_members) if item.id == unit.id
         )
-        unit_index = next(
-            index for index, item in enumerate(combat_units) if item.id == unit.id
-        )
+        local_offsets = ((0, 0), (0, 1), (1, 0))
+        local_dx, local_dy = local_offsets[member_index % len(local_offsets)]
         phase = turn.tick // self.config.offensive_patrol_goal_ttl
-        unit_spacing = max(1, len(offsets) // len(combat_units))
-        offset_index = (unit_index * unit_spacing + phase) % len(offsets)
-        if current is not None and current.purpose == COMBAT_PATROL_PURPOSE:
+        team_spacing = max(1, len(offsets) // PATROL_TEAM_COUNT)
+        offset_index = ((team - 1) * team_spacing + phase) % len(offsets)
+        if current is not None and current.purpose == purpose:
             current_offset = (
-                current.position[0] - core.position[0],
-                current.position[1] - core.position[1],
+                current.position[0] - core.position[0] - local_dx,
+                current.position[1] - core.position[1] - local_dy,
             )
             if current_offset in offsets:
-                offset_index = (offsets.index(current_offset) + unit_spacing) % len(
+                offset_index = (offsets.index(current_offset) + team_spacing) % len(
                     offsets
                 )
 
-        patrol_position = core.position
-        for step in range(len(offsets)):
-            dx, dy = offsets[(offset_index + step) % len(offsets)]
-            candidate = core.position[0] + dx, core.position[1] + dy
-            if (
-                candidate != unit.position
-                and candidate not in self.memory.obstacles
-                and candidate not in claimed_positions
-            ):
-                patrol_position = candidate
-                break
+        center_offset = offsets[offset_index]
+        # Keep the three members close while giving each a distinct cell.  The
+        # team still shares one route and phase; the small local offsets only
+        # prevent all three Units from queueing onto one occupied waypoint.
+        patrol_position = (
+            core.position[0] + center_offset[0] + local_dx,
+            core.position[1] + center_offset[1] + local_dy,
+        )
+        if (
+            manhattan(core.position, patrol_position)
+            > self.config.offensive_patrol_radius
+            or patrol_position in self.memory.obstacles
+            or patrol_position in claimed_positions
+        ):
+            patrol_position = core.position
+            for step in range(len(offsets)):
+                dx, dy = offsets[(offset_index + step) % len(offsets)]
+                candidate = core.position[0] + dx, core.position[1] + dy
+                if (
+                    candidate != unit.position
+                    and candidate not in self.memory.obstacles
+                    and candidate not in claimed_positions
+                ):
+                    patrol_position = candidate
+                    break
         goal = UnitGoal(
             position=patrol_position,
             assigned_tick=turn.tick,
-            purpose=COMBAT_PATROL_PURPOSE,
+            purpose=purpose,
             last_progress_position=unit.position,
         )
         self.memory.set_goal(unit_id, goal)

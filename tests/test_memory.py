@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from arena_hero_bot.memory import UnitGoal, WorldMemory
+from arena_hero_bot.memory import ExpeditionSquad, UnitGoal, WorldMemory
 
 from .factories import core, make_turn, object_id, unit
 
@@ -48,6 +48,27 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
     assert loaded.recent_positions(str(turn.workers[0].id)) == ()
     assert turn.core is not None
     assert loaded.recent_positions(str(turn.core.id)) == ()
+
+
+def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
+    memory = WorldMemory(
+        unit_roles={object_id(2): "defense", object_id(3): "patrol-2"},
+        expedition_squads=[
+            ExpeditionSquad(
+                serial=4,
+                members=(object_id(4), object_id(5)),
+                bearing=(1, 0),
+            )
+        ],
+        next_expedition_serial=4,
+    )
+    path = tmp_path / "memory.json"
+    memory.save(path)
+
+    loaded = WorldMemory.load(path)
+    assert loaded.unit_roles == memory.unit_roles
+    assert loaded.expedition_squads == memory.expedition_squads
+    assert loaded.next_expedition_serial == 4
 
 
 def test_enemy_ttl_sorting_and_goal_lifecycle() -> None:
