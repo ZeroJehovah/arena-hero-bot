@@ -6346,6 +6346,28 @@ def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None
     )
 
 
+def test_symmetric_posture_ignores_staged_surplus_when_assigning_defense_slots() -> (
+    None
+):
+    config = expedition_config(target_workers=16)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(20, 20)) for number in range(16)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(20, 20)) for number in range(32)]
+    turn = make_turn(resources=0, objects=[core(), *vanguards, *rangers])
+
+    strategy.decide(turn)
+
+    assert strategy._defensive_layout is not None
+    assert len(strategy._defensive_layout.assignments) == 24
+    assert all(
+        strategy.memory.unit_roles[str(unit_view["id"])] == DEFENSE_ROLE
+        for unit_view in vanguards + rangers
+        if UUID(unit_view["id"]) in strategy._defensive_layout.assignments
+    )
+
+
 def test_symmetric_posture_demotes_excess_legacy_defenders() -> None:
     memory = WorldMemory()
     old_strategy = AggressiveStrategy(memory, expedition_config())

@@ -4720,17 +4720,32 @@ class AggressiveStrategy:
                 key=lambda unit: unit.id.bytes,
             )
         )
+        if self._symmetric_posture():
+            defense_ids = {
+                unit_id
+                for unit_id, role in self.memory.unit_roles.items()
+                if role == DEFENSE_ROLE
+            }
+            guards = tuple(unit for unit in guards if str(unit.id) in defense_ids)
         if not guards:
             self._defensive_layout = None
             return {}
         ordered_guard_ids = tuple(unit.id for unit in guards)
 
         if self._symmetric_posture():
+            # Surplus combat units are deliberately staged outside the fixed
+            # defense ring.  Counting them here makes a live roster larger
+            # than 8V+16R look like an invalid symmetric formation and
+            # silently falls back to the legacy perimeter layout.
             vanguard_guards = tuple(
-                unit for unit in guards if unit.unit_type is UnitType.VANGUARD
+                unit
+                for unit in guards
+                if str(unit.id) in defense_ids and unit.unit_type is UnitType.VANGUARD
             )
             ranger_guards = tuple(
-                unit for unit in guards if unit.unit_type is UnitType.RANGER
+                unit
+                for unit in guards
+                if str(unit.id) in defense_ids and unit.unit_type is UnitType.RANGER
             )
             vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
             obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
