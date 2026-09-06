@@ -4483,14 +4483,11 @@ class AggressiveStrategy:
                         rendezvous,
                         "close up so the expedition's line of sight stays connected",
                     )
-                if squad is not None:
-                    members, _ = squad
-                    shared = self._expedition_shared_target(turn, members)
-                    if shared is not None:
-                        return (
-                            shared,
-                            "advance together on the squad's enemy target",
-                        )
+                # A squad may only acquire a new target from its own local
+                # sight.  Global enemy memory belongs to the defensive and
+                # patrol policies; feeding it here can pull an expedition
+                # hundreds of cells sideways after its bounded pursuit has
+                # expired, leaving the formation circling an obstacle pocket.
                 return (
                     self._expedition_goal(unit, turn),
                     "explore outward on this expedition bearing",

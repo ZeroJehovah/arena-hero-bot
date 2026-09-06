@@ -16,7 +16,7 @@ from arena_hero import (
 
 from arena_hero_bot.combat_policy import ThreatAssessment
 from arena_hero_bot.geometry import add, adjacent_positions, manhattan
-from arena_hero_bot.memory import UnitGoal, WorldMemory
+from arena_hero_bot.memory import EnemySighting, UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
     DEFENSE_ROLE,
@@ -6265,6 +6265,44 @@ def test_expedition_pursuit_only_expires_after_one_hundred_cells() -> None:
     strategy._expedition_pursuits[squad].distance = 100
     strategy._refresh_expedition_pursuits(turn)
     assert strategy._expedition_pursuits[squad].target_id is None
+
+
+def test_expedition_returns_to_bearing_after_pursuit_without_local_sight() -> None:
+    strategy = _expedition_strategy(
+        replace(expedition_config(), offensive_min_combat_units=4)
+    )
+    squad = frozenset({UUID(int=2), UUID(int=3), UUID(int=4), UUID(int=5)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    strategy.memory.enemies[object_id(90)] = EnemySighting(
+        object_id=object_id(90),
+        kind="UNIT",
+        position=(100, 100),
+        hp=4,
+        unit_type="VANGUARD",
+        tick=100,
+    )
+
+    turn = make_turn(
+        tick=101,
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "VANGUARD", position=(0, 1)),
+            unit(4, "RANGER", position=(1, 0)),
+            unit(5, "RANGER", position=(1, 1)),
+            unit(6, "VANGUARD", position=(0, 3)),
+            unit(7, "VANGUARD", position=(0, 4)),
+            unit(8, "RANGER", position=(1, 3)),
+            unit(9, "RANGER", position=(1, 4)),
+        ],
+    )
+
+    goal, reason = strategy._idle_combat_goal(turn.vanguards[0], turn, context=None)
+
+    assert reason == "explore outward on this expedition bearing"
+    assert goal[0] > turn.vanguards[0].position[0]
+    assert goal != (100, 100)
 
 
 def test_symmetric_posture_selects_and_starts_migration_to_clear_home() -> None:
