@@ -1655,12 +1655,11 @@ class AggressiveStrategy:
                 )
                 return
 
-        if (
-            self._symmetric_posture()
-            and not nearby_enemy
-            and context.turn.workers
-            and all(worker.cargo == 0 for worker in context.turn.workers)
-        ):
+        if self._symmetric_posture() and not nearby_enemy and context.turn.workers:
+            # Workers already know how to stage carried resources at the
+            # Core's current destination while it is moving.  Requiring the
+            # whole economy to be empty before starting the revised live
+            # relocation deadlocks as soon as a remote Worker is returning.
             direction = self._core_home_direction(context)
             if direction is not None:
                 core.start_move(direction)

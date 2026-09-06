@@ -6291,6 +6291,23 @@ def test_symmetric_posture_selects_and_starts_migration_to_clear_home() -> None:
     )
 
 
+def test_symmetric_posture_migrates_while_worker_returns_cargo() -> None:
+    config = expedition_config(target_workers=16)
+    memory = WorldMemory(core_home_position=(0, 4))
+    strategy = AggressiveStrategy(memory, config)
+    workers = [
+        unit(100 + number, "WORKER", position=(20 + number, 20)) for number in range(15)
+    ]
+    workers.append(unit(200, "WORKER", position=(2, 0), cargo=1))
+    turn = make_turn(resources=0, objects=[core(), *workers])
+
+    report = strategy.decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert any("symmetric-defense home" in item.reason for item in report.decisions)
+
+
 def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None:
     config = expedition_config(target_workers=16)
     strategy = AggressiveStrategy(WorldMemory(), config)
