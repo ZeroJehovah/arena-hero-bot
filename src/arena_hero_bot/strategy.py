@@ -3867,17 +3867,34 @@ class AggressiveStrategy:
             )
         if target is None:
             target = self._best_visible_target(ranger.position, context.turn, visible)
-        if (
-            target is not None
-            and ranger.hp <= 1
-            and self._ranger_would_take_return_fire(
-                ranger,
-                target,
-                self.memory.obstacles | set(context.turn.obstacle_cells),
+        if target is not None:
+            obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+            shot_cell = self._ranger_shot_cell(ranger, target, context.turn, obstacles)
+            # A diagonal Ranger duel can look safe in the current snapshot:
+            # the target cannot shoot this cell yet, but chasing it can step
+            # straight into the target's next axis-aligned firing lane.  If we
+            # cannot shoot back while the enemy is already inside Ranger range,
+            # break contact before the next combat resolution instead of
+            # waiting for the first hit to make the same choice one Tick late.
+            preemptive_ranged_contact = (
+                isinstance(target, UnitView)
+                and target.unit_type is UnitType.RANGER
+                and self._ranger_range(ranger.position, target.position)
+                <= RANGER_STANDOFF_RANGE
+                and shot_cell is None
             )
-            and self._expedition_break_contact(ranger, target, context)
-        ):
-            return True
+            wounded_ranged_contact = (
+                ranger.hp <= 1
+                and self._ranger_would_take_return_fire(
+                    ranger,
+                    target,
+                    obstacles,
+                )
+            )
+            if (
+                preemptive_ranged_contact or wounded_ranged_contact
+            ) and self._expedition_break_contact(ranger, target, context):
+                return True
         if pursuit is None or pursuit.target_id is None:
             return False
         squad = self._expedition_squad_for(ranger.id)
