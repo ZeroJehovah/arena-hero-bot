@@ -3872,15 +3872,15 @@ class AggressiveStrategy:
             shot_cell = self._ranger_shot_cell(ranger, target, context.turn, obstacles)
             # A diagonal Ranger duel can look safe in the current snapshot:
             # the target cannot shoot this cell yet, but chasing it can step
-            # straight into the target's next axis-aligned firing lane.  If we
-            # cannot shoot back while the enemy is already inside Ranger range,
-            # break contact before the next combat resolution instead of
-            # waiting for the first hit to make the same choice one Tick late.
+            # straight into the target's next axis-aligned firing lane.  Keep
+            # the one-cell approach boundary in this check too: a Ranger at
+            # distance four with no legal shot must not walk into range three
+            # and take the first hit before it gets another decision.
             preemptive_ranged_contact = (
                 isinstance(target, UnitView)
                 and target.unit_type is UnitType.RANGER
                 and self._ranger_range(ranger.position, target.position)
-                <= RANGER_STANDOFF_RANGE
+                <= RANGER_STANDOFF_RANGE + 1
                 and shot_cell is None
             )
             wounded_ranged_contact = (
