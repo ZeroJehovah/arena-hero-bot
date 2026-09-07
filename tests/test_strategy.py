@@ -5801,6 +5801,70 @@ def test_expedition_members_never_heal_or_retreat() -> None:
     assert not strategy._recover_if_critical(ranger_view, maximum_hp=2, context=context)
 
 
+def test_low_hp_expedition_ranger_returns_after_lost_ranged_contact() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
+        target_id=object_id(90),
+        position=(8, 5),
+    )
+
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 4)),
+            unit(3, "RANGER", position=(5, 5), hp=1),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions=set(),
+    )
+
+    ranger = turn.rangers[0]
+    assert strategy._decide_expedition_ranger(ranger, context)
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "return critical expedition Ranger to Core"
+        for item in context.report.decisions
+    )
+
+
+def test_wounded_expedition_vanguard_returns_after_lost_contact() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
+        target_id=object_id(90),
+        position=(8, 5),
+    )
+
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 4), hp=3),
+            unit(3, "RANGER", position=(5, 5)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions=set(),
+    )
+
+    vanguard = turn.vanguards[0]
+    assert strategy._decide_expedition_vanguard(vanguard, context)
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "return critical expedition Vanguard to Core"
+        for item in context.report.decisions
+    )
+
+
 def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> None:
     strategy = _expedition_strategy()
     vanguards = [

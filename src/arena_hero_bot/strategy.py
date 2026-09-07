@@ -3867,6 +3867,22 @@ class AggressiveStrategy:
             )
         if target is None:
             target = self._best_visible_target(ranger.position, context.turn, visible)
+        # A ranged target can disappear for one Tick while the pursuit memory
+        # keeps advancing.  Do not let a one-HP Ranger turn that brief sight
+        # gap into another blind chase and walk back into the same firing line.
+        if (
+            target is None
+            and ranger.hp <= 1
+            and pursuit is not None
+            and pursuit.target_id is not None
+            and pursuit.position is not None
+            and self._move_ranger_toward_core(
+                ranger,
+                context,
+                reason="return critical expedition Ranger to Core",
+            )
+        ):
+            return True
         if target is not None:
             obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
             shot_cell = self._ranger_shot_cell(ranger, target, context.turn, obstacles)
@@ -3950,6 +3966,26 @@ class AggressiveStrategy:
         if pursuit is None or pursuit.target_id is None:
             return False
         visible = self._visible_combat_targets(vanguard, context.turn)
+        pursued_target = next(
+            (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
+        )
+        # The same sight flicker is dangerous for a wounded Vanguard: the
+        # persistent chase would otherwise resume immediately after a safe
+        # contact-break step.  Recall it while it can still reach the Core.
+        if (
+            pursued_target is None
+            and vanguard.hp < 4
+            and pursuit.position is not None
+            and context.turn.core is not None
+            and self._move(
+                vanguard,
+                context.turn.core.position,
+                context,
+                reason="return critical expedition Vanguard to Core",
+                allow_goal=True,
+            )
+        ):
+            return True
         if self._expedition_under_fire(
             vanguard,
             context,
@@ -3957,9 +3993,7 @@ class AggressiveStrategy:
             offensive=True,
         ):
             return True
-        target = next(
-            (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
-        )
+        target = pursued_target
         if target is not None and self._expedition_close_to_engage(
             vanguard, target, context, offensive=True
         ):
