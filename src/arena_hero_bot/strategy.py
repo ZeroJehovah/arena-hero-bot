@@ -4178,6 +4178,30 @@ class AggressiveStrategy:
         if target is None:
             return False
 
+        ranged_attackers = tuple(
+            enemy
+            for enemy in visible_enemies
+            if isinstance(enemy, UnitView) and enemy.unit_type is UnitType.RANGER
+        )
+        # Two nearby Rangers can cover every cardinal escape cell around a
+        # Vanguard.  Do not let a full-health expedition member walk into that
+        # crossfire and rely on a later damaged-unit response to escape.
+        if (
+            len(ranged_attackers) >= 2
+            and min(
+                self._ranger_range(vanguard.position, enemy.position)
+                for enemy in ranged_attackers
+            )
+            <= RANGER_STANDOFF_RANGE + 1
+            and min(
+                self._ranger_range(vanguard.position, enemy.position)
+                for enemy in ranged_attackers
+            )
+            > 1
+            and self._expedition_break_contact(vanguard, target, context)
+        ):
+            return True
+
         distance = manhattan(vanguard.position, target.position)
         # Counter: a hostile inside the squad's short engagement window is worth
         # closing on; override the cohesion hold that used to park members next to
