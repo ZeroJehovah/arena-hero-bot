@@ -3911,6 +3911,21 @@ class AggressiveStrategy:
                 preemptive_ranged_contact or wounded_ranged_contact
             ) and self._expedition_break_contact(ranger, target, context):
                 return True
+            # A boxed-in one-HP Ranger may have no adjacent cell that increases
+            # its distance from the attacker.  Do not fall through to a final
+            # shot in that case: keep the expedition member moving home while
+            # the return route still offers a non-closing cell.
+            if (
+                ranger.hp <= 1
+                and isinstance(target, UnitView)
+                and target.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and self._move_ranger_toward_core(
+                    ranger,
+                    context,
+                    reason="return critical expedition Ranger to Core",
+                )
+            ):
+                return True
         if pursuit is None or pursuit.target_id is None:
             return False
         squad = self._expedition_squad_for(ranger.id)

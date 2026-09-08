@@ -6279,6 +6279,43 @@ def test_low_hp_expedition_ranger_disengages_before_return_fire() -> None:
     )
 
 
+def test_boxed_low_hp_expedition_ranger_returns_instead_of_shooting() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
+        target_id=object_id(90),
+        position=(2, 2),
+    )
+
+    turn = make_turn(
+        objects=[
+            core(position=(10, 0)),
+            unit(2, "VANGUARD", position=(0, 3)),
+            unit(3, "RANGER", position=(0, 0), hp=1),
+            unit(90, "RANGER", controlled=False, position=(2, 2)),
+        ],
+        obstacles=[(-1, 0), (0, -1)],
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    ranger = turn.rangers[0]
+    assert strategy._decide_expedition_ranger(ranger, context)
+    action = turn.plan.unit_actions[ranger.id]
+    assert action.type == "MOVE"
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "return critical expedition Ranger to Core"
+        for item in context.report.decisions
+    )
+
+
 def test_expedition_ranger_breaks_diagonal_ranged_contact_before_first_hit() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
