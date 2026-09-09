@@ -4375,6 +4375,33 @@ class AggressiveStrategy:
             for enemy in visible_enemies
             if isinstance(enemy, UnitView) and enemy.unit_type is UnitType.RANGER
         )
+        # A wounded Vanguard can see a closer melee target and still be inside
+        # a Ranger's firing line.  Letting target priority choose the melee
+        # unit makes the Vanguard close into the shot instead of breaking
+        # contact.  The single-Ranger version is the common expedition case;
+        # use the actual ranged threat as the contact-break anchor before the
+        # normal close-on-melee branch gets a chance to mask it.
+        if vanguard.hp < 4 and ranged_attackers:
+            threatening_ranger = min(
+                (
+                    enemy
+                    for enemy in ranged_attackers
+                    if self._enemy_can_attack_position(
+                        enemy,
+                        vanguard.position,
+                        self.memory.obstacles | set(context.turn.obstacle_cells),
+                    )
+                ),
+                key=lambda enemy: (
+                    self._ranger_range(vanguard.position, enemy.position),
+                    str(enemy.id),
+                ),
+                default=None,
+            )
+            if threatening_ranger is not None and self._expedition_break_contact(
+                vanguard, threatening_ranger, context
+            ):
+                return True
         # Two nearby Rangers can cover every cardinal escape cell around a
         # Vanguard.  Do not let a full-health expedition member walk into that
         # crossfire and rely on a later damaged-unit response to escape.

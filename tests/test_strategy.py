@@ -6317,6 +6317,45 @@ def test_expedition_vanguard_breaks_contact_when_damaged_and_outranged() -> None
     assert manhattan(moved, (9, 5)) > manhattan(vanguard.position, (9, 5))
 
 
+def test_wounded_expedition_vanguard_breaks_ranger_line_before_melee_close() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5), hp=1),
+            unit(3, "RANGER", position=(6, 5)),
+            unit(90, "VANGUARD", controlled=False, position=(7, 5)),
+            unit(91, "RANGER", controlled=False, position=(8, 5)),
+        ],
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+    vanguard = turn.vanguards[0]
+
+    assert strategy._expedition_under_fire(
+        vanguard, context, turn.visible_enemies, offensive=True
+    )
+    action = turn.plan.unit_actions[vanguard.id]
+    assert action.type == "MOVE"
+    moved = add(vanguard.position, action.direction)
+    assert manhattan(moved, (8, 5)) > manhattan(vanguard.position, (8, 5))
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "break contact with the ranged attacker"
+        for item in context.report.decisions
+    )
+
+
 def test_expedition_vanguard_disengages_before_two_rangers_box_it_in() -> None:
     strategy = _expedition_strategy()
     strategy._expedition_squads = [
