@@ -4180,23 +4180,29 @@ class AggressiveStrategy:
         alive = {
             member.id: member.position for member in (*turn.vanguards, *turn.rangers)
         }
-        teammates = [
-            alive[member_id]
+        ordered = sorted(
+            (
+                alive[member_id][0] * bear_x + alive[member_id][1] * bear_y,
+                alive[member_id][0],
+                alive[member_id][1],
+                member_id.bytes,
+                member_id,
+                alive[member_id],
+            )
             for member_id in members
-            if member_id in alive and member_id != unit.id
-        ]
-        if not teammates:
+            if member_id in alive
+        )
+        if len(ordered) < 2:
             return None
 
-        def progress(position: Position) -> int:
-            return position[0] * bear_x + position[1] * bear_y
-
-        own_progress = progress(unit.position)
-        laggards = [p for p in teammates if progress(p) < own_progress]
-        leaders = [p for p in teammates if progress(p) > own_progress]
-
-        laggard = max(laggards, key=lambda p: (progress(p), p)) if laggards else None
-        leader = min(leaders, key=lambda p: (progress(p), p)) if leaders else None
+        own_index = next(
+            (index for index, item in enumerate(ordered) if item[4] == unit.id),
+            None,
+        )
+        if own_index is None:
+            return None
+        laggard = ordered[own_index - 1][5] if own_index > 0 else None
+        leader = ordered[own_index + 1][5] if own_index + 1 < len(ordered) else None
 
         # A gap opened ahead of us: the member lags and must close forward.
         # This takes precedence when both gaps are open.  A middle member can

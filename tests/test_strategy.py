@@ -6171,6 +6171,28 @@ def test_expedition_middle_member_closes_forward_when_both_links_are_open() -> N
     assert goal == (21, 0)
 
 
+def test_expedition_same_bearing_projection_uses_stable_neighbor_order() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3), UUID(int=4)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "VANGUARD", position=(10, 0)),
+            unit(4, "VANGUARD", position=(10, 5)),
+        ],
+    )
+    middle = next(u for u in turn.vanguards if u.id == UUID(int=3))
+
+    # Members sharing a bearing projection still need a deterministic front
+    # neighbour.  Without the tie-break, the middle member sees no leader and
+    # waits forever for the tail while the same-projection member waits for it.
+    assert strategy._expedition_rendezvous_goal(middle, turn) == (11, 5)
+
+
 def test_expedition_close_cell_avoids_leader_occupied_cell() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
