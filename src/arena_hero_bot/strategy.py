@@ -4198,17 +4198,21 @@ class AggressiveStrategy:
         laggard = max(laggards, key=lambda p: (progress(p), p)) if laggards else None
         leader = min(leaders, key=lambda p: (progress(p), p)) if leaders else None
 
+        # A gap opened ahead of us: the member lags and must close forward.
+        # This takes precedence when both gaps are open.  A middle member can
+        # be separated from the tail by an obstacle detour while also falling
+        # behind the front; waiting for the tail in that state deadlocks the
+        # chain because the tail is trying to close on the waiting member.
+        if leader is not None and (
+            manhattan(unit.position, leader) > EXPEDITION_LINK_RADIUS
+        ):
+            return self._expedition_close_cell(unit, leader, turn)
         # A gap opened behind us: the member raced ahead, so it stops and lets
         # the tail close up rather than sprinting away from it.
         if laggard is not None and (
             manhattan(unit.position, laggard) > EXPEDITION_LINK_RADIUS
         ):
             return unit.position
-        # A gap opened ahead of us: the member lags and must close forward.
-        if leader is not None and (
-            manhattan(unit.position, leader) > EXPEDITION_LINK_RADIUS
-        ):
-            return self._expedition_close_cell(unit, leader, turn)
         return None
 
     def _expedition_close_cell(

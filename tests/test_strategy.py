@@ -2231,7 +2231,7 @@ def test_blocked_defensive_guard_does_not_yield_during_enemy_contact() -> None:
     assert "no safe path" in target.reason
 
 
-def test_blocked_defensive_guard_does_not_yield_when_route_is_statically_walled() -> None:
+def test_blocked_defensive_guard_stays_put_when_route_is_walled() -> None:
     """A permanent obstacle wall must remain a normal no-route wait."""
 
     turn = make_turn(
@@ -6146,6 +6146,29 @@ def test_expedition_laggard_catches_up_without_leader_turning_back() -> None:
     assert strategy._expedition_rendezvous_goal(laggard, turn) == (31, 0)
     leader = by_id[UUID(int=2)]
     assert strategy._expedition_rendezvous_goal(leader, turn) == (30, 0)
+
+
+def test_expedition_middle_member_closes_forward_when_both_links_are_open() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3), UUID(int=4)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+
+    turn = make_turn(
+        resources=10000,
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "VANGUARD", position=(10, 0)),
+            unit(4, "VANGUARD", position=(20, 0)),
+        ],
+    )
+    middle = next(u for u in turn.vanguards if u.id == UUID(int=3))
+
+    # The middle member is outside the link radius from both neighbours.  It
+    # must close on the front first; waiting for the tail here deadlocks the
+    # chain when the tail is itself trying to close on the middle member.
+    goal = strategy._expedition_rendezvous_goal(middle, turn)
+    assert goal == (21, 0)
 
 
 def test_expedition_close_cell_avoids_leader_occupied_cell() -> None:
