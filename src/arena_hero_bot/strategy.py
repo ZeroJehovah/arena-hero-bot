@@ -1989,6 +1989,20 @@ class AggressiveStrategy:
             reason=reason,
             allow_goal=allow_goal,
         ):
+            if self._yield_for_blocked_defensive_route(
+                unit,
+                goal,
+                context,
+                reason=reason,
+                allow_goal=allow_goal,
+            ) and self._move(
+                unit,
+                goal,
+                context,
+                reason=reason,
+                allow_goal=allow_goal,
+            ):
+                return
             self._record_wait(unit, context, f"no safe path for: {reason}")
             if (
                 wait_at_goal
@@ -1996,6 +2010,125 @@ class AggressiveStrategy:
                 and unit.id not in context.turn.plan.unit_actions
             ):
                 unit.wait()
+
+    def _yield_for_blocked_defensive_route(
+        self,
+        unit: Unit,
+        goal: Position,
+        context: _TurnContext,
+        *,
+        reason: str,
+        allow_goal: bool,
+    ) -> bool:
+        """Move one idle guard aside when friendly traffic seals its route.
+
+        A static route proves that the failure is caused by our own traffic,
+        rather than by an obstacle wall.  The exception is intentionally
+        narrow: only a quiet, stationary Core may reshuffle ordinary defense
+        guards, and only an adjacent guard with no higher-priority action may
+        yield one cell.  The original unit retries immediately after the
+        yielding move, so both actions remain part of the same complete plan.
+        """
+
+        if not isinstance(unit, (Ranger, Vanguard)):
+            return False
+        if reason != "hold a defensive perimeter around the resource Core":
+            return False
+        if context.emergency or context.combat_assault or context.turn.visible_enemies:
+            return False
+        if context.threat.level is not ThreatLevel.NORMAL:
+            return False
+        core = context.turn.core
+        if core is None or core.view.state is not CoreState.NORMAL:
+            return False
+        if self._is_offensive_combat_unit(unit, context.turn, context.threat):
+            return False
+        if not self._has_static_route(
+            unit,
+            goal,
+            context,
+            allow_goal=allow_goal,
+        ):
+            return False
+        assignments = context.defensive_assignments
+        if assignments is None or unit.id not in assignments:
+            return False
+
+        units_by_position = {
+            candidate.position: candidate for candidate in context.turn.units
+        }
+        obstacles = self._static_blockers(unit, context)
+        worker_corridors = self._worker_corridor_cells(core.position, obstacles)
+        blocked = obstacles | context.occupied | context.reserved | worker_corridors
+        blocked.update(context.enemy_positions)
+        blocked.add(core.position)
+        blocked.update(adjacent_positions(core.position))
+        blocked.discard(unit.position)
+
+        decisions = {item.actor_id: item for item in context.report.decisions}
+        for neighbour_position in adjacent_positions(unit.position):
+            neighbour = units_by_position.get(neighbour_position)
+            if not isinstance(neighbour, (Ranger, Vanguard)):
+                continue
+            if neighbour.id not in assignments:
+                continue
+            if neighbour.id in context.preplanned_ids:
+                continue
+            previous = decisions.get(str(neighbour.id))
+            if previous is not None and previous.action != "WAIT":
+                continue
+            queued = context.turn.plan.unit_actions.get(neighbour.id)
+            if queued is not None and queued.type != "WAIT":
+                continue
+
+            candidates = [
+                (destination, direction)
+                for direction in DIRECTIONS
+                if (destination := add(neighbour.position, direction)) not in blocked
+                and destination != unit.position
+                and destination != goal
+            ]
+            if not candidates:
+                continue
+            neighbour_goal = assignments[neighbour.id]
+            candidates.sort(
+                key=lambda item: (
+                    manhattan(item[0], neighbour_goal),
+                    manhattan(item[0], core.position),
+                    item[0],
+                )
+            )
+            for destination, direction in candidates:
+                simulated_blocked = self._static_blockers(unit, context)
+                simulated_blocked.update(context.occupied)
+                simulated_blocked.discard(neighbour.position)
+                simulated_blocked.update(context.reserved)
+                simulated_blocked.add(destination)
+                if (
+                    next_step(
+                        unit.position,
+                        goal,
+                        blocked=simulated_blocked,
+                        recent=self.memory.recent_positions(str(unit.id)),
+                        direction_offset=self._direction_offset(unit.id),
+                        allow_goal=allow_goal,
+                    )
+                    is None
+                ):
+                    continue
+                if not self._queue_move(
+                    neighbour,
+                    direction,
+                    context,
+                    reason="yield one cell to unblock a defensive route",
+                    target=destination,
+                ):
+                    continue
+                if previous is not None:
+                    context.report.decisions.remove(previous)
+                context.preplanned_ids.add(neighbour.id)
+                return True
+        return False
 
     def _retreat_worker(
         self,

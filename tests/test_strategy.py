@@ -2166,6 +2166,108 @@ def test_boxed_in_core_occupant_nudges_a_neighbour_aside() -> None:
     )
 
 
+def test_blocked_defensive_guard_asks_adjacent_guard_to_yield() -> None:
+    """A transient friendly wall must clear one cell of a static route."""
+
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "RANGER", position=(0, -5)),
+            unit(3, "VANGUARD", position=(-1, -5)),
+            unit(4, "VANGUARD", position=(1, -5)),
+        ],
+        obstacles=[(0, -6), (0, -4)],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    yielded = [
+        item
+        for item in report.decisions
+        if item.reason == "yield one cell to unblock a defensive route"
+    ]
+    assert len(yielded) == 1
+    assert yielded[0].actor_id == object_id(4)
+    assert yielded[0].target not in {(0, 0), (0, -6), (0, -4)}
+
+    target = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert target.action == "MOVE"
+    assert target.reason == PERIMETER_REASON
+    assert turn.plan.unit_actions[UUID(object_id(2))].type == "MOVE"
+    assert turn.plan.unit_actions[UUID(object_id(4))].type == "MOVE"
+    assert sum(item.actor_id == object_id(4) for item in report.decisions) == 1
+
+
+def test_blocked_defensive_guard_does_not_yield_during_enemy_contact() -> None:
+    """A visible enemy keeps the defense posture under combat policy control."""
+
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "RANGER", position=(0, -5)),
+            unit(3, "VANGUARD", position=(-1, -5)),
+            unit(4, "VANGUARD", position=(1, -5)),
+            unit(30, "VANGUARD", controlled=False, position=(100, 100)),
+        ],
+        obstacles=[(0, -6), (0, -4)],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    assert not any(
+        item.reason == "yield one cell to unblock a defensive route"
+        for item in report.decisions
+    )
+    target = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert target.action == "WAIT"
+    assert "no safe path" in target.reason
+
+
+def test_blocked_defensive_guard_does_not_yield_when_route_is_statically_walled() -> None:
+    """A permanent obstacle wall must remain a normal no-route wait."""
+
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "RANGER", position=(0, -5)),
+            unit(3, "VANGUARD", position=(-1, -5)),
+            unit(4, "VANGUARD", position=(1, -5)),
+        ],
+        obstacles=[
+            (0, -6),
+            (0, -4),
+            (-1, -6),
+            (-1, -4),
+            (-2, -5),
+            (1, -6),
+            (1, -4),
+            (2, -5),
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    assert not any(
+        item.reason == "yield one cell to unblock a defensive route"
+        for item in report.decisions
+    )
+    target = next(item for item in report.decisions if item.actor_id == object_id(2))
+    assert target.action == "WAIT"
+    assert "no safe path" in target.reason
+
+
 def test_core_occupant_nudges_a_decided_critical_neighbour_aside() -> None:
     """A failed critical return must not seal the Core cell indefinitely."""
 
