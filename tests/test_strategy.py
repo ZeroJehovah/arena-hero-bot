@@ -5967,6 +5967,36 @@ def test_wounded_expedition_vanguard_returns_after_lost_contact() -> None:
     )
 
 
+def test_wounded_expedition_vanguard_breaks_new_contact_before_sweeping() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5), hp=1),
+            unit(90, "RANGER", controlled=False, position=(6, 5)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={turn.visible_enemies[0].position},
+    )
+
+    vanguard = turn.vanguards[0]
+    assert strategy._decide_expedition_vanguard(vanguard, context)
+    action = turn.plan.unit_actions[vanguard.id]
+    assert action.type == "MOVE"
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "break contact with the ranged attacker"
+        for item in context.report.decisions
+    )
+
+
 def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> None:
     strategy = _expedition_strategy()
     vanguards = [

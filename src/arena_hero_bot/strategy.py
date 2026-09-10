@@ -4111,9 +4111,18 @@ class AggressiveStrategy:
         self, vanguard: Vanguard, context: _TurnContext
     ) -> bool:
         pursuit = self._expedition_pursuit_for(vanguard)
-        if pursuit is None or pursuit.target_id is None:
-            return False
         visible = self._visible_combat_targets(vanguard, context.turn)
+        # A squad can meet a new hostile before its shared pursuit memory has
+        # been created.  Let a wounded member break contact (or counter) in
+        # that first-contact Tick; otherwise the generic Vanguard branch below
+        # may spend the Tick on a fatal adjacent SWEEP.
+        if pursuit is None or pursuit.target_id is None:
+            return self._expedition_under_fire(
+                vanguard,
+                context,
+                visible,
+                offensive=True,
+            )
         pursued_target = next(
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
