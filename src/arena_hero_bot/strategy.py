@@ -1313,18 +1313,50 @@ class AggressiveStrategy:
                 allow_goal=True,
             ):
                 return
+            if (
+                allow_core
+                and self._yield_for_blocked_defensive_route(
+                    worker,
+                    core.position,
+                    context,
+                    reason="return carried resources to Core",
+                    allow_goal=True,
+                )
+                and self._move(
+                    worker,
+                    core.position,
+                    context,
+                    reason="return carried resources to Core",
+                    allow_goal=True,
+                )
+            ):
+                return
             # Only one Worker can hold the Core cell per Tick and the guard
             # ring adds more contention, so a loaded Worker regularly lost the
             # race.  Waiting in place left it idle wherever it happened to
             # stand; closing the remaining distance instead means the deposit
             # lands on the Tick the cell frees up.
-            if manhattan(worker.position, core.position) > 1 and self._move(
-                worker,
-                core.position,
-                context,
-                reason="stage carried resources next to the busy Core",
-            ):
-                return
+            if manhattan(worker.position, core.position) > 1:
+                if self._move(
+                    worker,
+                    core.position,
+                    context,
+                    reason="stage carried resources next to the busy Core",
+                ):
+                    return
+                if self._yield_for_blocked_defensive_route(
+                    worker,
+                    core.position,
+                    context,
+                    reason="stage carried resources next to the busy Core",
+                    allow_goal=False,
+                ) and self._move(
+                    worker,
+                    core.position,
+                    context,
+                    reason="stage carried resources next to the busy Core",
+                ):
+                    return
             self._record_wait(worker, context, "Core cell is not currently reachable")
             return
 
@@ -2020,19 +2052,31 @@ class AggressiveStrategy:
         reason: str,
         allow_goal: bool,
     ) -> bool:
-        """Move one idle guard aside when friendly traffic seals its route.
+        """Move one idle guard aside when friendly traffic seals a route.
 
         A static route proves that the failure is caused by our own traffic,
         rather than by an obstacle wall.  The exception is intentionally
         narrow: only a quiet, stationary Core may reshuffle ordinary defense
         guards, and only an adjacent guard with no higher-priority action may
-        yield one cell.  The original unit retries immediately after the
+        yield one cell.  This also covers a loaded Worker returning to a
+        stationary Core.  The original unit retries immediately after the
         yielding move, so both actions remain part of the same complete plan.
         """
 
-        if not isinstance(unit, (Ranger, Vanguard)):
-            return False
-        if reason != "hold a defensive perimeter around the resource Core":
+        defensive_unit = (
+            isinstance(unit, (Ranger, Vanguard))
+            and reason == "hold a defensive perimeter around the resource Core"
+        )
+        loaded_worker = (
+            isinstance(unit, Worker)
+            and unit.cargo > 0
+            and reason
+            in {
+                "return carried resources to Core",
+                "stage carried resources next to the busy Core",
+            }
+        )
+        if not defensive_unit and not loaded_worker:
             return False
         if context.emergency or context.combat_assault or context.turn.visible_enemies:
             return False
@@ -2041,7 +2085,9 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None or core.view.state is not CoreState.NORMAL:
             return False
-        if self._is_offensive_combat_unit(unit, context.turn, context.threat):
+        if defensive_unit and self._is_offensive_combat_unit(
+            unit, context.turn, context.threat
+        ):
             return False
         if not self._has_static_route(
             unit,
@@ -2051,7 +2097,10 @@ class AggressiveStrategy:
         ):
             return False
         assignments = context.defensive_assignments
-        if assignments is None or unit.id not in assignments:
+        if assignments is None:
+            assignments = self._defensive_perimeter_assignments(context)
+            context.defensive_assignments = assignments
+        if not assignments:
             return False
 
         units_by_position = {
@@ -2120,7 +2169,11 @@ class AggressiveStrategy:
                     neighbour,
                     direction,
                     context,
-                    reason="yield one cell to unblock a defensive route",
+                    reason=(
+                        "yield one cell to unblock a defensive route"
+                        if defensive_unit
+                        else "yield one cell to unblock a loaded return"
+                    ),
                     target=destination,
                 ):
                     continue
@@ -5015,11 +5068,17 @@ class AggressiveStrategy:
             )
             vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
             obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+            worker_corridors = self._worker_corridor_cells(core_position, obstacles)
             if (
                 len(vanguard_guards) == len(vanguard_offsets)
                 and len(ranger_guards) == len(ranger_offsets)
                 and all(
                     (core_position[0] + dx, core_position[1] + dy) not in obstacles
+                    for dx, dy in (*vanguard_offsets, *ranger_offsets)
+                )
+                and all(
+                    (core_position[0] + dx, core_position[1] + dy)
+                    not in worker_corridors
                     for dx, dy in (*vanguard_offsets, *ranger_offsets)
                 )
             ):

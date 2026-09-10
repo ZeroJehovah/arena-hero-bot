@@ -2231,6 +2231,76 @@ def test_blocked_defensive_guard_does_not_yield_during_enemy_contact() -> None:
     assert "no safe path" in target.reason
 
 
+def test_loaded_worker_asks_adjacent_guard_to_yield_from_core_return() -> None:
+    """A quiet defensive guard must clear a loaded Worker's return lane."""
+
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "WORKER", position=(-7, 0), cargo=1),
+            unit(3, "VANGUARD", position=(-6, 0)),
+            unit(4, "RANGER", position=(-8, 0)),
+        ],
+        obstacles=[(-7, -1), (-7, 1)],
+    )
+
+    strategy = AggressiveStrategy(
+        WorldMemory(),
+        StrategyConfig(target_workers=0, max_population=None),
+    )
+    assert turn.core is not None
+    core_position = turn.core.position
+    report = DecisionReport(tick=turn.tick)
+    turn.clear()
+    guards = (*turn.vanguards, *turn.rangers)
+    for guard in guards:
+        guard.wait()
+        report.add(
+            actor_id=str(guard.id),
+            actor_kind=guard.unit_type.value,
+            action="WAIT",
+            reason="hold a defensive perimeter around the resource Core",
+            target=guard.position,
+        )
+    context = _TurnContext(
+        turn=turn,
+        report=report,
+        occupied={item.position for item in turn.units} | {core_position},
+        enemy_positions=set(),
+        defensive_assignments={guard.id: guard.position for guard in guards},
+        threat=ThreatAssessment(),
+    )
+    worker = turn.workers[0]
+    assert strategy._yield_for_blocked_defensive_route(
+        worker,
+        core_position,
+        context,
+        reason="return carried resources to Core",
+        allow_goal=True,
+    )
+    assert strategy._move(
+        worker,
+        core_position,
+        context,
+        reason="return carried resources to Core",
+        allow_goal=True,
+    )
+    yielded = [
+        item
+        for item in report.decisions
+        if item.reason == "yield one cell to unblock a loaded return"
+    ]
+    assert len(yielded) == 1
+    assert yielded[0].actor_id in {object_id(3), object_id(4)}
+    assert turn.plan.unit_actions[UUID(yielded[0].actor_id)].type == "MOVE"
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    assert worker_decision.action == "MOVE"
+    assert worker_decision.reason == "return carried resources to Core"
+
+
 def test_blocked_defensive_guard_stays_put_when_route_is_walled() -> None:
     """A permanent obstacle wall must remain a normal no-route wait."""
 
@@ -6808,6 +6878,43 @@ def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None
         )
         == 16
     )
+
+
+def test_symmetric_posture_drops_fixed_slots_that_seal_a_worker_pocket() -> None:
+    config = expedition_config(target_workers=16)
+    vanguard_offsets, ranger_offsets = AggressiveStrategy._symmetric_defense_offsets()
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=position)
+        for number, position in enumerate(vanguard_offsets)
+    ]
+    rangers = [
+        unit(200 + number, "RANGER", position=position)
+        for number, position in enumerate(ranger_offsets)
+    ]
+    obstacles = [(-7, -1), (-7, 1)]
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(-7, 0), cargo=1),
+            *vanguards,
+            *rangers,
+        ],
+        obstacles=obstacles,
+    )
+    strategy = AggressiveStrategy(WorldMemory(), config)
+
+    report = strategy.decide(turn)
+
+    layout = strategy._defensive_layout
+    assert layout is not None
+    corridors = strategy._worker_corridor_cells((0, 0), set(obstacles))
+    assert {(-6, 0), (-8, 0)} <= corridors
+    assert not corridors.intersection(layout.assignments.values())
+    worker_decision = next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    )
+    assert worker_decision.action == "MOVE"
 
 
 def test_symmetric_posture_ignores_staged_surplus_when_assigning_defense_slots() -> (
