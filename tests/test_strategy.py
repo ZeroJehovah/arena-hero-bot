@@ -6674,6 +6674,41 @@ def test_expedition_ranger_does_not_chase_into_ranged_contact() -> None:
     )
 
 
+def test_expedition_ranger_disengage_avoids_visible_melee_threat() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+
+    turn = make_turn(
+        objects=[
+            core(position=(0, -10)),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "RANGER", position=(0, 0), hp=1),
+            unit(90, "RANGER", controlled=False, position=(-1, 1)),
+            unit(91, "VANGUARD", controlled=False, position=(1, 1)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    ranger = turn.rangers[0]
+    assert strategy._decide_expedition_ranger(ranger, context)
+    action = turn.plan.unit_actions[ranger.id]
+    assert action.type == "MOVE"
+    moved = add(ranger.position, action.direction)
+    assert manhattan(moved, (1, 1)) != 1
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "break contact with the ranged attacker"
+        for item in context.report.decisions
+    )
+
+
 def test_expedition_detached_member_advances_on_visible_enemy() -> None:
     # A member that would otherwise hold cohesion for the laggards still
     # advances on an enemy currently in the squad's sight: attack priority

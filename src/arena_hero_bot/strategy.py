@@ -4550,7 +4550,14 @@ class AggressiveStrategy:
         attacker: CoreView | UnitView,
         context: _TurnContext,
     ) -> bool:
-        """Step out of ``attacker``'s line of fire to stop absorbing hits."""
+        """Step out of every visible attack lane to stop absorbing hits.
+
+        The selected attacker is not necessarily the only threat on the cell
+        a member is escaping to.  A wounded Ranger once moved farther from an
+        enemy Ranger but onto an adjacent enemy Vanguard and died on the next
+        resolution.  Keep the distance rule, but prefer destinations that no
+        visible enemy can attack in the current post-movement snapshot.
+        """
         blocked = set(self.memory.obstacles)
         blocked.update(context.turn.obstacle_cells)
         blocked.update(context.occupied)
@@ -4564,12 +4571,33 @@ class AggressiveStrategy:
         if not candidates:
             return False
         current = manhattan(unit.position, attacker.position)
+        non_closing = [
+            position
+            for position in candidates
+            if manhattan(position, attacker.position) >= current
+        ]
+        if not non_closing:
+            return False
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        threats = tuple(
+            enemy
+            for enemy in context.turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+        )
+        protected = [
+            position
+            for position in non_closing
+            if not any(
+                self._enemy_can_attack_position(enemy, position, obstacles)
+                for enemy in threats
+            )
+        ]
+        preferred = protected or non_closing
         goal = max(
-            candidates,
+            preferred,
             key=lambda position: (manhattan(position, attacker.position), position),
         )
-        if manhattan(goal, attacker.position) < current:
-            return False
         return self._move(
             unit,
             goal,
