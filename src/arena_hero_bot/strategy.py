@@ -278,10 +278,9 @@ class AggressiveStrategy:
     ) -> None:
         self.memory = memory
         self.config = config or StrategyConfig()
-        # Defensive positions are intentionally strategy state rather than a
-        # per-Tick context value.  Recomputing them from newly observed
-        # obstacle/occupancy cells made guards oscillate between adjacent
-        # radii even when there was no enemy to react to.
+        # Cache the legacy perimeter layout.  The symmetric formation also
+        # stores each Unit's exact post in WorldMemory so assignments survive
+        # combat, casualties, and service restarts.
         self._defensive_layout: _DefensiveLayout | None = None
         # The roaming squad, cached against the roster it was drawn from so
         # membership only changes when a combat unit is built or dies.
@@ -442,6 +441,12 @@ class AggressiveStrategy:
             assault_enemies,
             threat,
         )
+        if self._symmetric_posture():
+            # Establish home posts even when every defender is fighting or
+            # healing and none will reach the idle movement branch this Tick.
+            context.defensive_assignments = self._defensive_perimeter_assignments(
+                context
+            )
         if context.combat_assault and context.assault_enemies:
             context.screen_assignments = self._combat_screen_assignments(context)
 
@@ -3175,6 +3180,11 @@ class AggressiveStrategy:
         ):
             roles[unit_id] = STAGED_ROLE
         self.memory.unit_roles = roles
+        self.memory.defense_posts = {
+            unit_id: position
+            for unit_id, position in self.memory.defense_posts.items()
+            if roles.get(unit_id) == DEFENSE_ROLE
+        }
         self.memory.unit_roles_initialized = True
         self._staged_ids = frozenset(
             UUID(unit_id) for unit_id, role in roles.items() if role == STAGED_ROLE
@@ -4474,8 +4484,13 @@ class AggressiveStrategy:
             context.defensive_assignments = self._defensive_perimeter_assignments(
                 context
             )
+        goal = context.defensive_assignments.get(unit.id, unit.position)
+        if goal in self.memory.obstacles or goal in turn.obstacle_cells:
+            # Retain the intended post until the Core reaches a clear home.
+            # Moving just this seat would silently break the mirrored shape.
+            return unit.position, "hold while the assigned defensive post is obstructed"
         return (
-            context.defensive_assignments.get(unit.id, unit.position),
+            goal,
             "hold a defensive perimeter around the resource Core",
         )
 
@@ -4646,6 +4661,10 @@ class AggressiveStrategy:
 
         core = context.turn.core
         if core is None:
+            if self._symmetric_posture():
+                self.memory.defense_posts.clear()
+                self.memory.defense_anchor = None
+                self._defensive_layout = None
             return {}
         core_position = core.position
         guards = tuple(
@@ -4667,48 +4686,54 @@ class AggressiveStrategy:
             guards = tuple(unit for unit in guards if str(unit.id) in defense_ids)
         if not guards:
             self._defensive_layout = None
+            if self._symmetric_posture():
+                self.memory.defense_posts.clear()
+                self.memory.defense_anchor = core_position
             return {}
         ordered_guard_ids = tuple(unit.id for unit in guards)
 
         if self._symmetric_posture():
-            # Surplus combat units are deliberately staged outside the fixed
-            # defense ring.  Counting them here makes a live roster larger
-            # than 8V+16R look like an invalid symmetric formation and
-            # silently falls back to the legacy perimeter layout.
-            vanguard_guards = tuple(
-                unit
-                for unit in guards
-                if str(unit.id) in defense_ids and unit.unit_type is UnitType.VANGUARD
-            )
-            ranger_guards = tuple(
-                unit
-                for unit in guards
-                if str(unit.id) in defense_ids and unit.unit_type is UnitType.RANGER
-            )
-            vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
-            obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
-            worker_corridors = self._worker_corridor_cells(core_position, obstacles)
-            if len(vanguard_guards) == len(vanguard_offsets) and len(
-                ranger_guards
-            ) == len(ranger_offsets):
-                assignments = _seat_symmetric_defense_ring(
-                    vanguard_guards,
-                    vanguard_offsets,
-                    ranger_guards,
-                    ranger_offsets,
-                    core_position,
-                    obstacles,
-                    worker_corridors,
+            # Posts belong to persistent UUIDs, not to each Tick's sorted
+            # roster.  A casualty leaves one vacancy; its replacement inherits
+            # only that slot.  An incomplete roster keeps the same template.
+            anchor = self.memory.defense_anchor or core_position
+            previous = {
+                unit_id: (
+                    position[0] + core_position[0] - anchor[0],
+                    position[1] + core_position[1] - anchor[1],
                 )
-                if assignments is not None:
-                    self._defensive_layout = _DefensiveLayout(
-                        core_id=core.id,
-                        core_position=core_position,
-                        guard_ids=ordered_guard_ids,
-                        radius=SYMMETRIC_CORE_RADIUS,
-                        assignments=assignments,
+                for unit_id, position in self.memory.defense_posts.items()
+            }
+            assignments: dict[UUID, Position] = {}
+            vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+            for unit_type, offsets in (
+                (UnitType.VANGUARD, vanguard_offsets),
+                (UnitType.RANGER, ranger_offsets),
+            ):
+                # Friendly traffic can pass through a guard.  Do not nudge
+                # individual posts away from pocket exits or occupied cells.
+                assignments.update(
+                    _assign_fixed_defense_posts(
+                        tuple(unit for unit in guards if unit.unit_type is unit_type),
+                        tuple(
+                            (core_position[0] + dx, core_position[1] + dy)
+                            for dx, dy in offsets
+                        ),
+                        previous,
                     )
-                    return assignments
+                )
+            self.memory.defense_posts = {
+                str(unit_id): position for unit_id, position in assignments.items()
+            }
+            self.memory.defense_anchor = core_position
+            self._defensive_layout = _DefensiveLayout(
+                core_id=core.id,
+                core_position=core_position,
+                guard_ids=ordered_guard_ids,
+                radius=SYMMETRIC_CORE_RADIUS,
+                assignments=assignments,
+            )
+            return assignments
 
         obstacles = set(self.memory.obstacles)
         obstacles.update(context.turn.obstacle_cells)
@@ -7154,62 +7179,37 @@ def _repair_defensive_ring_slots(
     return assignments
 
 
-def _seat_symmetric_defense_ring(
-    vanguard_guards: tuple[Ranger | Vanguard, ...],
-    vanguard_offsets: tuple[Position, ...],
-    ranger_guards: tuple[Ranger | Vanguard, ...],
-    ranger_offsets: tuple[Position, ...],
-    core_position: Position,
-    obstacles: set[Position],
-    worker_corridors: set[Position],
-) -> dict[UUID, Position] | None:
-    forbidden = set(obstacles)
-    forbidden.update(worker_corridors)
-    forbidden.add(core_position)
-    guards = vanguard_guards + ranger_guards
-    offsets = vanguard_offsets + ranger_offsets
-    intended_positions = {
-        unit.id: (core_position[0] + dx, core_position[1] + dy)
-        for (dx, dy), unit in zip(offsets, guards, strict=True)
-    }
-    claimed = set(intended_positions.values())
+def _assign_fixed_defense_posts(
+    guards: tuple[Ranger | Vanguard, ...],
+    positions: tuple[Position, ...],
+    previous: dict[str, Position],
+) -> dict[UUID, Position]:
+    """Keep surviving post owners, then fill vacancies with unassigned guards."""
+
+    available = set(positions)
     assigned: dict[UUID, Position] = {}
     for unit in guards:
-        intended = intended_positions[unit.id]
-        claimed.discard(intended)
-        if intended in forbidden:
-            seat = _nearest_open_defense_slot(
-                intended, core_position, forbidden, claimed
-            )
-            if seat is None:
-                return None
-        else:
-            seat = intended
-        assigned[unit.id] = seat
-        claimed.add(seat)
+        post = previous.get(str(unit.id))
+        if post is not None and post in available:
+            assigned[unit.id] = post
+            available.remove(post)
+    # On migration from old memory, preserve guards already on valid posts
+    # before assigning nearby recruits.  This only runs for unassigned UUIDs;
+    # temporarily crossing another guard's post never transfers ownership.
+    for unit in guards:
+        if unit.id not in assigned and unit.position in available:
+            assigned[unit.id] = unit.position
+            available.remove(unit.position)
+    for unit in guards:
+        if unit.id in assigned or not available:
+            continue
+        post = min(
+            (position for position in positions if position in available),
+            key=lambda position: manhattan(unit.position, position),
+        )
+        assigned[unit.id] = post
+        available.remove(post)
     return assigned
-
-
-def _nearest_open_defense_slot(
-    origin: Position,
-    core_position: Position,
-    forbidden: set[Position],
-    claimed: set[Position],
-) -> Position | None:
-    for radius in range(1, 4 + 1):
-        for dx in range(-radius, radius + 1):
-            for dy in range(-radius, radius + 1):
-                if (dx, dy) == (0, 0):
-                    continue
-                if abs(dx) + abs(dy) != radius:
-                    continue
-                spot = (origin[0] + dx, origin[1] + dy)
-                if spot in forbidden:
-                    continue
-                if spot in claimed:
-                    continue
-                return spot
-    return None
 
 
 def _ring_is_covered(

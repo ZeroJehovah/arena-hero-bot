@@ -106,6 +106,11 @@ class WorldMemory:
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
     # ``patrol-1`` .. ``patrol-4``, ``staged`` or ``expedition-N``.
     unit_roles: dict[str, str] = field(default_factory=dict)
+    # Exact defensive posts, independent of temporary combat/healing goals.
+    # The anchor lets the strategy translate every post together if the Core
+    # moves, without reallocating surviving Units to different slots.
+    defense_posts: dict[str, Position] = field(default_factory=dict)
+    defense_anchor: Position | None = None
     # Legacy memory files predate durable role assignment.  The strategy uses
     # this marker to run one spatial sanity pass, then never reclassifies live
     # UUIDs merely because their positions change.
@@ -186,6 +191,11 @@ class WorldMemory:
             self.position_history.pop(unit_id, None)
             self.goals.pop(unit_id, None)
             self.pending_move_targets.pop(unit_id, None)
+        self.defense_posts = {
+            unit_id: position
+            for unit_id, position in self.defense_posts.items()
+            if unit_id in active_ids
+        }
 
     def _closely_observed_cells(self, turn: Turn) -> set[Position]:
         """Return the cells close enough this Tick to trust an absence."""
@@ -443,6 +453,13 @@ class WorldMemory:
                 for position, absent_tick in sorted(self.resource_absences.items())
             ],
             "unit_roles": dict(sorted(self.unit_roles.items())),
+            "defense_posts": {
+                unit_id: list(position)
+                for unit_id, position in sorted(self.defense_posts.items())
+            },
+            "defense_anchor": (
+                list(self.defense_anchor) if self.defense_anchor is not None else None
+            ),
             "unit_roles_initialized": self.unit_roles_initialized,
             "expedition_squads": [
                 {
@@ -535,6 +552,11 @@ class WorldMemory:
                 str(unit_id): str(role)
                 for unit_id, role in raw.get("unit_roles", {}).items()
             },
+            defense_posts={
+                str(unit_id): _position(position)
+                for unit_id, position in raw.get("defense_posts", {}).items()
+            },
+            defense_anchor=_optional_position(raw.get("defense_anchor")),
             unit_roles_initialized=bool(raw.get("unit_roles_initialized", False)),
             expedition_squads=[
                 ExpeditionSquad(

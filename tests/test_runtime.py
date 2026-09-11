@@ -133,6 +133,11 @@ def test_plan_failure_falls_back_to_empty_plan() -> None:
 def test_turn_record_contains_state_plan_and_no_credential() -> None:
     turn = make_turn(objects=[core(), unit(2, "WORKER", position=(1, 0))])
     report = AggressiveStrategy(WorldMemory()).decide(turn)
+    memory = WorldMemory(
+        unit_roles={"u1": "defense"},
+        defense_posts={"u1": (3, -8)},
+        defense_anchor=(3, 0),
+    )
     record = runtime._turn_record(
         turn=turn,
         report=report,
@@ -140,11 +145,15 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
         planning_error=None,
         submission={"status": "observed"},
         observe_only=True,
-        identity_snapshot={"unit_roles": {"u1": "expedition-1"}},
+        identity_snapshot=runtime._identity_snapshot(memory),
     )
+    memory.defense_posts["u1"] = (9, 9)
+    memory.defense_anchor = (9, 17)
     assert record["tick"] == turn.tick
     assert record["state"]["status"] == "ACTIVE"
-    assert record["identity"]["unit_roles"]["u1"] == "expedition-1"
+    assert record["identity"]["unit_roles"]["u1"] == "defense"
+    assert record["identity"]["defense_posts"]["u1"] == [3, -8]
+    assert record["identity"]["defense_anchor"] == [3, 0]
     assert record["plan"]["tick"] == turn.tick
     assert "api_key" not in json.dumps(record).lower()
 

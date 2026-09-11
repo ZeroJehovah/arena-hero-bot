@@ -6906,7 +6906,7 @@ def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None
     )
 
 
-def test_symmetric_posture_drops_fixed_slots_that_seal_a_worker_pocket() -> None:
+def test_symmetric_posts_allow_workers_through_occupied_pocket_exits() -> None:
     config = expedition_config(target_workers=16)
     vanguard_offsets, ranger_offsets = AggressiveStrategy._symmetric_defense_offsets()
     vanguards = [
@@ -6936,7 +6936,8 @@ def test_symmetric_posture_drops_fixed_slots_that_seal_a_worker_pocket() -> None
     assert layout is not None
     corridors = strategy._worker_corridor_cells((0, 0), set(obstacles))
     assert {(-6, 0), (-8, 0)} <= corridors
-    assert not corridors.intersection(layout.assignments.values())
+    assert set(layout.assignments.values()) == set(vanguard_offsets + ranger_offsets)
+    assert {(-6, 0), (-8, 0)} <= set(layout.assignments.values())
     worker_decision = next(
         item for item in report.decisions if item.actor_id == object_id(2)
     )

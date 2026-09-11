@@ -231,5 +231,12 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
     ]
     return {
         "unit_roles": dict(sorted(memory.unit_roles.items())),
+        "defense_posts": {
+            unit_id: list(position)
+            for unit_id, position in sorted(memory.defense_posts.items())
+        },
+        "defense_anchor": (
+            list(memory.defense_anchor) if memory.defense_anchor is not None else None
+        ),
         "expedition_squads": squads,
     }

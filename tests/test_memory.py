@@ -53,6 +53,8 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
 def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
     memory = WorldMemory(
         unit_roles={object_id(2): "defense", object_id(3): "patrol-2"},
+        defense_posts={object_id(2): (7, -3)},
+        defense_anchor=(7, 3),
         unit_roles_initialized=True,
         expedition_squads=[
             ExpeditionSquad(
@@ -68,9 +70,25 @@ def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
 
     loaded = WorldMemory.load(path)
     assert loaded.unit_roles == memory.unit_roles
+    assert loaded.defense_posts == memory.defense_posts
+    assert loaded.defense_anchor == memory.defense_anchor
     assert loaded.unit_roles_initialized is True
     assert loaded.expedition_squads == memory.expedition_squads
     assert loaded.next_expedition_serial == 4
+
+
+def test_legacy_memory_loads_without_defensive_posts(tmp_path) -> None:
+    raw = WorldMemory(unit_roles={object_id(2): "defense"}).to_dict()
+    del raw["defense_posts"]
+    del raw["defense_anchor"]
+    path = tmp_path / "memory.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = WorldMemory.load(path)
+
+    assert loaded.unit_roles == {object_id(2): "defense"}
+    assert loaded.defense_posts == {}
+    assert loaded.defense_anchor is None
 
 
 def test_enemy_ttl_sorting_and_goal_lifecycle() -> None:
