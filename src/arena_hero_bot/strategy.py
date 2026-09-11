@@ -5598,11 +5598,13 @@ class AggressiveStrategy:
             self._worker_threat_exclusion_cells(turn) | set(self._unreachable_claims)
         ) - {worker.position for worker in workers.values()}
         hostile = {enemy.position for enemy in turn.visible_enemies}
-        visible_resources = set(turn.resource_cells) - hostile - unreachable
+        blocked_resources = self.memory.obstacles | set(turn.obstacle_cells)
+        visible_resources = set(turn.resource_cells) - hostile - unreachable - blocked_resources
         remembered_resources = (
             set(self.memory.remembered_resource_cells(turn.tick))
             - hostile
             - unreachable
+            - blocked_resources
             - visible_resources
         )
         resources = visible_resources | remembered_resources
@@ -5610,6 +5612,7 @@ class AggressiveStrategy:
             set(self.memory.resource_cells_worth_rechecking(turn.tick))
             - hostile
             - unreachable
+            - blocked_resources
             - resources
         )
         if not self._preserves_resources():
