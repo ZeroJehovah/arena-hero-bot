@@ -209,7 +209,7 @@ def _turn_record(
     identity_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "tick": turn.tick,
         "mode": "observe-only" if observe_only else "aggressive-pvp",
         "planning_ms": round(planning_seconds * 1000, 3),
