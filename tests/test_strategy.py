@@ -249,7 +249,7 @@ def test_outmatched_core_repairs_instead_of_an_unwinnable_migration() -> None:
     assert turn.plan.core_action.type == "REPAIR_SHIELD"
 
 
-def test_guardless_low_capacity_core_evacuates_before_first_hit() -> None:
+def test_guardless_low_capacity_core_stays_put_even_when_threatened() -> None:
     turn = make_turn(
         resources=5,
         objects=[
@@ -263,17 +263,15 @@ def test_guardless_low_capacity_core_evacuates_before_first_hit() -> None:
         turn,
         config=StrategyConfig(target_workers=12, max_population=None),
     )
-
-    assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
-    assert any(
+    assert turn.plan.core_action is None
+    assert not any(
         "evacuate Core from overwhelming enemy assault" in item.reason
         or "before the screen breaks" in item.reason
         for item in report.decisions
     )
 
 
-def test_unprotected_core_evacuates_on_nearby_pre_evade_enemy() -> None:
+def test_unprotected_core_stays_put_on_nearby_pre_evade_enemy() -> None:
     turn = make_turn(
         resources=5,
         objects=[
@@ -291,7 +289,7 @@ def test_unprotected_core_evacuates_on_nearby_pre_evade_enemy() -> None:
 
     assert report.threat_level == "PRE_EVADE"
     assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.type != "START_MOVE"
 
 
 def test_core_escape_lane_is_reserved_before_combat_moves() -> None:
@@ -315,23 +313,9 @@ def test_core_escape_lane_is_reserved_before_combat_moves() -> None:
     )
 
     assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.type != "START_MOVE"
+    assert not any("evacuate Core" in item.reason for item in report.decisions)
     assert turn.core is not None
-    escape_cell = (
-        turn.core.position[0] + turn.plan.core_action.direction.delta[0],
-        turn.core.position[1] + turn.plan.core_action.direction.delta[1],
-    )
-    unit_destinations = {
-        (
-            unit_view.position[0] + action.direction.delta[0],
-            unit_view.position[1] + action.direction.delta[1],
-        )
-        for unit_view in turn.units
-        if (action := turn.plan.unit_actions.get(unit_view.id)) is not None
-        and action.type == "MOVE"
-    }
-    assert escape_cell not in unit_destinations
-    assert any("before the screen breaks" in item.reason for item in report.decisions)
 
 
 def test_assault_limits_vanguard_strike_team_and_assigns_unique_screen_slots() -> None:
@@ -2790,7 +2774,7 @@ def test_unbounded_growth_keeps_reserve_for_damaged_low_capacity_core() -> None:
     assert turn.plan.core_action is None
 
 
-def test_pre_evade_moves_core_when_guards_match_the_closing_group() -> None:
+def test_pre_evade_holds_core_when_guards_match_the_closing_group() -> None:
     turn = make_turn(
         objects=[
             core(),
@@ -2808,8 +2792,7 @@ def test_pre_evade_moves_core_when_guards_match_the_closing_group() -> None:
     )
 
     assert report.threat_level == "PRE_EVADE"
-    assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
 
 
 def test_pre_evade_holds_an_unscreened_core_inside_breakaway_range() -> None:
@@ -6489,6 +6472,72 @@ def test_expedition_vanguard_disengages_before_two_rangers_box_it_in() -> None:
     assert any(
         item.action == "MOVE"
         and item.reason == "break contact with the ranged attacker"
+        for item in context.report.decisions
+    )
+
+
+def test_expedition_vanguard_with_three_close_enemies_breaks_contact() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5)),
+            unit(3, "RANGER", position=(6, 5)),
+            unit(90, "VANGUARD", controlled=False, position=(7, 5)),
+            unit(91, "VANGUARD", controlled=False, position=(6, 6)),
+            unit(92, "VANGUARD", controlled=False, position=(5, 7)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    assert strategy._expedition_under_fire(
+        turn.vanguards[0], context, turn.visible_enemies, offensive=True
+    )
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "break contact with the ranged attacker"
+        for item in context.report.decisions
+    )
+
+
+def test_critical_expedition_ranger_returns_from_three_close_enemies() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [
+        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
+    ]
+
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "VANGUARD", position=(5, 4)),
+            unit(3, "RANGER", position=(5, 5), hp=1),
+            unit(90, "VANGUARD", controlled=False, position=(6, 5)),
+            unit(91, "VANGUARD", controlled=False, position=(5, 6)),
+            unit(92, "RANGER", controlled=False, position=(6, 6)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    assert strategy._decide_expedition_ranger(turn.rangers[0], context)
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "return critical expedition Ranger to Core"
         for item in context.report.decisions
     )
 

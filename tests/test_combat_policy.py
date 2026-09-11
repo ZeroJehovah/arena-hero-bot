@@ -100,7 +100,7 @@ def test_breakout_prefers_an_exit_outside_two_attack_axes() -> None:
     assert direction in {Direction.UP, Direction.LEFT}
 
 
-def test_strategy_starts_core_evasion_on_predicted_contact() -> None:
+def test_strategy_holds_core_on_predicted_contact() -> None:
     strategy = AggressiveStrategy(WorldMemory())
     first = make_turn(
         tick=100,
@@ -123,5 +123,5 @@ def test_strategy_starts_core_evasion_on_predicted_contact() -> None:
     report = strategy.decide(second)
 
     assert report.threat_level == ThreatLevel.PRE_EVADE.value
-    assert second.plan.core_action is not None
-    assert second.plan.core_action.type == "START_MOVE"
+    core_action = second.plan.core_action
+    assert core_action is None or core_action.type != "START_MOVE"

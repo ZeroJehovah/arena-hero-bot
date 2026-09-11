@@ -158,6 +158,10 @@ EXPEDITION_LINK_RADIUS = 4
 # members skipped all the visible-target combat logic.  This radius is the
 # window a member may still close on to answer that fire.
 EXPEDITION_COUNTER_RADIUS = 3
+# Three combat units inside the expedition's counter window can cover every
+# useful approach cell.  Treat that as an encirclement before the normal
+# close-on-target branch, even while the member is still at full HP.
+EXPEDITION_OVERWHELMED_ENEMY_COUNT = 3
 
 # Revised live posture.  The legacy constants above remain available for
 # explicit small test configurations; ``target_workers >= 16`` selects this
@@ -440,24 +444,8 @@ class AggressiveStrategy:
             assault_enemies,
             threat,
         )
-        if context.combat_assault and self._should_evacuate_core(
-            turn,
-            assault_enemies,
-            threat,
-        ):
-            context.core_escape_direction = self._core_escape_direction(
-                context,
-                assault_enemies,
-            )
-            if context.core_escape_direction is not None and turn.core is not None:
-                # Reserve the escape lane before any unit receives a move.
-                # The previous controller calculated this after the roster had
-                # already occupied every useful exit.
-                context.reserved.add(
-                    add(turn.core.position, context.core_escape_direction)
-                )
+        if context.combat_assault and context.assault_enemies:
             context.screen_assignments = self._combat_screen_assignments(context)
-            self._clear_core_escape_lane(context)
 
         for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
             if ranger.id in context.preplanned_ids:
@@ -1577,53 +1565,10 @@ class AggressiveStrategy:
             )
             return
 
-        if context.core_escape_direction is not None:
-            core.start_move(context.core_escape_direction)
-            context.report.add(
-                actor_id=str(core.id),
-                actor_kind="CORE",
-                action="START_MOVE",
-                reason=(
-                    "evacuate Core from overwhelming enemy assault before "
-                    "the screen breaks"
-                ),
-                target=add(core.position, context.core_escape_direction),
-            )
-            return
-
         nearby_enemy = any(
             manhattan(core.position, enemy.position) <= 4
             for enemy in context.turn.visible_enemies
         )
-        nearby_combat_enemies = tuple(
-            enemy
-            for enemy in context.turn.visible_enemies
-            if isinstance(enemy, CoreView)
-            or (
-                enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and manhattan(core.position, enemy.position) <= 4
-            )
-        )
-        overwhelmed = (
-            nearby_enemy
-            and self._can_break_away(context.turn, nearby_combat_enemies)
-            and (
-                len(nearby_combat_enemies) >= self.config.core_escape_enemy_count
-                or (core.shield <= 2 and len(nearby_combat_enemies) >= 2)
-            )
-        )
-        if overwhelmed:
-            direction = self._core_escape_direction(context, nearby_combat_enemies)
-            if direction is not None:
-                core.start_move(direction)
-                context.report.add(
-                    actor_id=str(core.id),
-                    actor_kind="CORE",
-                    action="START_MOVE",
-                    reason="evacuate Core from overwhelming enemy assault",
-                    target=add(core.position, direction),
-                )
-                return
         if core.hp <= 2 and context.remaining_resources > 0:
             core.heal()
             context.report.add(
@@ -4072,6 +4017,16 @@ class AggressiveStrategy:
         if target is not None:
             obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
             shot_cell = self._ranger_shot_cell(ranger, target, context.turn, obstacles)
+            if (
+                ranger.hp <= 1
+                and self._expedition_overwhelmed(ranger, visible)
+                and self._move_ranger_toward_core(
+                    ranger,
+                    context,
+                    reason="return critical expedition Ranger to Core",
+                )
+            ):
+                return True
             # A diagonal Ranger duel can look safe in the current snapshot:
             # the target cannot shoot this cell yet, but chasing it can step
             # straight into the target's next axis-aligned firing lane.  Keep
@@ -4437,6 +4392,17 @@ class AggressiveStrategy:
             for enemy in visible_enemies
             if isinstance(enemy, UnitView) and enemy.unit_type is UnitType.RANGER
         )
+        if self._expedition_overwhelmed(vanguard, visible_enemies):
+            if self._expedition_break_contact(vanguard, target, context):
+                return True
+            if context.turn.core is not None and self._move(
+                vanguard,
+                context.turn.core.position,
+                context,
+                reason="withdraw overwhelmed expedition Vanguard",
+                allow_goal=True,
+            ):
+                return True
         # A wounded Vanguard can see a closer melee target and still be inside
         # a Ranger's firing line.  Letting target priority choose the melee
         # unit makes the Vanguard close into the shot instead of breaking
@@ -4503,6 +4469,24 @@ class AggressiveStrategy:
         if vanguard.hp < 4:
             return self._expedition_break_contact(vanguard, target, context)
         return False
+
+    @staticmethod
+    def _expedition_overwhelmed(
+        unit: Ranger | Vanguard,
+        visible_enemies: tuple[CoreView | UnitView, ...],
+    ) -> bool:
+        """Return whether several nearby combat units can box the member in."""
+
+        return (
+            sum(
+                isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and manhattan(unit.position, enemy.position)
+                <= EXPEDITION_COUNTER_RADIUS
+                for enemy in visible_enemies
+            )
+            >= EXPEDITION_OVERWHELMED_ENEMY_COUNT
+        )
 
     def _expedition_close_to_engage(
         self,
@@ -5097,41 +5081,27 @@ class AggressiveStrategy:
             vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
             obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
             worker_corridors = self._worker_corridor_cells(core_position, obstacles)
-            if (
-                len(vanguard_guards) == len(vanguard_offsets)
-                and len(ranger_guards) == len(ranger_offsets)
-                and all(
-                    (core_position[0] + dx, core_position[1] + dy) not in obstacles
-                    for dx, dy in (*vanguard_offsets, *ranger_offsets)
+            if len(vanguard_guards) == len(vanguard_offsets) and len(
+                ranger_guards
+            ) == len(ranger_offsets):
+                assignments = _seat_symmetric_defense_ring(
+                    vanguard_guards,
+                    vanguard_offsets,
+                    ranger_guards,
+                    ranger_offsets,
+                    core_position,
+                    obstacles,
+                    worker_corridors,
                 )
-                and all(
-                    (core_position[0] + dx, core_position[1] + dy)
-                    not in worker_corridors
-                    for dx, dy in (*vanguard_offsets, *ranger_offsets)
-                )
-            ):
-                assignments = {
-                    unit.id: (core_position[0] + dx, core_position[1] + dy)
-                    for unit, (dx, dy) in zip(
-                        vanguard_guards, vanguard_offsets, strict=True
+                if assignments is not None:
+                    self._defensive_layout = _DefensiveLayout(
+                        core_id=core.id,
+                        core_position=core_position,
+                        guard_ids=ordered_guard_ids,
+                        radius=SYMMETRIC_CORE_RADIUS,
+                        assignments=assignments,
                     )
-                }
-                assignments.update(
-                    {
-                        unit.id: (core_position[0] + dx, core_position[1] + dy)
-                        for unit, (dx, dy) in zip(
-                            ranger_guards, ranger_offsets, strict=True
-                        )
-                    }
-                )
-                self._defensive_layout = _DefensiveLayout(
-                    core_id=core.id,
-                    core_position=core_position,
-                    guard_ids=ordered_guard_ids,
-                    radius=SYMMETRIC_CORE_RADIUS,
-                    assignments=assignments,
-                )
-                return assignments
+                    return assignments
 
         obstacles = set(self.memory.obstacles)
         obstacles.update(context.turn.obstacle_cells)
@@ -7606,6 +7576,64 @@ def _repair_defensive_ring_slots(
         current, _, candidate, unit_id = best
         assignments[unit_id] = candidate
     return assignments
+
+
+def _seat_symmetric_defense_ring(
+    vanguard_guards: tuple[Ranger | Vanguard, ...],
+    vanguard_offsets: tuple[Position, ...],
+    ranger_guards: tuple[Ranger | Vanguard, ...],
+    ranger_offsets: tuple[Position, ...],
+    core_position: Position,
+    obstacles: set[Position],
+    worker_corridors: set[Position],
+) -> dict[UUID, Position] | None:
+    forbidden = set(obstacles)
+    forbidden.update(worker_corridors)
+    forbidden.add(core_position)
+    guards = vanguard_guards + ranger_guards
+    offsets = vanguard_offsets + ranger_offsets
+    intended_positions = {
+        unit.id: (core_position[0] + dx, core_position[1] + dy)
+        for (dx, dy), unit in zip(offsets, guards, strict=True)
+    }
+    claimed = set(intended_positions.values())
+    assigned: dict[UUID, Position] = {}
+    for unit in guards:
+        intended = intended_positions[unit.id]
+        claimed.discard(intended)
+        if intended in forbidden:
+            seat = _nearest_open_defense_slot(
+                intended, core_position, forbidden, claimed
+            )
+            if seat is None:
+                return None
+        else:
+            seat = intended
+        assigned[unit.id] = seat
+        claimed.add(seat)
+    return assigned
+
+
+def _nearest_open_defense_slot(
+    origin: Position,
+    core_position: Position,
+    forbidden: set[Position],
+    claimed: set[Position],
+) -> Position | None:
+    for radius in range(1, 4 + 1):
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if (dx, dy) == (0, 0):
+                    continue
+                if abs(dx) + abs(dy) != radius:
+                    continue
+                spot = (core_position[0] + dx, core_position[1] + dy)
+                if spot in forbidden:
+                    continue
+                if spot in claimed:
+                    continue
+                return spot
+    return None
 
 
 def _ring_is_covered(
