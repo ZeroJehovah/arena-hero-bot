@@ -140,9 +140,11 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
         planning_error=None,
         submission={"status": "observed"},
         observe_only=True,
+        identity_snapshot={"unit_roles": {"u1": "expedition-1"}},
     )
     assert record["tick"] == turn.tick
     assert record["state"]["status"] == "ACTIVE"
+    assert record["identity"]["unit_roles"]["u1"] == "expedition-1"
     assert record["plan"]["tick"] == turn.tick
     assert "api_key" not in json.dumps(record).lower()
 

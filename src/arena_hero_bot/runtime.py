@@ -110,6 +110,7 @@ def run_bot(
                         planning_error=planning_error,
                         submission=submission,
                         observe_only=config.observe_only,
+                        identity_snapshot=_identity_snapshot(memory),
                     )
                 )
                 if _is_beijing_day_change(pruned_day, datetime.now(UTC)):
@@ -205,6 +206,7 @@ def _turn_record(
     planning_error: str | None,
     submission: dict[str, Any],
     observe_only: bool,
+    identity_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -216,4 +218,18 @@ def _turn_record(
         "decision": report.to_dict(),
         "plan": turn.plan.model_dump(mode="json"),
         "submission": submission,
+        "identity": identity_snapshot or {},
+    }
+
+
+def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
+    """Persist the fixed combat identities needed for historical attribution."""
+
+    squads = [
+        {"serial": squad.serial, "members": list(squad.members)}
+        for squad in memory.expedition_squads
+    ]
+    return {
+        "unit_roles": dict(sorted(memory.unit_roles.items())),
+        "expedition_squads": squads,
     }
