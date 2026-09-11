@@ -570,7 +570,7 @@ def test_worker_releases_empty_resource_goal_on_arrival() -> None:
     assert goal is None or goal.purpose != "resource-claim-v1"
 
 
-def test_worker_deposits_at_core_and_frees_it_when_storage_full() -> None:
+def test_worker_deposits_at_core_and_waits_when_storage_full() -> None:
     deposit = make_turn(
         resources=5,
         objects=[core(), unit(2, "WORKER", position=(0, 0), cargo=1)],
@@ -583,14 +583,11 @@ def test_worker_deposits_at_core_and_frees_it_when_storage_full() -> None:
         objects=[core(), unit(2, "WORKER", position=(0, 0), cargo=1)],
     )
     report = decide(full)
-    assert full.plan.unit_actions[full.workers[0].id].type == "MOVE"
-    assert any(
-        item.reason == "free the Core cell instead of: Core storage is full"
-        for item in report.decisions
-    )
+    assert full.workers[0].id not in full.plan.unit_actions
+    assert any(item.reason == "Core storage is full" for item in report.decisions)
 
 
-def test_only_one_worker_reserves_the_core_cell() -> None:
+def test_multiple_workers_enter_core_together() -> None:
     turn = make_turn(
         objects=[
             core(),
@@ -599,21 +596,21 @@ def test_only_one_worker_reserves_the_core_cell() -> None:
         ]
     )
     report = decide(turn)
-    moving_home = [
-        worker
-        for worker in turn.workers
-        if turn.plan.unit_actions.get(worker.id) is not None
-        and turn.plan.unit_actions[worker.id].type == "MOVE"
-    ]
-    assert len(moving_home) == 1
-    assert any(
-        "Core cell is not currently reachable" in item.reason
-        for item in report.decisions
+    for worker in turn.workers:
+        action = turn.plan.unit_actions[worker.id]
+        assert action.type == "MOVE"
+        assert add(worker.position, action.direction) == (0, 0)
+    assert (
+        sum(
+            item.actor_kind == "WORKER" and item.action == "MOVE"
+            for item in report.decisions
+        )
+        == 2
     )
 
 
-def test_loaded_core_worker_clears_full_cell_before_neighbours_reenter() -> None:
-    """A full Core must not rotate loaded Workers through its only choke point."""
+def test_full_storage_waits_without_circulating_cargo() -> None:
+    """Full storage is a resource constraint, not a traffic blockage."""
 
     turn = make_turn(
         resources=15,
@@ -631,21 +628,15 @@ def test_loaded_core_worker_clears_full_cell_before_neighbours_reenter() -> None
         config=StrategyConfig(target_workers=12, max_population=None),
     )
 
-    occupant = object_id(4)
-    assert turn.plan.unit_actions[UUID(occupant)].type == "MOVE"
-    assert any(
-        item.actor_id == occupant
-        and item.reason == "free the Core cell instead of: Core storage is full"
-        for item in report.decisions
+    assert UUID(object_id(4)) not in turn.plan.unit_actions
+    assert (
+        next(d for d in report.decisions if d.actor_id == object_id(4)).reason
+        == "Core storage is full"
     )
-    assert all(
-        not (
-            item.actor_kind == "WORKER"
-            and item.action == "MOVE"
-            and item.target == (0, 0)
-        )
-        for item in report.decisions
-    )
+    for worker in turn.workers[:2]:
+        action = turn.plan.unit_actions[worker.id]
+        assert action.type == "MOVE"
+        assert add(worker.position, action.direction) == (0, 0)
 
 
 def test_empty_worker_vacates_core_before_returning_worker_moves() -> None:
@@ -664,7 +655,7 @@ def test_empty_worker_vacates_core_before_returning_worker_moves() -> None:
     assert action.direction is Direction.LEFT
 
 
-def test_core_does_not_spawn_into_worker_reserved_cell() -> None:
+def test_core_can_spawn_while_a_worker_enters() -> None:
     turn = make_turn(
         resources=10,
         objects=[
@@ -678,7 +669,8 @@ def test_core_does_not_spawn_into_worker_reserved_cell() -> None:
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
     assert action.direction is Direction.LEFT
-    assert turn.plan.core_action is None
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
 
 
 def test_worker_retreats_from_nearby_visible_enemy() -> None:
@@ -2106,52 +2098,27 @@ def test_workers_trade_claims_instead_of_walking_past_each_other() -> None:
     assert claims == {object_id(2): (3, 0), object_id(3): (10, 0)}
 
 
-def test_boxed_in_core_occupant_nudges_a_neighbour_aside() -> None:
-    """The Core cell must empty even when every exit is held by a friend.
-
-    Live Ticks 169831-170550: the Core sat in a pocket with two obstacle
-    neighbours, and the other two filled with loaded Workers queueing for the
-    Core cell.  The occupant had nowhere to step, the Workers would not leave
-    without depositing, and the base froze for 700 Ticks with no deposit and
-    no spawn.  One neighbour has to yield the Tick.
-    """
-
+def test_workers_enter_an_occupied_core_without_nudging() -> None:
     turn = make_turn(
-        resources=0,
         objects=[
-            core(position=(0, 0)),
-            unit(2, "VANGUARD", position=(0, 0)),
+            core(),
+            unit(2, "VANGUARD", hp=3),
             unit(3, "WORKER", position=(0, 1), cargo=1),
             unit(4, "WORKER", position=(-1, 0), cargo=1),
         ],
         obstacles=[(0, -1), (1, 0)],
     )
-
     report = decide(turn)
-
-    stepped_aside = [
-        item
-        for item in report.decisions
-        if item.reason == "step aside so the Core cell can empty"
-    ]
-    assert len(stepped_aside) == 1
-    assert stepped_aside[0].actor_kind == "WORKER"
-    vacated = next(item for item in report.decisions if item.actor_id == object_id(2))
-    assert vacated.action == "MOVE"
-    assert vacated.reason.startswith("free the Core cell instead of: ")
-    assert turn.plan.unit_actions[turn.vanguards[0].id].type == "MOVE"
-    # The nudged Worker keeps exactly one action; it is not re-planned back
-    # onto the cell it was just asked to give up.
-    assert (
-        sum(
-            1 for item in report.decisions if item.actor_id == stepped_aside[0].actor_id
-        )
-        == 1
-    )
+    assert turn.vanguards[0].id not in turn.plan.unit_actions
+    for worker in turn.workers:
+        action = turn.plan.unit_actions[worker.id]
+        assert action.type == "MOVE"
+        assert add(worker.position, action.direction) == (0, 0)
+    assert len([d for d in report.decisions if d.actor_id == object_id(2)]) == 1
 
 
-def test_blocked_defensive_guard_asks_adjacent_guard_to_yield() -> None:
-    """A transient friendly wall must clear one cell of a static route."""
+def test_defensive_guard_walks_through_friendly_wall() -> None:
+    """A narrow path remains traversable when friendly guards occupy it."""
 
     turn = make_turn(
         resources=0,
@@ -2169,24 +2136,15 @@ def test_blocked_defensive_guard_asks_adjacent_guard_to_yield() -> None:
         config=StrategyConfig(target_workers=0, max_population=None),
     )
 
-    yielded = [
-        item
-        for item in report.decisions
-        if item.reason == "yield one cell to unblock a defensive route"
-    ]
-    assert len(yielded) == 1
-    assert yielded[0].actor_id == object_id(4)
-    assert yielded[0].target not in {(0, 0), (0, -6), (0, -4)}
-
     target = next(item for item in report.decisions if item.actor_id == object_id(2))
     assert target.action == "MOVE"
     assert target.reason == PERIMETER_REASON
-    assert turn.plan.unit_actions[UUID(object_id(2))].type == "MOVE"
-    assert turn.plan.unit_actions[UUID(object_id(4))].type == "MOVE"
-    assert sum(item.actor_id == object_id(4) for item in report.decisions) == 1
+    action = turn.plan.unit_actions[UUID(object_id(2))]
+    assert action.type == "MOVE"
+    assert add((0, -5), action.direction) in {(-1, -5), (1, -5)}
 
 
-def test_blocked_defensive_guard_does_not_yield_during_enemy_contact() -> None:
+def test_distant_enemy_does_not_make_friendly_units_block_travel() -> None:
     """A visible enemy keeps the defense posture under combat policy control."""
 
     turn = make_turn(
@@ -2211,12 +2169,12 @@ def test_blocked_defensive_guard_does_not_yield_during_enemy_contact() -> None:
         for item in report.decisions
     )
     target = next(item for item in report.decisions if item.actor_id == object_id(2))
-    assert target.action == "WAIT"
-    assert "no safe path" in target.reason
+    assert target.action == "MOVE"
+    assert target.reason == PERIMETER_REASON
 
 
-def test_loaded_worker_asks_adjacent_guard_to_yield_from_core_return() -> None:
-    """A quiet defensive guard must clear a loaded Worker's return lane."""
+def test_loaded_worker_passes_through_stationary_guard() -> None:
+    """Passing through a guard must not change its stationary order."""
 
     turn = make_turn(
         resources=0,
@@ -2256,13 +2214,6 @@ def test_loaded_worker_asks_adjacent_guard_to_yield_from_core_return() -> None:
         threat=ThreatAssessment(),
     )
     worker = turn.workers[0]
-    assert strategy._yield_for_blocked_defensive_route(
-        worker,
-        core_position,
-        context,
-        reason="return carried resources to Core",
-        allow_goal=True,
-    )
     assert strategy._move(
         worker,
         core_position,
@@ -2270,14 +2221,10 @@ def test_loaded_worker_asks_adjacent_guard_to_yield_from_core_return() -> None:
         reason="return carried resources to Core",
         allow_goal=True,
     )
-    yielded = [
-        item
-        for item in report.decisions
-        if item.reason == "yield one cell to unblock a loaded return"
-    ]
-    assert len(yielded) == 1
-    assert yielded[0].actor_id in {object_id(3), object_id(4)}
-    assert turn.plan.unit_actions[UUID(yielded[0].actor_id)].type == "MOVE"
+    assert all(turn.plan.unit_actions[guard.id].type == "WAIT" for guard in guards)
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.RIGHT
     worker_decision = next(
         item for item in report.decisions if item.actor_id == object_id(2)
     )
@@ -2297,6 +2244,8 @@ def test_blocked_defensive_guard_stays_put_when_route_is_walled() -> None:
             unit(4, "VANGUARD", position=(1, -5)),
         ],
         obstacles=[
+            (-1, -5),
+            (1, -5),
             (0, -6),
             (0, -4),
             (-1, -6),
@@ -2322,8 +2271,8 @@ def test_blocked_defensive_guard_stays_put_when_route_is_walled() -> None:
     assert "no safe path" in target.reason
 
 
-def test_core_occupant_nudges_a_decided_critical_neighbour_aside() -> None:
-    """A failed critical return must not seal the Core cell indefinitely."""
+def test_wounded_units_enter_core_together_with_worker_departure() -> None:
+    """Healing returns may stack while a Worker leaves in the same Tick."""
 
     turn = make_turn(
         resources=0,
@@ -2338,21 +2287,14 @@ def test_core_occupant_nudges_a_decided_critical_neighbour_aside() -> None:
 
     report = decide(turn)
 
-    stepped_aside = [
-        item
-        for item in report.decisions
-        if item.reason == "step aside so the Core cell can empty"
-    ]
-    assert len(stepped_aside) == 1
-    assert stepped_aside[0].actor_id == object_id(3)
-    assert turn.plan.unit_actions[UUID(object_id(3))].type == "MOVE"
-    occupant = next(item for item in report.decisions if item.actor_id == object_id(2))
-    assert occupant.action == "MOVE"
-    assert occupant.reason.startswith("free the Core cell instead of: ")
-    assert sum(item.actor_id == object_id(3) for item in report.decisions) == 1
+    for fighter in (*turn.rangers, *turn.vanguards):
+        action = turn.plan.unit_actions[fighter.id]
+        assert action.type == "MOVE"
+        assert add(fighter.position, action.direction) == (0, 0)
+        assert sum(item.actor_id == str(fighter.id) for item in report.decisions) == 1
 
 
-def test_core_screen_vacate_move_is_not_overwritten_by_wait() -> None:
+def test_core_screen_keeps_single_combat_decision_without_traffic_override() -> None:
     turn = make_turn(
         resources=0,
         objects=[
@@ -2372,14 +2314,14 @@ def test_core_screen_vacate_move_is_not_overwritten_by_wait() -> None:
 
     report = decide(turn)
 
-    occupant = next(vanguard for vanguard in turn.vanguards if vanguard.id.int == 2)
-    vacated = next(item for item in report.decisions if item.actor_id == object_id(2))
-    assert vacated.action == "MOVE"
-    assert vacated.reason.startswith("free the Core cell instead of: ")
-    assert turn.plan.unit_actions[occupant.id].type == "MOVE"
+    decisions = [d for d in report.decisions if d.actor_id == object_id(2)]
+    assert len(decisions) == 1
+    action = turn.plan.unit_actions.get(UUID(object_id(2)))
+    assert decisions[0].action == (action.type if action is not None else "WAIT")
+    assert "free the Core cell" not in decisions[0].reason
 
 
-def test_unhealable_unit_vacates_the_core_cell() -> None:
+def test_unhealable_unit_waits_at_core_for_resources() -> None:
     turn = make_turn(
         resources=0,
         objects=[
@@ -2390,12 +2332,10 @@ def test_unhealable_unit_vacates_the_core_cell() -> None:
 
     report = decide(turn)
 
-    action = turn.plan.unit_actions[turn.vanguards[0].id]
-    assert action.type == "MOVE"
+    assert turn.vanguards[0].id not in turn.plan.unit_actions
     assert any(
         item.actor_id == object_id(2)
-        and item.reason
-        == "free the Core cell instead of: wait at Core for healing resources"
+        and item.reason == "wait at Core for healing resources"
         for item in report.decisions
     )
 
@@ -2426,7 +2366,9 @@ def test_unit_beacon_claim_prevents_duplicate_core_pickup() -> None:
     )
     decide(turn)
     assert turn.plan.unit_actions[turn.vanguards[0].id].type == "PICKUP_BEACON"
-    assert turn.plan.core_action is None
+    assert (
+        turn.plan.core_action is None or turn.plan.core_action.type != "PICKUP_BEACON"
+    )
 
 
 def test_combat_unit_hunts_recent_enemy_after_losing_vision() -> None:
@@ -3471,7 +3413,7 @@ def test_offensive_patrol_drops_stale_enemy_unit_memory() -> None:
     )
 
 
-def test_unbounded_population_clears_full_core_cell_for_expansion() -> None:
+def test_unbounded_population_expands_with_worker_on_full_core() -> None:
     units = [unit(number, "VANGUARD", position=(number, 2)) for number in range(3, 14)]
     units.extend(
         unit(number, "WORKER", position=(number, 3)) for number in range(14, 21)
@@ -3489,7 +3431,7 @@ def test_unbounded_population_clears_full_core_cell_for_expansion() -> None:
     )
 
     worker = next(item for item in turn.workers if str(item.id) == object_id(2))
-    assert turn.plan.unit_actions[worker.id].type == "MOVE"
+    assert worker.id not in turn.plan.unit_actions
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "SPAWN"
 
@@ -4659,7 +4601,7 @@ def test_resource_patrol_goal_is_renewed_while_the_worker_closes_in() -> None:
     assert renewed.assigned_tick == progressed.tick
 
 
-def test_loaded_worker_stages_next_to_a_busy_core_instead_of_idling() -> None:
+def test_loaded_worker_returns_directly_to_shared_core() -> None:
     turn = make_turn(
         objects=[
             core(position=(0, 0)),
@@ -4676,7 +4618,7 @@ def test_loaded_worker_stages_next_to_a_busy_core_instead_of_idling() -> None:
     assert staged.direction is Direction.UP
     assert any(
         item.actor_id == str(far.id)
-        and item.reason == "stage carried resources next to the busy Core"
+        and item.reason == "return carried resources to Core"
         for item in report.decisions
     )
 

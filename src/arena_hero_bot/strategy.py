@@ -226,7 +226,6 @@ class _TurnContext:
     occupied: set[Position]
     enemy_positions: set[Position]
     reserved: set[Position] = field(default_factory=set)
-    departures: set[str] = field(default_factory=set)
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
     defensive_assignments: dict[UUID, Position] | None = None
     remaining_resources: int = 0
@@ -247,7 +246,6 @@ class _TurnContext:
     emergency: bool = False
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
-    preplanned_ids: set[UUID] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -448,8 +446,6 @@ class AggressiveStrategy:
             context.screen_assignments = self._combat_screen_assignments(context)
 
         for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
-            if ranger.id in context.preplanned_ids:
-                continue
             self._decide_ranger(
                 ranger,
                 context,
@@ -457,8 +453,6 @@ class AggressiveStrategy:
                 offensive=self._is_offensive_combat_unit(ranger, turn, threat),
             )
         for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
-            if vanguard.id in context.preplanned_ids:
-                continue
             self._decide_vanguard(
                 vanguard,
                 context,
@@ -470,8 +464,6 @@ class AggressiveStrategy:
             turn.workers,
             key=lambda unit: self._worker_priority(unit, core_position),
         ):
-            if worker.id in context.preplanned_ids:
-                continue
             self._decide_worker(worker, context)
         self._decide_core(context)
         report.planned_damage = dict(context.damage_ledger.planned_damage)
@@ -837,10 +829,6 @@ class AggressiveStrategy:
                         for position in adjacent_positions(anchor)
                         if position not in self.memory.obstacles
                         and position not in context.enemy_positions
-                        and (
-                            position == vanguard.position
-                            or position not in context.occupied | context.reserved
-                        )
                     ]
                     if not candidates:
                         continue
@@ -1241,7 +1229,6 @@ class AggressiveStrategy:
                 if (
                     destination is not None
                     and worker.position != destination
-                    and destination not in context.occupied | context.reserved
                     and self._move(
                         worker,
                         destination,
@@ -1274,110 +1261,16 @@ class AggressiveStrategy:
                         target=core.position,
                     )
                 else:
-                    if self._unbounded_growth():
-                        congested, _inbound, outbound = self._core_traffic_lane(context)
-                        departure_goal = (
-                            outbound
-                            if congested
-                            else self._resource_patrol_goal(worker, context.turn, context)
-                        )
-                        if departure_goal != worker.position and self._move(
-                            worker,
-                            departure_goal,
-                            context,
-                            reason=(
-                                "clear the full Core cell for safe storage expansion"
-                            ),
-                            allow_goal=True,
-                        ):
-                            return
                     self._record_wait(worker, context, "Core storage is full")
                 return
-            congested, inbound_cells, outbound = self._core_traffic_lane(context)
-            if congested:
-                # The outbound cell is reserved for units leaving the Core;
-                # cargo queues may use any other nearby cell.  If an inbound
-                # gate is open, take the closest one.  If all gates are busy,
-                # hold position and let the queue drain rather than detouring.
-                if worker.position == outbound:
-                    self._record_wait(worker, context, "hold clear of the Core outbound lane")
-                    return
-                available = [
-                    cell
-                    for cell in inbound_cells
-                    if cell not in context.occupied | context.reserved
-                    and cell not in context.enemy_positions
-                ]
-                if worker.position not in inbound_cells and available:
-                    target = min(
-                        available,
-                        key=lambda cell: (manhattan(worker.position, cell), cell),
-                    )
-                    if self._move(
-                        worker,
-                        target,
-                        context,
-                        reason="queue at a Core inbound gate",
-                        allow_goal=True,
-                    ):
-                        return
-                if worker.position not in inbound_cells and not available:
-                    self._record_wait(worker, context, "queue behind occupied Core inbound gates")
-                    return
-            allow_core = self._core_has_room_for(worker, context)
-            if allow_core and self._move(
+            if not self._move(
                 worker,
                 core.position,
                 context,
                 reason="return carried resources to Core",
                 allow_goal=True,
             ):
-                return
-            if (
-                allow_core
-                and self._yield_for_blocked_defensive_route(
-                    worker,
-                    core.position,
-                    context,
-                    reason="return carried resources to Core",
-                    allow_goal=True,
-                )
-                and self._move(
-                    worker,
-                    core.position,
-                    context,
-                    reason="return carried resources to Core",
-                    allow_goal=True,
-                )
-            ):
-                return
-            # Only one Worker can hold the Core cell per Tick and the guard
-            # ring adds more contention, so a loaded Worker regularly lost the
-            # race.  Waiting in place left it idle wherever it happened to
-            # stand; closing the remaining distance instead means the deposit
-            # lands on the Tick the cell frees up.
-            if manhattan(worker.position, core.position) > 1:
-                if self._move(
-                    worker,
-                    core.position,
-                    context,
-                    reason="stage carried resources next to the busy Core",
-                ):
-                    return
-                if self._yield_for_blocked_defensive_route(
-                    worker,
-                    core.position,
-                    context,
-                    reason="stage carried resources next to the busy Core",
-                    allow_goal=False,
-                ) and self._move(
-                    worker,
-                    core.position,
-                    context,
-                    reason="stage carried resources next to the busy Core",
-                ):
-                    return
-            self._record_wait(worker, context, "Core cell is not currently reachable")
+                self._record_wait(worker, context, "no safe path to Core")
             return
 
         if worker_threats:
@@ -1550,7 +1443,7 @@ class AggressiveStrategy:
         worker: Worker,
         context: _TurnContext,
     ) -> Position:
-        """Move Workers away from the fight instead of clogging the Core exit."""
+        """Move Workers away from the Core fight."""
 
         core = context.turn.core
         if core is None:
@@ -1566,10 +1459,7 @@ class AggressiveStrategy:
         legal = [
             position
             for position in candidates
-            if position not in obstacles
-            and position not in enemy_positions
-            and position not in context.reserved
-            and (position == worker.position or position not in context.occupied)
+            if position not in obstacles and position not in enemy_positions
         ]
         if not legal:
             return worker.position
@@ -1756,9 +1646,8 @@ class AggressiveStrategy:
         When the withdrawal threshold was raised above ``maximum_hp // 2`` and
         this gate was left behind, a Vanguard at three HP counted as critical,
         walked onto the Core cell, and then never qualified for the heal it
-        came for.  It held the cell for 650 Ticks, and since that one cell is
-        the only place a Worker can deposit and the only place the Core can
-        spawn, income and growth both stopped with it.
+        came for. Friendly overlap does not remove the need to use the same
+        threshold for return and healing.
         """
 
         core = context.turn.core
@@ -1815,8 +1704,8 @@ class AggressiveStrategy:
             and isinstance(unit, (Ranger, Vanguard))
             and unit.id in self._expedition_member_ids(context.turn)
         ):
-            # Expedition squads fight on regardless of damage: no healing,
-            # no retreat, no return.
+            # Expedition returns and on-site healing belong to their own
+            # combat policy, rather than the generic defensive recall.
             return False
         retreat_threshold = maximum_hp // 2 if critical_hp is None else critical_hp
         if unit.hp > retreat_threshold:
@@ -1836,36 +1725,15 @@ class AggressiveStrategy:
         if unit.position == core.position:
             self._record_wait(unit, context, "wait at Core for healing resources")
             return True
-        if self._core_has_room_for(unit, context):
-            moved = (
-                self._move_ranger_toward_core(unit, context, reason=reason)
-                if isinstance(unit, Ranger)
-                else self._move(
-                    unit,
-                    core.position,
-                    context,
-                    reason=reason,
-                    allow_goal=True,
-                )
+        moved = (
+            self._move_ranger_toward_core(unit, context, reason=reason)
+            if isinstance(unit, Ranger)
+            else self._move(
+                unit, core.position, context, reason=reason, allow_goal=True
             )
-            if moved:
-                return True
-
-        staging_cells = [
-            position
-            for position in adjacent_positions(core.position)
-            if position not in self.memory.obstacles
-            and position not in context.turn.obstacle_cells
-            and position not in context.occupied | context.reserved
-        ]
-        if staging_cells:
-            goal = min(
-                staging_cells,
-                key=lambda position: (manhattan(unit.position, position), position),
-            )
-            if self._move(unit, goal, context, reason=reason):
-                return True
-        self._record_wait(unit, context, f"no safe path for: {reason}")
+        )
+        if not moved:
+            self._record_wait(unit, context, f"no safe path for: {reason}")
         return True
 
     def _move_ranger_toward_core(
@@ -1899,8 +1767,7 @@ class AggressiveStrategy:
             )
 
         blocked = self._static_blockers(ranger, context)
-        blocked.update(context.occupied)
-        blocked.update(context.reserved)
+        blocked.update(context.enemy_positions)
         blocked.discard(ranger.position)
         blocked.discard(core.position)
         candidates = [
@@ -1985,180 +1852,10 @@ class AggressiveStrategy:
     ) -> None:
         if unit.position == goal:
             self._record_wait(unit, context, reason)
-            # ``_record_wait`` may have replaced the fallback with a safe
-            # Core-cell evacuation.  Do not overwrite that queued MOVE with
-            # the explicit WAIT used when a unit really reached its goal.
-            if wait_at_goal and unit.id not in context.turn.plan.unit_actions:
+            if wait_at_goal:
                 unit.wait()
-            return
-        if not self._move(
-            unit,
-            goal,
-            context,
-            reason=reason,
-            allow_goal=allow_goal,
-        ):
-            if self._yield_for_blocked_defensive_route(
-                unit,
-                goal,
-                context,
-                reason=reason,
-                allow_goal=allow_goal,
-            ) and self._move(
-                unit,
-                goal,
-                context,
-                reason=reason,
-                allow_goal=allow_goal,
-            ):
-                return
+        elif not self._move(unit, goal, context, reason=reason, allow_goal=allow_goal):
             self._record_wait(unit, context, f"no safe path for: {reason}")
-            if (
-                wait_at_goal
-                and unit.position == goal
-                and unit.id not in context.turn.plan.unit_actions
-            ):
-                unit.wait()
-
-    def _yield_for_blocked_defensive_route(
-        self,
-        unit: Unit,
-        goal: Position,
-        context: _TurnContext,
-        *,
-        reason: str,
-        allow_goal: bool,
-    ) -> bool:
-        """Move one idle guard aside when friendly traffic seals a route.
-
-        A static route proves that the failure is caused by our own traffic,
-        rather than by an obstacle wall.  The exception is intentionally
-        narrow: only a quiet, stationary Core may reshuffle ordinary defense
-        guards, and only an adjacent guard with no higher-priority action may
-        yield one cell.  This also covers a loaded Worker returning to a
-        stationary Core.  The original unit retries immediately after the
-        yielding move, so both actions remain part of the same complete plan.
-        """
-
-        defensive_unit = (
-            isinstance(unit, (Ranger, Vanguard))
-            and reason == "hold a defensive perimeter around the resource Core"
-        )
-        loaded_worker = (
-            isinstance(unit, Worker)
-            and unit.cargo > 0
-            and reason
-            in {
-                "return carried resources to Core",
-                "stage carried resources next to the busy Core",
-            }
-        )
-        if not defensive_unit and not loaded_worker:
-            return False
-        if context.emergency or context.combat_assault or context.turn.visible_enemies:
-            return False
-        if context.threat.level is not ThreatLevel.NORMAL:
-            return False
-        core = context.turn.core
-        if core is None or core.view.state is not CoreState.NORMAL:
-            return False
-        if defensive_unit and self._is_offensive_combat_unit(
-            unit, context.turn, context.threat
-        ):
-            return False
-        if not self._has_static_route(
-            unit,
-            goal,
-            context,
-            allow_goal=allow_goal,
-        ):
-            return False
-        assignments = context.defensive_assignments
-        if assignments is None:
-            assignments = self._defensive_perimeter_assignments(context)
-            context.defensive_assignments = assignments
-        if not assignments:
-            return False
-
-        units_by_position = {
-            candidate.position: candidate for candidate in context.turn.units
-        }
-        obstacles = self._static_blockers(unit, context)
-        worker_corridors = self._worker_corridor_cells(core.position, obstacles)
-        blocked = obstacles | context.occupied | context.reserved | worker_corridors
-        blocked.update(context.enemy_positions)
-        blocked.add(core.position)
-        blocked.update(adjacent_positions(core.position))
-        blocked.discard(unit.position)
-
-        decisions = {item.actor_id: item for item in context.report.decisions}
-        for neighbour_position in adjacent_positions(unit.position):
-            neighbour = units_by_position.get(neighbour_position)
-            if not isinstance(neighbour, (Ranger, Vanguard)):
-                continue
-            if neighbour.id not in assignments:
-                continue
-            if neighbour.id in context.preplanned_ids:
-                continue
-            previous = decisions.get(str(neighbour.id))
-            if previous is not None and previous.action != "WAIT":
-                continue
-            queued = context.turn.plan.unit_actions.get(neighbour.id)
-            if queued is not None and queued.type != "WAIT":
-                continue
-
-            candidates = [
-                (destination, direction)
-                for direction in DIRECTIONS
-                if (destination := add(neighbour.position, direction)) not in blocked
-                and destination != unit.position
-                and destination != goal
-            ]
-            if not candidates:
-                continue
-            neighbour_goal = assignments[neighbour.id]
-            candidates.sort(
-                key=lambda item: (
-                    manhattan(item[0], neighbour_goal),
-                    manhattan(item[0], core.position),
-                    item[0],
-                )
-            )
-            for destination, direction in candidates:
-                simulated_blocked = self._static_blockers(unit, context)
-                simulated_blocked.update(context.occupied)
-                simulated_blocked.discard(neighbour.position)
-                simulated_blocked.update(context.reserved)
-                simulated_blocked.add(destination)
-                if (
-                    next_step(
-                        unit.position,
-                        goal,
-                        blocked=simulated_blocked,
-                        recent=self.memory.recent_positions(str(unit.id)),
-                        direction_offset=self._direction_offset(unit.id),
-                        allow_goal=allow_goal,
-                    )
-                    is None
-                ):
-                    continue
-                if not self._queue_move(
-                    neighbour,
-                    direction,
-                    context,
-                    reason=(
-                        "yield one cell to unblock a defensive route"
-                        if defensive_unit
-                        else "yield one cell to unblock a loaded return"
-                    ),
-                    target=destination,
-                ):
-                    continue
-                if previous is not None:
-                    context.report.decisions.remove(previous)
-                context.preplanned_ids.add(neighbour.id)
-                return True
-        return False
 
     def _retreat_worker(
         self,
@@ -2172,8 +1869,7 @@ class AggressiveStrategy:
         blocked = set(self.memory.obstacles)
         blocked.update(self.memory.contested_positions)
         blocked.update(context.turn.obstacle_cells)
-        blocked.update(context.occupied)
-        blocked.update(context.reserved)
+        blocked.update(context.enemy_positions)
         blocked.discard(worker.position)
         blocked.discard(core_position)
         threat_positions = set(threats)
@@ -2334,6 +2030,8 @@ class AggressiveStrategy:
         asks the question the fallback hides, against the blockers above.
         """
 
+        if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
+            return False
         if unit.position == goal:
             return True
         return (
@@ -2359,8 +2057,10 @@ class AggressiveStrategy:
         if unit.position == goal:
             return False
         blocked = self._static_blockers(unit, context)
-        blocked.update(context.occupied)
-        blocked.update(context.reserved)
+        # Friendly units may overlap and swap; they never block travel.
+        if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
+            return False
+        blocked.update(context.enemy_positions)
         max_expansions = (
             EXPEDITION_STAGING_PATH_EXPANSIONS
             if self.config.expedition_mode and unit.id in self._staged_ids
@@ -2378,10 +2078,7 @@ class AggressiveStrategy:
         if direction is None:
             return False
         destination = add(unit.position, direction)
-        if (
-            destination in blocked
-            and not (allow_goal and destination == goal)
-        ) or destination in context.reserved:
+        if destination in blocked and not (allow_goal and destination == goal):
             return False
         return self._queue_move(
             unit,
@@ -2401,24 +2098,16 @@ class AggressiveStrategy:
         target: Position,
     ) -> bool:
         destination = add(unit.position, direction)
-        if destination in context.reserved:
+        # Also protect direct retreat moves and permissive goal paths.
+        if (
+            destination in self.memory.obstacles
+            or destination in context.turn.obstacle_cells
+        ):
             return False
         unit.move(direction)
         self.memory.pending_move_targets[str(unit.id)] = destination
         context.reserved.add(destination)
-        # A queued move vacates the unit's current cell for the rest of this
-        # plan.  Keeping every origin in ``occupied`` made a dense defensive
-        # cluster behave like a solid wall: no guard could step through the
-        # cells that another guard was leaving, and nearby Workers could stay
-        # trapped indefinitely.  The Core itself remains occupied even when
-        # a unit departs from its cell.
-        if context.turn.core is None or unit.position != context.turn.core.position:
-            context.occupied.discard(unit.position)
-        if (
-            context.turn.core is not None
-            and unit.position == context.turn.core.position
-        ):
-            context.departures.add(str(unit.id))
+        # Reservations are tactical spacing hints, not movement locks.
         context.report.add(
             actor_id=str(unit.id),
             actor_kind=unit.unit_type.value,
@@ -2428,131 +2117,7 @@ class AggressiveStrategy:
         )
         return True
 
-    def _vacate_core_cell(
-        self,
-        unit: Unit,
-        context: _TurnContext,
-        reason: str,
-    ) -> bool:
-        """Step ``unit`` off the Core cell when it would otherwise idle there.
-
-        The Core cell is the only cell a Worker can deposit on and the only
-        cell the Core can spawn from, so a single Unit resting on it stalls
-        the entire base.  It happened twice from different branches: a
-        Vanguard waiting for a heal it did not qualify for, and the same
-        Vanguard afterwards boxed in by its own guard ring with "no safe
-        path" to roam.  Waiting there is never the better move, so the guard
-        belongs at the one place every branch funnels into.
-        """
-
-        core = context.turn.core
-        if core is None or unit.position != core.position:
-            return False
-        blocked = self.memory.obstacles | set(context.turn.obstacle_cells)
-        candidates = self._core_exit_cells(context, blocked)
-        if not candidates and self._nudge_core_neighbour(context, blocked):
-            candidates = self._core_exit_cells(context, blocked)
-        if not candidates:
-            return False
-        return self._move(
-            unit,
-            min(candidates),
-            context,
-            reason=f"free the Core cell instead of: {reason}",
-            allow_goal=True,
-        )
-
-    def _core_exit_cells(
-        self,
-        context: _TurnContext,
-        blocked: set[Position],
-    ) -> list[Position]:
-        core = context.turn.core
-        if core is None:
-            return []
-        return [
-            position
-            for position in adjacent_positions(core.position)
-            if position not in blocked
-            and position not in context.occupied
-            and position not in context.reserved
-        ]
-
-    def _nudge_core_neighbour(
-        self,
-        context: _TurnContext,
-        blocked: set[Position],
-    ) -> bool:
-        """Ask an un-planned neighbour to step aside so the Core cell can empty.
-
-        The Core can sit in a pocket with only two open neighbours, and both
-        of them fill with loaded Workers queueing for the Core cell.  The
-        occupant then has nowhere to go, the Workers will not leave until they
-        have deposited, and the base deadlocks: the one cell that funds every
-        deposit and every spawn stays held.  It cost 1000 Ticks of frozen
-        income at Tick 169831.  Someone has to yield, and the neighbour is the
-        one with somewhere to go; it loses a single Tick and the Core cell
-        frees up on the same Tick the occupant steps into the gap.
-        """
-
-        core = context.turn.core
-        if core is None:
-            return False
-        ring = set(adjacent_positions(core.position))
-        # A Unit that already has a decision this Tick is normally off limits:
-        # moving it now would leave a stale WAIT in the report or overwrite a
-        # plan action that the rest of the Turn already reasoned about.  A
-        # critical unit that failed to reach the occupied Core is the one
-        # exception.  Its recovery WAIT is exactly what seals the last exit,
-        # so replace that unhelpful WAIT with one safe yielding step.
-        decisions = {item.actor_id: item for item in context.report.decisions}
-        neighbours = sorted(
-            (
-                unit
-                for unit in context.turn.units
-                if unit.position in ring
-                and (
-                    (decision := decisions.get(str(unit.id))) is None
-                    or (
-                        decision.action == "WAIT"
-                        and decision.reason.startswith(
-                            "no safe path for: return critical unit to Core for healing"
-                        )
-                    )
-                )
-            ),
-            key=lambda unit: unit.id.bytes,
-        )
-        for neighbour in neighbours:
-            previous = decisions.get(str(neighbour.id))
-            if previous is None and neighbour.id in context.turn.plan.unit_actions:
-                continue
-            for direction in DIRECTIONS:
-                destination = add(neighbour.position, direction)
-                if (
-                    destination == core.position
-                    or destination in blocked
-                    or destination in context.occupied
-                    or destination in context.reserved
-                    or destination in context.enemy_positions
-                ):
-                    continue
-                if self._queue_move(
-                    neighbour,
-                    direction,
-                    context,
-                    reason="step aside so the Core cell can empty",
-                    target=destination,
-                ):
-                    if previous is not None:
-                        context.report.decisions.remove(previous)
-                    context.preplanned_ids.add(neighbour.id)
-                    return True
-        return False
-
     def _record_wait(self, unit: Unit, context: _TurnContext, reason: str) -> None:
-        if self._vacate_core_cell(unit, context, reason):
-            return
         context.report.add(
             actor_id=str(unit.id),
             actor_kind=unit.unit_type.value,
@@ -3238,9 +2803,7 @@ class AggressiveStrategy:
         candidates = [
             position
             for position in adjacent_positions(ranger.position)
-            if position not in obstacles
-            and position not in context.enemy_positions
-            and position not in context.occupied | context.reserved
+            if position not in obstacles and position not in context.enemy_positions
         ]
         if not candidates:
             return False
@@ -4553,10 +4116,6 @@ class AggressiveStrategy:
                 for position in adjacent_positions(anchor)
                 if position not in self.memory.obstacles
                 and position not in context.enemy_positions
-                and (
-                    position == vanguard.position
-                    or position not in context.occupied | context.reserved
-                )
             ]
             if not candidates:
                 continue
@@ -4593,8 +4152,7 @@ class AggressiveStrategy:
         """
         blocked = set(self.memory.obstacles)
         blocked.update(context.turn.obstacle_cells)
-        blocked.update(context.occupied)
-        blocked.update(context.reserved)
+        blocked.update(context.enemy_positions)
         blocked.discard(unit.position)
         candidates = [
             position
@@ -5551,10 +5109,6 @@ class AggressiveStrategy:
             for position in firing_positions(target.position)
             if position not in obstacles
             and position not in context.enemy_positions
-            and (
-                position == ranger.position
-                or position not in context.occupied | context.reserved
-            )
             and line_of_fire(position, target.position, obstacles)
         ]
         if not candidates:
@@ -5602,7 +5156,9 @@ class AggressiveStrategy:
         ) - {worker.position for worker in workers.values()}
         hostile = {enemy.position for enemy in turn.visible_enemies}
         blocked_resources = self.memory.obstacles | set(turn.obstacle_cells)
-        visible_resources = set(turn.resource_cells) - hostile - unreachable - blocked_resources
+        visible_resources = (
+            set(turn.resource_cells) - hostile - unreachable - blocked_resources
+        )
         remembered_resources = (
             set(self.memory.remembered_resource_cells(turn.tick))
             - hostile
@@ -6772,51 +6328,10 @@ class AggressiveStrategy:
             if abs(dx) + abs(dy) <= radius
         }
 
-    def _core_has_room_for(self, worker: Unit, context: _TurnContext) -> bool:
-        core = context.turn.core
-        if core is None:
-            return False
-        # A loaded Worker has nowhere useful to go on a full Core: entering
-        # the cell only replaces the current blocker and keeps the one-cell
-        # deposit/spawn choke point closed.
-        if self._unbounded_growth() and context.remaining_resource_space <= 0:
-            return False
-        if core.position in context.reserved:
-            return False
-        occupants = [
-            unit
-            for unit in context.turn.units
-            if unit.position == core.position
-            and unit.id != worker.id
-            and str(unit.id) not in context.departures
-        ]
-        return not occupants
-
-    def _core_traffic_lane(
-        self, context: _TurnContext
-    ) -> tuple[bool, tuple[Position, ...], Position]:
-        """Return congestion state, three inbound cells, and one outbound cell."""
-        core = context.turn.core
-        if core is None:
-            return False, (), (0, 0)
-        neighbours = set(adjacent_positions(core.position))
-        occupied_neighbours = sum(
-            unit.position in neighbours for unit in context.turn.units
-        )
-        loaded = sum(worker.cargo > 0 for worker in context.turn.workers)
-        congested = loaded >= 4 or occupied_neighbours >= 3
-        inbound = (
-            (core.position[0] - 1, core.position[1]),
-            (core.position[0] + 1, core.position[1]),
-            (core.position[0], core.position[1] + 1),
-        )
-        outbound = (core.position[0], core.position[1] - 1)
-        return congested, inbound, outbound
-
     def _core_can_spawn(self, context: _TurnContext) -> bool:
         core = context.turn.core
         growth_target = self._growth_population_target()
-        if (
+        return not (
             core is None
             or (
                 growth_target is not None
@@ -6826,16 +6341,7 @@ class AggressiveStrategy:
                 self.config.resource_target > 0
                 and context.remaining_resources >= self.config.resource_target
             )
-        ):
-            return False
-        if core.position in context.reserved:
-            return False
-        occupants = [
-            unit
-            for unit in context.turn.units
-            if unit.position == core.position and str(unit.id) not in context.departures
-        ]
-        return not occupants
+        )
 
     def _choose_spawn(self, turn: Turn, resources: int) -> UnitType | None:
         growth_target = self._growth_population_target()
@@ -7306,10 +6812,7 @@ class AggressiveStrategy:
         worker: Worker, core_position: Position | None
     ) -> tuple[bool, bool, bytes]:
         at_core = worker.position == core_position
-        # Any Core occupant must be handled before the queue surrounding it:
-        # a loaded occupant also needs to leave when storage is full, and it
-        # may need an unplanned neighbour to yield a step first.  Keep the
-        # old empty-Worker precedence among Core occupants.
+        # Process on-site deposits first for deterministic resource accounting.
         return not at_core, worker.cargo > 0, worker.id.bytes
 
     @staticmethod
