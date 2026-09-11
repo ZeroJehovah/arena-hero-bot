@@ -4020,6 +4020,20 @@ class AggressiveStrategy:
         return pursuit.position
 
     def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
+        # A wounded expedition member that has made it back to the Core must
+        # consume the heal there before the expedition policy is evaluated
+        # again.  Otherwise the pursuit branch immediately sends it back out,
+        # producing an endless Core in/out loop with no healing.
+        if ranger.hp <= 1 and context.turn.core is not None:
+            if self._heal_if_critical(
+                ranger,
+                maximum_hp=2,
+                context=context,
+            ):
+                return True
+            if ranger.position == context.turn.core.position:
+                self._record_wait(ranger, context, "wait at Core for healing resources")
+                return True
         pursuit = self._expedition_pursuit_for(ranger)
         visible = self._visible_combat_targets(ranger, context.turn)
         target = None
