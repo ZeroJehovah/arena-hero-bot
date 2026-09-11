@@ -2378,7 +2378,10 @@ class AggressiveStrategy:
         if direction is None:
             return False
         destination = add(unit.position, direction)
-        if destination in context.reserved:
+        if (
+            destination in blocked
+            and not (allow_goal and destination == goal)
+        ) or destination in context.reserved:
             return False
         return self._queue_move(
             unit,
