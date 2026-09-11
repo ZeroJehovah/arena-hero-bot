@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from math import atan2
 from uuid import UUID
@@ -3438,9 +3439,56 @@ class AggressiveStrategy:
             return unit.position
         front_id = max(progress, key=lambda mid: (progress[mid], mid))
         front = alive[front_id]
-        return (
+        goal = (
             front[0] + bear_x * EXPEDITION_LINK_RADIUS,
             front[1] + bear_y * EXPEDITION_LINK_RADIUS,
+        )
+        if (
+            goal not in self.memory.obstacles
+            and goal not in turn.obstacle_cells
+            and goal not in self.memory.contested_positions
+            and all(enemy.position != goal for enemy in turn.visible_enemies)
+        ):
+            return goal
+        blocked = (
+            self.memory.obstacles
+            | set(turn.obstacle_cells)
+            | set(self.memory.contested_positions)
+            | {enemy.position for enemy in turn.visible_enemies}
+        )
+
+        # A rock at the shared waypoint otherwise makes every member WAIT
+        # forever: the front stays put, so the same invalid goal is chosen on
+        # every Tick.  Search a bounded area from the front so the replacement
+        # is reachable and identical for the whole squad.  Friendly occupancy
+        # does not constrain this search.
+        radius = manhattan(front, goal) + EXPEDITION_LINK_RADIUS
+        reachable = {front}
+        frontier = deque([front])
+        while frontier:
+            position = frontier.popleft()
+            for neighbor in adjacent_positions(position):
+                if (
+                    neighbor in reachable
+                    or neighbor in blocked
+                    or manhattan(front, neighbor) > radius
+                ):
+                    continue
+                reachable.add(neighbor)
+                frontier.append(neighbor)
+        forward = {
+            position
+            for position in reachable
+            if position[0] * bear_x + position[1] * bear_y > progress[front_id]
+        }
+        return min(
+            forward or (reachable - {front}),
+            key=lambda position: (
+                manhattan(position, goal),
+                -(position[0] * bear_x + position[1] * bear_y),
+                position,
+            ),
+            default=front,
         )
 
     def _refresh_expedition_pursuits(self, turn: Turn) -> None:
