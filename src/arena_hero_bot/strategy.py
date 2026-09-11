@@ -1275,10 +1275,11 @@ class AggressiveStrategy:
                     )
                 else:
                     if self._unbounded_growth():
-                        departure_goal = self._resource_patrol_goal(
-                            worker,
-                            context.turn,
-                            context,
+                        congested, _inbound, outbound = self._core_traffic_lane(context)
+                        departure_goal = (
+                            outbound
+                            if congested
+                            else self._resource_patrol_goal(worker, context.turn, context)
                         )
                         if departure_goal != worker.position and self._move(
                             worker,
@@ -1291,6 +1292,18 @@ class AggressiveStrategy:
                         ):
                             return
                     self._record_wait(worker, context, "Core storage is full")
+                return
+            congested, inbound, _outbound = self._core_traffic_lane(context)
+            if congested and worker.position != inbound:
+                if self._move(
+                    worker,
+                    inbound,
+                    context,
+                    reason="queue for the fixed Core inbound lane",
+                    allow_goal=True,
+                ):
+                    return
+                self._record_wait(worker, context, "queue behind the fixed Core inbound lane")
                 return
             allow_core = self._core_has_room_for(worker, context)
             if allow_core and self._move(
@@ -6739,6 +6752,21 @@ class AggressiveStrategy:
             and str(unit.id) not in context.departures
         ]
         return not occupants
+
+    def _core_traffic_lane(self, context: _TurnContext) -> tuple[bool, Position, Position]:
+        """Return whether Core traffic is congested and its fixed in/out cells."""
+        core = context.turn.core
+        if core is None:
+            return False, (0, 0), (0, 0)
+        neighbours = set(adjacent_positions(core.position))
+        occupied_neighbours = sum(
+            unit.position in neighbours for unit in context.turn.units
+        )
+        loaded = sum(worker.cargo > 0 for worker in context.turn.workers)
+        congested = loaded >= 4 or occupied_neighbours >= 3
+        inbound = (core.position[0] - 1, core.position[1])
+        outbound = (core.position[0] + 1, core.position[1])
+        return congested, inbound, outbound
 
     def _core_can_spawn(self, context: _TurnContext) -> bool:
         core = context.turn.core
