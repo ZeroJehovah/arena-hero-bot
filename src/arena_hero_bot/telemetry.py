@@ -11,6 +11,7 @@ from typing import Any
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 RETAIN_TELEMETRY_DAYS = 4  # 今日 + 前 3 个北京自然日
+_TIMESTAMP_LEN = 19  # second-resolution UTC received_at prefix length
 
 
 class JsonlTelemetry:
@@ -55,9 +56,9 @@ class JsonlTelemetry:
 
         if not self.path.exists():
             return False
-        boundary = self.retained_since(days=days, tz=tz)
-        earliest = self._earliest_submission_utc()
-        if earliest is not None and earliest >= boundary:
+        boundary_prefix = self._boundary_prefix(days=days, tz=tz)
+        earliest = self._earliest_received_prefix()
+        if earliest is not None and earliest >= boundary_prefix:
             return False
         temporary: str | None = None
         try:
@@ -70,8 +71,8 @@ class JsonlTelemetry:
                 temporary = target.name
                 with self.path.open("rb") as source:
                     for line in source:
-                        received = self._received_at(line)
-                        if received is None or received >= boundary:
+                        prefix = self._received_prefix(line)
+                        if prefix is None or prefix >= boundary_prefix:
                             target.write(line)
                 target.flush()
                 os.fsync(target.fileno())
@@ -83,22 +84,29 @@ class JsonlTelemetry:
                 os.unlink(temporary)
         return True
 
-    def _received_at(self, line: bytes) -> datetime | None:
-        """Return the record's submission UTC instant, or None when undatable."""
+    def _boundary_prefix(
+        self, *, days: int = RETAIN_TELEMETRY_DAYS, tz: timezone = BEIJING_TZ
+    ) -> str:
+        """Render the retention boundary as a UTC second-resolution ISO prefix."""
 
-        try:
-            record = json.loads(line)
-        except ValueError:
-            return None
-        received = record.get("submission", {}).get("received_at")
-        if not isinstance(received, str):
-            return None
-        try:
-            return datetime.fromisoformat(received)
-        except ValueError:
-            return None
+        return self.retained_since(days=days, tz=tz).strftime("%Y-%m-%dT%H:%M:%S")
 
-    def _earliest_submission_utc(self, *, limit: int = 256) -> datetime | None:
+    def _received_prefix(self, line: bytes) -> str | None:
+        """Extract the record's received_at UTC second-resolution prefix, or None."""
+
+        marker = b'"received_at":"'
+        at = line.find(marker)
+        if at < 0:
+            return None
+        start = at + len(marker)
+        prefix = line[start : start + _TIMESTAMP_LEN].decode("ascii", errors="ignore")
+        if len(prefix) != _TIMESTAMP_LEN or not all(
+            ch.isdigit() or ch in "-T:" for ch in prefix
+        ):
+            return None
+        return prefix
+
+    def _earliest_received_prefix(self, *, limit: int = 256) -> str | None:
         """Return the first datable record near the chronological head without
         scanning the whole file."""
 
@@ -106,7 +114,7 @@ class JsonlTelemetry:
             for index, line in enumerate(source):
                 if index >= limit:
                     break
-                received = self._received_at(line)
-                if received is not None:
-                    return received
+                prefix = self._received_prefix(line)
+                if prefix is not None:
+                    return prefix
         return None
