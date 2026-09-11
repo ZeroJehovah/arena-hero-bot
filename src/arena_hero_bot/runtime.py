@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, Protocol
@@ -13,7 +14,7 @@ from arena_hero import APIError, ArenaHeroClient, ArenaHeroError, Turn, __versio
 from .memory import WorldMemory
 from .models import DecisionReport
 from .strategy import AggressiveStrategy, StrategyConfig
-from .telemetry import RETAIN_TELEMETRY_DAYS, JsonlTelemetry
+from .telemetry import BEIJING_TZ, RETAIN_TELEMETRY_DAYS, JsonlTelemetry
 
 LOGGER = logging.getLogger(__name__)
 RECONNECTABLE_SUBMISSION_ERRORS = frozenset({"COMMAND_WINDOW_CLOSED", "TICK_MISMATCH"})
@@ -51,14 +52,19 @@ def run_bot(
     telemetry = JsonlTelemetry(config.data_dir / "turns.jsonl")
     memory = WorldMemory.load(memory_path)
     strategy = AggressiveStrategy(memory, strategy_config)
-    try:
-        if telemetry.prune_recent():
-            LOGGER.info(
-                "pruned telemetry to the latest %d Beijing-natural-day window",
-                RETAIN_TELEMETRY_DAYS,
-            )
-    except OSError as exc:
-        LOGGER.warning("telemetry prune skipped: %s", exc)
+
+    def _prune_telemetry() -> None:
+        try:
+            if telemetry.prune_recent():
+                LOGGER.info(
+                    "pruned telemetry to the latest %d Beijing-natural-day window",
+                    RETAIN_TELEMETRY_DAYS,
+                )
+        except OSError as exc:
+            LOGGER.warning("telemetry prune skipped: %s", exc)
+
+    _prune_telemetry()
+    pruned_day = datetime.now(BEIJING_TZ).date()
     turns_seen = 0
     mode = "observe-only" if config.observe_only else "aggressive-pvp"
     LOGGER.info(
@@ -106,6 +112,9 @@ def run_bot(
                         observe_only=config.observe_only,
                     )
                 )
+                if _is_beijing_day_change(pruned_day, datetime.now(UTC)):
+                    pruned_day = datetime.now(BEIJING_TZ).date()
+                    _prune_telemetry()
                 LOGGER.info(
                     "tick=%d resources=%d/%d population=%d enemies=%d actions=%d "
                     "planning_ms=%.1f submit=%s",
@@ -135,6 +144,12 @@ def run_bot(
                     break
 
     return turns_seen
+
+
+def _is_beijing_day_change(previous: date, at: datetime) -> bool:
+    """Return whether ``at`` falls on a different Asia/Shanghai natural day."""
+
+    return at.astimezone(BEIJING_TZ).date() != previous
 
 
 def _plan_turn(strategy: Tactic, turn: Turn) -> tuple[DecisionReport, str | None]:

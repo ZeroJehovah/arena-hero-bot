@@ -41,6 +41,22 @@ def _stamp(days_ago: int) -> str:
     return at.isoformat()
 
 
+def test_is_beijing_day_change() -> None:
+    from datetime import date, datetime
+
+    # 2026-09-10T08:00Z = 北京时间 09-10 16:00, same day
+    same = datetime(2026, 9, 10, 8, 0, 0, tzinfo=UTC)
+    assert not runtime._is_beijing_day_change(previous=date(2026, 9, 10), at=same)
+
+    # 2026-09-10T16:00Z = 北京时间 09-11 00:00, new day
+    new_day = datetime(2026, 9, 10, 16, 0, 0, tzinfo=UTC)
+    assert runtime._is_beijing_day_change(previous=date(2026, 9, 10), at=new_day)
+
+    previous_day = date(2026, 9, 11)
+    same_day = datetime(2026, 9, 10, 23, 0, 0, tzinfo=UTC)
+    assert not runtime._is_beijing_day_change(previous=previous_day, at=same_day)
+
+
 def test_prune_recent_keeps_current_and_previous_three_beijing_days(tmp_path) -> None:
     path = tmp_path / "turns.jsonl"
     path.write_text(
