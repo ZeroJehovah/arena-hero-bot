@@ -7627,7 +7627,7 @@ def _nearest_open_defense_slot(
                     continue
                 if abs(dx) + abs(dy) != radius:
                     continue
-                spot = (core_position[0] + dx, core_position[1] + dy)
+                spot = (origin[0] + dx, origin[1] + dy)
                 if spot in forbidden:
                     continue
                 if spot in claimed:
