@@ -1293,18 +1293,37 @@ class AggressiveStrategy:
                             return
                     self._record_wait(worker, context, "Core storage is full")
                 return
-            congested, inbound, _outbound = self._core_traffic_lane(context)
-            if congested and worker.position != inbound:
-                if self._move(
-                    worker,
-                    inbound,
-                    context,
-                    reason="queue for the fixed Core inbound lane",
-                    allow_goal=True,
-                ):
+            congested, inbound_cells, outbound = self._core_traffic_lane(context)
+            if congested:
+                # The outbound cell is reserved for units leaving the Core;
+                # cargo queues may use any other nearby cell.  If an inbound
+                # gate is open, take the closest one.  If all gates are busy,
+                # hold position and let the queue drain rather than detouring.
+                if worker.position == outbound:
+                    self._record_wait(worker, context, "hold clear of the Core outbound lane")
                     return
-                self._record_wait(worker, context, "queue behind the fixed Core inbound lane")
-                return
+                available = [
+                    cell
+                    for cell in inbound_cells
+                    if cell not in context.occupied | context.reserved
+                    and cell not in context.enemy_positions
+                ]
+                if worker.position not in inbound_cells and available:
+                    target = min(
+                        available,
+                        key=lambda cell: (manhattan(worker.position, cell), cell),
+                    )
+                    if self._move(
+                        worker,
+                        target,
+                        context,
+                        reason="queue at a Core inbound gate",
+                        allow_goal=True,
+                    ):
+                        return
+                if worker.position not in inbound_cells and not available:
+                    self._record_wait(worker, context, "queue behind occupied Core inbound gates")
+                    return
             allow_core = self._core_has_room_for(worker, context)
             if allow_core and self._move(
                 worker,
@@ -6753,19 +6772,25 @@ class AggressiveStrategy:
         ]
         return not occupants
 
-    def _core_traffic_lane(self, context: _TurnContext) -> tuple[bool, Position, Position]:
-        """Return whether Core traffic is congested and its fixed in/out cells."""
+    def _core_traffic_lane(
+        self, context: _TurnContext
+    ) -> tuple[bool, tuple[Position, ...], Position]:
+        """Return congestion state, three inbound cells, and one outbound cell."""
         core = context.turn.core
         if core is None:
-            return False, (0, 0), (0, 0)
+            return False, (), (0, 0)
         neighbours = set(adjacent_positions(core.position))
         occupied_neighbours = sum(
             unit.position in neighbours for unit in context.turn.units
         )
         loaded = sum(worker.cargo > 0 for worker in context.turn.workers)
         congested = loaded >= 4 or occupied_neighbours >= 3
-        inbound = (core.position[0] - 1, core.position[1])
-        outbound = (core.position[0] + 1, core.position[1])
+        inbound = (
+            (core.position[0] - 1, core.position[1]),
+            (core.position[0] + 1, core.position[1]),
+            (core.position[0], core.position[1] + 1),
+        )
+        outbound = (core.position[0], core.position[1] - 1)
         return congested, inbound, outbound
 
     def _core_can_spawn(self, context: _TurnContext) -> bool:
