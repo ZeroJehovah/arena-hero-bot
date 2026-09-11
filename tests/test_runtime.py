@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 
 import pytest
 from arena_hero import APIError, ArenaHeroError, Turn
@@ -26,6 +27,33 @@ def test_jsonl_telemetry_appends_records(tmp_path) -> None:
         1,
         2,
     ]
+
+
+def _telemetry_line(tick: int, received_at: str | None) -> str:
+    record = {"tick": tick, "submission": {"received_at": received_at}}
+    return json.dumps(record, separators=(",", ":")) + "\n"
+
+
+def _stamp(days_ago: int) -> str:
+    from datetime import datetime, timedelta
+
+    at = datetime.now(UTC) - timedelta(days=days_ago)
+    return at.isoformat()
+
+
+def test_prune_recent_keeps_current_and_previous_three_beijing_days(tmp_path) -> None:
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        _telemetry_line(1, _stamp(4))
+        + _telemetry_line(2, _stamp(2))
+        + _telemetry_line(3, _stamp(0))
+        + _telemetry_line(4, None)
+    )
+    changed = JsonlTelemetry(path).prune_recent(days=4)
+    assert changed
+    kept = [json.loads(line)["tick"] for line in path.read_text().splitlines()]
+    # Undatable rows are kept, rows far outside the window are dropped..
+    assert kept == [2, 3, 4]
 
 
 def test_submit_turn_modes_and_errors() -> None:

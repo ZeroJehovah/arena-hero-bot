@@ -13,7 +13,7 @@ from arena_hero import APIError, ArenaHeroClient, ArenaHeroError, Turn, __versio
 from .memory import WorldMemory
 from .models import DecisionReport
 from .strategy import AggressiveStrategy, StrategyConfig
-from .telemetry import JsonlTelemetry
+from .telemetry import RETAIN_TELEMETRY_DAYS, JsonlTelemetry
 
 LOGGER = logging.getLogger(__name__)
 RECONNECTABLE_SUBMISSION_ERRORS = frozenset({"COMMAND_WINDOW_CLOSED", "TICK_MISMATCH"})
@@ -51,6 +51,14 @@ def run_bot(
     telemetry = JsonlTelemetry(config.data_dir / "turns.jsonl")
     memory = WorldMemory.load(memory_path)
     strategy = AggressiveStrategy(memory, strategy_config)
+    try:
+        if telemetry.prune_recent():
+            LOGGER.info(
+                "pruned telemetry to the latest %d Beijing-natural-day window",
+                RETAIN_TELEMETRY_DAYS,
+            )
+    except OSError as exc:
+        LOGGER.warning("telemetry prune skipped: %s", exc)
     turns_seen = 0
     mode = "observe-only" if config.observe_only else "aggressive-pvp"
     LOGGER.info(
