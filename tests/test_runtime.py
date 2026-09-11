@@ -18,6 +18,12 @@ from arena_hero_bot.telemetry import JsonlTelemetry
 from .factories import core, make_turn, unit
 
 
+def _written_telemetry(path):
+    files = sorted(path.glob("turns-*.jsonl"))
+    assert len(files) == 1
+    return files[0]
+
+
 def test_jsonl_telemetry_appends_records(tmp_path) -> None:
     path = tmp_path / "nested" / "turns.jsonl"
     telemetry = JsonlTelemetry(path)
@@ -27,6 +33,15 @@ def test_jsonl_telemetry_appends_records(tmp_path) -> None:
         1,
         2,
     ]
+
+
+def test_rotating_telemetry_writes_beijing_day_file(tmp_path) -> None:
+    path = tmp_path / "turns.jsonl"
+    telemetry = JsonlTelemetry(path, rotate_daily=True)
+    telemetry.append({"tick": 1})
+    files = list(tmp_path.glob("turns-*.jsonl"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["tick"] == 1
 
 
 def _telemetry_line(tick: int, received_at: str | None) -> str:
@@ -202,12 +217,11 @@ def test_run_bot_persists_memory_and_turn_telemetry(tmp_path, monkeypatch) -> No
     )
     assert count == 2
     assert (tmp_path / "memory.json").exists()
-    records = [
-        json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()
-    ]
+    telemetry_path = _written_telemetry(tmp_path)
+    records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
     assert [record["tick"] for record in records] == [100, 101]
     assert all(record["submission"]["status"] == "observed" for record in records)
-    assert "test-key" not in (tmp_path / "turns.jsonl").read_text()
+    assert "test-key" not in _written_telemetry(tmp_path).read_text()
 
 
 def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> None:
@@ -241,9 +255,8 @@ def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> Non
     )
 
     assert count == 2
-    records = [
-        json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()
-    ]
+    telemetry_path = _written_telemetry(tmp_path)
+    records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
     assert [record["tick"] for record in records] == [101]
     assert WorldMemory.load(tmp_path / "memory.json").last_tick == 101
 
@@ -288,9 +301,8 @@ def test_run_bot_reconnects_after_stale_command_rejection(
 
     assert count == 2
     assert len(clients) == 2
-    records = [
-        json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()
-    ]
+    telemetry_path = _written_telemetry(tmp_path)
+    records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
     assert [record["tick"] for record in records] == [100, 101]
     assert [record["submission"]["status"] for record in records] == [
         "rejected",

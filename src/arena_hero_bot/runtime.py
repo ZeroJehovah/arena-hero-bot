@@ -49,7 +49,7 @@ def run_bot(
     """Observe Turns, submit aggressive plans, and return the Turn count."""
 
     memory_path = config.data_dir / "memory.json"
-    telemetry = JsonlTelemetry(config.data_dir / "turns.jsonl")
+    telemetry = JsonlTelemetry(config.data_dir / "turns.jsonl", rotate_daily=True)
     memory = WorldMemory.load(memory_path)
     strategy = AggressiveStrategy(memory, strategy_config)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -17,14 +17,20 @@ _TIMESTAMP_LEN = 19  # second-resolution UTC received_at prefix length
 class JsonlTelemetry:
     """Write one complete, secret-free record per observed Turn."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, rotate_daily: bool = False) -> None:
         self.path = path
+        self.rotate_daily = rotate_daily
 
     def append(self, record: dict[str, Any]) -> None:
         """Append and flush one JSON object."""
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as stream:
+        target_path = (
+            self._daily_path(datetime.now(BEIJING_TZ).date())
+            if self.rotate_daily
+            else self.path
+        )
+        with target_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")))
             stream.write("\n")
             stream.flush()
@@ -54,6 +60,8 @@ class JsonlTelemetry:
         When every retained line already falls inside the window the file is left
         untouched.  Returns True iff the file was rewritten."""
 
+        if self.rotate_daily:
+            return self._prune_daily_files(days=days, tz=tz)
         if not self.path.exists():
             return False
         boundary_prefix = self._boundary_prefix(days=days, tz=tz)
@@ -83,6 +91,28 @@ class JsonlTelemetry:
             if temporary is not None:
                 os.unlink(temporary)
         return True
+
+    def _daily_path(self, day: date) -> Path:
+        filename = f"{self.path.stem}-{day.isoformat()}{self.path.suffix}"
+        return self.path.with_name(filename)
+
+    def _prune_daily_files(self, *, days: int, tz: timezone) -> bool:
+        boundary = self.retained_since(days=days, tz=tz).astimezone(tz).date()
+        changed = False
+        prefix = f"{self.path.stem}-"
+        pattern = f"{self.path.stem}-????????{self.path.suffix}"
+        for candidate in self.path.parent.glob(pattern):
+            name = candidate.name
+            if not name.startswith(prefix):
+                continue
+            try:
+                day = date.fromisoformat(name[len(prefix) : -len(self.path.suffix)])
+            except ValueError:
+                continue
+            if day < boundary:
+                candidate.unlink()
+                changed = True
+        return changed
 
     def _boundary_prefix(
         self, *, days: int = RETAIN_TELEMETRY_DAYS, tz: timezone = BEIJING_TZ
