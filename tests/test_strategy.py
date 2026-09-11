@@ -292,7 +292,7 @@ def test_unprotected_core_stays_put_on_nearby_pre_evade_enemy() -> None:
     assert turn.plan.core_action.type != "START_MOVE"
 
 
-def test_core_escape_lane_is_reserved_before_combat_moves() -> None:
+def test_core_holds_position_during_assault_without_escape_lane() -> None:
     turn = make_turn(
         resources=20,
         objects=[
@@ -639,7 +639,7 @@ def test_full_storage_waits_without_circulating_cargo() -> None:
         assert add(worker.position, action.direction) == (0, 0)
 
 
-def test_empty_worker_vacates_core_before_returning_worker_moves() -> None:
+def test_returning_worker_enters_core_with_an_empty_worker_present() -> None:
     turn = make_turn(
         objects=[
             core(),
@@ -1757,7 +1757,7 @@ def test_live_workers_keep_persisted_remote_resource_goals() -> None:
     assert worker_decision.reason == "continue toward recently seen resource"
 
 
-def test_worker_vacates_core_and_core_spawns_second_worker() -> None:
+def test_worker_leaves_to_harvest_while_core_spawns_second_worker() -> None:
     turn = make_turn(
         resources=5,
         objects=[core(), unit(2, "WORKER", position=(0, 0))],
@@ -3282,44 +3282,50 @@ def test_defensive_ring_ignores_obstacle_cells_and_keeps_unique_slots() -> None:
     assert all(manhattan((0, 0), target) == 4 for target in targets)
 
 
-def test_defensive_ring_keeps_the_last_exit_of_a_core_pocket_free() -> None:
-    """A stationary guard must never close the only open exits of a pocket.
-
-    Live Ticks 206201-206899: the Core sat at (-411,660) and its NE corner
-    cell (-410,659) was a resource pocket whose only two free neighbours were
-    ring-3 cells, the other two being obstacles.  The defensive ring parked a
-    Vanguard on each of them permanently, so the Worker that harvested the
-    pocket carried cargo it could never deliver for the whole window.  The
-    ring has to leave those lanes to Worker traffic instead.
-    """
-
+def test_defensive_ring_keeps_post_at_a_workers_only_exit() -> None:
+    """A loaded Worker passes through a guard who keeps its assigned post."""
     config = StrategyConfig(target_workers=0, max_population=None)
-    obstacles = [(1, 0), (0, -1)]
-    guards = [unit(10 + index, "VANGUARD", position=(0, 40)) for index in range(41)]
-    turn = make_turn(
-        objects=[core(position=(0, 0)), *guards],
-        resources=0,
-        obstacles=obstacles,
-    )
+    posts = {(0, -4), (4, 0), (0, 4), (-4, 0)}
+    guards = [
+        unit(10 + index, "VANGUARD", position=post)
+        for index, post in enumerate(sorted(posts))
+    ]
+    obstacles = [(2, 0), (3, -1), (3, 1)]
     strategy = AggressiveStrategy(WorldMemory(), config)
-    strategy.decide(turn)
-
-    corridors = strategy._worker_corridor_cells((0, 0), set(obstacles))
-    assert (2, -1) in corridors
-    assert (1, -2) in corridors
+    strategy.decide(make_turn(objects=[core(), *guards], obstacles=obstacles))
 
     layout = strategy._defensive_layout
     assert layout is not None
-    assert (2, -1) not in set(layout.assignments.values())
-    assert (1, -2) not in set(layout.assignments.values())
+    assert set(layout.assignments.values()) == posts
+    seated_guards = [
+        unit(guard_id.int, "VANGUARD", position=post)
+        for guard_id, post in layout.assignments.items()
+    ]
+    turn = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(3, 0), cargo=1),
+            *seated_guards,
+        ],
+        obstacles=obstacles,
+    )
+    report = strategy.decide(turn)
+
+    assert strategy._defensive_layout == layout
+    assert all(
+        item.action == "WAIT"
+        for item in report.decisions
+        if item.actor_kind == "VANGUARD"
+    )
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    assert add(worker.position, action.direction) == (4, 0)
 
 
-def test_loaded_worker_drives_out_of_an_open_core_pocket() -> None:
-    """A Worker harvesting the Core-side pocket can still drive home.
-
-    The pocket at (1,-1) is a dead-end with only two exits; both must stay
-    open for cargo traffic rather than being parked on by the guard ring.
-    """
+def test_loaded_worker_routes_home_from_a_core_pocket() -> None:
+    """A Worker routes around the rocks surrounding a Core-side pocket."""
 
     turn = make_turn(
         resources=0,
@@ -4786,8 +4792,7 @@ def test_surplus_guards_fill_inward_rings_instead_of_one_packed_circle() -> None
     radii = {manhattan((0, 0), slot) for slot in slots.values()}
     assert radii == {12, 9, 6, 3}
     assert max(radii) <= config.defensive_perimeter_max_radius
-    # The Core cell is the only DEPOSIT/SPAWN cell and its neighbours are the
-    # queue into it, so no guard may stand there.
+    # The inner ring keeps some distance from the Core for defensive coverage.
     assert all(manhattan((0, 0), slot) > 1 for slot in slots.values())
 
 
@@ -6136,8 +6141,7 @@ def test_expedition_members_regroup_when_detached() -> None:
         )
 
     # The front of the block sees the gap to the lone leader and closes on a
-    # standable cell beside it (the leader's own cell is occupied by the
-    # leader, so aiming at it directly would make the member orbit a wall).
+    # standable cell ahead of it to extend the squad's sight coverage.
     front = by_id[UUID(int=6)]
     goal = strategy._expedition_rendezvous_goal(front, turn)
     assert goal == (31, 0)
@@ -6218,7 +6222,7 @@ def test_expedition_same_bearing_projection_uses_stable_neighbor_order() -> None
     assert strategy._expedition_rendezvous_goal(middle, turn) == (11, 5)
 
 
-def test_expedition_close_cell_avoids_leader_occupied_cell() -> None:
+def test_expedition_close_cell_spreads_members_beside_the_leader() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
@@ -6233,11 +6237,8 @@ def test_expedition_close_cell_avoids_leader_occupied_cell() -> None:
     )
     laggard = next(u for u in turn.vanguards if u.id == UUID(int=3))
 
-    # The leader's own cell is occupied, so the close-up goal must be a
-    # reachable *empty* cell beside the leader instead.  Aiming at the leader
-    # cell itself would make ``_move`` treat it as blocked and the laggard
-    # orbit the nearest wall forever (observed live: a squad member pacing a
-    # 4-cell loop in an obstacle pocket, unable to rejoin).
+    # Distinct goals spread the squad's sight coverage; they do not make
+    # teammate positions impassable on the way to the chosen destination.
     goal = strategy._expedition_close_cell(laggard, (10, 0), turn)
     assert goal != (10, 0)
     assert goal in adjacent_positions((10, 0))
@@ -6934,8 +6935,6 @@ def test_symmetric_posts_allow_workers_through_occupied_pocket_exits() -> None:
 
     layout = strategy._defensive_layout
     assert layout is not None
-    corridors = strategy._worker_corridor_cells((0, 0), set(obstacles))
-    assert {(-6, 0), (-8, 0)} <= corridors
     assert set(layout.assignments.values()) == set(vanguard_offsets + ranger_offsets)
     assert {(-6, 0), (-8, 0)} <= set(layout.assignments.values())
     worker_decision = next(

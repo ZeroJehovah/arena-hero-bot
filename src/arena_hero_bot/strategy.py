@@ -80,9 +80,6 @@ DEFENSIVE_PERIMETER_MIN_RADIUS = 2
 # behind them, so anything that slipped through the circle met an empty
 # interior.
 DEFENSIVE_RING_SPACING = 3
-# The Core cell is the only DEPOSIT/SPAWN cell, so its four neighbours stay
-# clear of standing guards or loaded Workers queue outside the drop-off.
-DEFENSIVE_CORE_CLEARANCE = 1
 VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
 RANGER_STANDOFF_RANGE = 3
@@ -235,7 +232,6 @@ class _TurnContext:
     vanguard_attack_ids: frozenset[UUID] = field(default_factory=frozenset)
     assault_enemies: tuple[CoreView | UnitView, ...] = ()
     screen_assignments: dict[UUID, Position] = field(default_factory=dict)
-    core_escape_direction: Direction | None = None
     combat_assault: bool = False
     threat: ThreatAssessment = field(default_factory=ThreatAssessment)
     damage_ledger: CombatTargetLedger = field(default_factory=CombatTargetLedger)
@@ -2005,9 +2001,9 @@ class AggressiveStrategy:
     def _static_blockers(self, unit: Unit, context: _TurnContext) -> set[Position]:
         """Return the blockers for ``unit`` that outlive this Tick.
 
-        Our own bodies and queued destinations are deliberately left out: they
-        move every Tick, so they say nothing about whether a cell can ever be
-        reached.  Everything here still blocks the route on the next Tick.
+        Friendly occupancy and queued destinations are left out because units
+        may overlap and swap.  Terrain, contested cells, and Worker danger
+        zones still constrain the route.
         """
 
         blocked = set(self.memory.obstacles)
@@ -3868,14 +3864,10 @@ class AggressiveStrategy:
     ) -> Position:
         """Return a standable cell beside ``leader`` for a member to close on.
 
-        Aiming at the leader's own cell is a trap: that cell is occupied by the
-        leader, so ``_move`` treats it as blocked and ``next_step`` falls back
-        to the neighbour "closest to the goal", which orbits the nearest wall
-        forever when the member stands in an obstacle pocket.  Aim instead at
-        the leader's most *forward* reachable free neighbour, so a lagging
-        member converges on the front-side cells of the chain instead of piling
-        up behind the leader and drifting back toward the Core when walls get
-        in the way.
+        Prefer the leader's most forward reachable neighbour to keep the
+        squad spread along its bearing while closing gaps in sight coverage.
+        Teammate positions influence the destination, but never block the
+        route to it; members may overlap and pass through one another.
         """
 
         static = (
@@ -4209,12 +4201,10 @@ class AggressiveStrategy:
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
         """Hold a surplus unit at a unique cell outside the defensive ring.
 
-        Hashing every Unit directly onto the ring can give two staged Units the
-        same cell.  Once one arrives, the other treats that permanently occupied
-        goal as unreachable and ``next_step``'s local fallback can make it orbit
-        a distant obstacle forever.  Preserve Units that have already reached
-        any valid staging cell, then resolve the remaining hash collisions in a
-        stable order so every staged Unit has somewhere it can actually stand.
+        Resolve hash collisions in stable order to spread sight coverage.
+        Preserve Units that have already reached a valid staging cell so new
+        arrivals do not rearrange the ring.  These distinct destinations do
+        not prevent friendly units from sharing cells along their routes.
         """
         core = turn.core
         if core is None:
@@ -4494,43 +4484,6 @@ class AggressiveStrategy:
             "hold a defensive perimeter around the resource Core",
         )
 
-    def _worker_corridor_cells(
-        self,
-        core_position: Position,
-        obstacles: set[Position],
-    ) -> set[Position]:
-        """Return pocket exits that a stationary guard must never occupy.
-
-        A resource cell can sit in a dead-end pocket whose only open exits are
-        ring cells.  A single guard parked on a 1-exit pocket, or two guards
-        closing a 2-exit pocket, permanently seal in whatever Worker harvests
-        it.  Guard rings never need to sit on the last lane a Worker drives
-        home through, so every open exit of every tight pocket inside the
-        defensive band is taken off the seating table.
-        """
-
-        max_radius = self.config.defensive_perimeter_max_radius
-        corridors: set[Position] = set()
-        for x in range(
-            core_position[0] - max_radius, core_position[0] + max_radius + 1
-        ):
-            for y in range(
-                core_position[1] - max_radius, core_position[1] + max_radius + 1
-            ):
-                pocket = (x, y)
-                if pocket == core_position or pocket in obstacles:
-                    continue
-                if manhattan(core_position, pocket) > max_radius:
-                    continue
-                exits = [
-                    neighbour
-                    for neighbour in adjacent_positions(pocket)
-                    if neighbour != core_position and neighbour not in obstacles
-                ]
-                if 1 <= len(exits) <= 2:
-                    corridors.update(exits)
-        return corridors
-
     @staticmethod
     def _symmetric_defense_offsets() -> tuple[
         tuple[Position, ...], tuple[Position, ...]
@@ -4737,16 +4690,6 @@ class AggressiveStrategy:
 
         obstacles = set(self.memory.obstacles)
         obstacles.update(context.turn.obstacle_cells)
-        # A resource pocket hugging the Core can be walled in by obstacles
-        # until only one or two free neighbours remain, and those can coincide
-        # with the innermost guard ring.  Guards are stationary, so every exit
-        # they sit on is sealed forever: the Worker that harvests the pocket
-        # carries cargo it can never deliver (live Tick 206201-206899: a
-        # Worker sat on the Core's NE corner cell for the whole window because
-        # two ring-3 Vanguards held its only exits).  Worker traffic is
-        # transient while a guard seat is not, so the ring yields inside the
-        # defensive band: never take the last open exit of a tight pocket.
-        corridors = self._worker_corridor_cells(core_position, obstacles)
         cached = self._defensive_layout
         if (
             cached is not None
@@ -4754,25 +4697,13 @@ class AggressiveStrategy:
             and cached.core_position == core_position
             and cached.guard_ids == ordered_guard_ids
             and not any(slot in obstacles for slot in cached.assignments.values())
-            and not any(slot in corridors for slot in cached.assignments.values())
         ):
             return dict(cached.assignments)
 
-        # Transient unit occupancy is deliberately not a layout constraint.
-        # Workers naturally pass through the perimeter and guards can wait
-        # for a slot to clear; treating those cells as unavailable would make
-        # the radius and cardinal anchors depend on traffic at one Tick.
+        # Workers can pass through stationary guards, including at pocket
+        # exits.  Choose posts for coverage without reserving traffic lanes.
         unavailable = set(context.enemy_positions)
         unavailable.add(core.position)
-        # The Core cell is the only DEPOSIT and SPAWN cell, so a guard parked
-        # on one of its four neighbours narrows the queue for loaded Workers.
-        # Inner rings start outside that clearance.  Pocket exits get the same
-        # protection below: a guard on the last one strands a loaded Worker.
-        unavailable.update(
-            (core_position[0] + dx, core_position[1] + dy)
-            for dx, dy in _defensive_ring_offsets(DEFENSIVE_CORE_CLEARANCE)
-        )
-        unavailable.update(corridors)
         visions = {unit.id: _combat_vision_radius(unit) for unit in guards}
         # The count-and-vision radius grows linearly with the army, so a
         # 29-guard fleet parked its whole perimeter 30 cells out and left the
@@ -4825,7 +4756,7 @@ class AggressiveStrategy:
                 radius
                 for radius in range(
                     outer,
-                    DEFENSIVE_CORE_CLEARANCE,
+                    DEFENSIVE_PERIMETER_MIN_RADIUS - 1,
                     -DEFENSIVE_RING_SPACING,
                 )
                 if free_cells(radius)
@@ -4867,9 +4798,8 @@ class AggressiveStrategy:
             )
             return plan, remaining
 
-        # A Worker or a recently observed hostile can temporarily occupy a
-        # ring cell.  Expand only while the layered rings cannot seat the
-        # whole roster, keeping the count/vision radius as the primary choice.
+        # Expand only while terrain and hostile positions leave too few
+        # distinct posts, keeping the count/vision radius as the primary choice.
         max_radius = base_radius
         search_limit = base_radius + max(8, len(guards) * 2)
         while max_radius < search_limit and ring_plan(max_radius)[1]:
@@ -5066,8 +4996,8 @@ class AggressiveStrategy:
 
         center_offset = offsets[offset_index]
         # Keep the three members close while giving each a distinct cell.  The
-        # team still shares one route and phase; the small local offsets only
-        # prevent all three Units from queueing onto one occupied waypoint.
+        # team still shares one route and phase; the small local offsets
+        # spread its sight coverage around the shared waypoint.
         patrol_position = (
             core.position[0] + center_offset[0] + local_dx,
             core.position[1] + center_offset[1] + local_dy,
@@ -5545,34 +5475,6 @@ class AggressiveStrategy:
             direction_offset=self._direction_offset(core.id),
         )
 
-    def _core_escape_direction(
-        self,
-        context: _TurnContext,
-        enemies: tuple[CoreView | UnitView, ...],
-    ) -> Direction | None:
-        core = context.turn.core
-        if core is None:
-            return None
-        blocked = (
-            set(self.memory.obstacles)
-            | set(context.turn.obstacle_cells)
-            | set(context.turn.resource_cells)
-            | context.reserved
-        )
-        # A friendly unit may vacate the lane in this same plan.  The lane is
-        # cleared before the normal unit passes, so treating all transient
-        # occupancy as hard terrain would recreate the old boxed-Core failure.
-        for enemy in context.turn.visible_enemies:
-            blocked.add(enemy.position)
-        return self._combat_policy.escape_direction(
-            core.position,
-            enemies,
-            self.memory.obstacles | set(context.turn.obstacle_cells),
-            blocked,
-            beacon_position=context.turn.beacon.position,
-            previous_direction=None,
-        )
-
     def _visible_combat_enemies(
         self,
         turn: Turn,
@@ -5588,42 +5490,6 @@ class AggressiveStrategy:
                 and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             )
         )
-
-    def _clear_core_escape_lane(self, context: _TurnContext) -> None:
-        """Evacuate friendly occupants from the reserved Core escape cell."""
-
-        core = context.turn.core
-        direction = context.core_escape_direction
-        if core is None or direction is None:
-            return
-        escape_cell = add(core.position, direction)
-        occupants = sorted(
-            (unit for unit in context.turn.units if unit.position == escape_cell),
-            key=lambda unit: unit.id.bytes,
-        )
-        if not occupants:
-            return
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
-        enemy_positions = {enemy.position for enemy in context.turn.visible_enemies}
-        for unit in occupants:
-            for move_direction in DIRECTIONS:
-                destination = add(unit.position, move_direction)
-                if (
-                    destination == core.position
-                    or destination in obstacles
-                    or destination in enemy_positions
-                    or destination in context.reserved
-                    or destination in context.occupied
-                ):
-                    continue
-                if self._queue_move(
-                    unit,
-                    move_direction,
-                    context,
-                    reason="clear the reserved Core escape lane",
-                    target=destination,
-                ):
-                    break
 
     def _record_combat_kills(self, turn: Turn) -> None:
         """Log where enemy fighters died, before memory forgets what they were.
@@ -6205,7 +6071,7 @@ class AggressiveStrategy:
         route to it is sealed by the remembered obstacle map.  Reusing that
         goal then turns a Worker into a stationary WAIT stream until its goal
         TTL expires.  Check static reachability before holding or creating a
-        goal; dynamic unit traffic is intentionally left to ``_move``.
+        goal; ``_move`` also checks current enemy positions.
         """
 
         core = turn.core
