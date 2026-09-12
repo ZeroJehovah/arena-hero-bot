@@ -1,12 +1,17 @@
 """Friendly occupancy is not terrain, including on the Core service cell."""
 
 import pytest
-from arena_hero import Direction
+from arena_hero import Direction, MoveAction, core_resource_capacity
 
 from arena_hero_bot.geometry import add
 from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.models import DecisionReport
-from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig, _TurnContext
+from arena_hero_bot.strategy import (
+    AggressiveStrategy,
+    StrategyConfig,
+    _MoveIntent,
+    _TurnContext,
+)
 
 from .factories import core, make_turn, unit
 
@@ -22,30 +27,55 @@ def context_for(turn):
     )
 
 
-@pytest.mark.parametrize("target_workers", [2, 16])
 @pytest.mark.parametrize("kind", ["WORKER", "RANGER", "VANGUARD"])
-def test_all_units_can_share_destination_with_stationary_friends(kind, target_workers):
+def test_core_capacity_allows_one_inbound_and_rejects_the_next(kind):
     turn = make_turn(
         objects=[
             core(),
             unit(2, kind, position=(-1, 0)),
             unit(3, kind, position=(1, 0)),
-            unit(4, kind, position=(0, -1)),
-            unit(5, "RANGER"),
-            unit(6, "VANGUARD"),
         ]
     )
-    strategy = AggressiveStrategy(
-        WorldMemory(), StrategyConfig(target_workers=target_workers)
-    )
+    strategy = AggressiveStrategy(WorldMemory())
     context = context_for(turn)
-    context.reserved.add((0, 0))
-    for actor in turn.units[:3]:
-        assert strategy._move(actor, (0, 0), context, reason="return to shared Core")
-        action = turn.plan.unit_actions[actor.id]
-        assert action.type == "MOVE"
-        assert add(actor.position, action.direction) == (0, 0)
-    assert all(actor.id not in turn.plan.unit_actions for actor in turn.units[3:])
+    first, second = turn.units
+    assert strategy._move(
+        first,
+        (0, 0),
+        context,
+        reason="return to shared Core",
+        intent=_MoveIntent.INBOUND,
+    )
+    assert not strategy._move(
+        second,
+        (0, 0),
+        context,
+        reason="return to shared Core",
+        intent=_MoveIntent.INBOUND,
+    )
+
+
+def test_queue_slots_are_unique_and_stationary_units_hold_them():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(5, 0), cargo=1),
+            unit(3, "WORKER", position=(6, 0), cargo=1),
+        ]
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    context = context_for(turn)
+    first, second = turn.workers
+    assert strategy._move_to_core_queue(first, context, reason="queue full cargo")
+    assert strategy._move_to_core_queue(second, context, reason="queue full cargo")
+    first_action = turn.plan.unit_actions[first.id]
+    second_action = turn.plan.unit_actions[second.id]
+    assert isinstance(first_action, MoveAction)
+    assert isinstance(second_action, MoveAction)
+    first_destination = add(first.position, first_action.direction)
+    second_destination = add(second.position, second_action.direction)
+    assert first_destination != second_destination
+    assert len(context.standing_reserved) == 2
 
 
 @pytest.mark.parametrize(
@@ -91,24 +121,22 @@ def test_worker_harvest_trip_swaps_with_cargo_return_in_complete_plan():
     assert inbound.direction is Direction.LEFT
 
 
-def test_multiple_deposits_and_heals_share_core_without_eviction():
+def test_core_service_accepts_one_deposit_and_queues_the_next_unit():
     turn = make_turn(
         resources=2,
         objects=[
             core(),
             unit(2, "WORKER", cargo=1),
-            unit(3, "WORKER", cargo=1),
-            unit(4, "RANGER", hp=1),
-            unit(5, "VANGUARD", hp=3),
+            unit(3, "WORKER", position=(1, 0), cargo=1),
         ],
     )
     report = AggressiveStrategy(WorldMemory()).decide(turn)
-    assert all(turn.plan.unit_actions[w.id].type == "DEPOSIT" for w in turn.workers)
-    assert all(
-        turn.plan.unit_actions[u.id].type == "HEAL"
-        for u in (*turn.rangers, *turn.vanguards)
-    )
-    assert len([d for d in report.decisions if d.actor_kind != "CORE"]) == 4
+    assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
+    assert turn.plan.unit_actions.get(turn.workers[1].id) is None
+    assert [d.action for d in report.decisions if d.actor_kind == "WORKER"] == [
+        "DEPOSIT",
+        "WAIT",
+    ]
 
 
 def test_shared_core_deposits_respect_remaining_capacity():
@@ -118,22 +146,56 @@ def test_shared_core_deposits_respect_remaining_capacity():
     )
     report = AggressiveStrategy(WorldMemory()).decide(turn)
     workers = [d for d in report.decisions if d.actor_kind == "WORKER"]
-    assert sorted(d.action for d in workers) == ["DEPOSIT", "WAIT"]
-    assert (
-        next(d for d in workers if d.action == "WAIT").reason == "Core storage is full"
-    )
+    assert sorted(d.action for d in workers) == ["DEPOSIT", "MOVE"]
+    assert any("Core service cell" in d.reason for d in workers if d.action == "MOVE")
 
 
-def test_returned_expedition_rangers_heal_together_at_core():
+def test_returned_expedition_rangers_use_one_core_heal_service():
     turn = make_turn(
-        resources=2, objects=[core(), unit(2, "RANGER", hp=1), unit(3, "RANGER", hp=1)]
+        resources=2,
+        objects=[
+            core(),
+            unit(2, "RANGER", hp=1),
+            unit(3, "RANGER", position=(1, 0), hp=1),
+        ],
     )
     strategy = AggressiveStrategy(WorldMemory(), StrategyConfig(expedition_mode=True))
     context = context_for(turn)
-    for ranger in turn.rangers:
-        assert strategy._decide_expedition_ranger(ranger, context)
-        assert turn.plan.unit_actions[ranger.id].type == "HEAL"
-    assert context.remaining_resources == 0
+    assert strategy._heal_if_critical(turn.rangers[0], maximum_hp=2, context=context)
+    assert strategy._recover_if_critical(turn.rangers[1], maximum_hp=2, context=context)
+    actions = [turn.plan.unit_actions.get(ranger.id) for ranger in turn.rangers]
+    assert sum(action is not None and action.type == "HEAL" for action in actions) == 1
+    assert sum(action is not None and action.type == "MOVE" for action in actions) == 0
+    assert context.remaining_resources == 1
+
+
+def test_full_core_ring_clears_an_approach_before_core_departure():
+    neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    objects = [core(), unit(2, "WORKER", cargo=1)]
+    number = 3
+    for position in neighbors:
+        for _ in range(2):
+            objects.append(unit(number, "WORKER", position=position, cargo=1))
+            number += 1
+    population = len(objects) - 1
+    turn = make_turn(
+        resources=core_resource_capacity(population),
+        objects=objects,
+    )
+
+    report = AggressiveStrategy(
+        WorldMemory(), StrategyConfig(target_workers=16, max_population=None)
+    ).decide(turn)
+
+    core_worker = turn.workers[0]
+    core_action = turn.plan.unit_actions[core_worker.id]
+    assert core_action.type == "MOVE"
+    core_destination = add(core_worker.position, core_action.direction)
+    assert core_destination in neighbors
+    assert any(
+        item.action == "MOVE" and item.reason == "clear a full Core approach cell"
+        for item in report.decisions
+    )
 
 
 @pytest.mark.parametrize("remembered", [False, True])

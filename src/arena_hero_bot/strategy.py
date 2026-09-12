@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from enum import StrEnum
 from math import atan2
 from uuid import UUID
 
@@ -170,6 +171,16 @@ SYMMETRIC_PATROL_TEAM_COUNT = 4
 SYMMETRIC_DEFENSE_VANGUARDS = 8
 SYMMETRIC_DEFENSE_RANGERS = 16
 SYMMETRIC_CORE_RADIUS = 6
+CORE_QUEUE_RADIUS = 4
+
+
+class _MoveIntent(StrEnum):
+    """Movement class used by the transient friendly-traffic ledger."""
+
+    TRANSIT = "transit"
+    INBOUND = "inbound"
+    OUTBOUND = "outbound"
+    STAND = "stand"
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +235,13 @@ class _TurnContext:
     occupied: set[Position]
     enemy_positions: set[Position]
     reserved: set[Position] = field(default_factory=set)
+    friendly_occupancy: dict[Position, int] = field(default_factory=dict)
+    arrival_counts: dict[Position, int] = field(default_factory=dict)
+    departure_counts: dict[Position, int] = field(default_factory=dict)
+    standing_reserved: set[Position] = field(default_factory=set)
+    planned_ids: set[UUID] = field(default_factory=set)
+    core_inbound_id: UUID | None = None
+    core_service_action: str | None = None
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
     defensive_assignments: dict[UUID, Position] | None = None
     remaining_resources: int = 0
@@ -243,6 +261,20 @@ class _TurnContext:
     emergency: bool = False
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        """Seed the friendly occupancy ledger for hand-built test contexts."""
+
+        if self.friendly_occupancy:
+            return
+        for unit in self.turn.units:
+            self.friendly_occupancy[unit.position] = (
+                self.friendly_occupancy.get(unit.position, 0) + 1
+            )
+        if self.turn.core is not None:
+            self.friendly_occupancy[self.turn.core.position] = (
+                self.friendly_occupancy.get(self.turn.core.position, 0) + 1
+            )
 
 
 @dataclass(slots=True)
@@ -383,6 +415,15 @@ class AggressiveStrategy:
         occupied.update(enemy.position for enemy in turn.visible_enemies)
         if turn.core is not None:
             occupied.add(turn.core.position)
+        friendly_occupancy: dict[Position, int] = {}
+        for unit in turn.units:
+            friendly_occupancy[unit.position] = (
+                friendly_occupancy.get(unit.position, 0) + 1
+            )
+        if turn.core is not None:
+            friendly_occupancy[turn.core.position] = (
+                friendly_occupancy.get(turn.core.position, 0) + 1
+            )
         focus_target = self._focus_target(turn)
         raid_ids = self._update_raid(turn, threat)
         garrison_ids = self._garrison_ids(turn, raid_ids)
@@ -404,6 +445,7 @@ class AggressiveStrategy:
             report=report,
             occupied=occupied,
             enemy_positions={enemy.position for enemy in turn.visible_enemies},
+            friendly_occupancy=friendly_occupancy,
             resource_assignments=self._assign_resources(turn),
             remaining_resources=turn.resources,
             remaining_resource_space=turn.resource_space,
@@ -448,6 +490,8 @@ class AggressiveStrategy:
             context.screen_assignments = self._combat_screen_assignments(context)
 
         for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
+            if ranger.id in context.planned_ids:
+                continue
             self._decide_ranger(
                 ranger,
                 context,
@@ -455,17 +499,22 @@ class AggressiveStrategy:
                 offensive=self._is_offensive_combat_unit(ranger, turn, threat),
             )
         for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
+            if vanguard.id in context.planned_ids:
+                continue
             self._decide_vanguard(
                 vanguard,
                 context,
                 tactical_enemies,
                 offensive=self._is_offensive_combat_unit(vanguard, turn, threat),
             )
+        self._prepare_core_departure(context)
         core_position = turn.core.position if turn.core is not None else None
         for worker in sorted(
             turn.workers,
             key=lambda unit: self._worker_priority(unit, core_position),
         ):
+            if worker.id in context.planned_ids:
+                continue
             self._decide_worker(worker, context)
         self._decide_core(context)
         report.planned_damage = dict(context.damage_ledger.planned_damage)
@@ -1250,11 +1299,15 @@ class AggressiveStrategy:
                 return
 
             if worker.position == core.position:
-                if context.remaining_resource_space > 0:
+                if (
+                    context.remaining_resource_space > 0
+                    and context.core_service_action is None
+                ):
                     deposited = min(worker.cargo, context.remaining_resource_space)
                     worker.deposit()
                     context.remaining_resources += deposited
                     context.remaining_resource_space -= deposited
+                    context.core_service_action = "DEPOSIT"
                     context.report.add(
                         actor_id=str(worker.id),
                         actor_kind="WORKER",
@@ -1263,7 +1316,34 @@ class AggressiveStrategy:
                         target=core.position,
                     )
                 else:
-                    self._record_wait(worker, context, "Core storage is full")
+                    if not self._move_to_core_queue(
+                        worker,
+                        context,
+                        reason=(
+                            "leave full Core service cell for a unique cargo queue slot"
+                        ),
+                    ):
+                        self._record_wait(
+                            worker,
+                            context,
+                            "Core storage is full and no outbound queue slot is free",
+                        )
+                return
+            if (
+                context.remaining_resource_space <= 0
+                or context.core_service_action is not None
+                or context.core_inbound_id is not None
+            ):
+                if not self._move_to_core_queue(
+                    worker,
+                    context,
+                    reason="queue carried resources outside the Core service cell",
+                ):
+                    self._record_wait(
+                        worker,
+                        context,
+                        "Core service cell is occupied and no queue slot is free",
+                    )
                 return
             if not self._move(
                 worker,
@@ -1271,6 +1351,11 @@ class AggressiveStrategy:
                 context,
                 reason="return carried resources to Core",
                 allow_goal=True,
+                intent=_MoveIntent.INBOUND,
+            ) and not self._move_to_core_queue(
+                worker,
+                context,
+                reason="queue carried resources after a full Core approach",
             ):
                 self._record_wait(worker, context, "no safe path to Core")
             return
@@ -1440,6 +1525,249 @@ class AggressiveStrategy:
             reason=reason,
         )
 
+    @staticmethod
+    def _predicted_friendly_occupancy(
+        position: Position,
+        context: _TurnContext,
+    ) -> int:
+        """Return occupancy after the moves already accepted this Tick."""
+
+        return (
+            context.friendly_occupancy.get(position, 0)
+            + context.arrival_counts.get(position, 0)
+            - context.departure_counts.get(position, 0)
+        )
+
+    @staticmethod
+    def _has_unit_action(unit: Unit, context: _TurnContext) -> bool:
+        """Inspect queued actions without building a Pydantic command plan."""
+
+        builder = getattr(context.turn, "_builder", None)
+        actions = getattr(builder, "unit_actions", {})
+        return unit.id in context.planned_ids or unit.id in actions
+
+    def _core_queue_positions(
+        self,
+        unit: Unit,
+        context: _TurnContext,
+    ) -> tuple[Position, ...]:
+        """Return empty, reachable cells near the Core in stable order."""
+
+        core = context.turn.core
+        if core is None:
+            return ()
+        blockers = self._static_blockers(unit, context) | context.enemy_positions
+        candidates: list[Position] = []
+        for radius in range(1, CORE_QUEUE_RADIUS + 1):
+            for dx in range(-radius, radius + 1):
+                dy = radius - abs(dx)
+                offsets = ((dx, dy),) if dy == 0 else ((dx, dy), (dx, -dy))
+                for offset_x, offset_y in offsets:
+                    position = (
+                        core.position[0] + offset_x,
+                        core.position[1] + offset_y,
+                    )
+                    if (
+                        position in blockers
+                        or position == core.position
+                        or position in context.standing_reserved
+                        or self._predicted_friendly_occupancy(position, context) != 0
+                        or not self._has_static_route(
+                            unit,
+                            position,
+                            context,
+                            allow_goal=True,
+                        )
+                    ):
+                        continue
+                    candidates.append(position)
+        return tuple(
+            sorted(
+                set(candidates),
+                key=lambda position: (
+                    manhattan(position, core.position),
+                    manhattan(unit.position, position),
+                    position,
+                ),
+            )
+        )
+
+    def _move_to_core_queue(
+        self,
+        unit: Unit,
+        context: _TurnContext,
+        *,
+        reason: str,
+    ) -> bool:
+        """Move a unit toward a unique temporary Core queue slot."""
+
+        if self._has_unit_action(unit, context):
+            return False
+        core = context.turn.core
+        if core is not None:
+            distance = manhattan(unit.position, core.position)
+            if (
+                0 < distance <= CORE_QUEUE_RADIUS
+                and self._predicted_friendly_occupancy(unit.position, context) == 1
+                and unit.position not in self.memory.obstacles
+                and unit.position not in context.enemy_positions
+            ):
+                self._record_wait(unit, context, "hold a unique Core queue slot")
+                return True
+        for goal in self._core_queue_positions(unit, context):
+            context.standing_reserved.add(goal)
+            if self._move(
+                unit,
+                goal,
+                context,
+                reason=reason,
+                allow_goal=True,
+                intent=_MoveIntent.STAND,
+            ):
+                return True
+            context.standing_reserved.discard(goal)
+        return False
+
+    def _move_core_unit_via_neighbor(
+        self,
+        unit: Unit,
+        context: _TurnContext,
+        *,
+        reason: str,
+    ) -> bool:
+        """Release one full neighbour so a Core unit can leave its cell."""
+
+        core = context.turn.core
+        if core is None:
+            return False
+        blockers = self._static_blockers(unit, context) | context.enemy_positions
+        for neighbor in adjacent_positions(core.position):
+            if neighbor in blockers:
+                continue
+            occupants = [
+                candidate
+                for candidate in context.turn.units
+                if candidate.position == neighbor and candidate.id != unit.id
+            ]
+            predicted = self._predicted_friendly_occupancy(neighbor, context)
+            if predicted >= 2 and occupants:
+                movable = [
+                    candidate
+                    for candidate in occupants
+                    if candidate.id not in context.planned_ids
+                    and not self._has_unit_action(candidate, context)
+                ]
+                for occupant in sorted(
+                    movable,
+                    key=lambda candidate: candidate.id.bytes,
+                ):
+                    for escape in adjacent_positions(neighbor):
+                        if (
+                            escape == core.position
+                            or escape in blockers
+                            or escape in context.standing_reserved
+                            or self._predicted_friendly_occupancy(escape, context) != 0
+                        ):
+                            continue
+                        escape_direction = direction_between(occupant.position, escape)
+                        if escape_direction is None:
+                            continue
+                        context.standing_reserved.add(escape)
+                        if self._queue_move(
+                            occupant,
+                            escape_direction,
+                            context,
+                            reason="clear a full Core approach cell",
+                            target=escape,
+                            intent=_MoveIntent.STAND,
+                        ):
+                            predicted = self._predicted_friendly_occupancy(
+                                neighbor, context
+                            )
+                            break
+                        context.standing_reserved.discard(escape)
+                    if predicted < 2:
+                        break
+            if predicted >= 2:
+                continue
+            direction = direction_between(unit.position, neighbor)
+            if direction is None:
+                continue
+            if self._queue_move(
+                unit,
+                direction,
+                context,
+                reason=reason,
+                target=neighbor,
+                intent=_MoveIntent.OUTBOUND,
+            ):
+                return True
+        return False
+
+    def _prepare_core_departure(self, context: _TurnContext) -> None:
+        """Free the Core service cell before accepting new inbound traffic."""
+
+        core = context.turn.core
+        if core is None or core.view.state is CoreState.MOVING:
+            return
+        core_units = [
+            unit for unit in context.turn.units if unit.position == core.position
+        ]
+        if not core_units:
+            return
+        service_candidate: Unit | None = None
+        if context.remaining_resource_space > 0:
+            service_candidate = next(
+                (
+                    unit
+                    for unit in core_units
+                    if isinstance(unit, Worker) and unit.cargo > 0
+                ),
+                None,
+            )
+        if service_candidate is None:
+            service_candidate = next(
+                (
+                    unit
+                    for unit in core_units
+                    if unit.hp <= 1
+                    and self._heal_available(
+                        unit,
+                        maximum_hp=2 if isinstance(unit, (Worker, Ranger)) else 4,
+                        context=context,
+                    )
+                ),
+                None,
+            )
+        for unit in sorted(core_units, key=lambda candidate: candidate.id.bytes):
+            if unit is service_candidate:
+                continue
+            critical_without_service = (
+                unit.hp <= (1 if isinstance(unit, (Worker, Ranger)) else 2)
+                and context.remaining_resources <= 0
+            )
+            full_loaded_worker = isinstance(unit, Worker) and (
+                unit.cargo > 0 and context.remaining_resource_space <= 0
+            )
+            extra_service_unit = service_candidate is not None
+            if not (
+                critical_without_service or full_loaded_worker or extra_service_unit
+            ):
+                continue
+            if self._has_unit_action(unit, context):
+                continue
+            if self._move_to_core_queue(
+                unit,
+                context,
+                reason="leave Core service cell for unique traffic",
+            ):
+                continue
+            self._move_core_unit_via_neighbor(
+                unit,
+                context,
+                reason="leave Core service cell through a full approach",
+            )
+
     def _emergency_worker_goal(
         self,
         worker: Worker,
@@ -1541,6 +1869,7 @@ class AggressiveStrategy:
             )
             if unit_type is not None:
                 core.spawn(unit_type)
+                context.core_service_action = "SPAWN"
                 if self._growth_slowdown_active(context.turn) and not context.emergency:
                     self.memory.last_normal_growth_tick = context.turn.tick
                     self.memory.last_normal_growth_resources = (
@@ -1682,8 +2011,11 @@ class AggressiveStrategy:
             context=context,
         ):
             return False
+        if context.core_service_action is not None:
+            return False
         unit.heal()
         context.remaining_resources -= missing_hp
+        context.core_service_action = "HEAL"
         context.report.add(
             actor_id=str(unit.id),
             actor_kind=unit.unit_type.value,
@@ -1725,16 +2057,30 @@ class AggressiveStrategy:
             return False
         reason = "return critical unit to Core for healing"
         if unit.position == core.position:
-            self._record_wait(unit, context, "wait at Core for healing resources")
+            if not self._move_to_core_queue(
+                unit,
+                context,
+                reason="leave Core service cell while another unit is healing",
+            ):
+                self._record_wait(unit, context, "wait at Core for healing resources")
             return True
         moved = (
             self._move_ranger_toward_core(unit, context, reason=reason)
             if isinstance(unit, Ranger)
             else self._move(
-                unit, core.position, context, reason=reason, allow_goal=True
+                unit,
+                core.position,
+                context,
+                reason=reason,
+                allow_goal=True,
+                intent=_MoveIntent.INBOUND,
             )
         )
-        if not moved:
+        if not moved and not self._move_to_core_queue(
+            unit,
+            context,
+            reason="queue critical unit outside the Core service cell",
+        ):
             self._record_wait(unit, context, f"no safe path for: {reason}")
         return True
 
@@ -1766,6 +2112,7 @@ class AggressiveStrategy:
                 context,
                 reason=reason,
                 allow_goal=True,
+                intent=_MoveIntent.INBOUND,
             )
 
         blocked = self._static_blockers(ranger, context)
@@ -1784,6 +2131,7 @@ class AggressiveStrategy:
                 context,
                 reason=reason,
                 allow_goal=True,
+                intent=_MoveIntent.INBOUND,
             )
 
         def attack_distance(enemy: UnitView, position: Position) -> int:
@@ -1816,6 +2164,7 @@ class AggressiveStrategy:
                 context,
                 reason=reason,
                 allow_goal=True,
+                intent=_MoveIntent.INBOUND,
             )
         goal = min(
             preferred,
@@ -1833,6 +2182,7 @@ class AggressiveStrategy:
                 context,
                 reason=reason,
                 allow_goal=True,
+                intent=_MoveIntent.INBOUND,
             )
         return self._queue_move(
             ranger,
@@ -1840,6 +2190,11 @@ class AggressiveStrategy:
             context,
             reason=reason,
             target=core.position,
+            intent=(
+                _MoveIntent.INBOUND
+                if add(ranger.position, direction) == core.position
+                else _MoveIntent.TRANSIT
+            ),
         )
 
     def _move_or_wait(
@@ -1851,12 +2206,20 @@ class AggressiveStrategy:
         reason: str,
         allow_goal: bool = False,
         wait_at_goal: bool = False,
+        intent: _MoveIntent = _MoveIntent.STAND,
     ) -> None:
         if unit.position == goal:
             self._record_wait(unit, context, reason)
             if wait_at_goal:
                 unit.wait()
-        elif not self._move(unit, goal, context, reason=reason, allow_goal=allow_goal):
+        elif not self._move(
+            unit,
+            goal,
+            context,
+            reason=reason,
+            allow_goal=allow_goal,
+            intent=intent,
+        ):
             self._record_wait(unit, context, f"no safe path for: {reason}")
 
     def _retreat_worker(
@@ -2055,6 +2418,7 @@ class AggressiveStrategy:
         *,
         reason: str,
         allow_goal: bool = False,
+        intent: _MoveIntent = _MoveIntent.TRANSIT,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -2062,6 +2426,15 @@ class AggressiveStrategy:
         # Friendly units may overlap and swap; they never block travel.
         if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
             return False
+        core = context.turn.core
+        if (
+            intent is _MoveIntent.STAND
+            and core is not None
+            and goal != core.position
+            and unit.position != core.position
+        ):
+            # A queueing unit must not use the service cell as a shortcut.
+            blocked.add(core.position)
         blocked.update(context.enemy_positions)
         max_expansions = (
             EXPEDITION_STAGING_PATH_EXPANSIONS
@@ -2088,6 +2461,7 @@ class AggressiveStrategy:
             context,
             reason=reason,
             target=goal,
+            intent=intent if destination == goal else _MoveIntent.TRANSIT,
         )
 
     def _queue_move(
@@ -2098,18 +2472,39 @@ class AggressiveStrategy:
         *,
         reason: str,
         target: Position,
+        intent: _MoveIntent = _MoveIntent.TRANSIT,
     ) -> bool:
         destination = add(unit.position, direction)
+        if self._has_unit_action(unit, context):
+            return False
         # Also protect direct retreat moves and permissive goal paths.
         if (
             destination in self.memory.obstacles
             or destination in context.turn.obstacle_cells
         ):
             return False
+        predicted = self._predicted_friendly_occupancy(destination, context)
+        if intent is _MoveIntent.STAND:
+            if predicted != 0:
+                return False
+        elif predicted >= 2:
+            return False
         unit.move(direction)
         self.memory.pending_move_targets[str(unit.id)] = destination
         context.reserved.add(destination)
-        # Reservations are tactical spacing hints, not movement locks.
+        context.arrival_counts[destination] = (
+            context.arrival_counts.get(destination, 0) + 1
+        )
+        context.departure_counts[unit.position] = (
+            context.departure_counts.get(unit.position, 0) + 1
+        )
+        context.planned_ids.add(unit.id)
+        if intent is _MoveIntent.INBOUND:
+            core = context.turn.core
+            if core is not None and destination == core.position:
+                context.core_inbound_id = unit.id
+        if intent is _MoveIntent.STAND and destination == target:
+            context.standing_reserved.add(destination)
         context.report.add(
             actor_id=str(unit.id),
             actor_kind=unit.unit_type.value,
@@ -3652,7 +4047,14 @@ class AggressiveStrategy:
             ):
                 return True
             if ranger.position == context.turn.core.position:
-                self._record_wait(ranger, context, "wait at Core for healing resources")
+                if not self._move_to_core_queue(
+                    ranger,
+                    context,
+                    reason="queue returned expedition Ranger outside Core healing",
+                ):
+                    self._record_wait(
+                        ranger, context, "wait at Core for healing resources"
+                    )
                 return True
         pursuit = self._expedition_pursuit_for(ranger)
         visible = self._visible_combat_targets(ranger, context.turn)
@@ -6270,17 +6672,26 @@ class AggressiveStrategy:
     def _core_can_spawn(self, context: _TurnContext) -> bool:
         core = context.turn.core
         growth_target = self._growth_population_target()
-        return not (
-            core is None
-            or (
-                growth_target is not None
-                and context.turn.state.population >= growth_target
-            )
-            or (
-                self.config.resource_target > 0
-                and context.remaining_resources >= self.config.resource_target
-            )
-        )
+        if core is None:
+            return False
+        if growth_target is not None and context.turn.state.population >= growth_target:
+            return False
+        if (
+            self.config.resource_target > 0
+            and context.remaining_resources >= self.config.resource_target
+        ):
+            return False
+        if context.core_service_action is not None:
+            return False
+        core_position = core.position
+        # A spawn appears on the Core cell.  Account for current and planned
+        # occupants, and wait one Tick after departures or inbound traffic so
+        # resolution order cannot turn a valid-looking plan into a limit hit.
+        if context.departure_counts.get(core_position, 0):
+            return False
+        if context.arrival_counts.get(core_position, 0):
+            return False
+        return self._predicted_friendly_occupancy(core_position, context) < 2
 
     def _choose_spawn(self, turn: Turn, resources: int) -> UnitType | None:
         growth_target = self._growth_population_target()
