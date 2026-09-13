@@ -6002,6 +6002,39 @@ def test_wounded_expedition_vanguard_breaks_new_contact_before_sweeping() -> Non
     )
 
 
+def test_wounded_expedition_vanguard_waits_when_retreat_is_fully_blocked() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
+
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 5), hp=1),
+            unit(90, "VANGUARD", controlled=False, position=(6, 5)),
+            unit(91, "VANGUARD", controlled=False, position=(4, 5)),
+            unit(92, "VANGUARD", controlled=False, position=(5, 6)),
+            unit(93, "RANGER", controlled=False, position=(5, 4)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    strategy._decide_vanguard(turn.vanguards[0], context, (), offensive=True)
+
+    # ``_record_wait`` deliberately leaves the unit action unset; the server
+    # treats the missing unit command as WAIT while telemetry keeps the reason.
+    assert turn.vanguards[0].id not in turn.plan.unit_actions
+    assert any(
+        item.action == "WAIT" and item.reason == "wait for a safe expedition retreat"
+        for item in context.report.decisions
+    )
+
+
 def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> None:
     strategy = _expedition_strategy()
     vanguards = [

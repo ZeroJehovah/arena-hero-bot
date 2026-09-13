@@ -4277,12 +4277,23 @@ class AggressiveStrategy:
         if pursuit is None or pursuit.target_id is None:
             if not visible and self._regroup_quiet_expedition(vanguard, context):
                 return True
-            return self._expedition_under_fire(
+            if self._expedition_under_fire(
                 vanguard,
                 context,
                 visible,
                 offensive=True,
-            )
+            ):
+                return True
+            # A wounded member can be boxed in so tightly that neither the
+            # protected retreat nor the counter route has a legal first step.
+            # Do not let the generic Vanguard branch turn that failed safety
+            # response into a fatal adjacent SWEEP.
+            if vanguard.hp < 4 and visible:
+                self._record_wait(
+                    vanguard, context, "wait for a safe expedition retreat"
+                )
+                return True
+            return False
         pursued_target = next(
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
@@ -4309,6 +4320,13 @@ class AggressiveStrategy:
             visible,
             offensive=True,
         ):
+            return True
+        # ``_expedition_under_fire`` returns false when every retreat and
+        # counter cell is blocked.  A wounded expedition Vanguard must still
+        # consume the Tick through the expedition policy instead of falling
+        # through to the ordinary combat Sweep branch.
+        if vanguard.hp < 4 and visible:
+            self._record_wait(vanguard, context, "wait for a safe expedition retreat")
             return True
         if not visible and self._regroup_quiet_expedition(vanguard, context):
             return True
