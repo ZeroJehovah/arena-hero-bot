@@ -145,6 +145,10 @@ EXPEDITION_STAGING_RADIUS = 13
 # 50 ms.  Apply the larger budget only to staged Units so normal fleet planning
 # keeps its existing bound.
 EXPEDITION_STAGING_PATH_EXPANSIONS = 8192
+# A separated expedition's rejoining members need the same bounded long-route
+# budget. Quiet pursuit otherwise falls into a greedy loop before reaching
+# the teammate it is meant to accompany.
+EXPEDITION_REJOIN_PATH_EXPANSIONS = 8192
 # Maximum Manhattan distance between a member and its nearest teammate before
 # the member stops to let the gap close.  This keeps *adjacent* members within
 # sight (Vanguard vision is 4, Ranger vision is 5) so the squad stays a
@@ -2424,6 +2428,8 @@ class AggressiveStrategy:
         reason: str,
         allow_goal: bool = False,
         intent: _MoveIntent = _MoveIntent.TRANSIT,
+        path_expansions: int = 4096,
+        require_path: bool = False,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -2444,7 +2450,7 @@ class AggressiveStrategy:
         max_expansions = (
             EXPEDITION_STAGING_PATH_EXPANSIONS
             if self.config.expedition_mode and unit.id in self._staged_ids
-            else 4096
+            else path_expansions
         )
         direction = next_step(
             unit.position,
@@ -2454,6 +2460,7 @@ class AggressiveStrategy:
             direction_offset=self._direction_offset(unit.id),
             max_expansions=max_expansions,
             allow_goal=allow_goal,
+            require_path=require_path,
         )
         if direction is None:
             return False
@@ -4065,6 +4072,29 @@ class AggressiveStrategy:
             return None
         return pursuit.position
 
+    def _regroup_quiet_expedition(
+        self, unit: Ranger | Vanguard, context: _TurnContext
+    ) -> bool:
+        """Reconnect before quiet travel; callers handle immediate combat first."""
+
+        goal = self._expedition_rendezvous_goal(unit, context.turn, whole_squad=True)
+        if goal is None:
+            return False
+        if goal == unit.position:
+            self._record_wait(
+                unit, context, "hold for the expedition's laggards to close up"
+            )
+        elif not self._move(
+            unit,
+            goal,
+            context,
+            reason="close up so the expedition's line of sight stays connected",
+            path_expansions=EXPEDITION_REJOIN_PATH_EXPANSIONS,
+            require_path=True,
+        ):
+            self._record_wait(unit, context, "no safe route to rejoin the expedition")
+        return True
+
     def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
         # A wounded expedition member that has made it back to the Core must
         # consume the heal there before the expedition policy is evaluated
@@ -4185,6 +4215,8 @@ class AggressiveStrategy:
                 )
             ):
                 return True
+        if not visible and self._regroup_quiet_expedition(ranger, context):
+            return True
         if pursuit is None or pursuit.target_id is None:
             return False
         squad = self._expedition_squad_for(ranger.id)
@@ -4243,6 +4275,8 @@ class AggressiveStrategy:
         # that first-contact Tick; otherwise the generic Vanguard branch below
         # may spend the Tick on a fatal adjacent SWEEP.
         if pursuit is None or pursuit.target_id is None:
+            if not visible and self._regroup_quiet_expedition(vanguard, context):
+                return True
             return self._expedition_under_fire(
                 vanguard,
                 context,
@@ -4276,6 +4310,8 @@ class AggressiveStrategy:
             offensive=True,
         ):
             return True
+        if not visible and self._regroup_quiet_expedition(vanguard, context):
+            return True
         target = pursued_target
         if target is not None and self._expedition_close_to_engage(
             vanguard, target, context, offensive=True
@@ -4293,6 +4329,8 @@ class AggressiveStrategy:
         self,
         unit: Ranger | Vanguard,
         turn: Turn,
+        *,
+        whole_squad: bool = False,
     ) -> Position | None:
         """Return where a member must move to keep the squad connected.
 
@@ -4354,6 +4392,18 @@ class AggressiveStrategy:
             manhattan(unit.position, laggard) > EXPEDITION_LINK_RADIUS
         ):
             return unit.position
+        if whole_squad and any(
+            manhattan(left[5], right[5]) > EXPEDITION_LINK_RADIUS
+            for left, right in pairwise(ordered)
+        ):
+            # The member's immediate links can be intact while another link
+            # is open. Follow its local leader instead of independently
+            # chasing a distant enemy on the other side of the broken chain.
+            return (
+                self._expedition_close_cell(unit, leader, turn)
+                if leader is not None
+                else unit.position
+            )
         return None
 
     def _expedition_close_cell(
@@ -4398,6 +4448,7 @@ class AggressiveStrategy:
                 cell,
                 blocked=static,
                 require_path=True,
+                max_expansions=EXPEDITION_REJOIN_PATH_EXPANSIONS,
             )
             is not None
         ]

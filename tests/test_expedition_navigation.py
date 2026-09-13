@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 
+import arena_hero_bot.strategy as strategy_module
 from arena_hero_bot.geometry import add, adjacent_positions, manhattan, next_step
 from arena_hero_bot.memory import ExpeditionSquad, WorldMemory
 from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig
@@ -253,3 +254,79 @@ def test_coordinator_reserves_different_routes_for_nearby_squads():
             item.target for item in report.decisions if item.actor_id in squad.members
         }
         assert targets == {squad.exploration_route.waypoint}
+
+
+@pytest.mark.parametrize("front_number", [2, 4])
+def test_quiet_pursuit_holds_detached_front_and_rejoins_before_chasing(front_number):
+    template = _strategy()
+    template.memory.expedition_squads = [
+        replace(
+            template.memory.expedition_squads[0],
+            pursuit_target_id=object_id(90),
+            pursuit_position=(100, 0),
+            pursuit_direction=(1, 0),
+        )
+    ]
+    strategy = AggressiveStrategy(template.memory, template.config)
+    members = _members()
+    for member in members:
+        if member["id"] == object_id(front_number):
+            member["position"] = [30, 0]
+
+    report = strategy.decide(make_turn(objects=[core(position=(-30, -30)), *members]))
+
+    decisions = [item for item in report.decisions if item.actor_kind != "CORE"]
+    front = next(item for item in decisions if item.actor_id == object_id(front_number))
+    assert front.action == "WAIT" and "laggards" in front.reason
+    for item in decisions:
+        if item.actor_id != object_id(front_number):
+            assert item.action == "MOVE"
+            assert "close up" in item.reason
+    assert not any("pursuit after lost sight" in item.reason for item in decisions)
+
+
+def test_long_rejoin_requires_a_complete_route_with_a_bounded_larger_budget(
+    monkeypatch,
+):
+    strategy = _strategy()
+    turn = make_turn(
+        objects=[
+            core(position=(-30, -30)),
+            unit(2, "VANGUARD", position=(400, 0)),
+            unit(4, "RANGER", position=(0, 0)),
+        ]
+    )
+    calls = []
+    original = strategy_module.next_step
+
+    def recorded(origin, goal, **kwargs):
+        if origin == (0, 0) and goal[0] >= 399:
+            calls.append((kwargs.get("max_expansions"), kwargs.get("require_path")))
+        return original(origin, goal, **kwargs)
+
+    monkeypatch.setattr(strategy_module, "next_step", recorded)
+    report = strategy.decide(turn)
+
+    ranger = next(item for item in report.decisions if item.actor_id == object_id(4))
+    assert ranger.action == "MOVE" and "close up" in ranger.reason
+    assert calls and all(budget == 8192 and required for budget, required in calls)
+
+
+def test_trapped_rejoining_member_waits_without_greedy_orbit():
+    rocks = set(adjacent_positions((0, 0)))
+    strategy = _strategy(obstacles=rocks)
+    turn = make_turn(
+        objects=[
+            core(position=(-30, -30)),
+            unit(2, "VANGUARD", position=(20, 0)),
+            unit(4, "RANGER", position=(0, 0)),
+        ],
+        obstacles=rocks,
+    )
+
+    report = strategy.decide(turn)
+
+    ranger = next(item for item in report.decisions if item.actor_id == object_id(4))
+    assert ranger.action == "WAIT"
+    assert ranger.reason == "no safe route to rejoin the expedition"
+    assert object_id(4) not in {str(mid) for mid in turn.plan.unit_actions}
