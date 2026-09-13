@@ -330,3 +330,22 @@ def test_trapped_rejoining_member_waits_without_greedy_orbit():
     assert ranger.action == "WAIT"
     assert ranger.reason == "no safe route to rejoin the expedition"
     assert object_id(4) not in {str(mid) for mid in turn.plan.unit_actions}
+
+
+def test_rejoining_member_does_not_choose_an_enemy_occupied_forward_cell():
+    strategy = _strategy()
+    enemy_cell = (11, 0)
+    turn = make_turn(
+        objects=[
+            core(position=(-30, -30)),
+            unit(2, "VANGUARD", position=(10, 0)),
+            unit(4, "RANGER", position=(0, 0)),
+            core(90, controlled=False, position=enemy_cell),
+        ]
+    )
+
+    goal = strategy._expedition_close_cell(turn.rangers[0], (10, 0), turn)
+
+    assert goal != enemy_cell
+    assert goal in adjacent_positions((10, 0))
+    assert next_step((0, 0), goal, blocked={enemy_cell}, require_path=True) is not None

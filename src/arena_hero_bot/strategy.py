@@ -4424,6 +4424,7 @@ class AggressiveStrategy:
             self.memory.obstacles
             | set(self.memory.contested_positions)
             | set(turn.obstacle_cells)
+            | {enemy.position for enemy in turn.visible_enemies}
         )
         teammates = {
             member.id: member.position for member in (*turn.vanguards, *turn.rangers)
