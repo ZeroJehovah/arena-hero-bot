@@ -6598,6 +6598,36 @@ def test_one_hp_expedition_ranger_returns_before_chasing_worker() -> None:
     )
 
 
+def test_one_hp_expedition_ranger_returns_before_exploring() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(5, 4)),
+            unit(3, "RANGER", position=(5, 5), hp=1),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions=set(),
+    )
+
+    ranger = turn.rangers[0]
+    assert strategy._decide_expedition_ranger(ranger, context)
+    action = turn.plan.unit_actions[ranger.id]
+    assert action.type == "MOVE"
+    assert any(
+        item.action == "MOVE"
+        and item.reason == "return critical expedition Ranger to Core"
+        for item in context.report.decisions
+    )
+
+
 def test_boxed_low_hp_expedition_ranger_returns_instead_of_shooting() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})

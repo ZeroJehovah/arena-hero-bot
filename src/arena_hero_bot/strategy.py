@@ -4067,9 +4067,23 @@ class AggressiveStrategy:
         if target is None:
             target = self._best_visible_target(ranger.position, context.turn, visible)
         # A one-HP expedition Ranger must not spend its last safe Tick chasing
-        # a Worker.  Workers are not themselves ranged threats, but a local
-        # snapshot can expose the Worker while the hostile fire line remains
-        # outside this member's vision; return before pursuing or shooting.
+        # a Worker or exploring blind.  Workers are not themselves ranged
+        # threats, but a local snapshot can expose one while the hostile fire
+        # line remains outside this member's vision; return before pursuing,
+        # shooting, or resuming exploration.
+        if ranger.hp <= 1 and target is None:
+            if self._move_ranger_toward_core(
+                ranger,
+                context,
+                reason="return critical expedition Ranger to Core",
+            ):
+                return True
+            self._record_wait(
+                ranger,
+                context,
+                "no safe path for: return critical expedition Ranger to Core",
+            )
+            return True
         if (
             ranger.hp <= 1
             and isinstance(target, UnitView)
@@ -4086,22 +4100,6 @@ class AggressiveStrategy:
                 context,
                 "no safe path for: return critical expedition Ranger to Core",
             )
-            return True
-        # A ranged target can disappear for one Tick while the pursuit memory
-        # keeps advancing.  Do not let a one-HP Ranger turn that brief sight
-        # gap into another blind chase and walk back into the same firing line.
-        if (
-            target is None
-            and ranger.hp <= 1
-            and pursuit is not None
-            and pursuit.target_id is not None
-            and pursuit.position is not None
-            and self._move_ranger_toward_core(
-                ranger,
-                context,
-                reason="return critical expedition Ranger to Core",
-            )
-        ):
             return True
         if target is not None:
             obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
