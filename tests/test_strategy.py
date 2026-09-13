@@ -6002,6 +6002,35 @@ def test_wounded_expedition_vanguard_breaks_new_contact_before_sweeping() -> Non
     )
 
 
+def test_expedition_retreat_prefers_cell_with_more_escape_options() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
+
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "VANGUARD", position=(5, 5), hp=3),
+            unit(90, "VANGUARD", controlled=False, position=(5, 4)),
+        ],
+        obstacles=[(4, 5), (6, 4), (7, 5)],
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    vanguard = turn.vanguards[0]
+    assert strategy._expedition_break_contact(
+        vanguard, turn.visible_enemies[0], context
+    )
+    action = turn.plan.unit_actions[vanguard.id]
+    assert action.type == "MOVE"
+    assert add(vanguard.position, action.direction) == (5, 6)
+
+
 def test_wounded_expedition_vanguard_waits_when_retreat_is_fully_blocked() -> None:
     strategy = _expedition_strategy()
     strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]

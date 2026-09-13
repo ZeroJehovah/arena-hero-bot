@@ -4757,9 +4757,22 @@ class AggressiveStrategy:
             )
         ]
         preferred = protected or non_closing
+
+        def escape_options(position: Position) -> int:
+            """Prefer a retreat cell that is less likely to become a pocket."""
+
+            return sum(
+                neighbor not in obstacles and neighbor not in context.enemy_positions
+                for neighbor in adjacent_positions(position)
+            )
+
         goal = max(
             preferred,
-            key=lambda position: (manhattan(position, attacker.position), position),
+            key=lambda position: (
+                escape_options(position),
+                manhattan(position, attacker.position),
+                position,
+            ),
         )
         return self._move(
             unit,
