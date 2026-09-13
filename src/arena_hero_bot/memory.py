@@ -7,7 +7,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from arena_hero import CoreView, Position, Turn, UnitView
+from arena_hero import CoreView, Position, Turn, UnitType, UnitView
+
+from .exploration import ExplorationMap, ExplorationRoute, visible_cells
 
 SCHEMA_VERSION = 1
 POSITION_HISTORY_LIMIT = 8
@@ -76,7 +78,7 @@ class UnitGoal:
 
 @dataclass(frozen=True, slots=True)
 class ExpeditionSquad:
-    """A persisted expedition membership and its fixed travel bearing."""
+    """A persisted expedition membership, current heading and shared route."""
 
     serial: int
     members: tuple[str, ...]
@@ -85,6 +87,7 @@ class ExpeditionSquad:
     pursuit_position: Position | None = None
     pursuit_direction: Position = (0, 0)
     pursuit_distance: int = 0
+    exploration_route: ExplorationRoute = field(default_factory=ExplorationRoute)
 
 
 @dataclass(slots=True)
@@ -116,6 +119,7 @@ class WorldMemory:
     # UUIDs merely because their positions change.
     unit_roles_initialized: bool = False
     expedition_squads: list[ExpeditionSquad] = field(default_factory=list)
+    exploration: ExplorationMap = field(default_factory=ExplorationMap)
     next_expedition_serial: int = 0
     # Normal high-tier production is deliberately throttled.  Keep its
     # payback marker with the rest of the durable strategy observations so a
@@ -132,6 +136,7 @@ class WorldMemory:
 
         self.last_tick = turn.tick
         self.obstacles.update(turn.obstacle_cells)
+        self.observe_exploration(turn)
         self._observe_resource_cells(turn)
         destroyed_enemy_ids = {
             str(event.target_id)
@@ -196,6 +201,29 @@ class WorldMemory:
             for unit_id, position in self.defense_posts.items()
             if unit_id in active_ids
         }
+
+    def observe_exploration(self, turn: Turn) -> None:
+        """Share authoritative vision, including empty ground, across squads."""
+
+        if self.exploration.last_tick == turn.tick:
+            return
+        radii = {UnitType.WORKER: 3, UnitType.VANGUARD: 4, UnitType.RANGER: 5}
+        observers = [(unit.position, radii[unit.unit_type]) for unit in turn.units]
+        if turn.core is not None:
+            observers.append((turn.core.position, 5))
+        obstacles = self.obstacles | set(turn.obstacle_cells)
+        if not self.exploration.tiles and self.position_history:
+            # Old memory has no empty-ground atlas. Seed only the short paths
+            # actually observed by surviving units, not imagined travel lines
+            # or the empty space between distant expeditions.
+            cells: set[Position] = set()
+            for unit in turn.units:
+                for position in self.position_history.get(str(unit.id), ()):
+                    cells.update(
+                        visible_cells(position, radii[unit.unit_type], obstacles)
+                    )
+            self.exploration.mark(cells, turn.tick - 1)
+        self.exploration.observe(observers, obstacles, turn.tick)
 
     def _closely_observed_cells(self, turn: Turn) -> set[Position]:
         """Return the cells close enough this Tick to trust an absence."""
@@ -474,9 +502,18 @@ class WorldMemory:
                     ),
                     "pursuit_direction": list(squad.pursuit_direction),
                     "pursuit_distance": squad.pursuit_distance,
+                    "exploration_route": asdict(squad.exploration_route),
                 }
                 for squad in self.expedition_squads
             ],
+            "exploration": {
+                "tiles": [
+                    {"position": list(position), "mask": hex(mask), "tick": tick}
+                    for position, (mask, tick) in sorted(self.exploration.tiles.items())
+                ],
+                "last_tick": self.exploration.last_tick,
+                "new_cells": self.exploration.new_cells,
+            },
             "next_expedition_serial": self.next_expedition_serial,
             "last_normal_growth_tick": self.last_normal_growth_tick,
             "last_normal_growth_resources": self.last_normal_growth_resources,
@@ -573,9 +610,23 @@ class WorldMemory:
                     ),
                     pursuit_direction=_position(value.get("pursuit_direction", [0, 0])),
                     pursuit_distance=int(value.get("pursuit_distance", 0)),
+                    exploration_route=_exploration_route(
+                        value.get("exploration_route", {})
+                    ),
                 )
                 for index, value in enumerate(raw.get("expedition_squads", []))
             ],
+            exploration=ExplorationMap(
+                tiles={
+                    _position(value["position"]): (
+                        int(value["mask"], 16),
+                        int(value["tick"]),
+                    )
+                    for value in raw.get("exploration", {}).get("tiles", [])
+                },
+                last_tick=int(raw.get("exploration", {}).get("last_tick", -1)),
+                new_cells=int(raw.get("exploration", {}).get("new_cells", 0)),
+            ),
             next_expedition_serial=int(raw.get("next_expedition_serial", 0)),
             last_normal_growth_tick=_optional_integer(
                 raw.get("last_normal_growth_tick")
@@ -586,6 +637,21 @@ class WorldMemory:
             core_home_position=_optional_position(raw.get("core_home_position")),
             last_tick=int(raw.get("last_tick", 0)),
         )
+
+
+def _exploration_route(raw: dict[str, Any]) -> ExplorationRoute:
+    return ExplorationRoute(
+        path=tuple(_position(position) for position in raw.get("path", [])),
+        assigned_tick=int(raw.get("assigned_tick", 0)),
+        checked_tick=int(raw.get("checked_tick", 0)),
+        progress_tick=int(raw.get("progress_tick", 0)),
+        remaining=int(raw.get("remaining", 0)),
+        expected_gain=float(raw.get("expected_gain", 0.0)),
+        cooldowns=tuple(
+            (_position(position), int(tick))
+            for position, tick in raw.get("cooldowns", [])
+        ),
+    )
 
 
 def _position(value: object) -> Position:

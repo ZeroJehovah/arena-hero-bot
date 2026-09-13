@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from itertools import pairwise
 from math import atan2
 from uuid import UUID
 
@@ -32,6 +32,7 @@ from .combat_policy import (
     ThreatAssessment,
     ThreatLevel,
 )
+from .exploration import ExpeditionNavigator, ExplorationRoute
 from .geometry import (
     DIRECTIONS,
     add,
@@ -353,13 +354,15 @@ class AggressiveStrategy:
         self._raid_cooldown_until: int = -1
         # Expedition posture state.  Surplus combat units are staged at the
         # defensive ring edge until a full expedition can depart.  Each
-        # expedition is a fixed 2-Vanguard/2-Ranger squad bound to a stable
-        # bearing; it never returns, heals, or recalls, so membership and the
-        # chosen direction are the only durable facts.
+        # expedition keeps its membership, pursuit and shared exploration
+        # route. Its bearing is the current formation heading, not a mandate
+        # to march ever farther in the original direction.
         self._staged_ids: frozenset[UUID] = frozenset()
         self._expedition_squads: list[tuple[frozenset[UUID], Position]] = []
         self._expedition_serial_by_members: dict[frozenset[UUID], int] = {}
         self._expedition_pursuits: dict[frozenset[UUID], _ExpeditionPursuit] = {}
+        self._expedition_routes: dict[frozenset[UUID], ExplorationRoute] = {}
+        self._expedition_navigation_turn: Turn | None = None
         self._expedition_serial: int = self.memory.next_expedition_serial
         for persisted in self.memory.expedition_squads:
             try:
@@ -369,6 +372,7 @@ class AggressiveStrategy:
             if members:
                 self._expedition_squads.append((members, persisted.bearing))
                 self._expedition_serial_by_members[members] = persisted.serial
+                self._expedition_routes[members] = persisted.exploration_route
                 self._expedition_pursuits[members] = _ExpeditionPursuit(
                     target_id=persisted.pursuit_target_id,
                     position=persisted.pursuit_position,
@@ -392,6 +396,7 @@ class AggressiveStrategy:
             self._reconcile_unit_roles(turn)
             self._update_expeditions(turn)
             self._refresh_expedition_pursuits(turn)
+            self._refresh_expedition_navigation(turn)
         obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         threat = self._combat_policy.assess(turn, obstacles)
         recent_enemies = self.memory.recent_enemies(
@@ -3693,7 +3698,7 @@ class AggressiveStrategy:
 
         Surplus combat units are staged at the ring edge as soon as they are
         built.  Once a full expedition (2 Vanguards + 2 Rangers) is available
-        it departs on a stable bearing and is never recalled.  Existing
+        it departs with one shared exploration route. Existing
         defence, patrol, and expedition UUIDs are never reclassified merely
         because another UUID sorts before them.
         """
@@ -3701,18 +3706,25 @@ class AggressiveStrategy:
         self._reconcile_unit_roles(turn)
         core = turn.core
         live = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
-        self._expedition_squads = [
-            (members & live, bearing)
+        survivors = [
+            (members, members & live, bearing)
             for members, bearing in self._expedition_squads
             if members & live
         ]
+        self._expedition_squads = [
+            (remaining, bearing) for _original, remaining, bearing in survivors
+        ]
         self._expedition_pursuits = {
-            members: self._expedition_pursuits.get(members, _ExpeditionPursuit())
-            for members, _bearing in self._expedition_squads
+            remaining: self._expedition_pursuits.get(original, _ExpeditionPursuit())
+            for original, remaining, _bearing in survivors
         }
         self._expedition_serial_by_members = {
-            members: self._expedition_serial_by_members.get(members, index + 1)
-            for index, (members, _bearing) in enumerate(self._expedition_squads)
+            remaining: self._expedition_serial_by_members.get(original, index + 1)
+            for index, (original, remaining, _bearing) in enumerate(survivors)
+        }
+        self._expedition_routes = {
+            remaining: self._expedition_routes.get(original, ExplorationRoute())
+            for original, remaining, _bearing in survivors
         }
         staged_vanguards = sorted(
             (
@@ -3742,6 +3754,7 @@ class AggressiveStrategy:
             bearing = self._expedition_bearing(core)
             self._expedition_squads.append((members, bearing))
             self._expedition_pursuits[members] = _ExpeditionPursuit()
+            self._expedition_routes[members] = ExplorationRoute()
             self._expedition_serial += 1
             self._expedition_serial_by_members[members] = self._expedition_serial
             role = f"{EXPEDITION_ROLE_PREFIX}{self._expedition_serial}"
@@ -3750,37 +3763,15 @@ class AggressiveStrategy:
             del staged_vanguards[:EXPEDITION_SQUAD_VANGUARDS]
             del staged_rangers[:EXPEDITION_SQUAD_RANGERS]
         self._staged_ids = frozenset(staged_vanguards) | frozenset(staged_rangers)
-        self.memory.expedition_squads = [
-            ExpeditionSquad(
-                serial=self._expedition_serial_by_members.get(members, index + 1),
-                members=tuple(
-                    str(member_id)
-                    for member_id in sorted(members, key=lambda value: value.bytes)
-                ),
-                bearing=bearing,
-                pursuit_target_id=self._expedition_pursuits.get(
-                    members, _ExpeditionPursuit()
-                ).target_id,
-                pursuit_position=self._expedition_pursuits.get(
-                    members, _ExpeditionPursuit()
-                ).position,
-                pursuit_direction=self._expedition_pursuits.get(
-                    members, _ExpeditionPursuit()
-                ).direction,
-                pursuit_distance=self._expedition_pursuits.get(
-                    members, _ExpeditionPursuit()
-                ).distance,
-            )
-            for index, (members, bearing) in enumerate(self._expedition_squads)
-        ]
+        self._persist_expedition_pursuits()
         self.memory.next_expedition_serial = self._expedition_serial
 
     def _expedition_bearing(self, core: Core | None) -> Position:
-        """Choose a stable pseudo-random compass bearing for one expedition.
+        """Choose a deterministic initial heading to break exploration ties.
 
         The bearing is derived from the Core identity and a running squad
-        serial so that two expeditions rarely share a direction, which keeps
-        them exploring disjoint regions of the map.
+        serial. Actual information gain and other squads' route reservations
+        decide where to travel after assembly.
         """
 
         offsets = (
@@ -3809,82 +3800,119 @@ class AggressiveStrategy:
         )
 
     def _expedition_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
-        """Return the far exploration point ahead of this squad's front.
+        """Return the same short route checkpoint to every squad member."""
 
-        Anchoring the point on the Core made it a fixed cell: once the squad
-        marched past it, every member was pulled *back* toward the Core on the
-        next Tick and the whole squad orbited the horizon forever.  Anchor on
-        the squad's own front-most member instead so the far point keeps
-        moving forward with the squad and the expedition never has to turn
-        back.
-        """
+        self._refresh_expedition_navigation(turn)
         squad = self._expedition_squad_for(unit.id)
         if squad is None:
             return unit.position
-        members, (bear_x, bear_y) = squad
-        alive = {
-            member.id: member.position for member in (*turn.vanguards, *turn.rangers)
-        }
-        progress = {
-            member_id: (alive[member_id][0] * bear_x + alive[member_id][1] * bear_y)
-            for member_id in members
-            if member_id in alive
-        }
-        if not progress:
-            return unit.position
-        front_id = max(progress, key=lambda mid: (progress[mid], mid))
-        front = alive[front_id]
-        goal = (
-            front[0] + bear_x * EXPEDITION_LINK_RADIUS,
-            front[1] + bear_y * EXPEDITION_LINK_RADIUS,
-        )
-        if (
-            goal not in self.memory.obstacles
-            and goal not in turn.obstacle_cells
-            and goal not in self.memory.contested_positions
-            and all(enemy.position != goal for enemy in turn.visible_enemies)
-        ):
-            return goal
+        route = self._expedition_routes.get(squad[0], ExplorationRoute())
+        return route.waypoint if route.waypoint is not None else unit.position
+
+    def _refresh_expedition_navigation(self, turn: Turn) -> None:
+        """Select and reserve one information-gathering route per whole squad."""
+
+        if self._expedition_navigation_turn is turn:
+            return
+        self._expedition_navigation_turn = turn
+        self.memory.observe_exploration(turn)
+        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         blocked = (
-            self.memory.obstacles
-            | set(turn.obstacle_cells)
+            obstacles
             | set(self.memory.contested_positions)
             | {enemy.position for enemy in turn.visible_enemies}
         )
+        for enemy in turn.visible_enemies:
+            if isinstance(enemy, UnitView) and enemy.unit_type is UnitType.RANGER:
+                blocked.update(
+                    cell
+                    for cell in firing_positions(enemy.position)
+                    if line_of_fire(enemy.position, cell, obstacles)
+                )
+            elif isinstance(enemy, UnitView) and enemy.unit_type is UnitType.VANGUARD:
+                blocked.update(adjacent_positions(enemy.position))
+        alive = {unit.id: unit for unit in (*turn.vanguards, *turn.rangers)}
+        navigators: dict[frozenset[UUID], ExpeditionNavigator] = {}
+        reservations: dict[frozenset[UUID], set[Position]] = {}
+        for members, _bearing in self._expedition_squads:
+            live_members = [alive[mid] for mid in members if mid in alive]
+            if not live_members:
+                continue
+            navigator = ExpeditionNavigator(
+                self.memory.exploration,
+                obstacles,
+                blocked,
+                max(_combat_vision_radius(member) for member in live_members),
+            )
+            navigators[members] = navigator
+            reservations[members] = navigator.reservation(
+                self._expedition_routes.get(members, ExplorationRoute())
+            )
 
-        # A rock at the shared waypoint otherwise makes every member WAIT
-        # forever: the front stays put, so the same invalid goal is chosen on
-        # every Tick.  Search a bounded area from the front so the replacement
-        # is reachable and identical for the whole squad.  Friendly occupancy
-        # does not constrain this search.
-        radius = manhattan(front, goal) + EXPEDITION_LINK_RADIUS
-        reachable = {front}
-        frontier = deque([front])
-        while frontier:
-            position = frontier.popleft()
-            for neighbor in adjacent_positions(position):
-                if (
-                    neighbor in reachable
-                    or neighbor in blocked
-                    or manhattan(front, neighbor) > radius
-                ):
-                    continue
-                reachable.add(neighbor)
-                frontier.append(neighbor)
-        forward = {
-            position
-            for position in reachable
-            if position[0] * bear_x + position[1] * bear_y > progress[front_id]
-        }
-        return min(
-            forward or (reachable - {front}),
-            key=lambda position: (
-                manhattan(position, goal),
-                -(position[0] * bear_x + position[1] * bear_y),
-                position,
-            ),
-            default=front,
-        )
+        headings: dict[frozenset[UUID], Position] = {}
+        for members, bearing in self._expedition_squads:
+            if members not in navigators:
+                continue
+            ordered = sorted(
+                (alive[mid] for mid in members if mid in alive),
+                key=lambda member: (
+                    member.position[0] * bearing[0] + member.position[1] * bearing[1],
+                    member.position,
+                    member.id.bytes,
+                ),
+            )
+            previous = self._expedition_routes.get(members, ExplorationRoute())
+            pursuit = self._expedition_pursuits.get(members)
+            if pursuit is not None and pursuit.target_id is not None:
+                # Contact has its existing survival/combat priority. A route
+                # selected before a chase must not later drag the team back.
+                self._expedition_routes[members] = ExplorationRoute(
+                    cooldowns=previous.cooldowns
+                )
+                reservations[members] = set()
+                continue
+            if any(
+                manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
+                for left, right in pairwise(ordered)
+            ):
+                # Finish the existing forward regrouping chain before turning;
+                # no detached member receives its own exploration assignment.
+                self._expedition_routes[members] = replace(
+                    previous, progress_tick=turn.tick
+                )
+                continue
+            centroid = (
+                sum(member.position[0] for member in ordered) // len(ordered),
+                sum(member.position[1] for member in ordered) // len(ordered),
+            )
+            origin = min(
+                ordered,
+                key=lambda member: (
+                    manhattan(member.position, centroid),
+                    member.id.bytes,
+                ),
+            ).position
+            reserved = {
+                cell
+                for other, cells in reservations.items()
+                if other != members
+                for cell in cells
+            }
+            navigator = navigators[members]
+            route = navigator.plan(origin, bearing, turn.tick, previous, reserved)
+            self._expedition_routes[members] = route
+            reservations[members] = navigator.reservation(route)
+            if route.goal is not None and route.goal != previous.goal:
+                delta = route.goal[0] - origin[0], route.goal[1] - origin[1]
+                headings[members] = (
+                    0 if delta[0] == 0 else (1 if delta[0] > 0 else -1),
+                    0 if delta[1] == 0 else (1 if delta[1] > 0 else -1),
+                )
+        self._expedition_squads = [
+            (members, headings.get(members, bearing))
+            for members, bearing in self._expedition_squads
+        ]
+        self._persist_expedition_pursuits()
 
     def _refresh_expedition_pursuits(self, turn: Turn) -> None:
         """Update each squad's durable target without allowing silent disengage."""
@@ -4016,6 +4044,9 @@ class AggressiveStrategy:
                 pursuit_distance=self._expedition_pursuits.get(
                     members, _ExpeditionPursuit()
                 ).distance,
+                exploration_route=self._expedition_routes.get(
+                    members, ExplorationRoute()
+                ),
             )
             for index, (members, bearing) in enumerate(self._expedition_squads)
         ]
@@ -4871,6 +4902,7 @@ class AggressiveStrategy:
     ) -> tuple[Position, str]:
         if self.config.expedition_mode:
             if unit.id in self._expedition_member_ids(turn):
+                self._refresh_expedition_navigation(turn)
                 squad = self._expedition_squad_for(unit.id)
                 if squad is not None:
                     members, _ = squad
@@ -4900,7 +4932,7 @@ class AggressiveStrategy:
                 # expired, leaving the formation circling an obstacle pocket.
                 return (
                     self._expedition_goal(unit, turn),
-                    "explore outward on this expedition bearing",
+                    "explore new ground along the squad's shared route",
                 )
             if unit.id in self._staged_ids:
                 return (

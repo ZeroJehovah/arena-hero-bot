@@ -6025,7 +6025,7 @@ def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> Non
     assert patrol_id not in returns
 
 
-def test_expedition_idle_goal_points_outward() -> None:
+def test_expedition_idle_goal_uses_a_local_shared_exploration_route() -> None:
     strategy = _expedition_strategy()
     strategy._expedition_squads = [
         (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
@@ -6042,17 +6042,10 @@ def test_expedition_idle_goal_points_outward() -> None:
 
     member_view = turn.vanguards[0]
     goal, reason = strategy._idle_combat_goal(member_view, turn, context=None)
-    assert reason == "explore outward on this expedition bearing"
-    # The far point tracks the squad's front-most member forward along the
-    # bearing, not a fixed Core-anchored cell.  A fixed target made every
-    # member turn back the moment it crossed the horizon (observed live:
-    # the rearmost expedition member drifting back toward the Core).
-    front = max(
-        (unit_view.position for unit_view in (*turn.vanguards, *turn.rangers)),
-        key=lambda position: position[0],
-    )
-    assert manhattan(front, goal) == 4
-    assert goal[0] > front[0]
+    assert reason == "explore new ground along the squad's shared route"
+    assert 0 < manhattan(member_view.position, goal) <= 10
+    assert goal == strategy._expedition_goal(turn.rangers[0], turn)
+    assert strategy.memory.expedition_squads[0].exploration_route.expected_gain > 0
 
 
 def test_expedition_squad_shares_one_enemy_target() -> None:
@@ -6861,7 +6854,7 @@ def test_expedition_pursuit_only_expires_after_one_hundred_cells() -> None:
     assert strategy._expedition_pursuits[squad].target_id is None
 
 
-def test_expedition_returns_to_bearing_after_pursuit_without_local_sight() -> None:
+def test_expedition_resumes_exploration_after_pursuit_without_local_sight() -> None:
     strategy = _expedition_strategy(
         replace(expedition_config(), offensive_min_combat_units=4)
     )
@@ -6894,8 +6887,8 @@ def test_expedition_returns_to_bearing_after_pursuit_without_local_sight() -> No
 
     goal, reason = strategy._idle_combat_goal(turn.vanguards[0], turn, context=None)
 
-    assert reason == "explore outward on this expedition bearing"
-    assert goal[0] > turn.vanguards[0].position[0]
+    assert reason == "explore new ground along the squad's shared route"
+    assert 0 < manhattan(turn.vanguards[0].position, goal) <= 10
     assert goal != (100, 100)
 
 

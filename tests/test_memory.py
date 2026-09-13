@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from arena_hero_bot.exploration import ExplorationRoute
 from arena_hero_bot.memory import ExpeditionSquad, UnitGoal, WorldMemory
 
 from .factories import core, make_turn, object_id, unit
@@ -61,6 +62,15 @@ def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
                 serial=4,
                 members=(object_id(4), object_id(5)),
                 bearing=(1, 0),
+                exploration_route=ExplorationRoute(
+                    path=((0, 0), (1, 0), (2, 0)),
+                    assigned_tick=40,
+                    checked_tick=42,
+                    progress_tick=41,
+                    remaining=2,
+                    expected_gain=11.4,
+                    cooldowns=(((0, -1), 70),),
+                ),
             )
         ],
         next_expedition_serial=4,
@@ -75,6 +85,30 @@ def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
     assert loaded.unit_roles_initialized is True
     assert loaded.expedition_squads == memory.expedition_squads
     assert loaded.next_expedition_serial == 4
+
+
+def test_legacy_squads_start_without_invented_exploration_history(tmp_path):
+    raw = WorldMemory(
+        expedition_squads=[ExpeditionSquad(7, (object_id(2),), (1, 0))]
+    ).to_dict()
+    del raw["exploration"]
+    del raw["expedition_squads"][0]["exploration_route"]
+    path = tmp_path / "legacy-memory.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    memory = WorldMemory.load(path)
+
+    assert memory.exploration.tiles == {}
+    assert memory.expedition_squads[0].serial == 7
+    assert memory.expedition_squads[0].exploration_route.path == ()
+
+
+def test_initial_exploration_seed_only_uses_actual_recent_observer_positions():
+    memory = WorldMemory(position_history={object_id(2): [(49, 0)]})
+    memory.observe(make_turn(objects=[core(), unit(2, "RANGER", position=(50, 0))]))
+    assert memory.exploration.seen((44, 0))
+    assert memory.exploration.seen((55, 0))
+    assert not memory.exploration.seen((25, 0))
 
 
 def test_legacy_memory_loads_without_defensive_posts(tmp_path) -> None:

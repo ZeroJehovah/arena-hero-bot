@@ -226,7 +226,20 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
     """Persist the fixed combat identities needed for historical attribution."""
 
     squads = [
-        {"serial": squad.serial, "members": list(squad.members)}
+        {
+            "serial": squad.serial,
+            "members": list(squad.members),
+            "heading": list(squad.bearing),
+            "navigation": {
+                "goal": squad.exploration_route.goal,
+                "waypoint": squad.exploration_route.waypoint,
+                "assigned_tick": squad.exploration_route.assigned_tick,
+                "expected_new_cells": round(squad.exploration_route.expected_gain, 2),
+                "remaining_steps": len(squad.exploration_route.path) - 1
+                if squad.exploration_route.path
+                else 0,
+            },
+        }
         for squad in memory.expedition_squads
     ]
     return {
@@ -239,4 +252,8 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             list(memory.defense_anchor) if memory.defense_anchor is not None else None
         ),
         "expedition_squads": squads,
+        "exploration": {
+            "new_cells": memory.exploration.new_cells,
+            "tracked_tiles": len(memory.exploration.tiles),
+        },
     }
