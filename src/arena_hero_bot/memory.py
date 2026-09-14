@@ -88,6 +88,7 @@ class ExpeditionSquad:
     pursuit_direction: Position = (0, 0)
     pursuit_distance: int = 0
     exploration_route: ExplorationRoute = field(default_factory=ExplorationRoute)
+    regroup_order: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -503,6 +504,7 @@ class WorldMemory:
                     "pursuit_direction": list(squad.pursuit_direction),
                     "pursuit_distance": squad.pursuit_distance,
                     "exploration_route": asdict(squad.exploration_route),
+                    "regroup_order": list(squad.regroup_order),
                 }
                 for squad in self.expedition_squads
             ],
@@ -612,6 +614,9 @@ class WorldMemory:
                     pursuit_distance=int(value.get("pursuit_distance", 0)),
                     exploration_route=_exploration_route(
                         value.get("exploration_route", {})
+                    ),
+                    regroup_order=tuple(
+                        str(member) for member in value.get("regroup_order", [])
                     ),
                 )
                 for index, value in enumerate(raw.get("expedition_squads", []))

@@ -66,3 +66,33 @@ def test_pathfinder_distinguishes_no_route_from_a_greedy_step() -> None:
     assert (
         next_step((0, 0), (3, 0), blocked=set(), require_path=True) is Direction.RIGHT
     )
+
+
+def test_partial_path_stops_at_the_closest_cell_to_a_sealed_goal() -> None:
+    rocks = {(2, 0), (4, 0), (3, -1), (3, 1)}
+    assert next_step((0, 0), (3, 0), blocked=rocks) is Direction.RIGHT
+    assert next_step((1, 0), (3, 0), blocked=rocks) is None
+
+
+def test_partial_path_keeps_a_detour_when_the_goal_exceeds_the_search_budget() -> None:
+    rocks = {(-2, 0), (-1, -1), (-1, 1), (0, -2), (1, -2), (2, -1)}
+    origin = (0, 0)
+    goal = (-400, -10000)
+    history = []
+    for _step in range(24):
+        direction = next_step(
+            origin,
+            goal,
+            blocked=rocks,
+            recent=tuple(reversed(history[-4:])),
+            max_expansions=64,
+        )
+        assert direction is not None
+        history.append(origin)
+        origin = add(origin, direction)
+        assert origin not in rocks
+    assert manhattan((0, 0), goal) - manhattan(origin, goal) >= 10
+    assert (
+        next_step((0, 0), goal, blocked=rocks, max_expansions=64, require_path=True)
+        is None
+    )

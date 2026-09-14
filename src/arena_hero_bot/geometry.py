@@ -103,13 +103,10 @@ def next_step(
 ) -> Direction | None:
     """Find one deterministic A* step with a penalty for recent cells.
 
-    When no route to ``goal`` exists the greedy fallback below still returns
-    the neighbour closest to it.  That is the right answer while the blockage
-    is transient, because units shuffle and one step of pressure resolves it.
-    It is the wrong answer when the goal is walled off for good: the caller
-    cannot tell progress from an orbit around the wall, so it keeps asking and
-    the unit circles forever.  ``require_path=True`` returns ``None`` in that
-    case so the caller can choose a reachable goal instead.
+    A goal beyond the search budget still has a useful, searched route prefix.
+    Follow that prefix toward the closest reached cell instead of discarding
+    the detour and choosing a greedy neighbour. Stop when the search finds no
+    closer cell. ``require_path=True`` still requires a complete route.
     """
 
     if origin == goal:
@@ -152,22 +149,16 @@ def next_step(
     if goal not in came_from:
         if require_path:
             return None
-        candidates = [
-            add(origin, direction)
-            for direction in rotated
-            if add(origin, direction) not in blocked
-        ]
-        if not candidates:
-            return None
-        first = min(
-            candidates,
+        goal = min(
+            cost_so_far,
             key=lambda cell: (
-                manhattan(cell, goal) + recent_penalty.get(cell, 0) * 3,
                 manhattan(cell, goal),
+                cost_so_far[cell],
                 cell,
             ),
         )
-        return direction_between(origin, first)
+        if goal == origin:
+            return None
 
     current = goal
     while came_from[current] != origin:

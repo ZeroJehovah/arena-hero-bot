@@ -62,6 +62,7 @@ def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
                 serial=4,
                 members=(object_id(4), object_id(5)),
                 bearing=(1, 0),
+                regroup_order=(object_id(5), object_id(4)),
                 exploration_route=ExplorationRoute(
                     path=((0, 0), (1, 0), (2, 0)),
                     assigned_tick=40,
@@ -93,6 +94,7 @@ def test_legacy_squads_start_without_invented_exploration_history(tmp_path):
     ).to_dict()
     del raw["exploration"]
     del raw["expedition_squads"][0]["exploration_route"]
+    del raw["expedition_squads"][0]["regroup_order"]
     path = tmp_path / "legacy-memory.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
 
@@ -101,6 +103,7 @@ def test_legacy_squads_start_without_invented_exploration_history(tmp_path):
     assert memory.exploration.tiles == {}
     assert memory.expedition_squads[0].serial == 7
     assert memory.expedition_squads[0].exploration_route.path == ()
+    assert memory.expedition_squads[0].regroup_order == ()
 
 
 def test_initial_exploration_seed_only_uses_actual_recent_observer_positions():

@@ -349,3 +349,167 @@ def test_rejoining_member_does_not_choose_an_enemy_occupied_forward_cell():
     assert goal != enemy_cell
     assert goal in adjacent_positions((10, 0))
     assert next_step((0, 0), goal, blocked={enemy_cell}, require_path=True) is not None
+
+
+@pytest.mark.parametrize("restart_tick", [None, 104])
+def test_regroup_detour_reconnects_without_swapping_leaders(tmp_path, restart_tick):
+    # The two rear members must go around a wall before closing on the front.
+    # Sorting them again on each step makes them trade leaders and orbit here.
+    rocks = {
+        (-6, 6),
+        (-5, 3),
+        (-5, 4),
+        (-5, 5),
+        (-4, 1),
+        (-3, 7),
+        (-2, -2),
+        (-2, 0),
+        (-1, 4),
+        (-1, 8),
+        (0, -2),
+        (0, 4),
+        (0, 6),
+        (1, -1),
+        (1, 9),
+        (2, 0),
+        (2, 1),
+        (2, 2),
+        (2, 3),
+        (2, 6),
+        (3, 0),
+        (3, 6),
+        (4, 1),
+        (5, 1),
+        (5, 4),
+        (6, 2),
+        (7, 3),
+        (7, 4),
+        (7, 5),
+    }
+    strategy = _strategy((0, -1), obstacles=rocks)
+    members = [
+        unit(2, "VANGUARD", position=(3, 3)),
+        unit(3, "VANGUARD", position=(-1, 1)),
+        unit(4, "RANGER", position=(3, 2)),
+        unit(5, "RANGER", position=(0, 0)),
+    ]
+    moves = Counter()
+    new_ground = 0
+    for tick in range(100, 140):
+        turn = make_turn(
+            tick=tick,
+            objects=[core(position=(-30, -30)), *members],
+            obstacles=rocks,
+        )
+        strategy.decide(turn)
+        if tick > 100:
+            new_ground += strategy.memory.exploration.new_cells
+        positions = {}
+        for member in turn.units:
+            action = turn.plan.unit_actions.get(member.id)
+            position = member.position
+            if action is not None and action.type == "MOVE":
+                position = add(position, action.direction)
+                moves[str(member.id)] += 1
+            positions[str(member.id)] = position
+        assert not (set(positions.values()) & rocks)
+        assert max(Counter(positions.values()).values()) <= 2
+        for member in members:
+            member["position"] = list(positions[member["id"]])
+        if tick == restart_tick:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+
+    assert all(moves[member["id"]] >= 8 for member in members)
+    assert new_ground > 60
+
+
+def test_distant_wounded_ranger_leaves_a_rock_pocket_on_its_way_home():
+    rocks = {
+        (-2, 0),
+        (-1, -2),
+        (-1, -1),
+        (-1, 1),
+        (-1, 3),
+        (0, -3),
+        (1, -3),
+        (2, -2),
+        (2, -1),
+        (2, 1),
+        (3, -2),
+        (3, 2),
+        (4, -3),
+        (4, 2),
+        (4, 3),
+        (4, 4),
+    }
+    home = (-400, -10000)
+    member = unit(4, "RANGER", hp=1)
+    strategy = _strategy(obstacles=rocks)
+    strategy.memory.core_home_position = home
+    for tick in range(100, 124):
+        turn = make_turn(
+            tick=tick, objects=[core(position=home), member], obstacles=rocks
+        )
+        report = strategy.decide(turn)
+        ranger = turn.rangers[0]
+        decision = next(
+            item for item in report.decisions if item.actor_id == str(ranger.id)
+        )
+        assert decision.reason == "return critical expedition Ranger to Core"
+        action = turn.plan.unit_actions[ranger.id]
+        assert action.type == "MOVE"
+        position = add(ranger.position, action.direction)
+        assert position not in rocks
+        member["position"] = list(position)
+
+    assert manhattan((0, 0), home) - manhattan(position, home) >= 10
+
+
+def test_expedition_vanguard_keeps_sweeping_a_stationary_core():
+    strategy = _strategy()
+    for tick in range(100, 104):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(position=(-30, -30)),
+                unit(2, "VANGUARD", position=(4, 0)),
+                core(90, controlled=False, position=(5, 0)),
+                unit(91, "WORKER", controlled=False, position=(5, 0)),
+            ],
+        )
+        report = strategy.decide(turn)
+        action = turn.plan.unit_actions[turn.vanguards[0].id]
+        assert action.type == "SWEEP"
+        assert add(turn.vanguards[0].position, action.direction) == (5, 0)
+        assert report.planned_damage[object_id(90)] > 0
+
+
+def test_expedition_ranger_reaches_a_firing_cell_within_its_own_vision():
+    rocks = {(2, 0), (8, 0), (5, 3), (4, -1), (4, 2)}
+    strategy = _strategy(obstacles=rocks)
+    member = unit(4, "RANGER", position=(1, 1))
+    fired = False
+    for tick in range(100, 124):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(position=(-30, -30)),
+                unit(2, "VANGUARD", position=(4, 0)),
+                member,
+                core(90, controlled=False, position=(5, 0)),
+            ],
+            obstacles=rocks,
+        )
+        strategy.decide(turn)
+        ranger = turn.rangers[0]
+        action = turn.plan.unit_actions.get(ranger.id)
+        if action is not None and action.type == "SHOOT":
+            fired = True
+            assert action.target_id == turn.visible_enemies[0].id
+            break
+        if action is not None and action.type == "MOVE":
+            member["position"] = list(add(ranger.position, action.direction))
+
+    assert fired

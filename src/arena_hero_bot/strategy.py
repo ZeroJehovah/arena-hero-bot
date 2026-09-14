@@ -366,6 +366,7 @@ class AggressiveStrategy:
         self._expedition_serial_by_members: dict[frozenset[UUID], int] = {}
         self._expedition_pursuits: dict[frozenset[UUID], _ExpeditionPursuit] = {}
         self._expedition_routes: dict[frozenset[UUID], ExplorationRoute] = {}
+        self._expedition_regroup_orders: dict[frozenset[UUID], tuple[UUID, ...]] = {}
         self._expedition_navigation_turn: Turn | None = None
         self._expedition_serial: int = self.memory.next_expedition_serial
         for persisted in self.memory.expedition_squads:
@@ -377,6 +378,11 @@ class AggressiveStrategy:
                 self._expedition_squads.append((members, persisted.bearing))
                 self._expedition_serial_by_members[members] = persisted.serial
                 self._expedition_routes[members] = persisted.exploration_route
+                self._expedition_regroup_orders[members] = tuple(
+                    UUID(member)
+                    for member in persisted.regroup_order
+                    if member in persisted.members
+                )
                 self._expedition_pursuits[members] = _ExpeditionPursuit(
                     target_id=persisted.pursuit_target_id,
                     position=persisted.pursuit_position,
@@ -526,6 +532,8 @@ class AggressiveStrategy:
                 continue
             self._decide_worker(worker, context)
         self._decide_core(context)
+        if self.config.expedition_mode:
+            self._persist_expedition_pursuits()
         report.planned_damage = dict(context.damage_ledger.planned_damage)
         return report
 
@@ -1354,14 +1362,29 @@ class AggressiveStrategy:
                         "Core service cell is occupied and no queue slot is free",
                     )
                 return
-            if not self._move(
+            if self._move(
                 worker,
                 core.position,
                 context,
                 reason="return carried resources to Core",
                 allow_goal=True,
                 intent=_MoveIntent.INBOUND,
-            ) and not self._move_to_core_queue(
+            ):
+                return
+            # A blocked home approach can end just outside the danger zone.
+            # Keep withdrawing from that nearby threat instead of treating
+            # the pathfinder's lack of progress as a normal cargo queue.
+            approach_threats = tuple(
+                position
+                for position in self._remembered_worker_danger_positions(context.turn)
+                if manhattan(worker.position, position)
+                <= self.config.worker_threat_radius + 1
+            )
+            if approach_threats and self._retreat_worker(
+                worker, core.position, context, approach_threats
+            ):
+                return
+            if not self._move_to_core_queue(
                 worker,
                 context,
                 reason="queue carried resources after a full Core approach",
@@ -2396,12 +2419,9 @@ class AggressiveStrategy:
     ) -> bool:
         """Return whether ``goal`` is reachable ignoring our own traffic.
 
-        ``next_step`` answers an unreachable goal with the neighbour closest to
-        it.  That is right while the blockage is transient, because units
-        shuffle and one step of pressure resolves it, and wrong when the goal is
-        walled off: the caller cannot tell that step from an orbit around the
-        wall, so it keeps asking and the Unit circles the rim forever.  This
-        asks the question the fallback hides, against the blockers above.
+        A partial path toward a goal does not prove the goal is reachable.
+        Resource claims require the complete route so a Worker does not keep
+        approaching a permanently sealed site without ever harvesting it.
         """
 
         if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
@@ -3733,6 +3753,14 @@ class AggressiveStrategy:
             remaining: self._expedition_routes.get(original, ExplorationRoute())
             for original, remaining, _bearing in survivors
         }
+        self._expedition_regroup_orders = {
+            remaining: tuple(
+                member
+                for member in self._expedition_regroup_orders.get(original, ())
+                if member in remaining
+            )
+            for original, remaining, _bearing in survivors
+        }
         staged_vanguards = sorted(
             (
                 unit.id
@@ -3860,14 +3888,7 @@ class AggressiveStrategy:
         for members, bearing in self._expedition_squads:
             if members not in navigators:
                 continue
-            ordered = sorted(
-                (alive[mid] for mid in members if mid in alive),
-                key=lambda member: (
-                    member.position[0] * bearing[0] + member.position[1] * bearing[1],
-                    member.position,
-                    member.id.bytes,
-                ),
-            )
+            ordered = self._ordered_expedition_members(turn, members, bearing)
             previous = self._expedition_routes.get(members, ExplorationRoute())
             pursuit = self._expedition_pursuits.get(members)
             if pursuit is not None and pursuit.target_id is not None:
@@ -4053,6 +4074,10 @@ class AggressiveStrategy:
                 ).distance,
                 exploration_route=self._expedition_routes.get(
                     members, ExplorationRoute()
+                ),
+                regroup_order=tuple(
+                    str(member)
+                    for member in self._expedition_regroup_orders.get(members, ())
                 ),
             )
             for index, (members, bearing) in enumerate(self._expedition_squads)
@@ -4328,6 +4353,16 @@ class AggressiveStrategy:
         if vanguard.hp < 4 and visible:
             self._record_wait(vanguard, context, "wait for a safe expedition retreat")
             return True
+        # The survival response above keeps priority. Once it permits holding
+        # melee range, let the ordinary predicted-cell sweep consume the Tick;
+        # chasing the occupied target cell here used to walk away from it.
+        if any(
+            weight >= SWEEP_LIKELY_WEIGHT
+            for _targets, weight in self._sweep_groups(
+                vanguard, context, visible
+            ).values()
+        ):
+            return False
         if not visible and self._regroup_quiet_expedition(vanguard, context):
             return True
         target = pursued_target
@@ -4343,6 +4378,52 @@ class AggressiveStrategy:
             reason="continue expedition pursuit after lost sight",
         )
 
+    def _ordered_expedition_members(
+        self,
+        turn: Turn,
+        members: frozenset[UUID],
+        bearing: Position,
+    ) -> list[Ranger | Vanguard]:
+        """Keep the same leaders throughout a detour until the chain closes.
+
+        Projection orders an intact travelling squad. Reapplying that order
+        while disconnected makes detouring members swap leaders every few
+        steps and abandon the path around the wall. Persist the broken chain
+        by UUID, including across a restart, until its links reconnect.
+        """
+
+        alive = {
+            member.id: member
+            for member in (*turn.vanguards, *turn.rangers)
+            if member.id in members
+        }
+        previous = self._expedition_regroup_orders.get(members, ())
+        if len(previous) == len(alive) and set(previous) == alive.keys():
+            ordered = [alive[member] for member in previous]
+            if any(
+                manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
+                for left, right in pairwise(ordered)
+            ):
+                return ordered
+        ordered = sorted(
+            alive.values(),
+            key=lambda member: (
+                member.position[0] * bearing[0] + member.position[1] * bearing[1],
+                member.position,
+                member.id.bytes,
+            ),
+        )
+        if any(
+            manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
+            for left, right in pairwise(ordered)
+        ):
+            self._expedition_regroup_orders[members] = tuple(
+                member.id for member in ordered
+            )
+        else:
+            self._expedition_regroup_orders.pop(members, None)
+        return ordered
+
     def _expedition_rendezvous_goal(
         self,
         unit: Ranger | Vanguard,
@@ -4352,8 +4433,8 @@ class AggressiveStrategy:
     ) -> Position | None:
         """Return where a member must move to keep the squad connected.
 
-        Squad members are ordered by their projection along the bearing into a
-        chain, and each member only enforces the gap to its two *adjacent*
+        Squad members follow a chain that stays fixed while reconnecting,
+        and each member only enforces the gap to its two *adjacent*
         neighbours in that chain.  When its gap to the neighbour behind it
         exceeds ``EXPEDITION_LINK_RADIUS`` the member has raced ahead and
         holds in place; when its gap to the neighbour ahead exceeds the radius
@@ -4367,33 +4448,21 @@ class AggressiveStrategy:
         squad = self._expedition_squad_for(unit.id)
         if squad is None:
             return None
-        members, (bear_x, bear_y) = squad
-        alive = {
-            member.id: member.position for member in (*turn.vanguards, *turn.rangers)
-        }
-        ordered = sorted(
-            (
-                alive[member_id][0] * bear_x + alive[member_id][1] * bear_y,
-                alive[member_id][0],
-                alive[member_id][1],
-                member_id.bytes,
-                member_id,
-                alive[member_id],
-            )
-            for member_id in members
-            if member_id in alive
-        )
+        members, bearing = squad
+        ordered = self._ordered_expedition_members(turn, members, bearing)
         if len(ordered) < 2:
             return None
 
         own_index = next(
-            (index for index, item in enumerate(ordered) if item[4] == unit.id),
+            (index for index, member in enumerate(ordered) if member.id == unit.id),
             None,
         )
         if own_index is None:
             return None
-        laggard = ordered[own_index - 1][5] if own_index > 0 else None
-        leader = ordered[own_index + 1][5] if own_index + 1 < len(ordered) else None
+        laggard = ordered[own_index - 1].position if own_index > 0 else None
+        leader = (
+            ordered[own_index + 1].position if own_index + 1 < len(ordered) else None
+        )
 
         # A gap opened ahead of us: the member lags and must close forward.
         # This takes precedence when both gaps are open.  A middle member can
@@ -4411,7 +4480,7 @@ class AggressiveStrategy:
         ):
             return unit.position
         if whole_squad and any(
-            manhattan(left[5], right[5]) > EXPEDITION_LINK_RADIUS
+            manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
             for left, right in pairwise(ordered)
         ):
             # The member's immediate links can be intact while another link
@@ -5649,6 +5718,10 @@ class AggressiveStrategy:
             if position not in obstacles
             and position not in context.enemy_positions
             and line_of_fire(position, target.position, obstacles)
+            # Range-three diagonals have Manhattan distance six, outside a
+            # Ranger's local vision. Such a firing goal made it lose contact
+            # on arrival and immediately chase back out of the firing cell.
+            and manhattan(position, target.position) <= RANGER_VISION_RADIUS
         ]
         if not candidates:
             return None
