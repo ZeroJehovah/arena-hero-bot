@@ -69,7 +69,7 @@ RESOURCE_SCOUT_INTERVAL = 12
 # limiting leg of a refill cycle.  Count that leg with a higher weight for sites outside
 # the local patrol ring; this remains a soft preference and never removes a
 # far site from the candidate pool.
-REMOTE_RETURN_WEIGHT = 55
+REMOTE_RETURN_WEIGHT = 56
 # Keep the established local-ring round-trip price independent of the remote
 # fallback tuning above; local pairing also covers unreachable-route guards.
 LOCAL_RETURN_WEIGHT = 3
