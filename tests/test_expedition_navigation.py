@@ -513,3 +513,41 @@ def test_expedition_ranger_reaches_a_firing_cell_within_its_own_vision():
             member["position"] = list(add(ranger.position, action.direction))
 
     assert fired
+
+
+@pytest.mark.parametrize("patrol", [((2, 0), (3, 0)), ((0, -3), (0, -2))])
+@pytest.mark.parametrize("restart", [False, True])
+def test_expedition_ranger_finishes_a_worker_patrolling_between_two_cells(
+    tmp_path, patrol, restart
+):
+    strategy = _strategy()
+    enemy_hp = 2
+    for offset in range(8):
+        if restart and offset == 4:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+        turn = make_turn(
+            tick=100 + offset,
+            objects=[
+                core(position=(-30, -30)),
+                unit(4, "RANGER", position=(0, 0)),
+                unit(
+                    90,
+                    "WORKER",
+                    controlled=False,
+                    position=patrol[offset % 2],
+                    hp=enemy_hp,
+                ),
+            ],
+        )
+        strategy.decide(turn)
+        action = turn.plan.unit_actions[turn.rangers[0].id]
+        assert action.type == "SHOOT"
+        # Resolve against the Worker's next cell, after its movement.
+        if action.expected_cell == patrol[(offset + 1) % 2]:
+            enemy_hp -= 1
+        if enemy_hp == 0:
+            break
+
+    assert enemy_hp == 0

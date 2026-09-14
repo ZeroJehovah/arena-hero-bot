@@ -3307,11 +3307,10 @@ class AggressiveStrategy:
         turn: Turn,
         obstacles: set[Position] | frozenset[Position],
     ) -> Position | None:
-        # Movement resolves before the shot, so aiming at the cell a moving
-        # target currently occupies is a guaranteed miss.  ``drift`` is the
-        # loose one-step estimate and fires far more often than the strict
-        # three-Tick predictor, which almost never triggers while vision over
-        # the target keeps flickering.  At range 1 the target is close enough
+        # Movement resolves before the shot. Prefer a repeated straight or
+        # two-cell patrol track over extrapolating just the last direction.
+        # The looser ``drift`` estimate also works across flickering vision.
+        # At range 1 the target is close enough
         # to stall or collide, so the standing cell is still the better guess
         # there; from range 2 outwards the lead is preferred.
         strict = self.memory.predicted_enemy_position(str(enemy.id), turn.tick)

@@ -174,6 +174,34 @@ def test_enemy_track_predicts_one_cardinal_step() -> None:
     assert memory.predicted_enemy_position(object_id(6), 22) == (0, 1)
 
 
+@pytest.mark.parametrize(
+    ("ticks", "positions", "expected"),
+    [
+        ((20, 21, 22, 23), ((2, 0), (3, 0), (2, 0), (3, 0)), (2, 0)),
+        ((20, 21, 22, 23), ((3, 0), (2, 0), (3, 0), (2, 0)), (3, 0)),
+        ((20, 21, 22), ((2, 0), (3, 0), (2, 0)), None),
+        ((19, 21, 22, 23), ((2, 0), (3, 0), (2, 0), (3, 0)), None),
+        ((20, 21, 23, 24), ((2, 0), (3, 0), (2, 0), (3, 0)), None),
+        ((20, 21, 22, 23), ((2, 0), (2, 0), (2, 0), (2, 0)), None),
+        ((20, 21, 22, 23), ((2, 0), (3, 1), (2, 0), (3, 1)), None),
+    ],
+)
+def test_enemy_patrol_prediction_requires_repeated_contiguous_steps(
+    ticks, positions, expected
+):
+    memory = WorldMemory()
+    for tick, position in zip(ticks, positions, strict=True):
+        memory.observe(
+            make_turn(
+                tick=tick,
+                objects=[unit(6, "WORKER", controlled=False, position=position)],
+            )
+        )
+
+    assert memory.predicted_enemy_position(object_id(6), ticks[-1]) == expected
+    assert memory.predicted_enemy_position(object_id(6), ticks[-1] + 1) is None
+
+
 def test_missing_file_and_unknown_schema(tmp_path) -> None:
     assert WorldMemory.load(tmp_path / "missing.json") == WorldMemory()
     path = tmp_path / "bad.json"

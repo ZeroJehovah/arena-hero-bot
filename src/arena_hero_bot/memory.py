@@ -358,7 +358,7 @@ class WorldMemory:
         enemy_id: str,
         tick: int,
     ) -> Position | None:
-        """Predict one cardinal step after two consecutive matching moves."""
+        """Predict repeated straight motion or a two-cell cardinal patrol."""
 
         history = self.enemy_position_history.get(enemy_id, [])
         if len(history) < 3:
@@ -374,12 +374,20 @@ class WorldMemory:
             return None
         previous_delta = previous[0] - older[0], previous[1] - older[1]
         current_delta = current[0] - previous[0], current[1] - previous[1]
-        if (
-            previous_delta != current_delta
-            or abs(current_delta[0]) + abs(current_delta[1]) != 1
-        ):
+        if abs(current_delta[0]) + abs(current_delta[1]) != 1:
             return None
-        return current[0] + current_delta[0], current[1] + current_delta[1]
+        if previous_delta == current_delta:
+            return current[0] + current_delta[0], current[1] + current_delta[1]
+        # Four consecutive A-B-A-B observations establish a repeated reversal.
+        # Extrapolating the last direction instead aims outside the patrol on
+        # every Tick, even after hundreds of missed shots.
+        if (
+            len(history) >= 4
+            and older == current
+            and history[-4] == (older_tick - 1, previous)
+        ):
+            return previous
+        return None
 
     def enemy_drift_position(
         self,
@@ -389,8 +397,8 @@ class WorldMemory:
     ) -> Position | None:
         """Extrapolate a hostile's recent drift ``steps`` Ticks ahead.
 
-        ``predicted_enemy_position`` only fires after three consecutive
-        same-delta observations, which almost never happens for an intruder
+        ``predicted_enemy_position`` needs consecutive observations of repeated
+        motion, which almost never happens for an intruder
         that keeps flickering in and out of fleet vision.  Combat resolves on
         the post-movement snapshot, so a chaser that aims at the cell a target
         currently stands in always swings at empty ground.  This looser
