@@ -5908,15 +5908,13 @@ def test_expedition_members_never_heal_or_retreat() -> None:
     assert not strategy._recover_if_critical(ranger_view, maximum_hp=2, context=context)
 
 
-def test_low_hp_expedition_ranger_returns_after_lost_ranged_contact() -> None:
+def test_low_hp_expedition_ranger_continues_lost_contact_pursuit() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
     strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(8, 5),
+        target_id=object_id(90), position=(8, 5)
     )
-
     turn = make_turn(
         objects=[
             core(),
@@ -5933,26 +5931,25 @@ def test_low_hp_expedition_ranger_returns_after_lost_ranged_contact() -> None:
 
     ranger = turn.rangers[0]
     assert strategy._decide_expedition_ranger(ranger, context)
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "return critical expedition Ranger to Core"
-        for item in context.report.decisions
+    action = turn.plan.unit_actions[ranger.id]
+    assert action.type == "MOVE"
+    assert manhattan(add(ranger.position, action.direction), (8, 5)) < manhattan(
+        ranger.position, (8, 5)
     )
+    assert all("Core" not in item.reason for item in context.report.decisions)
 
 
-def test_wounded_expedition_vanguard_returns_after_lost_contact() -> None:
+def test_wounded_expedition_vanguard_continues_lost_contact_pursuit() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
     strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(8, 5),
+        target_id=object_id(90), position=(8, 5)
     )
-
     turn = make_turn(
         objects=[
             core(),
-            unit(2, "VANGUARD", position=(5, 4), hp=3),
+            unit(2, "VANGUARD", position=(5, 4), hp=1),
             unit(3, "RANGER", position=(5, 5)),
         ]
     )
@@ -5965,18 +5962,17 @@ def test_wounded_expedition_vanguard_returns_after_lost_contact() -> None:
 
     vanguard = turn.vanguards[0]
     assert strategy._decide_expedition_vanguard(vanguard, context)
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "return critical expedition Vanguard to Core"
-        for item in context.report.decisions
+    action = turn.plan.unit_actions[vanguard.id]
+    assert action.type == "MOVE"
+    assert manhattan(add(vanguard.position, action.direction), (8, 5)) < manhattan(
+        vanguard.position, (8, 5)
     )
+    assert all("Core" not in item.reason for item in context.report.decisions)
 
 
-def test_wounded_expedition_vanguard_breaks_new_contact_before_sweeping() -> None:
+def test_wounded_expedition_vanguard_sweeps_instead_of_retreating() -> None:
     strategy = _expedition_strategy()
-    squad = frozenset({UUID(int=2)})
-    strategy._expedition_squads = [(squad, (1, 0))]
-
+    strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
     turn = make_turn(
         objects=[
             core(),
@@ -5991,50 +5987,15 @@ def test_wounded_expedition_vanguard_breaks_new_contact_before_sweeping() -> Non
         enemy_positions={turn.visible_enemies[0].position},
     )
 
-    vanguard = turn.vanguards[0]
-    assert strategy._decide_expedition_vanguard(vanguard, context)
-    action = turn.plan.unit_actions[vanguard.id]
-    assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
-    )
+    strategy._decide_vanguard(turn.vanguards[0], context, (), offensive=True)
+
+    assert turn.plan.unit_actions[turn.vanguards[0].id].type == "SWEEP"
+    assert all("retreat" not in item.reason for item in context.report.decisions)
 
 
-def test_expedition_retreat_prefers_cell_with_more_escape_options() -> None:
+def test_boxed_wounded_expedition_vanguard_fights_instead_of_waiting() -> None:
     strategy = _expedition_strategy()
     strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
-
-    turn = make_turn(
-        objects=[
-            core(position=(100, 100)),
-            unit(2, "VANGUARD", position=(5, 5), hp=3),
-            unit(90, "VANGUARD", controlled=False, position=(5, 4)),
-        ],
-        obstacles=[(4, 5), (6, 4), (7, 5)],
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-
-    vanguard = turn.vanguards[0]
-    assert strategy._expedition_break_contact(
-        vanguard, turn.visible_enemies[0], context
-    )
-    action = turn.plan.unit_actions[vanguard.id]
-    assert action.type == "MOVE"
-    assert add(vanguard.position, action.direction) == (5, 6)
-
-
-def test_wounded_expedition_vanguard_waits_when_retreat_is_fully_blocked() -> None:
-    strategy = _expedition_strategy()
-    strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
-
     turn = make_turn(
         objects=[
             core(),
@@ -6055,13 +6016,8 @@ def test_wounded_expedition_vanguard_waits_when_retreat_is_fully_blocked() -> No
 
     strategy._decide_vanguard(turn.vanguards[0], context, (), offensive=True)
 
-    # ``_record_wait`` deliberately leaves the unit action unset; the server
-    # treats the missing unit command as WAIT while telemetry keeps the reason.
-    assert turn.vanguards[0].id not in turn.plan.unit_actions
-    assert any(
-        item.action == "WAIT" and item.reason == "wait for a safe expedition retreat"
-        for item in context.report.decisions
-    )
+    assert turn.plan.unit_actions[turn.vanguards[0].id].type == "SWEEP"
+    assert all(item.action != "WAIT" for item in context.report.decisions)
 
 
 def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> None:
@@ -6337,227 +6293,17 @@ def test_expedition_never_forms_pure_vanguard_squad() -> None:
         assert len(members) == 4
 
 
-def test_expedition_vanguard_closes_on_ranged_attacker() -> None:
-    strategy = _expedition_strategy()
-    strategy._expedition_squads = [
-        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
-    ]
-
-    turn = make_turn(
-        resources=10000,
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(5, 5)),
-            unit(3, "RANGER", position=(6, 5)),
-            unit(90, "RANGER", controlled=False, position=(8, 5)),
-        ],
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-    vanguard = turn.vanguards[0]
-
-    assert strategy._expedition_under_fire(
-        vanguard, context, turn.visible_enemies, offensive=True
-    )
-    action = turn.plan.unit_actions[vanguard.id]
-    assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE" and "close on the ranged attacker" in item.reason
-        for item in context.report.decisions
-    )
-
-
-def test_expedition_vanguard_breaks_contact_when_damaged_and_outranged() -> None:
-    strategy = _expedition_strategy()
-    strategy._expedition_squads = [
-        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
-    ]
-
-    turn = make_turn(
-        resources=10000,
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(5, 5), hp=2),
-            unit(3, "RANGER", position=(6, 5)),
-            unit(90, "RANGER", controlled=False, position=(9, 5)),
-        ],
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-    vanguard = turn.vanguards[0]
-
-    assert strategy._expedition_under_fire(
-        vanguard, context, turn.visible_enemies, offensive=True
-    )
-    action = turn.plan.unit_actions[vanguard.id]
-    assert action.type == "MOVE"
-    moved = add(vanguard.position, action.direction)
-    assert manhattan(moved, (9, 5)) > manhattan(vanguard.position, (9, 5))
-
-
-def test_wounded_expedition_vanguard_breaks_ranger_line_before_melee_close() -> None:
-    strategy = _expedition_strategy()
-    strategy._expedition_squads = [
-        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
-    ]
-
-    turn = make_turn(
-        resources=10000,
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(5, 5), hp=1),
-            unit(3, "RANGER", position=(6, 5)),
-            unit(90, "VANGUARD", controlled=False, position=(7, 5)),
-            unit(91, "RANGER", controlled=False, position=(8, 5)),
-        ],
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-    vanguard = turn.vanguards[0]
-
-    assert strategy._expedition_under_fire(
-        vanguard, context, turn.visible_enemies, offensive=True
-    )
-    action = turn.plan.unit_actions[vanguard.id]
-    assert action.type == "MOVE"
-    moved = add(vanguard.position, action.direction)
-    assert manhattan(moved, (8, 5)) > manhattan(vanguard.position, (8, 5))
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
-    )
-
-
-def test_expedition_vanguard_disengages_before_two_rangers_box_it_in() -> None:
-    strategy = _expedition_strategy()
-    strategy._expedition_squads = [
-        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
-    ]
-
-    turn = make_turn(
-        resources=10000,
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(5, 5)),
-            unit(3, "RANGER", position=(6, 5)),
-            unit(90, "RANGER", controlled=False, position=(2, 5)),
-            unit(91, "RANGER", controlled=False, position=(2, 6)),
-        ],
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-    vanguard = turn.vanguards[0]
-
-    assert strategy._expedition_under_fire(
-        vanguard, context, turn.visible_enemies, offensive=True
-    )
-    action = turn.plan.unit_actions[vanguard.id]
-    assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
-    )
-
-
-def test_expedition_vanguard_with_three_close_enemies_breaks_contact() -> None:
-    strategy = _expedition_strategy()
-    strategy._expedition_squads = [
-        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
-    ]
-
-    turn = make_turn(
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(5, 5)),
-            unit(3, "RANGER", position=(6, 5)),
-            unit(90, "VANGUARD", controlled=False, position=(7, 5)),
-            unit(91, "VANGUARD", controlled=False, position=(6, 6)),
-            unit(92, "VANGUARD", controlled=False, position=(5, 7)),
-        ]
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-
-    assert strategy._expedition_under_fire(
-        turn.vanguards[0], context, turn.visible_enemies, offensive=True
-    )
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
-    )
-
-
-def test_critical_expedition_ranger_returns_from_three_close_enemies() -> None:
-    strategy = _expedition_strategy()
-    strategy._expedition_squads = [
-        (frozenset({UUID(int=2), UUID(int=3)}), (1, 0)),
-    ]
-
-    turn = make_turn(
-        objects=[
-            core(position=(0, 0)),
-            unit(2, "VANGUARD", position=(5, 4)),
-            unit(3, "RANGER", position=(5, 5), hp=1),
-            unit(90, "VANGUARD", controlled=False, position=(6, 5)),
-            unit(91, "VANGUARD", controlled=False, position=(5, 6)),
-            unit(92, "RANGER", controlled=False, position=(6, 6)),
-        ]
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-
-    assert strategy._decide_expedition_ranger(turn.rangers[0], context)
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "return critical expedition Ranger to Core"
-        for item in context.report.decisions
-    )
-
-
-def test_expedition_pursuit_vanguard_disengages_when_wounded_and_outranged() -> None:
+def test_wounded_expedition_vanguard_closes_on_ranged_attacker() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
     strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(9, 5),
+        target_id=object_id(90), position=(9, 5)
     )
-
     turn = make_turn(
         objects=[
             core(),
-            unit(2, "VANGUARD", position=(5, 5), hp=2),
+            unit(2, "VANGUARD", position=(5, 5), hp=1),
             unit(3, "RANGER", position=(6, 5)),
             unit(90, "RANGER", controlled=False, position=(9, 5)),
         ]
@@ -6574,22 +6320,19 @@ def test_expedition_pursuit_vanguard_disengages_when_wounded_and_outranged() -> 
     assert strategy._decide_expedition_vanguard(vanguard, context)
     action = turn.plan.unit_actions[vanguard.id]
     assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
+    assert manhattan(add(vanguard.position, action.direction), (9, 5)) < manhattan(
+        vanguard.position, (9, 5)
     )
+    assert any("close on" in item.reason for item in context.report.decisions)
 
 
-def test_low_hp_expedition_ranger_disengages_before_return_fire() -> None:
+def test_low_hp_expedition_ranger_shoots_instead_of_retreating() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
     strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(8, 5),
+        target_id=object_id(90), position=(8, 5)
     )
-
     turn = make_turn(
         objects=[
             core(),
@@ -6606,26 +6349,21 @@ def test_low_hp_expedition_ranger_disengages_before_return_fire() -> None:
         enemy_positions={item.position for item in turn.visible_enemies},
     )
 
-    ranger = turn.rangers[0]
-    assert strategy._decide_expedition_ranger(ranger, context)
-    action = turn.plan.unit_actions[ranger.id]
-    assert action.type == "MOVE"
+    assert strategy._decide_expedition_ranger(turn.rangers[0], context)
+
+    assert turn.plan.unit_actions[turn.rangers[0].id].type == "SHOOT"
     assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
+        item.reason == "aggressive expedition fire" for item in context.report.decisions
     )
 
 
-def test_one_hp_expedition_ranger_returns_before_chasing_worker() -> None:
+def test_one_hp_expedition_ranger_shoots_worker_instead_of_returning() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
     strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(8, 5),
+        target_id=object_id(90), position=(7, 5)
     )
-
     turn = make_turn(
         objects=[
             core(),
@@ -6642,22 +6380,15 @@ def test_one_hp_expedition_ranger_returns_before_chasing_worker() -> None:
         enemy_positions={item.position for item in turn.visible_enemies},
     )
 
-    ranger = turn.rangers[0]
-    assert strategy._decide_expedition_ranger(ranger, context)
-    action = turn.plan.unit_actions[ranger.id]
-    assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "return critical expedition Ranger to Core"
-        for item in context.report.decisions
-    )
+    assert strategy._decide_expedition_ranger(turn.rangers[0], context)
+
+    assert turn.plan.unit_actions[turn.rangers[0].id].type == "SHOOT"
 
 
-def test_one_hp_expedition_ranger_returns_before_exploring() -> None:
+def test_one_hp_expedition_ranger_explores_instead_of_returning() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
-
     turn = make_turn(
         objects=[
             core(),
@@ -6672,99 +6403,41 @@ def test_one_hp_expedition_ranger_returns_before_exploring() -> None:
         enemy_positions=set(),
     )
 
-    ranger = turn.rangers[0]
-    assert strategy._decide_expedition_ranger(ranger, context)
-    action = turn.plan.unit_actions[ranger.id]
-    assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "return critical expedition Ranger to Core"
-        for item in context.report.decisions
-    )
+    strategy._decide_ranger(turn.rangers[0], context, (), offensive=True)
+
+    assert turn.plan.unit_actions[turn.rangers[0].id].type == "MOVE"
+    assert any("shared route" in item.reason for item in context.report.decisions)
+    assert all("Core" not in item.reason for item in context.report.decisions)
 
 
-def test_boxed_low_hp_expedition_ranger_returns_instead_of_shooting() -> None:
+def test_expedition_ranger_on_core_does_not_heal() -> None:
     strategy = _expedition_strategy()
-    squad = frozenset({UUID(int=2), UUID(int=3)})
-    strategy._expedition_squads = [(squad, (1, 0))]
-    strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(2, 2),
-    )
-
+    strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
     turn = make_turn(
-        objects=[
-            core(position=(10, 0)),
-            unit(2, "VANGUARD", position=(0, 3)),
-            unit(3, "RANGER", position=(0, 0), hp=1),
-            unit(90, "RANGER", controlled=False, position=(2, 2)),
-        ],
-        obstacles=[(-1, 0), (0, -1)],
+        resources=100,
+        objects=[core(position=(5, 5)), unit(2, "RANGER", position=(5, 5), hp=1)],
     )
     context = _TurnContext(
         turn=turn,
         report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
+        occupied={item.position for item in turn.units},
+        enemy_positions=set(),
+        remaining_resources=100,
     )
 
-    ranger = turn.rangers[0]
-    assert strategy._decide_expedition_ranger(ranger, context)
-    action = turn.plan.unit_actions[ranger.id]
-    assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "return critical expedition Ranger to Core"
-        for item in context.report.decisions
-    )
+    strategy._decide_ranger(turn.rangers[0], context, (), offensive=True)
+
+    assert turn.plan.unit_actions[turn.rangers[0].id].type == "MOVE"
+    assert all(item.action != "HEAL" for item in context.report.decisions)
 
 
-def test_expedition_ranger_breaks_diagonal_ranged_contact_before_first_hit() -> None:
+def test_expedition_ranger_advances_into_ranged_contact() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})
     strategy._expedition_squads = [(squad, (1, 0))]
     strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(8, 6),
+        target_id=object_id(90), position=(9, 5)
     )
-
-    turn = make_turn(
-        objects=[
-            core(),
-            unit(2, "VANGUARD", position=(5, 4)),
-            unit(3, "RANGER", position=(5, 5)),
-            unit(90, "RANGER", controlled=False, position=(8, 6)),
-        ]
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-
-    ranger = turn.rangers[0]
-    assert strategy._decide_expedition_ranger(ranger, context)
-    action = turn.plan.unit_actions[ranger.id]
-    assert action.type == "MOVE"
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
-    )
-
-
-def test_expedition_ranger_does_not_chase_into_ranged_contact() -> None:
-    strategy = _expedition_strategy()
-    squad = frozenset({UUID(int=2), UUID(int=3)})
-    strategy._expedition_squads = [(squad, (1, 0))]
-    strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
-        target_id=object_id(90),
-        position=(9, 5),
-    )
-
     turn = make_turn(
         objects=[
             core(),
@@ -6785,45 +6458,11 @@ def test_expedition_ranger_does_not_chase_into_ranged_contact() -> None:
     assert strategy._decide_expedition_ranger(ranger, context)
     action = turn.plan.unit_actions[ranger.id]
     assert action.type == "MOVE"
+    assert manhattan(add(ranger.position, action.direction), (9, 5)) < manhattan(
+        ranger.position, (9, 5)
+    )
     assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
-    )
-
-
-def test_expedition_ranger_disengage_avoids_visible_melee_threat() -> None:
-    strategy = _expedition_strategy()
-    squad = frozenset({UUID(int=2), UUID(int=3)})
-    strategy._expedition_squads = [(squad, (1, 0))]
-
-    turn = make_turn(
-        objects=[
-            core(position=(0, -10)),
-            unit(2, "VANGUARD", position=(5, 5)),
-            unit(3, "RANGER", position=(0, 0), hp=1),
-            unit(90, "RANGER", controlled=False, position=(-1, 1)),
-            unit(91, "VANGUARD", controlled=False, position=(1, 1)),
-        ]
-    )
-    context = _TurnContext(
-        turn=turn,
-        report=DecisionReport(tick=turn.tick),
-        occupied={item.position for item in turn.units}
-        | {item.position for item in turn.visible_enemies},
-        enemy_positions={item.position for item in turn.visible_enemies},
-    )
-
-    ranger = turn.rangers[0]
-    assert strategy._decide_expedition_ranger(ranger, context)
-    action = turn.plan.unit_actions[ranger.id]
-    assert action.type == "MOVE"
-    moved = add(ranger.position, action.direction)
-    assert manhattan(moved, (1, 1)) != 1
-    assert any(
-        item.action == "MOVE"
-        and item.reason == "break contact with the ranged attacker"
-        for item in context.report.decisions
+        item.reason == "pursue expedition target" for item in context.report.decisions
     )
 
 

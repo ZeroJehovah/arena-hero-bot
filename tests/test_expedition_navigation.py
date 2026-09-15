@@ -466,7 +466,7 @@ def test_connected_regroup_order_is_kept_when_projection_would_break_the_chain()
     )
 
 
-def test_distant_wounded_ranger_leaves_a_rock_pocket_on_its_way_home():
+def test_distant_wounded_ranger_explores_out_of_a_rock_pocket():
     rocks = {
         (-2, 0),
         (-1, -2),
@@ -489,6 +489,7 @@ def test_distant_wounded_ranger_leaves_a_rock_pocket_on_its_way_home():
     member = unit(4, "RANGER", hp=1)
     strategy = _strategy(obstacles=rocks)
     strategy.memory.core_home_position = home
+    visited = {(0, 0)}
     for tick in range(100, 124):
         turn = make_turn(
             tick=tick, objects=[core(position=home), member], obstacles=rocks
@@ -498,14 +499,15 @@ def test_distant_wounded_ranger_leaves_a_rock_pocket_on_its_way_home():
         decision = next(
             item for item in report.decisions if item.actor_id == str(ranger.id)
         )
-        assert decision.reason == "return critical expedition Ranger to Core"
+        assert decision.reason == "explore new ground along the squad's shared route"
         action = turn.plan.unit_actions[ranger.id]
         assert action.type == "MOVE"
         position = add(ranger.position, action.direction)
         assert position not in rocks
+        visited.add(position)
         member["position"] = list(position)
 
-    assert manhattan((0, 0), home) - manhattan(position, home) >= 10
+    assert len(visited) >= 12
 
 
 def test_expedition_vanguard_keeps_sweeping_a_stationary_core():

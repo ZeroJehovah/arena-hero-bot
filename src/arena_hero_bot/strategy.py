@@ -161,11 +161,9 @@ EXPEDITION_LINK_RADIUS = 4
 # full-HP Vanguard from range 2-3 used to kill it in place because expedition
 # members skipped all the visible-target combat logic.  This radius is the
 # window a member may still close on to answer that fire.
-EXPEDITION_COUNTER_RADIUS = 3
 # Three combat units inside the expedition's counter window can cover every
 # useful approach cell.  Treat that as an encirclement before the normal
 # close-on-target branch, even while the member is still at full HP.
-EXPEDITION_OVERWHELMED_ENEMY_COUNT = 3
 
 # Revised live posture.  The legacy constants above remain available for
 # explicit small test configurations; ``target_workers >= 16`` selects this
@@ -545,9 +543,8 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
-        if self._is_expedition_member(
-            ranger, context.turn
-        ) and self._decide_expedition_ranger(ranger, context):
+        expedition_member = self._is_expedition_member(ranger, context.turn)
+        if expedition_member and self._decide_expedition_ranger(ranger, context):
             return
         visible_enemies = self._visible_combat_targets(
             ranger,
@@ -586,7 +583,8 @@ class AggressiveStrategy:
         # at the Core's edge that used to turn a defensive Ranger's final shot
         # into a preventable death during Core migration.
         if (
-            ranger.hp <= 1
+            not expedition_member
+            and ranger.hp <= 1
             and context.threat.level
             in {ThreatLevel.PRE_EVADE, ThreatLevel.ENGAGED, ThreatLevel.BREAKOUT}
             and self._recover_if_critical(
@@ -601,7 +599,8 @@ class AggressiveStrategy:
         # branch can pull it back into the same remote duel and make it
         # oscillate between disengaging and heading home.
         if (
-            ranger.id in context.squad_return_ids
+            not expedition_member
+            and ranger.id in context.squad_return_ids
             and context.turn.core is not None
             and self._move_ranger_toward_core(
                 ranger,
@@ -629,10 +628,13 @@ class AggressiveStrategy:
             if target is None or shot_cell is None:
                 shootable = []
             else:
-                if self._decline_ranger_duel(ranger, target, context):
+                if not expedition_member and self._decline_ranger_duel(
+                    ranger, target, context
+                ):
                     return
                 if (
-                    ranger.hp <= 1
+                    not expedition_member
+                    and ranger.hp <= 1
                     and self._ranger_would_take_return_fire(
                         ranger,
                         target,
@@ -701,12 +703,13 @@ class AggressiveStrategy:
         # firing platform.  Let it take a legal shot before withdrawing;
         # otherwise a whole damaged fireteam can collapse into the Core while
         # an enemy remains in range.
-        if self._recover_if_critical(ranger, maximum_hp=2, context=context):
+        if not expedition_member and self._recover_if_critical(
+            ranger, maximum_hp=2, context=context
+        ):
             return
 
         if self._pickup_beacon(ranger, context):
             return
-        expedition_member = self._is_expedition_member(ranger, context.turn)
         if not expedition_member:
             visible_target = self._preferred_target(
                 context.focus_target, visible_enemies
@@ -945,14 +948,6 @@ class AggressiveStrategy:
                 reason=f"hunt last seen {remembered.kind.lower()}",
             ):
                 return
-        elif self._expedition_under_fire(
-            vanguard,
-            context,
-            visible_enemies,
-            offensive=offensive,
-        ):
-            return
-
         goal, reason = self._idle_combat_goal(
             vanguard,
             context.turn,
@@ -2070,8 +2065,8 @@ class AggressiveStrategy:
             and isinstance(unit, (Ranger, Vanguard))
             and unit.id in self._expedition_member_ids(context.turn)
         ):
-            # Expedition returns and on-site healing belong to their own
-            # combat policy, rather than the generic defensive recall.
+            # Expeditions are one-way combat units. Low health never enrolls
+            # them in defensive recall or Core healing.
             return False
         retreat_threshold = maximum_hp // 2 if critical_hp is None else critical_hp
         if unit.hp > retreat_threshold:
@@ -4120,27 +4115,6 @@ class AggressiveStrategy:
         return True
 
     def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
-        # A wounded expedition member that has made it back to the Core must
-        # consume the heal there before the expedition policy is evaluated
-        # again.  Otherwise the pursuit branch immediately sends it back out,
-        # producing an endless Core in/out loop with no healing.
-        if ranger.hp <= 1 and context.turn.core is not None:
-            if self._heal_if_critical(
-                ranger,
-                maximum_hp=2,
-                context=context,
-            ):
-                return True
-            if ranger.position == context.turn.core.position:
-                if not self._move_to_core_queue(
-                    ranger,
-                    context,
-                    reason="queue returned expedition Ranger outside Core healing",
-                ):
-                    self._record_wait(
-                        ranger, context, "wait at Core for healing resources"
-                    )
-                return True
         pursuit = self._expedition_pursuit_for(ranger)
         visible = self._visible_combat_targets(ranger, context.turn)
         target = None
@@ -4151,102 +4125,10 @@ class AggressiveStrategy:
             )
         if target is None:
             target = self._best_visible_target(ranger.position, context.turn, visible)
-        # A one-HP expedition Ranger must not spend its last safe Tick chasing
-        # a Worker or exploring blind.  Workers are not themselves ranged
-        # threats, but a local snapshot can expose one while the hostile fire
-        # line remains outside this member's vision; return before pursuing,
-        # shooting, or resuming exploration.
-        if ranger.hp <= 1 and target is None:
-            if self._move_ranger_toward_core(
-                ranger,
-                context,
-                reason="return critical expedition Ranger to Core",
-            ):
-                return True
-            self._record_wait(
-                ranger,
-                context,
-                "no safe path for: return critical expedition Ranger to Core",
-            )
-            return True
-        if (
-            ranger.hp <= 1
-            and isinstance(target, UnitView)
-            and target.unit_type is UnitType.WORKER
-        ):
-            if self._move_ranger_toward_core(
-                ranger,
-                context,
-                reason="return critical expedition Ranger to Core",
-            ):
-                return True
-            self._record_wait(
-                ranger,
-                context,
-                "no safe path for: return critical expedition Ranger to Core",
-            )
-            return True
-        if target is not None:
-            obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
-            shot_cell = self._ranger_shot_cell(ranger, target, context.turn, obstacles)
-            if (
-                ranger.hp <= 1
-                and self._expedition_overwhelmed(ranger, visible)
-                and self._move_ranger_toward_core(
-                    ranger,
-                    context,
-                    reason="return critical expedition Ranger to Core",
-                )
-            ):
-                return True
-            # A diagonal Ranger duel can look safe in the current snapshot:
-            # the target cannot shoot this cell yet, but chasing it can step
-            # straight into the target's next axis-aligned firing lane.  Keep
-            # the one-cell approach boundary in this check too: a Ranger at
-            # distance four with no legal shot must not walk into range three
-            # and take the first hit before it gets another decision.
-            preemptive_ranged_contact = (
-                isinstance(target, UnitView)
-                and target.unit_type is UnitType.RANGER
-                and self._ranger_range(ranger.position, target.position)
-                <= RANGER_STANDOFF_RANGE + 1
-                and shot_cell is None
-            )
-            wounded_ranged_contact = (
-                ranger.hp <= 1
-                and self._ranger_would_take_return_fire(
-                    ranger,
-                    target,
-                    obstacles,
-                )
-            )
-            if (
-                preemptive_ranged_contact or wounded_ranged_contact
-            ) and self._expedition_break_contact(ranger, target, context):
-                return True
-            # A boxed-in one-HP Ranger may have no adjacent cell that increases
-            # its distance from the attacker.  Do not fall through to a final
-            # shot in that case: keep the expedition member moving home while
-            # the return route still offers a non-closing cell.
-            if (
-                ranger.hp <= 1
-                and isinstance(target, UnitView)
-                and target.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and self._move_ranger_toward_core(
-                    ranger,
-                    context,
-                    reason="return critical expedition Ranger to Core",
-                )
-            ):
-                return True
         if not visible and self._regroup_quiet_expedition(ranger, context):
             return True
         if pursuit is None or pursuit.target_id is None:
             return False
-        squad = self._expedition_squad_for(ranger.id)
-        alive_vanguard = squad is not None and any(
-            unit.id in squad[0] for unit in context.turn.vanguards
-        )
         target = next(
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
@@ -4255,20 +4137,6 @@ class AggressiveStrategy:
                 ranger, target, context.turn, self.memory.obstacles
             )
             if shot_cell is not None:
-                if (
-                    alive_vanguard
-                    and isinstance(target, UnitView)
-                    and self._decline_ranger_duel(ranger, target, context)
-                ):
-                    goal = self._ranger_approach_goal(ranger, target, context)
-                    if goal is None or goal == ranger.position:
-                        return True
-                    return self._move(
-                        ranger,
-                        goal,
-                        context,
-                        reason="reposition flexibly behind expedition Vanguard",
-                    )
                 ranger.shoot(target, expected_cell=shot_cell)
                 context.damage_ledger.record(target)
                 context.report.add(
@@ -4294,67 +4162,16 @@ class AggressiveStrategy:
     ) -> bool:
         pursuit = self._expedition_pursuit_for(vanguard)
         visible = self._visible_combat_targets(vanguard, context.turn)
-        # A squad can meet a new hostile before its shared pursuit memory has
-        # been created.  Let a wounded member break contact (or counter) in
-        # that first-contact Tick; otherwise the generic Vanguard branch below
-        # may spend the Tick on a fatal adjacent SWEEP.
         if pursuit is None or pursuit.target_id is None:
             if not visible and self._regroup_quiet_expedition(vanguard, context):
                 return True
-            if self._expedition_under_fire(
-                vanguard,
-                context,
-                visible,
-                offensive=True,
-            ):
-                return True
-            # A wounded member can be boxed in so tightly that neither the
-            # protected retreat nor the counter route has a legal first step.
-            # Do not let the generic Vanguard branch turn that failed safety
-            # response into a fatal adjacent SWEEP.
-            if vanguard.hp < 4 and visible:
-                self._record_wait(
-                    vanguard, context, "wait for a safe expedition retreat"
-                )
-                return True
-            return False
+            target = self._best_visible_target(vanguard.position, context.turn, visible)
+            return target is not None and self._expedition_close_to_engage(
+                vanguard, target, context, offensive=True
+            )
         pursued_target = next(
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
-        # The same sight flicker is dangerous for a wounded Vanguard: the
-        # persistent chase would otherwise resume immediately after a safe
-        # contact-break step.  Recall it while it can still reach the Core.
-        if (
-            pursued_target is None
-            and vanguard.hp < 4
-            and pursuit.position is not None
-            and context.turn.core is not None
-            and self._move(
-                vanguard,
-                context.turn.core.position,
-                context,
-                reason="return critical expedition Vanguard to Core",
-                allow_goal=True,
-            )
-        ):
-            return True
-        if self._expedition_under_fire(
-            vanguard,
-            context,
-            visible,
-            offensive=True,
-        ):
-            return True
-        # ``_expedition_under_fire`` returns false when every retreat and
-        # counter cell is blocked.  A wounded expedition Vanguard must still
-        # consume the Tick through the expedition policy instead of falling
-        # through to the ordinary combat Sweep branch.
-        if vanguard.hp < 4 and visible:
-            self._record_wait(vanguard, context, "wait for a safe expedition retreat")
-            return True
-        # The survival response above keeps priority. Once it permits holding
-        # melee range, let the ordinary predicted-cell sweep consume the Tick;
-        # chasing the occupied target cell here used to walk away from it.
         if any(
             weight >= SWEEP_LIKELY_WEIGHT
             for _targets, weight in self._sweep_groups(
@@ -4622,138 +4439,6 @@ class AggressiveStrategy:
                 return target.position
         return None
 
-    def _expedition_under_fire(
-        self,
-        vanguard: Vanguard,
-        context: _TurnContext,
-        visible_enemies: tuple[CoreView | UnitView, ...],
-        *,
-        offensive: bool,
-    ) -> bool:
-        """Answer ranged fire instead of waiting for the cohesion chain to close.
-
-        A 1HP enemy Ranger kiting a full-HP Vanguard from range 2-3 used
-        to kill it in place because the dying member only ever got the cohesion goal
-        ("hold for the expedition's laggards to close up") and never closed the
-        distance nor broke away.  When a visible hostile is close enough to
-        engage, advance onto it exactly like the normal rush (counter); when
-        the attacker stays out of melee reach and we have already been hit, step
-        out of its line of fire instead of absorbing another volley (disengage).
-        The survival/attack answer overrides the cohesion hold when under fire.
-        """
-
-        if not visible_enemies:
-            return False
-
-        target = self._preferred_target(context.focus_target, visible_enemies)
-        if target is None:
-            target = self._best_visible_target(
-                vanguard.position, context.turn, visible_enemies
-            )
-        if target is None:
-            return False
-
-        ranged_attackers = tuple(
-            enemy
-            for enemy in visible_enemies
-            if isinstance(enemy, UnitView) and enemy.unit_type is UnitType.RANGER
-        )
-        if self._expedition_overwhelmed(vanguard, visible_enemies):
-            if self._expedition_break_contact(vanguard, target, context):
-                return True
-            if context.turn.core is not None and self._move(
-                vanguard,
-                context.turn.core.position,
-                context,
-                reason="withdraw overwhelmed expedition Vanguard",
-                allow_goal=True,
-            ):
-                return True
-        # A wounded Vanguard can see a closer melee target and still be inside
-        # a Ranger's firing line.  Letting target priority choose the melee
-        # unit makes the Vanguard close into the shot instead of breaking
-        # contact.  The single-Ranger version is the common expedition case;
-        # use the actual ranged threat as the contact-break anchor before the
-        # normal close-on-melee branch gets a chance to mask it.
-        if vanguard.hp < 4 and ranged_attackers:
-            threatening_ranger = min(
-                (
-                    enemy
-                    for enemy in ranged_attackers
-                    if self._enemy_can_attack_position(
-                        enemy,
-                        vanguard.position,
-                        self.memory.obstacles | set(context.turn.obstacle_cells),
-                    )
-                ),
-                key=lambda enemy: (
-                    self._ranger_range(vanguard.position, enemy.position),
-                    str(enemy.id),
-                ),
-                default=None,
-            )
-            if threatening_ranger is not None and self._expedition_break_contact(
-                vanguard, threatening_ranger, context
-            ):
-                return True
-        # Two nearby Rangers can cover every cardinal escape cell around a
-        # Vanguard.  Do not let a full-health expedition member walk into that
-        # crossfire and rely on a later damaged-unit response to escape.
-        if (
-            len(ranged_attackers) >= 2
-            and min(
-                self._ranger_range(vanguard.position, enemy.position)
-                for enemy in ranged_attackers
-            )
-            <= RANGER_STANDOFF_RANGE + 1
-            and min(
-                self._ranger_range(vanguard.position, enemy.position)
-                for enemy in ranged_attackers
-            )
-            > 1
-            and self._expedition_break_contact(vanguard, target, context)
-        ):
-            return True
-
-        distance = manhattan(vanguard.position, target.position)
-        # Counter: a hostile inside the squad's short engagement window is worth
-        # closing on; override the cohesion hold that used to park members next to
-        # each other while a single Ranger shot them one by one.
-        if distance <= EXPEDITION_COUNTER_RADIUS:
-            if self._expedition_close_to_engage(
-                vanguard, target, context, offensive=offensive
-            ):
-                return True
-            # A blocked counter route must not turn the damage response into
-            # a stationary pursuit.  If the member is already wounded, use
-            # the same break-contact fallback as an outranged attacker.
-            if vanguard.hp < 4:
-                return self._expedition_break_contact(vanguard, target, context)
-            return False
-        # Disengage: the attacker stays beyond melee reach and we are already
-        # damaged: break contact instead of standing still for the next hit.
-        if vanguard.hp < 4:
-            return self._expedition_break_contact(vanguard, target, context)
-        return False
-
-    @staticmethod
-    def _expedition_overwhelmed(
-        unit: Ranger | Vanguard,
-        visible_enemies: tuple[CoreView | UnitView, ...],
-    ) -> bool:
-        """Return whether several nearby combat units can box the member in."""
-
-        return (
-            sum(
-                isinstance(enemy, UnitView)
-                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and manhattan(unit.position, enemy.position)
-                <= EXPEDITION_COUNTER_RADIUS
-                for enemy in visible_enemies
-            )
-            >= EXPEDITION_OVERWHELMED_ENEMY_COUNT
-        )
-
     def _expedition_close_to_engage(
         self,
         vanguard: Vanguard,
@@ -4789,79 +4474,6 @@ class AggressiveStrategy:
                 reason="close on the ranged attacker instead of waiting",
             )
         return False
-
-    def _expedition_break_contact(
-        self,
-        unit: Ranger | Vanguard,
-        attacker: CoreView | UnitView,
-        context: _TurnContext,
-    ) -> bool:
-        """Step out of every visible attack lane to stop absorbing hits.
-
-        The selected attacker is not necessarily the only threat on the cell
-        a member is escaping to.  A wounded Ranger once moved farther from an
-        enemy Ranger but onto an adjacent enemy Vanguard and died on the next
-        resolution.  Keep the distance rule, but prefer destinations that no
-        visible enemy can attack in the current post-movement snapshot.
-        """
-        blocked = set(self.memory.obstacles)
-        blocked.update(context.turn.obstacle_cells)
-        blocked.update(context.enemy_positions)
-        blocked.discard(unit.position)
-        candidates = [
-            position
-            for position in adjacent_positions(unit.position)
-            if position not in blocked and position not in context.enemy_positions
-        ]
-        if not candidates:
-            return False
-        current = manhattan(unit.position, attacker.position)
-        non_closing = [
-            position
-            for position in candidates
-            if manhattan(position, attacker.position) >= current
-        ]
-        if not non_closing:
-            return False
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
-        threats = tuple(
-            enemy
-            for enemy in context.turn.visible_enemies
-            if isinstance(enemy, UnitView)
-            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-        )
-        protected = [
-            position
-            for position in non_closing
-            if not any(
-                self._enemy_can_attack_position(enemy, position, obstacles)
-                for enemy in threats
-            )
-        ]
-        preferred = protected or non_closing
-
-        def escape_options(position: Position) -> int:
-            """Prefer a retreat cell that is less likely to become a pocket."""
-
-            return sum(
-                neighbor not in obstacles and neighbor not in context.enemy_positions
-                for neighbor in adjacent_positions(position)
-            )
-
-        goal = max(
-            preferred,
-            key=lambda position: (
-                escape_options(position),
-                manhattan(position, attacker.position),
-                position,
-            ),
-        )
-        return self._move(
-            unit,
-            goal,
-            context,
-            reason="break contact with the ranged attacker",
-        )
 
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
         """Hold a surplus unit at a unique cell outside the defensive ring.
