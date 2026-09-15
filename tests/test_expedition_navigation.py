@@ -425,6 +425,47 @@ def test_regroup_detour_reconnects_without_swapping_leaders(tmp_path, restart_ti
     assert new_ground > 60
 
 
+def test_connected_regroup_order_is_kept_when_projection_would_break_the_chain():
+    members = [
+        unit(2, "VANGUARD", position=(0, 0)),
+        unit(3, "VANGUARD", position=(0, 1)),
+        unit(4, "RANGER", position=(4, 0)),
+        unit(5, "RANGER", position=(5, 0)),
+    ]
+    memory = WorldMemory(
+        core_home_position=(-30, -30),
+        expedition_squads=[
+            ExpeditionSquad(
+                serial=1,
+                members=tuple(object_id(number) for number in range(2, 6)),
+                bearing=(1, 0),
+                regroup_order=tuple(object_id(number) for number in (3, 2, 4, 5)),
+            )
+        ],
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
+    )
+
+    turn = make_turn(objects=[core(position=(-30, -30)), *members])
+
+    assert all(
+        strategy._expedition_rendezvous_goal(member, turn, whole_squad=True) is None
+        for member in (*turn.vanguards, *turn.rangers)
+    )
+    squad = next(iter(strategy._expedition_regroup_orders))
+    assert strategy._expedition_regroup_orders[squad] == tuple(
+        member.id
+        for member in (
+            turn.vanguards[1],
+            turn.vanguards[0],
+            turn.rangers[0],
+            turn.rangers[1],
+        )
+    )
+
+
 def test_distant_wounded_ranger_leaves_a_rock_pocket_on_its_way_home():
     rocks = {
         (-2, 0),

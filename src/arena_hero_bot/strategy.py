@@ -4397,13 +4397,11 @@ class AggressiveStrategy:
             if member.id in members
         }
         previous = self._expedition_regroup_orders.get(members, ())
-        if len(previous) == len(alive) and set(previous) == alive.keys():
-            ordered = [alive[member] for member in previous]
-            if any(
-                manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
-                for left, right in pairwise(ordered)
-            ):
-                return ordered
+        previous_order = (
+            [alive[member] for member in previous]
+            if len(previous) == len(alive) and set(previous) == alive.keys()
+            else []
+        )
         ordered = sorted(
             alive.values(),
             key=lambda member: (
@@ -4412,6 +4410,22 @@ class AggressiveStrategy:
                 member.id.bytes,
             ),
         )
+        if previous_order:
+            previous_broken = any(
+                manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
+                for left, right in pairwise(previous_order)
+            )
+            canonical_broken = any(
+                manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
+                for left, right in pairwise(ordered)
+            )
+            # A connected chain can have a different projection order whose
+            # adjacent links are disconnected. Switching immediately between
+            # those two orders makes the middle pair trade leaders forever.
+            # Keep the proven connected order until the canonical order is
+            # itself safe to adopt.
+            if previous_broken or canonical_broken:
+                return previous_order
         if any(
             manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
             for left, right in pairwise(ordered)
