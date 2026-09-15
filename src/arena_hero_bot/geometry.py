@@ -112,9 +112,6 @@ def next_step(
     if origin == goal:
         return None
 
-    blocked = blocked - {origin}
-    if allow_goal:
-        blocked.discard(goal)
     recent_penalty = {position: index + 1 for index, position in enumerate(recent)}
     rotated = DIRECTIONS[direction_offset % 4 :] + DIRECTIONS[: direction_offset % 4]
     sequence = count()
@@ -132,7 +129,11 @@ def next_step(
 
         for direction in rotated:
             neighbor = add(current, direction)
-            if neighbor in blocked:
+            if (
+                neighbor != origin
+                and (not allow_goal or neighbor != goal)
+                and neighbor in blocked
+            ):
                 continue
             step_cost = 1 + recent_penalty.get(neighbor, 0) * 3
             new_cost = cost_so_far[current] + step_cost

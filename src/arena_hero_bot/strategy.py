@@ -1583,7 +1583,7 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return ()
-        blockers = self._static_blockers(unit, context) | context.enemy_positions
+        blockers = self._static_blockers(unit, context)
         candidates: list[Position] = []
         for radius in range(1, CORE_QUEUE_RADIUS + 1):
             for dx in range(-radius, radius + 1):
@@ -1596,6 +1596,7 @@ class AggressiveStrategy:
                     )
                     if (
                         position in blockers
+                        or position in context.enemy_positions
                         or position == core.position
                         or position in context.standing_reserved
                         or self._predicted_friendly_occupancy(position, context) != 0
@@ -1667,9 +1668,9 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return False
-        blockers = self._static_blockers(unit, context) | context.enemy_positions
+        blockers = self._static_blockers(unit, context)
         for neighbor in adjacent_positions(core.position):
-            if neighbor in blockers:
+            if neighbor in blockers or neighbor in context.enemy_positions:
                 continue
             occupants = [
                 candidate
@@ -1692,6 +1693,7 @@ class AggressiveStrategy:
                         if (
                             escape == core.position
                             or escape in blockers
+                            or escape in context.enemy_positions
                             or escape in context.standing_reserved
                             or self._predicted_friendly_occupancy(escape, context) != 0
                         ):
@@ -2142,7 +2144,10 @@ class AggressiveStrategy:
                 intent=_MoveIntent.INBOUND,
             )
 
-        blocked = self._static_blockers(ranger, context)
+        # The static blocker helper may return the durable obstacle set
+        # directly. Copy only on this threat-specific branch, which mutates
+        # the local view to exempt the Ranger and Core.
+        blocked = set(self._static_blockers(ranger, context))
         blocked.update(context.enemy_positions)
         blocked.discard(ranger.position)
         blocked.discard(core.position)
@@ -2397,11 +2402,15 @@ class AggressiveStrategy:
         zones still constrain the route.
         """
 
-        blocked = set(self.memory.obstacles)
-        blocked.update(self.memory.contested_positions)
-        blocked.update(context.turn.obstacle_cells)
+        blocked = self.memory.obstacles
+        if self.memory.contested_positions:
+            blocked = blocked | set(self.memory.contested_positions)
+        if not context.turn.obstacle_cells <= blocked:
+            blocked = blocked | set(context.turn.obstacle_cells)
         if isinstance(unit, Worker):
-            blocked.update(self._worker_threat_exclusion_cells(context.turn))
+            threat_exclusion = self._worker_threat_exclusion_cells(context.turn)
+            if threat_exclusion:
+                blocked = blocked | threat_exclusion
         return blocked
 
     def _has_static_route(
@@ -2452,6 +2461,7 @@ class AggressiveStrategy:
         # Friendly units may overlap and swap; they never block travel.
         if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
             return False
+        extra_blocked: set[Position] = set()
         core = context.turn.core
         if (
             intent is _MoveIntent.STAND
@@ -2460,8 +2470,10 @@ class AggressiveStrategy:
             and unit.position != core.position
         ):
             # A queueing unit must not use the service cell as a shortcut.
-            blocked.add(core.position)
-        blocked.update(context.enemy_positions)
+            extra_blocked.add(core.position)
+        extra_blocked.update(context.enemy_positions)
+        if extra_blocked:
+            blocked = blocked | extra_blocked
         max_expansions = (
             EXPEDITION_STAGING_PATH_EXPANSIONS
             if self.config.expedition_mode and unit.id in self._staged_ids
