@@ -6357,6 +6357,41 @@ def test_low_hp_expedition_ranger_shoots_instead_of_retreating() -> None:
     )
 
 
+def test_singleton_expedition_ranger_advances_on_visible_target() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
+        target_id=object_id(90), position=(8, 5)
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(3, "RANGER", position=(5, 5), hp=1),
+            unit(90, "RANGER", controlled=False, position=(8, 5)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    assert strategy._decide_expedition_ranger(turn.rangers[0], context)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+    assert manhattan(
+        add(turn.rangers[0].position, action.direction), (8, 5)
+    ) < manhattan(turn.rangers[0].position, (8, 5))
+    assert any(
+        item.reason == "advance on visible expedition target"
+        for item in context.report.decisions
+    )
+
+
 def test_one_hp_expedition_ranger_shoots_worker_instead_of_returning() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=2), UUID(int=3)})

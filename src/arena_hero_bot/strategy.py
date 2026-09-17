@@ -4126,6 +4126,45 @@ class AggressiveStrategy:
             self._record_wait(unit, context, "no safe route to rejoin the expedition")
         return True
 
+    def _expedition_attack_goal(
+        self,
+        ranger: Ranger,
+        target: CoreView | UnitView,
+        context: _TurnContext,
+    ) -> Position | None:
+        """Return a free cell that advances a lone Ranger on its target.
+
+        A surviving Ranger keeps its expedition identity, but it no longer has
+        a squad route to follow.  Firing from a legal cell is normally enough
+        for a full squad; for a singleton, repeatedly firing at a nearby
+        moving target can leave it pinned to one cell indefinitely.  Approach
+        the target through a free adjacent cell so the residual expedition
+        continues attacking without inventing a return-to-Core path.
+        """
+
+        current_distance = manhattan(ranger.position, target.position)
+        if current_distance <= 1:
+            return None
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        candidates = [
+            position
+            for position in adjacent_positions(target.position)
+            if position != ranger.position
+            and position not in obstacles
+            and position not in context.enemy_positions
+            and manhattan(position, target.position) < current_distance
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda position: (
+                manhattan(ranger.position, position),
+                manhattan(position, target.position),
+                position,
+            ),
+        )
+
     def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
         pursuit = self._expedition_pursuit_for(ranger)
         visible = self._visible_combat_targets(ranger, context.turn)
@@ -4145,6 +4184,23 @@ class AggressiveStrategy:
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
         if target is not None:
+            squad = self._expedition_squad_for(ranger.id)
+            if (
+                squad is not None
+                and len(squad[0]) == 1
+                and (
+                    isinstance(target, CoreView)
+                    or target.unit_type is not UnitType.WORKER
+                )
+            ):
+                attack_goal = self._expedition_attack_goal(ranger, target, context)
+                if attack_goal is not None and self._move(
+                    ranger,
+                    attack_goal,
+                    context,
+                    reason="advance on visible expedition target",
+                ):
+                    return True
             shot_cell = self._ranger_shot_cell(
                 ranger, target, context.turn, self.memory.obstacles
             )
