@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Container
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from itertools import pairwise
@@ -42,6 +43,7 @@ from .geometry import (
     line_of_fire,
     manhattan,
     next_step,
+    overlay_blockers,
 )
 from .memory import (
     RESOURCE_MEMORY_LIMIT,
@@ -240,6 +242,12 @@ class _TurnContext:
     report: DecisionReport
     occupied: set[Position]
     enemy_positions: set[Position]
+    static_blockers: Container[Position] | None = None
+    dynamic_blockers: Container[Position] | None = None
+    worker_blockers: Container[Position] | None = None
+    worker_dynamic_blockers: Container[Position] | None = None
+    standing_blockers: Container[Position] | None = None
+    worker_standing_blockers: Container[Position] | None = None
     reserved: set[Position] = field(default_factory=set)
     friendly_occupancy: dict[Position, int] = field(default_factory=dict)
     arrival_counts: dict[Position, int] = field(default_factory=dict)
@@ -461,6 +469,12 @@ class AggressiveStrategy:
             report=report,
             occupied=occupied,
             enemy_positions={enemy.position for enemy in turn.visible_enemies},
+            static_blockers=(
+                obstacles | set(self.memory.contested_positions)
+                if self.memory.contested_positions
+                else obstacles
+            ),
+            dynamic_blockers=obstacles,
             friendly_occupancy=friendly_occupancy,
             resource_assignments=self._assign_resources(turn),
             remaining_resources=turn.resources,
@@ -483,6 +497,33 @@ class AggressiveStrategy:
             garrison_ids=garrison_ids,
             raid_ids=raid_ids,
         )
+        static_blockers = context.static_blockers
+        if static_blockers is None:
+            static_blockers = obstacles
+        dynamic_blockers: Container[Position] = static_blockers
+        if context.enemy_positions:
+            dynamic_blockers = overlay_blockers(
+                static_blockers, context.enemy_positions
+            )
+        context.dynamic_blockers = dynamic_blockers
+        worker_threat_exclusion = self._worker_threat_exclusion_cells(turn)
+        worker_blockers: Container[Position] = static_blockers
+        if worker_threat_exclusion:
+            worker_blockers = overlay_blockers(static_blockers, worker_threat_exclusion)
+        context.worker_blockers = worker_blockers
+        worker_dynamic_blockers: Container[Position] = dynamic_blockers
+        if worker_threat_exclusion:
+            worker_dynamic_blockers = overlay_blockers(
+                dynamic_blockers, worker_threat_exclusion
+            )
+        context.worker_dynamic_blockers = worker_dynamic_blockers
+        if turn.core is not None:
+            context.standing_blockers = overlay_blockers(
+                dynamic_blockers, {turn.core.position}
+            )
+            context.worker_standing_blockers = overlay_blockers(
+                worker_dynamic_blockers, {turn.core.position}
+            )
         assault_enemies = self._core_assault_enemies(turn)
         if threat.requires_coordination or self._needs_preemptive_ranger_evasion(
             turn,
@@ -2147,17 +2188,15 @@ class AggressiveStrategy:
                 intent=_MoveIntent.INBOUND,
             )
 
-        # The static blocker helper may return the durable obstacle set
-        # directly. Copy only on this threat-specific branch, which mutates
-        # the local view to exempt the Ranger and Core.
-        blocked = set(self._static_blockers(ranger, context))
-        blocked.update(context.enemy_positions)
-        blocked.discard(ranger.position)
-        blocked.discard(core.position)
+        # Friendly units and the Core are not static blockers. Layer the
+        # visible enemies onto the durable view without copying it.
+        blocked = overlay_blockers(
+            self._static_blockers(ranger, context), context.enemy_positions
+        )
         candidates = [
             position
             for position in adjacent_positions(ranger.position)
-            if position not in blocked and position not in context.enemy_positions
+            if position not in blocked
         ]
         if not candidates:
             return self._move(
@@ -2397,7 +2436,9 @@ class AggressiveStrategy:
         ]
         return tuple(dict.fromkeys((*visible, *remembered)))
 
-    def _static_blockers(self, unit: Unit, context: _TurnContext) -> set[Position]:
+    def _static_blockers(
+        self, unit: Unit, context: _TurnContext
+    ) -> Container[Position]:
         """Return the blockers for ``unit`` that outlive this Tick.
 
         Friendly occupancy and queued destinations are left out because units
@@ -2405,15 +2446,21 @@ class AggressiveStrategy:
         zones still constrain the route.
         """
 
-        blocked = self.memory.obstacles
-        if self.memory.contested_positions:
-            blocked = blocked | set(self.memory.contested_positions)
-        if not context.turn.obstacle_cells <= blocked:
-            blocked = blocked | set(context.turn.obstacle_cells)
+        if isinstance(unit, Worker) and context.worker_blockers is not None:
+            blocked = context.worker_blockers
+        else:
+            blocked = context.static_blockers
+        if blocked is None:
+            layers: list[Container[Position]] = [self.memory.obstacles]
+            if self.memory.contested_positions:
+                layers.append(self.memory.contested_positions.keys())
+            if context.turn.obstacle_cells:
+                layers.append(context.turn.obstacle_cells)
+            blocked = overlay_blockers(*layers)
         if isinstance(unit, Worker):
             threat_exclusion = self._worker_threat_exclusion_cells(context.turn)
             if threat_exclusion:
-                blocked = blocked | threat_exclusion
+                blocked = overlay_blockers(blocked, threat_exclusion)
         return blocked
 
     def _has_static_route(
@@ -2460,23 +2507,34 @@ class AggressiveStrategy:
     ) -> bool:
         if unit.position == goal:
             return False
-        blocked = self._static_blockers(unit, context)
+        use_standing_blockers = (
+            intent is _MoveIntent.STAND
+            and context.turn.core is not None
+            and goal != context.turn.core.position
+            and unit.position != context.turn.core.position
+        )
+        if context.dynamic_blockers is not None:
+            if isinstance(unit, Worker):
+                blocked = (
+                    context.worker_standing_blockers
+                    if use_standing_blockers
+                    else context.worker_dynamic_blockers
+                )
+            else:
+                blocked = (
+                    context.standing_blockers
+                    if use_standing_blockers
+                    else context.dynamic_blockers
+                )
+            if blocked is None:
+                blocked = self._static_blockers(unit, context)
+        else:
+            blocked = self._static_blockers(unit, context)
+            if context.enemy_positions:
+                blocked = overlay_blockers(blocked, context.enemy_positions)
         # Friendly units may overlap and swap; they never block travel.
         if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
             return False
-        extra_blocked: set[Position] = set()
-        core = context.turn.core
-        if (
-            intent is _MoveIntent.STAND
-            and core is not None
-            and goal != core.position
-            and unit.position != core.position
-        ):
-            # A queueing unit must not use the service cell as a shortcut.
-            extra_blocked.add(core.position)
-        extra_blocked.update(context.enemy_positions)
-        if extra_blocked:
-            blocked = blocked | extra_blocked
         max_expansions = (
             EXPEDITION_STAGING_PATH_EXPANSIONS
             if self.config.expedition_mode and unit.id in self._staged_ids

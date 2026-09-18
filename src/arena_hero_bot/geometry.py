@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Container
 from heapq import heappop, heappush
 from itertools import count
 from typing import Final
@@ -14,6 +15,53 @@ DIRECTIONS: Final[tuple[Direction, ...]] = (
     Direction.DOWN,
     Direction.LEFT,
 )
+
+
+class LayeredBlocked:
+    """Read-only membership view over durable and transient blocked cells.
+
+    The durable obstacle map can contain hundreds of thousands of cells.  A
+    path query only needs membership checks, so layering the small transient
+    sets avoids copying that map for every Unit in a Turn.
+    """
+
+    __slots__ = ("_excluded", "_layers")
+
+    def __init__(
+        self,
+        layers: tuple[Container[Position], ...],
+        excluded: Container[Position] = frozenset(),
+    ) -> None:
+        self._layers = layers
+        self._excluded = excluded
+
+    def __contains__(self, position: Position) -> bool:
+        if position in self._excluded:
+            return False
+        if len(self._layers) == 1:
+            return position in self._layers[0]
+        if len(self._layers) == 2:
+            return position in self._layers[0] or position in self._layers[1]
+        if len(self._layers) == 3:
+            return (
+                position in self._layers[0]
+                or position in self._layers[1]
+                or position in self._layers[2]
+            )
+        return any(position in layer for layer in self._layers)
+
+
+def overlay_blockers(
+    *layers: Container[Position],
+    excluded: Container[Position] = frozenset(),
+) -> Container[Position]:
+    """Return a membership-only overlay without copying any layer."""
+
+    if not layers:
+        return LayeredBlocked((), excluded)
+    if len(layers) == 1 and not excluded:
+        return layers[0]
+    return LayeredBlocked(tuple(layers), excluded)
 
 
 def add(position: Position, direction: Direction) -> Position:
@@ -42,7 +90,7 @@ def direction_between(origin: Position, destination: Position) -> Direction | No
 def line_of_fire(
     origin: Position,
     target: Position,
-    obstacles: set[Position] | frozenset[Position],
+    obstacles: Container[Position],
 ) -> bool:
     """Return whether a Ranger cell shot is legal under v0.14 geometry."""
 
@@ -94,7 +142,7 @@ def next_step(
     origin: Position,
     goal: Position,
     *,
-    blocked: set[Position],
+    blocked: Container[Position],
     recent: tuple[Position, ...] = (),
     direction_offset: int = 0,
     max_expansions: int = 4096,

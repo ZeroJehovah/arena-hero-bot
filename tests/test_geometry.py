@@ -10,6 +10,7 @@ from arena_hero_bot.geometry import (
     line_of_fire,
     manhattan,
     next_step,
+    overlay_blockers,
 )
 
 
@@ -35,6 +36,17 @@ def test_ranger_line_of_fire_geometry_and_obstacles() -> None:
 def test_pathfinder_routes_around_obstacle() -> None:
     direction = next_step((0, 0), (2, 0), blocked={(1, 0)})
     assert direction in {Direction.UP, Direction.DOWN}
+
+
+def test_pathfinder_accepts_layered_blockers_without_merging_the_layers() -> None:
+    durable = {(1, 0)}
+    transient = {(0, 1)}
+    blocked = overlay_blockers(durable, transient)
+
+    assert (1, 0) in blocked
+    assert (0, 1) in blocked
+    assert (2, 0) not in blocked
+    assert next_step((0, 0), (2, 0), blocked=blocked) is not Direction.RIGHT
 
 
 def test_pathfinder_penalizes_recent_backtracking() -> None:
