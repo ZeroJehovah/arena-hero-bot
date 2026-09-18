@@ -25,6 +25,7 @@ from arena_hero_bot.strategy import (
     RANGER_VISION_RADIUS,
     RESOURCE_SCOUT_INTERVAL,
     STAGED_ROLE,
+    SYMMETRIC_PATROL_RECALL_RADIUS,
     AggressiveStrategy,
     StrategyConfig,
     _clear_manhattan_path,
@@ -5714,6 +5715,42 @@ def test_patrol_team_routes_are_independent() -> None:
 
     assert set(team_targets) == {1, 2, 3}
     assert len({next(iter(targets)) for targets in team_targets.values()}) == 3
+
+
+def test_symmetric_paused_patrol_recalls_to_unique_ring_cells() -> None:
+    config = expedition_config(target_workers=16)
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(20, 20)) for number in range(12)
+    ]
+    rangers = [unit(200 + number, "RANGER", position=(20, 20)) for number in range(24)]
+    turn = make_turn(
+        tick=100,
+        resources=10_000,
+        objects=[core(), *vanguards, *rangers],
+    )
+    assert turn.core is not None
+    strategy._reconcile_unit_roles(turn)
+    patrol_units = sorted(
+        (
+            candidate
+            for candidate in (*turn.vanguards, *turn.rangers)
+            if candidate.id in strategy._patrol_ids(turn)
+        ),
+        key=lambda candidate: candidate.id.bytes,
+    )
+
+    assert len(patrol_units) == 12
+    targets: dict[UUID, tuple[int, int]] = {}
+    for member in patrol_units:
+        goal, reason = strategy._idle_combat_goal(member, turn, offensive=False)
+        assert reason == "return patrol to the defensive ring"
+        assert manhattan(turn.core.position, goal) == SYMMETRIC_PATROL_RECALL_RADIUS
+        assert goal not in strategy.memory.obstacles
+        assert goal not in {item.position for item in turn.visible_enemies}
+        targets[member.id] = goal
+
+    assert len(set(targets.values())) == len(patrol_units)
 
 
 def test_expedition_spawn_fills_formation_gap_with_ranger() -> None:

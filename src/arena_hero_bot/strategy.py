@@ -139,6 +139,9 @@ EXPEDITION_HORIZON = 256
 EXPEDITION_PURSUIT_MIN_DISTANCE = 100
 # Staging cells sit just outside the defensive ring's maximum radius.
 EXPEDITION_STAGING_RADIUS = 13
+# Paused patrol members fall back to a compact ring one cell outside the outer
+# Ranger posts, rather than staying at their last outward waypoint.
+SYMMETRIC_PATROL_RECALL_RADIUS = 11
 # A legacy expedition member can be hundreds of cells away when it rejoins the
 # staging pool.  The default 4,096-node A* budget was measured stopping inside
 # a six-cell loop on such a return, while 8,192 found the real route in about
@@ -4603,6 +4606,73 @@ class AggressiveStrategy:
 
         return assignments.get(unit.id, unit.position)
 
+    def _patrol_recall_goal(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+    ) -> Position:
+        """Hold a paused patrol member at a unique cell beside the ring.
+
+        While the outward patrol is suspended by threat or reserve pressure the
+        member no longer has an active waypoint, but it must not treat the last
+        outward position as its fallback post.  Assign every live patrol member
+        a stable, distinct recall cell just outside the outer Ranger posts, and
+        keep members that already stand on a valid cell where they are.
+        """
+        core = turn.core
+        if core is None:
+            return unit.position
+        offsets = _defensive_ring_offsets(SYMMETRIC_PATROL_RECALL_RADIUS)
+        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        enemy_positions = {item.position for item in turn.visible_enemies}
+        cells = tuple(
+            (core.position[0] + dx, core.position[1] + dy)
+            for dx, dy in offsets
+            if (core.position[0] + dx, core.position[1] + dy) not in obstacles
+            and (core.position[0] + dx, core.position[1] + dy) not in enemy_positions
+        )
+        if not cells:
+            return unit.position
+
+        patrol_units = sorted(
+            (
+                candidate
+                for candidate in (*turn.vanguards, *turn.rangers)
+                if candidate.id in self._patrol_ids(turn)
+            ),
+            key=lambda candidate: candidate.id.bytes,
+        )
+        assignments: dict[UUID, Position] = {}
+        claimed: set[Position] = set()
+        valid_cells = set(cells)
+
+        # Preserve members that have already reached a valid recall cell before
+        # hashing preferences for everyone still in transit.
+        for candidate in patrol_units:
+            if candidate.position in valid_cells and candidate.position not in claimed:
+                assignments[candidate.id] = candidate.position
+                claimed.add(candidate.position)
+
+        for candidate in patrol_units:
+            if candidate.id in assignments:
+                continue
+            preferred = candidate.id.int % len(cells)
+            goal = next(
+                (
+                    cells[index % len(cells)]
+                    for index in range(preferred, preferred + len(cells))
+                    if cells[index % len(cells)] not in claimed
+                ),
+                None,
+            )
+            if goal is None:
+                assignments[candidate.id] = candidate.position
+                continue
+            assignments[candidate.id] = goal
+            claimed.add(goal)
+
+        return assignments.get(unit.id, unit.position)
+
     def _is_offensive_combat_unit(
         self,
         unit: Ranger | Vanguard,
@@ -4784,6 +4854,13 @@ class AggressiveStrategy:
                     self._staging_goal(unit, turn),
                     "hold at the defensive ring edge awaiting expedition",
                 )
+            if self._symmetric_posture():
+                role = self.memory.unit_roles.get(str(unit.id))
+                if self._patrol_team_from_role(role) is not None and not offensive:
+                    return (
+                        self._patrol_recall_goal(unit, turn),
+                        "return patrol to the defensive ring",
+                    )
         if (
             context is not None
             and self._raid_target is not None
