@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from itertools import pairwise
 from math import atan2
+from time import monotonic
 from uuid import UUID
 
 from arena_hero import (
@@ -62,6 +63,10 @@ COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
 CLAIM_STALL_BUDGET = 3
 UNREACHABLE_CLAIM_COOLDOWN = 128
+# Once combat has consumed the soft planning budget the remaining units switch
+# to shorter path searches so the full Turn still fits inside the command
+# window before the hard planning_time_limit cuts in.
+SIMPLIFIED_PATH_EXPANSIONS = 1024
 # Resource replenishment resolves every four Ticks.  On a saturated map,
 # reserve one Worker for a refresh every twelve Ticks; between refreshes it can
 # service the known resource pool instead of paying a full Worker of income
@@ -233,6 +238,8 @@ class StrategyConfig:
     raid_max_ticks: int = 160
     raid_trigger_kills: int = 3
     raid_kill_window: int = 24
+    planning_time_limit: float = 10.0
+    planning_soft_budget: float = 6.0
     expedition_mode: bool = False
 
 
@@ -321,6 +328,8 @@ class AggressiveStrategy:
     ) -> None:
         self.memory = memory
         self.config = config or StrategyConfig()
+        self._planning_deadline: float = 0.0
+        self._simplify_planning = False
         # Cache the legacy perimeter layout.  The symmetric formation also
         # stores each Unit's exact post in WorldMemory so assignments survive
         # combat, casualties, and service restarts.
@@ -546,34 +555,109 @@ class AggressiveStrategy:
         if context.combat_assault and context.assault_enemies:
             context.screen_assignments = self._combat_screen_assignments(context)
 
-        for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
-            if ranger.id in context.planned_ids:
-                continue
-            self._decide_ranger(
-                ranger,
-                context,
-                tactical_enemies,
-                offensive=self._is_offensive_combat_unit(ranger, turn, threat),
-            )
-        for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
-            if vanguard.id in context.planned_ids:
-                continue
-            self._decide_vanguard(
-                vanguard,
-                context,
-                tactical_enemies,
-                offensive=self._is_offensive_combat_unit(vanguard, turn, threat),
-            )
-        self._prepare_core_departure(context)
+        combat_unit_ids = self._combat_unit_ids(turn)
+        threatened_worker_ids = self._threatened_worker_ids(turn)
         core_position = turn.core.position if turn.core is not None else None
-        for worker in sorted(
-            turn.workers,
-            key=lambda unit: self._worker_priority(unit, core_position),
-        ):
-            if worker.id in context.planned_ids:
-                continue
-            self._decide_worker(worker, context)
-        self._decide_core(context)
+
+        def core_distance(unit: Unit) -> int:
+            if core_position is None:
+                return 0
+            return manhattan(unit.position, core_position)
+
+        planning_started = monotonic()
+        self._planning_deadline = planning_started + self.config.planning_time_limit
+        self._simplify_planning = False
+
+        def within_budget() -> bool:
+            if monotonic() >= self._planning_deadline:
+                return False
+            if (
+                not self._simplify_planning
+                and monotonic() - planning_started >= self.config.planning_soft_budget
+            ):
+                self._simplify_planning = True
+            return True
+
+        deadlined = False
+        combat_units = [
+            unit
+            for unit in (*turn.rangers, *turn.vanguards)
+            if unit.id in combat_unit_ids and unit.id not in context.planned_ids
+        ]
+        decided_ids: set[UUID] = set()
+        combat_units.sort(key=lambda unit: (core_distance(unit), unit.id.bytes))
+        for unit in combat_units:
+            if not within_budget():
+                deadlined = True
+                break
+            if isinstance(unit, Ranger):
+                self._decide_ranger(
+                    unit,
+                    context,
+                    tactical_enemies,
+                    offensive=self._is_offensive_combat_unit(unit, turn, threat),
+                )
+            else:
+                self._decide_vanguard(
+                    unit,
+                    context,
+                    tactical_enemies,
+                    offensive=self._is_offensive_combat_unit(unit, turn, threat),
+                )
+            decided_ids.add(unit.id)
+
+        if not deadlined:
+            for ranger in sorted(turn.rangers, key=lambda unit: unit.id.bytes):
+                if not within_budget():
+                    deadlined = True
+                    break
+                if ranger.id in context.planned_ids or ranger.id in decided_ids:
+                    continue
+                self._decide_ranger(
+                    ranger,
+                    context,
+                    tactical_enemies,
+                    offensive=self._is_offensive_combat_unit(ranger, turn, threat),
+                )
+                decided_ids.add(ranger.id)
+
+        if not deadlined:
+            for vanguard in sorted(turn.vanguards, key=lambda unit: unit.id.bytes):
+                if not within_budget():
+                    deadlined = True
+                    break
+                if vanguard.id in context.planned_ids or vanguard.id in decided_ids:
+                    continue
+                self._decide_vanguard(
+                    vanguard,
+                    context,
+                    tactical_enemies,
+                    offensive=self._is_offensive_combat_unit(vanguard, turn, threat),
+                )
+                decided_ids.add(vanguard.id)
+
+        if not deadlined:
+            self._prepare_core_departure(context)
+
+        if not deadlined:
+            for worker in sorted(
+                turn.workers,
+                key=lambda unit: (
+                    0 if unit.id in threatened_worker_ids else 1,
+                    self._worker_priority(unit, core_position),
+                ),
+            ):
+                if not within_budget():
+                    deadlined = True
+                    break
+                if worker.id in context.planned_ids:
+                    continue
+                self._decide_worker(worker, context)
+
+        if deadlined:
+            self._wait_unplanned_units(context, turn)
+        else:
+            self._decide_core(context)
         if self.config.expedition_mode:
             self._persist_expedition_pursuits()
         report.planned_damage = dict(context.damage_ledger.planned_damage)
@@ -2540,6 +2624,8 @@ class AggressiveStrategy:
             if self.config.expedition_mode and unit.id in self._staged_ids
             else path_expansions
         )
+        if self._simplify_planning:
+            max_expansions = min(max_expansions, SIMPLIFIED_PATH_EXPANSIONS)
         direction = next_step(
             unit.position,
             goal,
@@ -4495,7 +4581,11 @@ class AggressiveStrategy:
                 cell,
                 blocked=static,
                 require_path=True,
-                max_expansions=EXPEDITION_REJOIN_PATH_EXPANSIONS,
+                max_expansions=(
+                    SIMPLIFIED_PATH_EXPANSIONS
+                    if self._simplify_planning
+                    else EXPEDITION_REJOIN_PATH_EXPANSIONS
+                ),
             )
             is not None
         ]
@@ -4759,6 +4849,68 @@ class AggressiveStrategy:
         ):
             return False
         return unit.id in self._offensive_ids(turn)
+
+    @staticmethod
+    def _enemy_attack_range(enemy: CoreView | UnitView) -> int | None:
+        """Return the compatible range at which a visible enemy can fire."""
+
+        if isinstance(enemy, CoreView):
+            return None
+        if enemy.unit_type is UnitType.RANGER:
+            return 3
+        if enemy.unit_type is UnitType.VANGUARD:
+            return 1
+        return None
+
+    @staticmethod
+    def _chebyshev_distance(left: Position, right: Position) -> int:
+        return max(abs(left[0] - right[0]), abs(left[1] - right[1]))
+
+    def _combat_unit_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return controlled combat units that are engaged or under fire."""
+
+        engaged: set[UUID] = set()
+        for unit in (*turn.rangers, *turn.vanguards):
+            own_range = 3 if isinstance(unit, Ranger) else 1
+            for enemy in turn.visible_enemies:
+                enemy_range = self._enemy_attack_range(enemy)
+                if (
+                    enemy_range is not None
+                    and self._chebyshev_distance(enemy.position, unit.position)
+                    <= enemy_range
+                ):
+                    engaged.add(unit.id)
+                    break
+                if self._chebyshev_distance(enemy.position, unit.position) <= own_range:
+                    engaged.add(unit.id)
+                    break
+        return frozenset(engaged)
+
+    def _threatened_worker_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return Workers inside a visible enemy's attack range."""
+
+        threatened: set[UUID] = set()
+        for worker in turn.workers:
+            for enemy in turn.visible_enemies:
+                enemy_range = self._enemy_attack_range(enemy)
+                if (
+                    enemy_range is not None
+                    and self._chebyshev_distance(enemy.position, worker.position)
+                    <= enemy_range
+                ):
+                    threatened.add(worker.id)
+                    break
+        return frozenset(threatened)
+
+    def _wait_unplanned_units(self, context: _TurnContext, turn: Turn) -> None:
+        """Park every unit that the planning deadline left undecided."""
+
+        decided = {item.actor_id for item in context.report.decisions}
+        for unit in (*turn.rangers, *turn.vanguards, *turn.workers):
+            if str(unit.id) not in decided:
+                self._record_wait(
+                    unit, context, "planning time limit reached: hold position"
+                )
 
     def _offensive_ids(self, turn: Turn) -> frozenset[UUID]:
         """Return the capped, stable roaming squad.

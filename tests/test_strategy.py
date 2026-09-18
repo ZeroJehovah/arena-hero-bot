@@ -6850,3 +6850,25 @@ def test_symmetric_patrol_teams_stay_in_separate_quadrants() -> None:
         goal, _ = strategy._combat_patrol_goal(member, turn)
         assert goal[0] * sx >= 0
         assert goal[1] * sy >= 0
+
+
+def test_combat_units_plan_first_ordered_by_core_distance() -> None:
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(10, "RANGER", position=(1, 0)),
+            unit(11, "RANGER", position=(4, 0)),
+            unit(12, "RANGER", position=(20, 0)),
+            unit(90, "RANGER", controlled=False, position=(2, 0)),
+        ],
+    )
+
+    report = decide(turn)
+
+    order = {
+        item.actor_id: index
+        for index, item in enumerate(report.decisions)
+        if item.actor_kind == "RANGER"
+    }
+    assert order[object_id(10)] < order[object_id(11)] < order[object_id(12)]
