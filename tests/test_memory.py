@@ -419,3 +419,55 @@ def test_stale_resource_cells_expire_and_memory_stays_bounded() -> None:
     crowd = [(x, 500) for x in range(RESOURCE_MEMORY_LIMIT + 40)]
     memory.observe(make_turn(tick=9000, objects=[core()], resource_cells=crowd))
     assert len(memory.remembered_resource_cells(999)) == RESOURCE_MEMORY_LIMIT
+
+
+def test_enemy_drift_detects_a_one_cell_reversal() -> None:
+    memory = WorldMemory()
+    for tick, position in ((20, (2, 0)), (21, (3, 0)), (22, (2, 0))):
+        memory.observe(
+            make_turn(
+                tick=tick,
+                objects=[
+                    core(),
+                    unit(6, "WORKER", controlled=False, position=position),
+                ],
+            )
+        )
+
+    assert memory.enemy_drift_position(object_id(6), 22, 1) == (3, 0)
+
+
+def test_enemy_recently_moved_flags_only_a_confirmed_prior_cell() -> None:
+    memory = WorldMemory()
+    memory.observe(
+        make_turn(
+            tick=20,
+            objects=[core(), unit(6, "WORKER", controlled=False, position=(2, 0))],
+        )
+    )
+    assert memory.enemy_recently_moved(object_id(6), 20) is False
+
+    memory.observe(
+        make_turn(
+            tick=21,
+            objects=[core(), unit(6, "WORKER", controlled=False, position=(3, 0))],
+        )
+    )
+    assert memory.enemy_recently_moved(object_id(6), 21) is True
+
+
+def test_enemy_recently_moved_ignores_a_stale_prior_cell() -> None:
+    memory = WorldMemory()
+    memory.observe(
+        make_turn(
+            tick=20,
+            objects=[core(), unit(6, "WORKER", controlled=False, position=(2, 0))],
+        )
+    )
+    memory.observe(
+        make_turn(
+            tick=24,
+            objects=[core(), unit(6, "WORKER", controlled=False, position=(3, 0))],
+        )
+    )
+    assert memory.enemy_recently_moved(object_id(6), 24) is False

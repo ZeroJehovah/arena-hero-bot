@@ -1244,7 +1244,9 @@ class AggressiveStrategy:
         question is not "who stands next to me" but "who will stand in the
         cell I am about to sweep".  A hostile whose drift leads into the cell,
         and a hostile with no movement evidence at all, are both likely to be
-        there.  One that is visibly walking out of the cell is not.
+        there.  One that is visibly walking out of the cell is not, and one
+        that moved recently but whose current cell is unknown is not reliable
+        either.
         """
 
         collected: dict[Direction, dict[str, CoreView | UnitView]] = {}
@@ -1257,11 +1259,12 @@ class AggressiveStrategy:
             )
             reachable: dict[Direction, int] = {}
             here = direction_between(vanguard.position, enemy.position)
+            recently_moved = (
+                lead is not None and lead != enemy.position
+            ) or self.memory.enemy_recently_moved(str(enemy.id), context.turn.tick)
             if here is not None:
                 reachable[here] = (
-                    SWEEP_STAY_WEIGHT
-                    if lead is not None and lead != enemy.position
-                    else SWEEP_LIKELY_WEIGHT
+                    SWEEP_STAY_WEIGHT if recently_moved else SWEEP_LIKELY_WEIGHT
                 )
             if lead is not None and lead != enemy.position:
                 ahead = direction_between(vanguard.position, lead)
@@ -3475,10 +3478,20 @@ class AggressiveStrategy:
             and predicted != enemy.position
             and self._ranger_range(ranger.position, enemy.position) > 1
         )
-        candidates = (predicted, enemy.position) if leads else (enemy.position,)
-        for cell in dict.fromkeys(cell for cell in candidates if cell is not None):
-            if line_of_fire(ranger.position, cell, obstacles):
-                return cell
+        if leads:
+            # A hostile that moved out of its cell makes the standing cell a
+            # guaranteed miss once movement settles first.  When the lead cell
+            # is not on a legal ray from here (typically the one-cell lead from
+            # max range falls one cell beyond it), decline the shot so the
+            # caller closes on a range where the lead is legal, instead of
+            # spending the Tick on an arrow aimed at empty ground.
+            if predicted is not None and line_of_fire(
+                ranger.position, predicted, obstacles
+            ):
+                return predicted
+            return None
+        if line_of_fire(ranger.position, enemy.position, obstacles):
+            return enemy.position
         return None
 
     def _combat_target_is_local(
@@ -4331,6 +4344,29 @@ class AggressiveStrategy:
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
         if target is not None:
+            if (
+                isinstance(target, UnitView)
+                and target.unit_type is UnitType.VANGUARD
+                and manhattan(ranger.position, target.position) == 1
+            ):
+                # Melee range hands an enemy Vanguard a free sweep every Tick
+                # while a two-HP Ranger can only answer with one damage.  Keep
+                # firing on the same target from a legal standoff cell; this is
+                # a reposition inside the engagement, not a retreat from it.
+                standoff = self._ranger_approach_goal(ranger, target, context)
+                if (
+                    standoff is not None
+                    and standoff != ranger.position
+                    and self._ranger_range(standoff, target.position)
+                    > self._ranger_range(ranger.position, target.position)
+                    and self._move(
+                        ranger,
+                        standoff,
+                        context,
+                        reason=f"hold firing range on {self._enemy_label(target)}",
+                    )
+                ):
+                    return True
             squad = self._expedition_squad_for(ranger.id)
             if (
                 squad is not None

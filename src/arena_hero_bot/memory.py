@@ -412,6 +412,21 @@ class WorldMemory:
         current_tick, current = history[-1]
         if current_tick != tick:
             return None
+        if steps == 1 and len(history) >= 3:
+            before_tick, before = history[-3]
+            previous_tick, previous = history[-2]
+            if previous_tick - before_tick == 1 and current_tick - previous_tick == 1:
+                first_step = previous[0] - before[0], previous[1] - before[1]
+                second_step = current[0] - previous[0], current[1] - previous[1]
+                if (
+                    first_step != (0, 0)
+                    and first_step[0] == -second_step[0]
+                    and first_step[1] == -second_step[1]
+                ):
+                    # A one-cell reversal means the target is oscillating; the
+                    # cell it just came from is the only useful lead, while
+                    # extrapolating the last direction aims where it turned.
+                    return previous
         for older_tick, older in reversed(history[:-1]):
             span = current_tick - older_tick
             if not 1 <= span <= ENEMY_DRIFT_MAX_GAP:
@@ -424,6 +439,25 @@ class WorldMemory:
                 current[1] + _scaled_delta(delta[1], steps, span),
             )
         return None
+
+    def enemy_recently_moved(self, enemy_id: str, tick: int) -> bool:
+        """Whether a hostile's last two observations disagree.
+
+        A fresh first-contact target has no prior observation, so this stays
+        ``False`` and the guard may still test the standing cell.  A target
+        that moved recently but whose current-tick drift is unavailable (a
+        one-tick vision gap is enough) is known to have left some previous
+        cell, so the standing cell is no longer a reliable sweep target.
+        """
+
+        history = self.enemy_position_history.get(enemy_id, [])
+        if not history or history[-1][0] != tick:
+            return False
+        current = history[-1][1]
+        for older_tick, older in reversed(history[:-1]):
+            if 1 <= tick - older_tick <= ENEMY_DRIFT_MAX_GAP:
+                return older != current
+        return False
 
     def goal_for(self, unit_id: str) -> UnitGoal | None:
         """Return a Unit's current durable exploration goal."""

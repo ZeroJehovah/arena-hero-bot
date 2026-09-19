@@ -586,9 +586,13 @@ def test_expedition_ranger_finishes_a_worker_patrolling_between_two_cells(
         )
         strategy.decide(turn)
         action = turn.plan.unit_actions[turn.rangers[0].id]
-        assert action.type == "SHOOT"
+        # An out-of-range prediction legally yields a closing MOVE while the
+        # Ranger creeps back into a range where the lead cell can be hit;
+        # it must still finish the oscillating Worker instead of shooting
+        # the empty standing cell every Tick.
+        assert action.type in {"SHOOT", "MOVE"}
         # Resolve against the Worker's next cell, after its movement.
-        if action.expected_cell == patrol[(offset + 1) % 2]:
+        if action.type == "SHOOT" and action.expected_cell == patrol[(offset + 1) % 2]:
             enemy_hp -= 1
         if enemy_hp == 0:
             break
