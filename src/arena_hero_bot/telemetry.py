@@ -100,13 +100,12 @@ class JsonlTelemetry:
         boundary = self.retained_since(days=days, tz=tz).astimezone(tz).date()
         changed = False
         prefix = f"{self.path.stem}-"
-        pattern = f"{self.path.stem}-????????{self.path.suffix}"
+        pattern = f"{self.path.stem}-*{self.path.suffix}"
         for candidate in self.path.parent.glob(pattern):
-            name = candidate.name
-            if not name.startswith(prefix):
-                continue
             try:
-                day = date.fromisoformat(name[len(prefix) : -len(self.path.suffix)])
+                day = date.fromisoformat(
+                    candidate.name[len(prefix) : -len(self.path.suffix)]
+                )
             except ValueError:
                 continue
             if day < boundary:

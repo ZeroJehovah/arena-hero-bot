@@ -13,7 +13,7 @@ from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.runtime import RuntimeConfig
 from arena_hero_bot.strategy import AggressiveStrategy
-from arena_hero_bot.telemetry import JsonlTelemetry
+from arena_hero_bot.telemetry import BEIJING_TZ, JsonlTelemetry
 
 from .factories import core, make_turn, unit
 
@@ -85,6 +85,28 @@ def test_prune_recent_keeps_current_and_previous_three_beijing_days(tmp_path) ->
     kept = [json.loads(line)["tick"] for line in path.read_text().splitlines()]
     # Undatable rows are kept, rows far outside the window are dropped..
     assert kept == [2, 3, 4]
+
+
+def test_prune_daily_files_drops_beijing_days_outside_the_window(tmp_path) -> None:
+    from datetime import datetime, timedelta
+
+    telemetry = JsonlTelemetry(tmp_path / "turns.jsonl", rotate_daily=True)
+    today = datetime.now(BEIJING_TZ).date()
+    kept = [today - timedelta(days=offset) for offset in range(4)]
+    dropped = [today - timedelta(days=offset) for offset in (4, 14)]
+    for day in kept + dropped:
+        (tmp_path / f"turns-{day.isoformat()}.jsonl").write_text("")
+    # A sibling that is not a dated daily file must survive untouched.
+    (tmp_path / "turns-notadate.jsonl").write_text("")
+
+    assert telemetry.prune_recent(days=4) is True
+    names = sorted(candidate.name for candidate in tmp_path.glob("turns-*.jsonl"))
+    expected = [f"turns-{day.isoformat()}.jsonl" for day in kept] + [
+        "turns-notadate.jsonl"
+    ]
+    assert names == sorted(expected)
+    # Nothing left to drop: a second pass reports no change.
+    assert telemetry.prune_recent(days=4) is False
 
 
 def test_submit_turn_modes_and_errors() -> None:
