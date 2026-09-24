@@ -96,6 +96,7 @@ def run_bot(
                     if config.max_turns is not None and turns_seen >= config.max_turns:
                         break
                     continue
+                observed_at = datetime.now(UTC).isoformat()
                 started = monotonic()
                 report, planning_error = _plan_turn(strategy, turn)
                 planning_seconds = monotonic() - started
@@ -105,6 +106,7 @@ def run_bot(
                 telemetry.append(
                     _turn_record(
                         turn=turn,
+                        observed_at=observed_at,
                         report=report,
                         planning_seconds=planning_seconds,
                         planning_error=planning_error,
@@ -201,6 +203,7 @@ def _submit_turn(turn: Turn, *, observe_only: bool) -> dict[str, Any]:
 def _turn_record(
     *,
     turn: Turn,
+    observed_at: str,
     report: DecisionReport,
     planning_seconds: float,
     planning_error: str | None,
@@ -211,6 +214,7 @@ def _turn_record(
     return {
         "schema_version": 2,
         "tick": turn.tick,
+        "observed_at": observed_at,
         "mode": "observe-only" if observe_only else "aggressive-pvp",
         "planning_ms": round(planning_seconds * 1000, 3),
         "planning_error": planning_error,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC
+from datetime import UTC, datetime
 
 import pytest
 from arena_hero import APIError, ArenaHeroError, Turn
@@ -162,6 +162,7 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
     )
     record = runtime._turn_record(
         turn=turn,
+        observed_at=datetime.now(UTC).isoformat(),
         report=report,
         planning_seconds=0.001,
         planning_error=None,
@@ -254,6 +255,7 @@ def test_run_bot_persists_memory_and_turn_telemetry(tmp_path, monkeypatch) -> No
     records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
     assert [record["tick"] for record in records] == [100, 101]
     assert all(record["submission"]["status"] == "observed" for record in records)
+    assert all(record["observed_at"].endswith("+00:00") for record in records)
     assert "test-key" not in _written_telemetry(tmp_path).read_text()
 
 
