@@ -6167,6 +6167,47 @@ def test_expedition_squad_shares_target_seen_by_one_member() -> None:
     assert ranger_reason == "advance together on the squad's enemy target"
 
 
+def test_expedition_vanguard_skips_full_friendly_approach_cell() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3), UUID(int=4), UUID(int=5)})
+    strategy._expedition_squads = [(squad, (0, 1))]
+    strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
+        target_id=object_id(90), position=(0, 2)
+    )
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "VANGUARD", position=(0, 0)),
+            unit(4, "RANGER", position=(0, 1)),
+            unit(5, "RANGER", position=(0, 1)),
+            unit(90, "WORKER", controlled=False, position=(0, 2)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units}
+        | {item.position for item in turn.visible_enemies},
+        enemy_positions={item.position for item in turn.visible_enemies},
+    )
+
+    for vanguard in turn.vanguards:
+        strategy._decide_vanguard(vanguard, context, (), offensive=True)
+
+    decisions = [
+        item
+        for item in context.report.decisions
+        if item.actor_id in {object_id(2), object_id(3)}
+    ]
+    assert all(item.action == "MOVE" for item in decisions)
+    assert all("close on" in item.reason for item in decisions)
+    for vanguard in turn.vanguards:
+        action = turn.plan.unit_actions[vanguard.id]
+        assert action.type == "MOVE"
+        assert add(vanguard.position, action.direction) != (0, 1)
+
+
 def test_expedition_members_regroup_when_detached() -> None:
     strategy = _expedition_strategy()
     squad = frozenset({UUID(int=number) for number in range(2, 8)})

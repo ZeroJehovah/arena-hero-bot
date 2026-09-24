@@ -2591,6 +2591,7 @@ class AggressiveStrategy:
         intent: _MoveIntent = _MoveIntent.TRANSIT,
         path_expansions: int = 4096,
         require_path: bool = False,
+        extra_blockers: Container[Position] | None = None,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -2619,6 +2620,8 @@ class AggressiveStrategy:
             blocked = self._static_blockers(unit, context)
             if context.enemy_positions:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
+        if extra_blockers:
+            blocked = overlay_blockers(blocked, extra_blockers)
         # Friendly units may overlap and swap; they never block travel.
         if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
             return False
@@ -4704,6 +4707,13 @@ class AggressiveStrategy:
     ) -> bool:
         """Advance onto ``target`` like the non-expedition rush, overriding cohesion."""
         intercept = self._intercept_cell(target, context)
+        capacity_cells = set(context.friendly_occupancy) | set(context.arrival_counts)
+        full_capacity = {
+            position
+            for position in capacity_cells
+            if position != vanguard.position
+            and self._predicted_friendly_occupancy(position, context) >= 2
+        }
         for anchor in dict.fromkeys((intercept, target.position)):
             candidates = [
                 position
@@ -4711,23 +4721,39 @@ class AggressiveStrategy:
                 if position not in self.memory.obstacles
                 and position not in context.enemy_positions
             ]
+            # Preserve the normal adjacent-target sweep path.  The current
+            # cell is a valid approach candidate geometrically, but moving to
+            # it is a no-op; returning here lets the caller resolve melee.
+            if vanguard.position in candidates:
+                return False
+            candidates = [
+                position
+                for position in candidates
+                # Friendly occupancy is not a path blocker, but a cell that
+                # already has two entities cannot accept another arrival this
+                # Tick.  Leave it out of the ranked approach candidates so a
+                # full teammate cell cannot pin the whole squad in place.
+                if self._predicted_friendly_occupancy(position, context) < 2
+            ]
             if not candidates:
                 continue
-            goal = min(
+            for goal in sorted(
                 candidates,
                 key=lambda position: (
                     manhattan(vanguard.position, position),
                     manhattan(intercept, position),
                     position,
                 ),
-            )
-            return self._move_within_leash(
-                vanguard,
-                goal,
-                context,
-                offensive=offensive,
-                reason="close on the ranged attacker instead of waiting",
-            )
+            ):
+                if self._move_within_leash(
+                    vanguard,
+                    goal,
+                    context,
+                    offensive=offensive,
+                    reason="close on the ranged attacker instead of waiting",
+                    extra_blockers=full_capacity,
+                ):
+                    return True
         return False
 
     def _staging_goal(self, unit: Ranger | Vanguard, turn: Turn) -> Position:
@@ -6258,12 +6284,19 @@ class AggressiveStrategy:
         *,
         offensive: bool,
         reason: str,
+        extra_blockers: Container[Position] | None = None,
     ) -> bool:
         """Move towards ``goal`` only while it stays inside the combat zone."""
 
         if not self._within_combat_leash(unit, goal, context, offensive=offensive):
             return False
-        return self._move(unit, goal, context, reason=reason)
+        return self._move(
+            unit,
+            goal,
+            context,
+            reason=reason,
+            extra_blockers=extra_blockers,
+        )
 
     def _garrison_ids(
         self,
