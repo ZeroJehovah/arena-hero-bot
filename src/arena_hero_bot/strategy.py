@@ -105,6 +105,9 @@ PERIMETER_INTERCEPT_MAX_ENEMIES = 2
 INTRUDER_LEAD_STEPS = 2
 SWEEP_STAY_WEIGHT = 1
 SWEEP_LIKELY_WEIGHT = 3
+SWEEP_EMPTY_REPOSITION_THRESHOLD = 2
+EXPEDITION_COMBAT_HISTORY_LENGTH = 8
+EXPEDITION_COMBAT_MAX_UNIQUE_CELLS = 4
 CORE_CAPACITY_FAST_EXPANSION = 50
 CORE_CAPACITY_MEDIUM_RESERVE = 95
 CORE_CAPACITY_HIGH_RESERVE = 100
@@ -340,6 +343,10 @@ class AggressiveStrategy:
         self._combat_focus_id: str | None = None
         self._intruder_hunt_id: str | None = None
         self._combat_policy = CombatPolicy()
+        # A predicted sweep can be empty even when the hostile remains beside
+        # the Vanguard.  Keep the short streak in memory so the next Tick can
+        # retry the current adjacent cell instead of repeating the prediction.
+        self._sweep_empty_streak: dict[UUID, int] = {}
         self._squad_return_until: dict[UUID, int] = {}
         # The last cell a lone fighter was seen in inside the defensive zone,
         # kept so the converging squad does not disband on the first dark Tick.
@@ -419,6 +426,7 @@ class AggressiveStrategy:
         # ``observe`` drops destroyed enemies from memory, taking the only
         # record of what they were with them, so log the kills first.
         self._record_combat_kills(turn)
+        self._record_sweep_results(turn)
         self.memory.observe(turn)
         if self.config.expedition_mode:
             self._reconcile_unit_roles(turn)
@@ -683,6 +691,7 @@ class AggressiveStrategy:
             converge_ids=context.perimeter_intercept_ids,
         )
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        friendly_positions = self._predicted_friendly_positions(context)
         # A Ranger outranges a Worker by three cells and is the cheapest way
         # to finish a thief off, but it is far too fragile to join the chase.
         # Thieves are offered to the firing solution only; where the Ranger
@@ -701,6 +710,7 @@ class AggressiveStrategy:
                     enemy,
                     context.turn,
                     obstacles,
+                    friendly_positions,
                 )
             )
         ]
@@ -779,7 +789,12 @@ class AggressiveStrategy:
                     isinstance(target, UnitView)
                     and target.unit_type is not UnitType.WORKER
                 ):
-                    standoff = self._ranger_approach_goal(ranger, target, context)
+                    standoff = self._ranger_approach_goal(
+                        ranger,
+                        target,
+                        context,
+                        friendly_positions=friendly_positions,
+                    )
                     if (
                         not context.combat_assault
                         and standoff is not None
@@ -849,7 +864,12 @@ class AggressiveStrategy:
                     visible_enemies,
                 )
             if visible_target is not None:
-                goal = self._ranger_approach_goal(ranger, visible_target, context)
+                goal = self._ranger_approach_goal(
+                    ranger,
+                    visible_target,
+                    context,
+                    friendly_positions=friendly_positions,
+                )
                 if goal is not None and self._move_within_leash(
                     ranger,
                     goal,
@@ -935,6 +955,20 @@ class AggressiveStrategy:
             self._decide_vanguard_screen(vanguard, context, visible_enemies)
             return
         sweep_groups = self._sweep_groups(vanguard, context, visible_enemies)
+        sweep_streak = self._sweep_empty_streak.get(vanguard.id, 0)
+        if sweep_streak >= SWEEP_EMPTY_REPOSITION_THRESHOLD:
+            # Prediction is useful on a moving target, but repeated empty
+            # resolutions mean the target is no longer following that model.
+            # Re-evaluate the cells occupied now before spending another Tick
+            # on the same lead.
+            current_groups = self._sweep_groups(
+                vanguard,
+                context,
+                visible_enemies,
+                predict=False,
+            )
+            if current_groups:
+                sweep_groups = current_groups
         if sweep_groups:
             focused_group = next(
                 (
@@ -972,6 +1006,20 @@ class AggressiveStrategy:
                     reason=f"hit {len(targets)} adjacent hostile object(s)",
                     target=add(vanguard.position, direction),
                 )
+                self._sweep_empty_streak.pop(vanguard.id, None)
+                return
+
+        if self._is_expedition_member(vanguard, context.turn):
+            target = self._best_visible_target(
+                vanguard.position,
+                context.turn,
+                visible_enemies,
+            )
+            if target is not None and self._break_expedition_combat_cycle(
+                vanguard,
+                target,
+                context,
+            ):
                 return
 
         if (
@@ -1237,6 +1285,8 @@ class AggressiveStrategy:
         vanguard: Vanguard,
         context: _TurnContext,
         visible_enemies: tuple[CoreView | UnitView, ...],
+        *,
+        predict: bool = True,
     ) -> dict[Direction, tuple[tuple[CoreView | UnitView, ...], int]]:
         """Group reachable hostiles per sweep direction with a hit confidence.
 
@@ -1252,16 +1302,22 @@ class AggressiveStrategy:
         collected: dict[Direction, dict[str, CoreView | UnitView]] = {}
         weights: dict[Direction, int] = {}
         for enemy in visible_enemies:
-            lead = self.memory.enemy_drift_position(
-                str(enemy.id),
-                context.turn.tick,
-                1,
+            lead = (
+                self.memory.enemy_drift_position(
+                    str(enemy.id),
+                    context.turn.tick,
+                    1,
+                )
+                if predict
+                else None
             )
             reachable: dict[Direction, int] = {}
             here = direction_between(vanguard.position, enemy.position)
             recently_moved = (
                 lead is not None and lead != enemy.position
             ) or self.memory.enemy_recently_moved(str(enemy.id), context.turn.tick)
+            if not predict:
+                recently_moved = False
             if here is not None:
                 reachable[here] = (
                     SWEEP_STAY_WEIGHT if recently_moved else SWEEP_LIKELY_WEIGHT
@@ -1277,6 +1333,23 @@ class AggressiveStrategy:
             direction: (tuple(targets.values()), weights[direction])
             for direction, targets in collected.items()
         }
+
+    @staticmethod
+    def _line_of_fire_clear(
+        origin: Position,
+        target: Position,
+        obstacles: Container[Position],
+        friendly_positions: Container[Position] = (),
+    ) -> bool:
+        """Check the shot ray after movement resolves for this Tick."""
+
+        if friendly_positions:
+            obstacles = overlay_blockers(
+                obstacles,
+                friendly_positions,
+                excluded={origin, target},
+            )
+        return line_of_fire(origin, target, obstacles)
 
     def _vanguard_block_goal(
         self,
@@ -1694,6 +1767,18 @@ class AggressiveStrategy:
             context.friendly_occupancy.get(position, 0)
             + context.arrival_counts.get(position, 0)
             - context.departure_counts.get(position, 0)
+        )
+
+    @classmethod
+    def _predicted_friendly_positions(
+        cls, context: _TurnContext
+    ) -> frozenset[Position]:
+        """Return friendly cells that survive the already queued departures."""
+
+        return frozenset(
+            position
+            for position in context.friendly_occupancy
+            if cls._predicted_friendly_occupancy(position, context) > 0
         )
 
     @staticmethod
@@ -3466,6 +3551,7 @@ class AggressiveStrategy:
         enemy: CoreView | UnitView,
         turn: Turn,
         obstacles: set[Position] | frozenset[Position],
+        friendly_positions: Container[Position] = (),
     ) -> Position | None:
         # Movement resolves before the shot. Prefer a repeated straight or
         # two-cell patrol track over extrapolating just the last direction.
@@ -3488,12 +3574,20 @@ class AggressiveStrategy:
             # max range falls one cell beyond it), decline the shot so the
             # caller closes on a range where the lead is legal, instead of
             # spending the Tick on an arrow aimed at empty ground.
-            if predicted is not None and line_of_fire(
-                ranger.position, predicted, obstacles
+            if predicted is not None and self._line_of_fire_clear(
+                ranger.position,
+                predicted,
+                obstacles,
+                friendly_positions,
             ):
                 return predicted
             return None
-        if line_of_fire(ranger.position, enemy.position, obstacles):
+        if self._line_of_fire_clear(
+            ranger.position,
+            enemy.position,
+            obstacles,
+            friendly_positions,
+        ):
             return enemy.position
         return None
 
@@ -4328,6 +4422,59 @@ class AggressiveStrategy:
             ),
         )
 
+    def _expedition_combat_cycle(self, unit: Ranger | Vanguard) -> bool:
+        """Detect a short local route loop from the durable position history."""
+
+        history = self.memory.position_history.get(str(unit.id), [])
+        recent = history[-EXPEDITION_COMBAT_HISTORY_LENGTH:]
+        if len(recent) < EXPEDITION_COMBAT_HISTORY_LENGTH:
+            return False
+        return len(set(recent)) <= EXPEDITION_COMBAT_MAX_UNIQUE_CELLS
+
+    def _break_expedition_combat_cycle(
+        self,
+        unit: Ranger | Vanguard,
+        target: CoreView | UnitView,
+        context: _TurnContext,
+    ) -> bool:
+        """Move to another enemy-adjacent cell after a local combat loop."""
+
+        if not self._expedition_combat_cycle(unit):
+            return False
+        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        recent = set(self.memory.recent_positions(str(unit.id), limit=8))
+        recent.add(unit.position)
+        anchors = (self._intercept_cell(target, context), target.position)
+        candidates = {
+            position
+            for anchor in anchors
+            for position in adjacent_positions(anchor)
+            if position not in obstacles
+            and position not in context.enemy_positions
+            and position != unit.position
+            and self._predicted_friendly_occupancy(position, context) < 2
+        }
+        if not candidates:
+            return False
+        ordered = sorted(
+            candidates,
+            key=lambda position: (
+                position in recent,
+                manhattan(unit.position, position),
+                manhattan(position, target.position),
+                position,
+            ),
+        )
+        for goal in ordered:
+            if self._move(
+                unit,
+                goal,
+                context,
+                reason="break repeated expedition combat route",
+            ):
+                return True
+        return False
+
     def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
         pursuit = self._expedition_pursuit_for(ranger)
         visible = self._visible_combat_targets(ranger, context.turn)
@@ -4388,7 +4535,11 @@ class AggressiveStrategy:
                 ):
                     return True
             shot_cell = self._ranger_shot_cell(
-                ranger, target, context.turn, self.memory.obstacles
+                ranger,
+                target,
+                context.turn,
+                self.memory.obstacles,
+                self._predicted_friendly_positions(context),
             )
             if shot_cell is not None:
                 ranger.shoot(target, expected_cell=shot_cell)
@@ -4401,10 +4552,17 @@ class AggressiveStrategy:
                     target=shot_cell,
                 )
                 return True
-            goal = self._ranger_approach_goal(ranger, target, context)
+            goal = self._ranger_approach_goal(
+                ranger,
+                target,
+                context,
+                friendly_positions=self._predicted_friendly_positions(context),
+            )
             if goal is not None and self._move(
                 ranger, goal, context, reason="pursue expedition target"
             ):
+                return True
+            if self._break_expedition_combat_cycle(ranger, target, context):
                 return True
         goal = self._expedition_chase_goal(ranger, context)
         return goal is not None and self._move(
@@ -5752,6 +5910,8 @@ class AggressiveStrategy:
         ranger: Ranger,
         target: CoreView | UnitView,
         context: _TurnContext,
+        *,
+        friendly_positions: Container[Position] = (),
     ) -> Position | None:
         obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
         candidates = [
@@ -5759,7 +5919,12 @@ class AggressiveStrategy:
             for position in firing_positions(target.position)
             if position not in obstacles
             and position not in context.enemy_positions
-            and line_of_fire(position, target.position, obstacles)
+            and self._line_of_fire_clear(
+                position,
+                target.position,
+                obstacles,
+                friendly_positions,
+            )
             # Range-three diagonals have Manhattan distance six, outside a
             # Ranger's local vision. Such a firing goal made it lose contact
             # on arrival and immediately chase back out of the firing cell.
@@ -5770,6 +5935,7 @@ class AggressiveStrategy:
         return min(
             candidates,
             key=lambda position: (
+                position in friendly_positions,
                 -self._ranger_range(position, target.position),
                 manhattan(ranger.position, position),
                 position,
@@ -6215,6 +6381,29 @@ class AggressiveStrategy:
             if sighting.kind == "UNIT" and sighting.unit_type not in combat_types:
                 continue
             self._combat_kills.append((turn.tick, event.position))
+
+    def _record_sweep_results(self, turn: Turn) -> None:
+        """Carry empty sweep results into the next combat decision."""
+
+        live_ids = {unit.id for unit in turn.vanguards}
+        for event in turn.events:
+            if event.event_type != "SWEEP_RESOLVED" or event.actor_id is None:
+                continue
+            actor_id = event.actor_id
+            if actor_id not in live_ids:
+                continue
+            targets_hit = (event.values or {}).get("targets_hit", 0)
+            if targets_hit:
+                self._sweep_empty_streak.pop(actor_id, None)
+            else:
+                self._sweep_empty_streak[actor_id] = (
+                    self._sweep_empty_streak.get(actor_id, 0) + 1
+                )
+        self._sweep_empty_streak = {
+            unit_id: streak
+            for unit_id, streak in self._sweep_empty_streak.items()
+            if unit_id in live_ids
+        }
 
     def _recent_combat_kills(self, turn: Turn) -> int:
         """Count fighters killed inside the raid trigger window."""

@@ -86,6 +86,27 @@ def test_ranger_does_not_shoot_through_remembered_obstacle() -> None:
     assert turn.plan.unit_actions[turn.rangers[0].id].type == "MOVE"
 
 
+def test_ranger_moves_to_clear_a_friendly_firing_line() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 0)),
+            unit(3, "RANGER", position=(0, 1)),
+            core(
+                4,
+                controlled=False,
+                owner_username="rival",
+                position=(0, 3),
+            ),
+        ]
+    )
+
+    decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+
+
 def test_ranger_tracks_target_and_leads_one_cell() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)
@@ -150,7 +171,10 @@ def test_emergency_focuses_fire_and_bursts_combat_production() -> None:
         if unit.id in turn.plan.unit_actions
     ]
     shoot_actions = [action for action in ranger_actions if action.type == "SHOOT"]
-    assert len(shoot_actions) == len(turn.rangers)
+    move_actions = [action for action in ranger_actions if action.type == "MOVE"]
+    assert len(shoot_actions) == 1
+    assert len(move_actions) == 1
+    assert shoot_actions[0].target_id == UUID(int=6)
     assert len({action.target_id for action in shoot_actions}) == 1
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "SPAWN"
@@ -170,6 +194,36 @@ def test_vanguard_sweeps_every_adjacent_hostile() -> None:
     action = turn.plan.unit_actions[turn.vanguards[0].id]
     assert action.type == "SWEEP"
     assert action.direction is Direction.RIGHT
+
+
+def test_vanguard_rechecks_the_current_cell_after_empty_predicted_sweeps() -> None:
+    enemy_id = object_id(3)
+    memory = WorldMemory(
+        enemy_position_history={
+            enemy_id: [
+                (98, (1, 2)),
+                (99, (1, 1)),
+                (100, (0, 1)),
+            ]
+        }
+    )
+    strategy = AggressiveStrategy(memory)
+    vanguard_id = UUID(int=2)
+    strategy._sweep_empty_streak[vanguard_id] = 2
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "RANGER", controlled=False, position=(0, 1)),
+        ],
+    )
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions[vanguard_id]
+    assert action.type == "SWEEP"
+    assert action.direction is Direction.DOWN
 
 
 def test_vanguards_intercept_worker_near_core_on_distinct_escape_cells() -> None:
@@ -5943,6 +5997,46 @@ def test_expedition_members_never_heal_or_retreat() -> None:
         enemy_positions=set(),
     )
     assert not strategy._recover_if_critical(ranger_view, maximum_hp=2, context=context)
+
+
+def test_expedition_breaks_a_short_combat_route_loop() -> None:
+    strategy = _expedition_strategy()
+    squad = frozenset({UUID(int=2), UUID(int=3)})
+    strategy._expedition_squads = [(squad, (1, 0))]
+    strategy.memory.position_history[str(UUID(int=2))] = [
+        (0, 0),
+        (1, 0),
+        (1, 1),
+        (0, 1),
+        (0, 0),
+        (1, 0),
+        (1, 1),
+        (0, 1),
+    ]
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "RANGER", position=(0, 1)),
+            unit(90, "VANGUARD", controlled=False, position=(1, 0)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={turn.visible_enemies[0].position},
+    )
+
+    assert strategy._break_expedition_combat_cycle(
+        turn.vanguards[0], turn.visible_enemies[0], context
+    )
+    action = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert action.type == "MOVE"
+    assert any(
+        item.reason == "break repeated expedition combat route"
+        for item in context.report.decisions
+    )
 
 
 def test_low_hp_expedition_ranger_continues_lost_contact_pursuit() -> None:
