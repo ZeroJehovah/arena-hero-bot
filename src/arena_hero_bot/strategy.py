@@ -393,8 +393,24 @@ class AggressiveStrategy:
         self._expedition_routes: dict[frozenset[UUID], ExplorationRoute] = {}
         self._expedition_regroup_orders: dict[frozenset[UUID], tuple[UUID, ...]] = {}
         self._expedition_navigation_turn: Turn | None = None
-        self._expedition_serial: int = self.memory.next_expedition_serial
-        for persisted in self.memory.expedition_squads:
+        self._expedition_serial = max(
+            self.memory.next_expedition_serial,
+            max((squad.serial for squad in self.memory.expedition_squads), default=0),
+        )
+        used_serials: set[int] = set()
+        for index, persisted in enumerate(self.memory.expedition_squads):
+            # Older casualty handling could replace a serial with the list
+            # index. Repair those collisions once, without changing membership,
+            # pursuit, navigation or regrouping state.
+            if persisted.serial <= 0 or persisted.serial in used_serials:
+                self._expedition_serial += 1
+                persisted = replace(persisted, serial=self._expedition_serial)
+                self.memory.expedition_squads[index] = persisted
+                for member in persisted.members:
+                    self.memory.unit_roles[member] = (
+                        f"{EXPEDITION_ROLE_PREFIX}{persisted.serial}"
+                    )
+            used_serials.add(persisted.serial)
             try:
                 members = frozenset(UUID(member) for member in persisted.members)
             except (TypeError, ValueError):
@@ -414,10 +430,7 @@ class AggressiveStrategy:
                     direction=persisted.pursuit_direction,
                     distance=persisted.pursuit_distance,
                 )
-        self._expedition_serial = max(
-            self._expedition_serial,
-            max((squad.serial for squad in self.memory.expedition_squads), default=0),
-        )
+        self.memory.next_expedition_serial = self._expedition_serial
 
     def decide(self, turn: Turn) -> DecisionReport:
         """Queue one complete aggressive plan for the current Turn."""
@@ -7187,9 +7200,9 @@ class AggressiveStrategy:
     def _expedition_spawn(self, turn: Turn, resources: int) -> UnitType | None:
         """Choose the next Unit for the active-offense formation.
 
-        The formation fills 12 Workers, 16 Vanguards and 32 Rangers first,
-        then spends surplus production on an alternating 1:1 Vanguard/Ranger
-        stream whose units are staged at the ring edge.  Emergency combat
+        Fill the configured economy and local formation first, then complete
+        the next staged 2V+2R squad. Already departed expeditions, including
+        remnants, do not participate in production balancing. Emergency combat
         decided by the existing threat logic still buys the type that best
         balances the local roster, and the early resource-guard sequence is
         preserved so a freshly respawned Core always establishes its first
@@ -7215,8 +7228,19 @@ class AggressiveStrategy:
             return self._affordable_spawn(
                 turn, resources, candidates, strict_preference=True
             )
-        vanguards = len(turn.vanguards)
-        rangers = len(turn.rangers)
+        self._ensure_unit_roles(turn)
+        vanguards = sum(
+            self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
+            or self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
+            is not None
+            for unit in turn.vanguards
+        )
+        rangers = sum(
+            self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
+            or self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
+            is not None
+            for unit in turn.rangers
+        )
         formation_vanguards, formation_rangers, _, _ = self._formation_quota()
         if len(turn.workers) < self.config.target_workers:
             candidates = (UnitType.WORKER,)
@@ -7234,13 +7258,17 @@ class AggressiveStrategy:
             else:
                 candidates = (UnitType.VANGUARD, UnitType.RANGER)
         else:
-            # Formation full: surplus built 1:1, balancing the two quotas so
-            # staged units can pair off into full expeditions.
-            surplus_vanguards = vanguards - formation_vanguards
-            surplus_rangers = rangers - formation_rangers
+            # Only units still available for a new squad count. Faraway
+            # remnants cannot fill a missing slot at the staging ring.
+            staged_vanguards = sum(
+                unit.id in self._staged_ids for unit in turn.vanguards
+            )
+            staged_rangers = sum(unit.id in self._staged_ids for unit in turn.rangers)
+            vanguard_short = max(0, EXPEDITION_SQUAD_VANGUARDS - staged_vanguards)
+            ranger_short = max(0, EXPEDITION_SQUAD_RANGERS - staged_rangers)
             candidates = (
                 (UnitType.RANGER, UnitType.VANGUARD)
-                if surplus_rangers < surplus_vanguards
+                if ranger_short > vanguard_short
                 else (UnitType.VANGUARD, UnitType.RANGER)
             )
         return self._affordable_spawn(
