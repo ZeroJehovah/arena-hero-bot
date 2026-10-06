@@ -242,7 +242,7 @@ class StrategyConfig:
     raid_trigger_kills: int = 3
     raid_kill_window: int = 24
     planning_time_limit: float = 10.0
-    planning_soft_budget: float = 5.0
+    planning_soft_budget: float = 6.0
     expedition_mode: bool = False
 
 
