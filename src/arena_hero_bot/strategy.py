@@ -373,6 +373,10 @@ class AggressiveStrategy:
         # threat picture, so a restart should re-ask the question rather than
         # inherit an answer.
         self._unreachable_claims: dict[Position, int] = {}
+        # The rock map holds over a million cells once exploration has spread.
+        # Rebuilding ``memory.obstacles | turn.obstacle_cells`` per Unit made
+        # planning time grow with the explored map, so cache it per Tick.
+        self._rock_map_cache: tuple[int, set[Position]] | None = None
         # Raid state deliberately lives on the strategy instead of
         # ``WorldMemory``: a restart then aborts the raid and walks the
         # detachment home, which is the safe direction to fail in.
@@ -446,7 +450,7 @@ class AggressiveStrategy:
             self._update_expeditions(turn)
             self._refresh_expedition_pursuits(turn)
             self._refresh_expedition_navigation(turn)
-        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        obstacles = self._rock_map(turn)
         threat = self._combat_policy.assess(turn, obstacles)
         recent_enemies = self.memory.recent_enemies(
             turn.tick, self.config.enemy_memory_ttl
@@ -684,6 +688,16 @@ class AggressiveStrategy:
         report.planned_damage = dict(context.damage_ledger.planned_damage)
         return report
 
+    def _rock_map(self, turn: Turn) -> set[Position]:
+        """Return this Tick's rock cells without copying the map per Unit."""
+
+        cached = self._rock_map_cache
+        if cached is not None and cached[0] == turn.tick:
+            return cached[1]
+        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        self._rock_map_cache = (turn.tick, obstacles)
+        return obstacles
+
     def _decide_ranger(
         self,
         ranger: Ranger,
@@ -703,7 +717,7 @@ class AggressiveStrategy:
             intercept_ids=context.intruder_intercept_ids,
             converge_ids=context.perimeter_intercept_ids,
         )
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         friendly_positions = self._predicted_friendly_positions(context)
         # A Ranger outranges a Worker by three cells and is the cheapest way
         # to finish a thief off, but it is far too fragile to join the chase.
@@ -1234,7 +1248,7 @@ class AggressiveStrategy:
         )
         if not screens:
             return {}
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         enemy_positions = {enemy.position for enemy in context.assault_enemies}
         screen_positions = {unit.position for unit in screens}
         available = [
@@ -2036,7 +2050,7 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return worker.position
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         enemy_positions = {enemy.position for enemy in context.assault_enemies}
         candidates = [
             (core.position[0] + dx, core.position[1] + dy)
@@ -2354,7 +2368,7 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None or ranger.position == core.position:
             return False
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         threats = tuple(
             enemy
             for enemy in context.turn.visible_enemies
@@ -3148,7 +3162,7 @@ class AggressiveStrategy:
             )
             self._combat_focus_id = str(target.id)
             return target
-        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        obstacles = self._rock_map(turn)
         shootable = tuple(
             enemy
             for enemy in enemies
@@ -3486,7 +3500,7 @@ class AggressiveStrategy:
             return False
         if self._ranger_range(ranger.position, target.position) < RANGER_STANDOFF_RANGE:
             return False
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         candidates = [
             position
             for position in adjacent_positions(ranger.position)
@@ -4127,7 +4141,7 @@ class AggressiveStrategy:
             return
         self._expedition_navigation_turn = turn
         self.memory.observe_exploration(turn)
-        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        obstacles = self._rock_map(turn)
         blocked = (
             obstacles
             | set(self.memory.contested_positions)
@@ -4415,7 +4429,7 @@ class AggressiveStrategy:
         current_distance = manhattan(ranger.position, target.position)
         if current_distance <= 1:
             return None
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         candidates = [
             position
             for position in adjacent_positions(target.position)
@@ -4454,7 +4468,7 @@ class AggressiveStrategy:
 
         if not self._expedition_combat_cycle(unit):
             return False
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         recent = set(self.memory.recent_positions(str(unit.id), limit=8))
         recent.add(unit.position)
         anchors = (self._intercept_cell(target, context), target.position)
@@ -4939,7 +4953,7 @@ class AggressiveStrategy:
         if core is None:
             return unit.position
         offsets = _defensive_ring_offsets(EXPEDITION_STAGING_RADIUS)
-        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        obstacles = self._rock_map(turn)
         cells = tuple(
             (core.position[0] + dx, core.position[1] + dy)
             for dx, dy in offsets
@@ -5004,7 +5018,7 @@ class AggressiveStrategy:
         if core is None:
             return unit.position
         offsets = _defensive_ring_offsets(SYMMETRIC_PATROL_RECALL_RADIUS)
-        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        obstacles = self._rock_map(turn)
         enemy_positions = {item.position for item in turn.visible_enemies}
         cells = tuple(
             (core.position[0] + dx, core.position[1] + dy)
@@ -5394,7 +5408,7 @@ class AggressiveStrategy:
             return None
         vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
         offsets = (*vanguard_offsets, *ranger_offsets)
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         resources = set(context.turn.resource_cells) | set(self.memory.resource_cells)
         occupied = set(context.occupied) - {core.position}
         candidates: list[tuple[int, int, int, Position]] = []
@@ -5435,7 +5449,7 @@ class AggressiveStrategy:
         if core is None:
             return None
         target = self.memory.core_home_position
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         footprint_offsets = (
             *self._symmetric_defense_offsets()[0],
             *self._symmetric_defense_offsets()[1],
@@ -5926,7 +5940,7 @@ class AggressiveStrategy:
         *,
         friendly_positions: Container[Position] = (),
     ) -> Position | None:
-        obstacles = self.memory.obstacles | set(context.turn.obstacle_cells)
+        obstacles = self._rock_map(context.turn)
         candidates = [
             position
             for position in firing_positions(target.position)
@@ -5988,7 +6002,7 @@ class AggressiveStrategy:
             self._worker_threat_exclusion_cells(turn) | set(self._unreachable_claims)
         ) - {worker.position for worker in workers.values()}
         hostile = {enemy.position for enemy in turn.visible_enemies}
-        blocked_resources = self.memory.obstacles | set(turn.obstacle_cells)
+        blocked_resources = self._rock_map(turn)
         visible_resources = (
             set(turn.resource_cells) - hostile - unreachable - blocked_resources
         )
@@ -6985,7 +6999,7 @@ class AggressiveStrategy:
         core = turn.core
         if core is None:
             return worker.position
-        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
+        obstacles = self._rock_map(turn)
         unit_id = str(worker.id)
         current = self.memory.goal_for(unit_id)
         claimed_positions = {
