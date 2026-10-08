@@ -67,9 +67,12 @@ For a long-running local instance that restarts after an unexpected process exit
 
 The supervisor uses the live defaults `--target-workers 16 --no-max-population
 --expedition-mode` when no arguments are supplied. Pass normal CLI arguments to
-override them. The live expedition posture reserves 8 Vanguards and 16 Rangers
-for a symmetric eight-direction perimeter, assigns four 3-unit quadrant patrol
-teams, and grows the Worker economy to 16 units.
+override them. The live expedition posture reserves 4 Vanguards on the cardinal
+posts and 16 Rangers around the perimeter, assigns four quadrant patrol teams
+of 2 Rangers each, and grows the Worker economy to 16 units. Surplus combat units
+form one-way expeditions of 2 Vanguards and 2 Rangers. Upgrading an older formation
+preserves the cardinal post owners and patrol Rangers while releasing diagonal
+and patrol Vanguards into expedition staging.
 
 For a persistent systemd deployment, install the supplied service after creating
 the virtual environment and `.env` file:

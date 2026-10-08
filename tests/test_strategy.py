@@ -5794,7 +5794,7 @@ def test_symmetric_paused_patrol_recalls_to_unique_ring_cells() -> None:
         key=lambda candidate: candidate.id.bytes,
     )
 
-    assert len(patrol_units) == 12
+    assert len(patrol_units) == 8
     targets: dict[UUID, tuple[int, int]] = {}
     for member in patrol_units:
         goal, reason = strategy._idle_combat_goal(member, turn, offensive=False)
@@ -6841,7 +6841,9 @@ def test_symmetric_posture_migrates_while_worker_returns_cargo() -> None:
     assert any("symmetric-defense home" in item.reason for item in report.decisions)
 
 
-def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None:
+def test_symmetric_posture_assigns_four_cardinal_vanguards_and_sixteen_rangers() -> (
+    None
+):
     config = expedition_config(target_workers=16)
     strategy = AggressiveStrategy(WorldMemory(), config)
     vanguards = [
@@ -6859,14 +6861,13 @@ def test_symmetric_posture_assigns_eight_vanguards_and_sixteen_rangers() -> None
         for unit_id, role in strategy.memory.unit_roles.items()
         if role == DEFENSE_ROLE
     }
-    assert len(defense_ids) == 24
+    assert len(defense_ids) == 20
     assert set(assignments) == {UUID(unit_id) for unit_id in defense_ids}
-    vanguard_offsets, _ranger_offsets = strategy._symmetric_defense_offsets()
     assert {
         (assignments[UUID(unit["id"])][0], assignments[UUID(unit["id"])][1])
         for unit in vanguards
         if UUID(unit["id"]) in assignments
-    } == set(vanguard_offsets)
+    } == {(0, -6), (6, 0), (0, 6), (-6, 0)}
     assert (
         len(
             {
@@ -6929,7 +6930,7 @@ def test_symmetric_posture_ignores_staged_surplus_when_assigning_defense_slots()
     strategy.decide(turn)
 
     assert strategy._defensive_layout is not None
-    assert len(strategy._defensive_layout.assignments) == 24
+    assert len(strategy._defensive_layout.assignments) == 20
     assert all(
         strategy.memory.unit_roles[str(unit_view["id"])] == DEFENSE_ROLE
         for unit_view in vanguards + rangers
@@ -6963,9 +6964,9 @@ def test_symmetric_posture_demotes_excess_legacy_defenders() -> None:
         ]
         for unit_type in (UnitType.VANGUARD, UnitType.RANGER)
     }
-    assert role_by_type[UnitType.VANGUARD].count(DEFENSE_ROLE) == 8
+    assert role_by_type[UnitType.VANGUARD].count(DEFENSE_ROLE) == 4
     assert role_by_type[UnitType.RANGER].count(DEFENSE_ROLE) == 16
-    assert len(strategy._patrol_ids(turn)) == 12
+    assert len(strategy._patrol_ids(turn)) == 8
 
 
 def test_symmetric_patrol_teams_stay_in_separate_quadrants() -> None:
@@ -6981,10 +6982,13 @@ def test_symmetric_patrol_teams_stay_in_separate_quadrants() -> None:
 
     signs = {1: (1, -1), 2: (1, 1), 3: (-1, 1), 4: (-1, -1)}
     for team, (sx, sy) in signs.items():
-        member = strategy._patrol_team_members(team, turn)[0]
-        goal, _ = strategy._combat_patrol_goal(member, turn)
-        assert goal[0] * sx >= 0
-        assert goal[1] * sy >= 0
+        members = strategy._patrol_team_members(team, turn)
+        assert len(members) == 2
+        for member in members:
+            assert member.unit_type is UnitType.RANGER
+            goal, _ = strategy._combat_patrol_goal(member, turn)
+            assert goal[0] * sx >= 0
+            assert goal[1] * sy >= 0
 
 
 def test_combat_units_plan_first_ordered_by_core_distance() -> None:

@@ -180,11 +180,12 @@ EXPEDITION_LINK_RADIUS = 4
 
 # Revised live posture.  The legacy constants above remain available for
 # explicit small test configurations; ``target_workers >= 16`` selects this
-# formation and its four quadrant patrol teams.
-SYMMETRIC_FORMATION_VANGUARDS = 12
+# formation: four cardinal Vanguard posts, sixteen Ranger posts, and four
+# two-Ranger quadrant patrol teams. Surplus Vanguards join expedition staging.
+SYMMETRIC_FORMATION_VANGUARDS = 4
 SYMMETRIC_FORMATION_RANGERS = 24
 SYMMETRIC_PATROL_TEAM_COUNT = 4
-SYMMETRIC_DEFENSE_VANGUARDS = 8
+SYMMETRIC_DEFENSE_VANGUARDS = 4
 SYMMETRIC_DEFENSE_RANGERS = 16
 SYMMETRIC_CORE_RADIUS = 6
 CORE_QUEUE_RADIUS = 4
@@ -3761,6 +3762,12 @@ class AggressiveStrategy:
             else PATROL_TEAM_COUNT
         )
 
+    def _patrol_team_quota(self) -> tuple[int, int]:
+        return (
+            0 if self._symmetric_posture() else PATROL_TEAM_VANGUARDS,
+            PATROL_TEAM_RANGERS,
+        )
+
     def _formation_quota(self) -> tuple[int, int, int, int]:
         if self._symmetric_posture():
             return (
@@ -3826,17 +3833,19 @@ class AggressiveStrategy:
                     migration_excluded_ids.add(unit_id)
 
         if self._symmetric_posture():
-            # The revised formation deliberately shrinks the old 13V+26R
-            # garrison.  Stable roles normally never displace a survivor, but
-            # that rule cannot preserve an explicitly superseded formation:
-            # retain a deterministic 8V+16R core and release every excess
-            # defender into staging, where normal expedition assembly can use
-            # it without losing the UUID's identity.
+            # Migrate older garrisons by their durable posts. Cardinal owners
+            # keep their UUIDs even while away fighting or healing; diagonal
+            # Vanguards and the old patrol Vanguards become expedition recruits.
             _, _, defense_vanguards, defense_rangers = self._formation_quota()
-            for unit_type, quota in (
-                (UnitType.VANGUARD, defense_vanguards),
-                (UnitType.RANGER, defense_rangers),
+            anchor = self.memory.defense_anchor or (
+                turn.core.position if turn.core is not None else (0, 0)
+            )
+            vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+            for unit_type, quota, offsets in (
+                (UnitType.VANGUARD, defense_vanguards, vanguard_offsets),
+                (UnitType.RANGER, defense_rangers, ranger_offsets),
             ):
+                posts = {(anchor[0] + dx, anchor[1] + dy) for dx, dy in offsets}
                 assigned = sorted(
                     (
                         unit_id
@@ -3844,9 +3853,19 @@ class AggressiveStrategy:
                         if role == DEFENSE_ROLE
                         and live_units[unit_id].unit_type is unit_type
                     ),
-                    key=lambda unit_id: UUID(unit_id).bytes,
+                    key=lambda unit_id, posts=posts: (
+                        self.memory.defense_posts.get(unit_id) not in posts,
+                        live_units[unit_id].position not in posts,
+                        UUID(unit_id).bytes,
+                    ),
                 )
                 for unit_id in assigned[quota:]:
+                    roles[unit_id] = STAGED_ROLE
+            for unit_id, role in tuple(roles.items()):
+                if (
+                    self._patrol_team_from_role(role) is not None
+                    and live_units[unit_id].unit_type is UnitType.VANGUARD
+                ):
                     roles[unit_id] = STAGED_ROLE
 
         def candidate_key(unit_id: str) -> tuple[object, ...]:
@@ -3884,10 +3903,11 @@ class AggressiveStrategy:
         _, _, defense_vanguards, defense_rangers = self._formation_quota()
         assign_available(UnitType.VANGUARD, DEFENSE_ROLE, defense_vanguards)
         assign_available(UnitType.RANGER, DEFENSE_ROLE, defense_rangers)
+        patrol_vanguards, patrol_rangers = self._patrol_team_quota()
         for team in range(1, self._patrol_team_count() + 1):
             role = f"{PATROL_ROLE_PREFIX}{team}"
-            assign_available(UnitType.VANGUARD, role, PATROL_TEAM_VANGUARDS)
-            assign_available(UnitType.RANGER, role, PATROL_TEAM_RANGERS)
+            assign_available(UnitType.VANGUARD, role, patrol_vanguards)
+            assign_available(UnitType.RANGER, role, patrol_rangers)
 
         for unit_id in sorted(
             live_ids - set(roles), key=lambda value: UUID(value).bytes
@@ -3957,7 +3977,7 @@ class AggressiveStrategy:
         )
 
     def _patrol_ids(self, turn: Turn) -> frozenset[UUID]:
-        """Return the nine live members of the three fixed patrol teams."""
+        """Return the live members of the configured fixed patrol teams."""
 
         self._ensure_unit_roles(turn)
         live_ids = {str(unit.id) for unit in (*turn.vanguards, *turn.rangers)}
@@ -5368,17 +5388,13 @@ class AggressiveStrategy:
     def _symmetric_defense_offsets() -> tuple[
         tuple[Position, ...], tuple[Position, ...]
     ]:
-        """Return eight mirrored Vanguard spokes and two Ranger posts each."""
+        """Return four cardinal Vanguard posts and sixteen mirrored Ranger posts."""
 
         vanguards = (
             (0, -6),
-            (4, -4),
             (6, 0),
-            (4, 4),
             (0, 6),
-            (-4, 4),
             (-6, 0),
-            (-4, -4),
         )
         rangers = (
             (0, -8),
@@ -5789,7 +5805,7 @@ class AggressiveStrategy:
         unit: Ranger | Vanguard,
         turn: Turn,
     ) -> tuple[Position, str]:
-        """Choose a waypoint for the Unit's independent three-member team."""
+        """Choose a waypoint for the Unit's independent quadrant patrol team."""
 
         core = turn.core
         if core is None:
@@ -5875,7 +5891,7 @@ class AggressiveStrategy:
                 )
 
         center_offset = offsets[offset_index]
-        # Keep the three members close while giving each a distinct cell.  The
+        # Give each member a distinct cell around its assigned waypoint. The
         # team still shares one route and phase; the small local offsets
         # spread its sight coverage around the shared waypoint.
         patrol_position = (
@@ -7259,8 +7275,8 @@ class AggressiveStrategy:
         if len(turn.workers) < self.config.target_workers:
             candidates = (UnitType.WORKER,)
         elif vanguards < formation_vanguards or rangers < formation_rangers:
-            # Fill the formation gaps first, preferring the type whose
-            # formation quota is furthest behind (targets a 1:2 V:R split).
+            # Fill local formation gaps before recruiting an expedition,
+            # retaining the existing priority for a larger Ranger shortage.
             vanguard_short = max(0, formation_vanguards - vanguards)
             ranger_short = max(0, formation_rangers - rangers)
             if vanguard_short <= 0:

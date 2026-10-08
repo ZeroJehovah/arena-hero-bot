@@ -77,10 +77,9 @@ def _production_case(staged_v, staged_r, away_v=13, away_r=11):
         return members
 
     add("WORKER", 16, "worker")
-    add("VANGUARD", 8, "defense")
+    add("VANGUARD", 4, "defense")
     add("RANGER", 16, "defense")
     for team in range(1, 5):
-        add("VANGUARD", 1, f"patrol-{team}")
         add("RANGER", 2, f"patrol-{team}")
     squads = []
     # Independent remnants deliberately skew the departed force's ratio.
@@ -106,6 +105,8 @@ def _production_case(staged_v, staged_r, away_v=13, away_r=11):
         (1, 3, UnitType.VANGUARD),
         (0, 3, UnitType.VANGUARD),
         (3, 1, UnitType.RANGER),
+        (9, 1, UnitType.RANGER),
+        (7, 0, UnitType.RANGER),
     ],
 )
 def test_production_completes_staging_instead_of_balancing_remnants(
@@ -145,3 +146,68 @@ def test_recruit_completes_new_squad_without_absorbing_remnants():
     assert len({s.serial for s in squads}) == len(squads)
     assert squads[-1].serial > max(s.serial for s in squads[:-1])
     assert len(strategy._staged_ids) == 1
+
+
+def test_released_vanguards_form_a_new_squad_when_the_missing_ranger_arrives():
+    strategy, turn = _production_case(9, 1)
+    original = {frozenset(s.members) for s in strategy.memory.expedition_squads}
+    local_roles = {
+        uid: role
+        for uid, role in strategy.memory.unit_roles.items()
+        if role == "defense" or role.startswith("patrol-")
+    }
+    assert strategy._choose_spawn(turn, turn.resources) is UnitType.RANGER
+    strategy._update_expeditions(turn)
+    assert {frozenset(s.members) for s in strategy.memory.expedition_squads} == original
+    assert len(strategy._staged_ids) == 10
+    recruited = make_turn(
+        tick=101,
+        resources=10000,
+        objects=[*turn.state.model_dump(mode="json")["objects"], unit(999, "RANGER")],
+    )
+
+    strategy._update_expeditions(recruited)
+
+    squads = strategy.memory.expedition_squads
+    assert {frozenset(s.members) for s in squads[:-1]} == original
+    new_members = set(squads[-1].members)
+    assert object_id(999) in new_members
+    assert sum(str(u.id) in new_members for u in recruited.vanguards) == 2
+    assert sum(str(u.id) in new_members for u in recruited.rangers) == 2
+    assert len(strategy._staged_ids) == 7
+    assert strategy._staged_ids <= {u.id for u in recruited.vanguards}
+    assert all(
+        strategy.memory.unit_roles[uid] == role for uid, role in local_roles.items()
+    )
+    assert strategy._choose_spawn(recruited, recruited.resources) is UnitType.RANGER
+
+
+def test_missing_patrol_ranger_is_replaced_without_reintroducing_a_vanguard():
+    strategy, turn = _production_case(9, 0)
+    original_roles = {
+        uid: role
+        for uid, role in strategy.memory.unit_roles.items()
+        if role != "worker"
+    }
+    missing = next(uid for uid, role in original_roles.items() if role == "patrol-2")
+    survivors = [
+        obj
+        for obj in turn.state.model_dump(mode="json")["objects"]
+        if obj.get("id") != missing
+    ]
+    depleted = make_turn(tick=101, resources=10000, objects=survivors)
+
+    assert strategy._choose_spawn(depleted, depleted.resources) is UnitType.RANGER
+    recruited = make_turn(
+        tick=102, resources=10000, objects=[*survivors, unit(999, "RANGER")]
+    )
+    strategy._reconcile_unit_roles(recruited)
+
+    assert strategy.memory.unit_roles == {
+        **{uid: role for uid, role in original_roles.items() if uid != missing},
+        object_id(999): "patrol-2",
+    }
+    for team in range(1, 5):
+        members = strategy._patrol_team_members(team, recruited)
+        assert len(members) == 2
+        assert all(member.unit_type is UnitType.RANGER for member in members)
