@@ -43,6 +43,95 @@ def _members(bearing=(1, 0)):
     ]
 
 
+@pytest.mark.parametrize("hp", [1, 2])
+def test_regrouping_expedition_leaves_core_even_when_approaches_are_full(hp):
+    template = _strategy((1, -1))
+    template.memory.core_home_position = (0, 0)
+    template.memory.expedition_squads = [
+        replace(
+            template.memory.expedition_squads[0],
+            regroup_order=tuple(object_id(number) for number in (2, 5, 3, 4)),
+        )
+    ]
+    strategy = AggressiveStrategy(template.memory, template.config)
+    objects = [
+        core(),
+        unit(2, "VANGUARD", position=(-6, 0)),
+        unit(3, "VANGUARD", position=(0, -4)),
+        unit(4, "RANGER", hp=hp),
+        unit(5, "RANGER", position=(-1, 0)),
+        unit(10, "WORKER", position=(-1, 0), cargo=1),
+        unit(11, "WORKER", position=(0, -1), cargo=1),
+        unit(12, "WORKER", position=(0, -1), cargo=1),
+        unit(13, "WORKER", position=(0, 1), cargo=1),
+        unit(14, "WORKER", position=(0, 1), cargo=1),
+    ]
+    resources = 20
+    deposited = set()
+    for tick in range(100, 140):
+        turn = make_turn(
+            tick=tick, resources=resources, objects=objects, obstacles=[(1, 0)]
+        )
+        report = strategy.decide(turn)
+        core_unit = turn.core
+        assert core_unit is not None
+        if tick == 100:
+            ranger = next(
+                member for member in turn.rangers if str(member.id) == object_id(4)
+            )
+            action = turn.plan.unit_actions.get(ranger.id)
+            assert action is not None and action.type == "MOVE"
+        assert len({item.actor_id for item in report.decisions}) == len(
+            report.decisions
+        )
+        positions = Counter({core_unit.position: 1})
+        by_id = {obj["id"]: obj for obj in objects}
+        for member in turn.units:
+            action = turn.plan.unit_actions.get(member.id)
+            destination = (
+                add(member.position, action.direction)
+                if action is not None and action.type == "MOVE"
+                else member.position
+            )
+            positions[destination] += 1
+            by_id[str(member.id)]["position"] = list(destination)
+            if action is not None and action.type == "DEPOSIT":
+                assert member.position == core_unit.position
+                by_id[str(member.id)]["cargo"] = 0
+                resources += 1
+                deposited.add(str(member.id))
+        assert max(positions.values()) <= 2
+        assert all(item.action != "HEAL" for item in report.decisions)
+
+    assert deposited == {object_id(number) for number in range(10, 15)}
+    assert all(
+        strategy.memory.unit_roles[object_id(number)] == "expedition-1"
+        for number in range(2, 6)
+    )
+    assert all(
+        manhattan(tuple(obj["position"]), (0, 0)) > 4
+        for obj in objects
+        if obj["id"] in {object_id(number) for number in range(2, 6)}
+    )
+
+
+def test_expedition_does_not_choose_core_as_a_regroup_waiting_cell():
+    strategy = _strategy()
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(-1, 0)),
+            unit(4, "RANGER", position=(-6, 0)),
+        ]
+    )
+
+    goal = strategy._expedition_close_cell(turn.rangers[0], (-1, 0), turn)
+
+    assert turn.core is not None
+    assert goal != turn.core.position
+    assert goal in adjacent_positions((-1, 0))
+
+
 @pytest.mark.parametrize("bearing", [(1, 0), (-1, 0), (1, -1)])
 @pytest.mark.parametrize("remembered", [False, True])
 def test_whole_squad_moves_toward_one_clear_goal_when_waypoint_is_rock(

@@ -103,6 +103,57 @@ def test_units_swap_positions_in_a_one_cell_corridor(kinds):
     assert second_action.direction is Direction.LEFT
 
 
+@pytest.mark.parametrize("kind", ["WORKER", "RANGER", "VANGUARD"])
+@pytest.mark.parametrize("departing", [False, True])
+def test_transit_routes_around_full_cells_and_reuses_departing_capacity(
+    kind, departing
+):
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, kind, position=(0, 0)),
+            unit(3, "WORKER", position=(1, 0)),
+            unit(4, "WORKER", position=(1, 0)),
+        ]
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    context = context_for(turn)
+    actor, occupant, _ = turn.units
+    if departing:
+        assert strategy._move(occupant, (2, 0), context, reason="depart shared cell")
+
+    assert strategy._move(
+        actor, (3, 0), context, reason="continue through traffic", require_path=True
+    )
+
+    action = turn.plan.unit_actions[actor.id]
+    assert action.type == "MOVE"
+    destination = add(actor.position, action.direction)
+    assert (destination == (1, 0)) is departing
+    assert strategy._predicted_friendly_occupancy(destination, context) <= 2
+
+
+def test_transit_avoids_a_cell_filled_by_this_ticks_arrivals():
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "WORKER", position=(1, -1)),
+            unit(3, "WORKER", position=(1, 1)),
+            unit(4, "RANGER", position=(0, 0)),
+        ]
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    context = context_for(turn)
+    for worker in turn.workers:
+        assert strategy._move(worker, (1, 0), context, reason="share transit cell")
+
+    actor = turn.rangers[0]
+    assert strategy._move(actor, (3, 0), context, reason="route around arrivals")
+    action = turn.plan.unit_actions[actor.id]
+    assert action.type == "MOVE"
+    assert add(actor.position, action.direction) != (1, 0)
+
+
 def test_worker_harvest_trip_swaps_with_cargo_return_in_complete_plan():
     turn = make_turn(
         objects=[

@@ -1933,10 +1933,11 @@ class AggressiveStrategy:
                     movable,
                     key=lambda candidate: candidate.id.bytes,
                 ):
+                    occupant_blockers = self._static_blockers(occupant, context)
                     for escape in adjacent_positions(neighbor):
                         if (
                             escape == core.position
-                            or escape in blockers
+                            or escape in occupant_blockers
                             or escape in context.enemy_positions
                             or escape in context.standing_reserved
                             or self._predicted_friendly_occupancy(escape, context) != 0
@@ -2735,7 +2736,19 @@ class AggressiveStrategy:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
-        # Friendly units may overlap and swap; they never block travel.
+        # Only the next step settles this Tick. Route around saturated
+        # neighbours using departures and arrivals already planned, while
+        # allowing single occupants, swaps and later transit through the cell.
+        full_neighbors = {
+            position
+            for position in adjacent_positions(unit.position)
+            if self._predicted_friendly_occupancy(position, context)
+            >= (1 if intent is _MoveIntent.STAND and position == goal else 2)
+        }
+        if goal in full_neighbors:
+            return False
+        if full_neighbors:
+            blocked = overlay_blockers(blocked, full_neighbors)
         if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
             return False
         max_expansions = (
@@ -4415,6 +4428,16 @@ class AggressiveStrategy:
         goal = self._expedition_rendezvous_goal(unit, context.turn, whole_squad=True)
         if goal is None:
             return False
+        core = context.turn.core
+        if core is not None and unit.position == core.position:
+            # A newly spawned member can be the waiting end of a broken
+            # chain. It must release the sole service slot before regrouping,
+            # including when loaded Workers have filled every approach.
+            reason = "leave Core service cell before expedition regroup"
+            if self._move_to_core_queue(
+                unit, context, reason=reason
+            ) or self._move_core_unit_via_neighbor(unit, context, reason=reason):
+                return True
         if goal == unit.position:
             self._record_wait(
                 unit, context, "hold for the expedition's laggards to close up"
@@ -4796,11 +4819,10 @@ class AggressiveStrategy:
         route to it; members may overlap and pass through one another.
         """
 
-        static = (
-            self.memory.obstacles
-            | set(self.memory.contested_positions)
-            | set(turn.obstacle_cells)
-            | {enemy.position for enemy in turn.visible_enemies}
+        static = overlay_blockers(
+            self._rock_map(turn),
+            self.memory.contested_positions,
+            {enemy.position for enemy in turn.visible_enemies},
         )
         teammates = {
             member.id: member.position for member in (*turn.vanguards, *turn.rangers)
@@ -4808,15 +4830,17 @@ class AggressiveStrategy:
         squad = self._expedition_squad_for(unit.id)
         members, bearing = squad if squad is not None else (frozenset(), (0, 0))
         occupied_by_team = {teammates[mid] for mid in members if mid in teammates}
+        core_position = turn.core.position if turn.core is not None else None
         candidates = [
             cell
             for cell in adjacent_positions(leader)
             if cell not in static
             and cell not in occupied_by_team
             and cell != unit.position
+            and cell != core_position
         ]
         if not candidates:
-            return leader
+            return leader if leader != core_position else unit.position
         reachable = [
             cell
             for cell in candidates
