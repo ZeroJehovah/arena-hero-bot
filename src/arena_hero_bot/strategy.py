@@ -61,7 +61,22 @@ RESOURCE_CLAIM_PURPOSE = "resource-claim-v1"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
-CLAIM_STALL_BUDGET = 3
+# A held claim is only released when its approach has stopped paying, not when
+# the Worker is briefly blocked.  Measured on the 2026-10-10 restock day:
+# Workers re-picked their claimed cell 7.1 times per delivered load against 3.5
+# on 10-08, and the outbound leg grew from 56 to 84 MOVE steps for a
+# destination that was still only ~32 cells away.  Four consecutive
+# non-closing Ticks released an approach that was still reachable, and the
+# greedy pass then handed the Worker a different cell 25-30 cells away.  A
+# genuinely walled-off cell is already handled by the static-route check and
+# ``UNREACHABLE_CLAIM_COOLDOWN``, so this budget only has to bound a hopeless
+# route, not a crowded one.
+CLAIM_STALL_BUDGET = 8
+# A Worker this close to its claimed cell has effectively arrived.  Traffic on
+# the doorstep, or the cell being momentarily occupied, must not read as a
+# stalled approach: the Worker is about to step on and observe the cell, and an
+# empty one is released by that close observation itself.
+CLAIM_ARRIVAL_SLACK = 2
 UNREACHABLE_CLAIM_COOLDOWN = 128
 # Once combat has consumed the soft planning budget the remaining units switch
 # to shorter path searches so the full Turn still fits inside the command
@@ -147,8 +162,15 @@ PATROL_ROLE_PREFIX = "patrol-"
 EXPEDITION_ROLE_PREFIX = "expedition-"
 EXPEDITION_HORIZON = 256
 EXPEDITION_PURSUIT_MIN_DISTANCE = 100
-# Staging cells sit just outside the defensive ring's maximum radius.
-EXPEDITION_STAGING_RADIUS = 13
+# Staging cells sit outside the defensive screen's inner rings and its compact
+# patrol-recall ring (11), on a ring wide enough that the camp is thin where
+# the Workers' outbound lane crosses it.  At 13 the camp of surplus squads sat
+# inside the 13-28 band right behind the screen, where every Worker crossing
+# shares a cell with a camper and turns it into a saturated cell; a ring at 20
+# holds the same number of units on `80` cells instead of `52`, so ~35% fewer
+# crossings coincide with a camper, and it still sits well inside the local
+# harvest ring.
+EXPEDITION_STAGING_RADIUS = 20
 # Paused patrol members fall back to a compact ring one cell outside the outer
 # Ranger posts, rather than staying at their last outward waypoint.
 SYMMETRIC_PATROL_RECALL_RADIUS = 11
@@ -6319,6 +6341,12 @@ class AggressiveStrategy:
         the released cell the approach is handed off rather than dropped, and
         ``_uncross_claims`` is free to trade the two claims afterwards.
 
+        Two things keep that bound away from a merely busy route.  A Worker
+        within ``CLAIM_ARRIVAL_SLACK`` cells of its cell counts as arrived, so
+        queueing on the doorstep cannot release an approach that is about to
+        land, and ``CLAIM_STALL_BUDGET`` is sized for a hopeless route rather
+        than for a few Ticks of congestion.
+
         Arrival needs no special case.  A Worker reaching an empty cell
         records the absence before this runs, which takes the cell out of
         every pool for RESOURCE_RECHECK_FLOOR Ticks, so the observation itself
@@ -6335,9 +6363,12 @@ class AggressiveStrategy:
             if pool is None:
                 continue
             reference = goal.last_progress_position
-            closing = reference is None or manhattan(
-                worker.position, goal.position
-            ) < manhattan(reference, goal.position)
+            distance = manhattan(worker.position, goal.position)
+            closing = (
+                distance <= CLAIM_ARRIVAL_SLACK
+                or reference is None
+                or distance < manhattan(reference, goal.position)
+            )
             stalled = 0 if closing else stalls.get(worker.id, 0) + 1
             if stalled > CLAIM_STALL_BUDGET:
                 continue

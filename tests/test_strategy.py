@@ -5413,7 +5413,7 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
     )
 
     targets = []
-    for tick in range(101, 107):
+    for tick in range(101, 111):
         # The Worker is pinned at (3, 0) every Tick, so it never closes on the
         # cell it claimed - the stall the budget exists to bound.
         report = strategy.decide(
@@ -5436,8 +5436,46 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
         )
 
     # Held for the budget, then released to the cell one step away.
-    assert targets[:3] == [(12, 0), (12, 0), (12, 0)]
-    assert targets[3:] == [(4, 0), (4, 0), (4, 0)]
+    assert targets[:8] == [(12, 0)] * 8
+    assert targets[8:] == [(4, 0), (4, 0)]
+
+
+def test_a_worker_queueing_on_the_doorstep_keeps_its_claim() -> None:
+    """Arrival slack: the last two cells are not a stalled approach."""
+
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    strategy = AggressiveStrategy(memory, config)
+    memory.set_goal(
+        object_id(2),
+        UnitGoal((12, 0), 100, "resource-claim-v1", last_progress_position=(10, 0)),
+    )
+
+    targets = []
+    for tick in range(101, 107):
+        # The Worker waits two cells short of its claimed cell while traffic
+        # clears, so it never beats its stored best progress again.
+        report = strategy.decide(
+            make_turn(
+                tick=tick,
+                objects=[core(), unit(2, "WORKER", position=(10, 0))],
+                resource_cells=[(11, 0), (12, 0)],
+            )
+        )
+        targets.append(
+            next(
+                (
+                    item.target
+                    for item in report.decisions
+                    if item.actor_id == object_id(2)
+                    and item.reason == "claim nearest unassigned known resource"
+                ),
+                None,
+            )
+        )
+
+    # The old three-Tick budget released this approach to the nearer cell.
+    assert targets == [(12, 0)] * 6
 
 
 def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None:
@@ -5451,7 +5489,7 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
         UnitGoal((12, 0), 100, "resource-claim-v1", last_progress_position=(3, 0)),
     )
 
-    positions = [(3, 0), (4, 0), (5, 0), (4, 0), (4, 0), (4, 0), (4, 0)]
+    positions = [(3, 0), (4, 0), (5, 0)] + [(4, 0)] * 9
     targets = []
     for tick, position in enumerate(positions, start=101):
         report = strategy.decide(
@@ -5473,8 +5511,8 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
             )
         )
 
-    assert targets[:6] == [(12, 0)] * 6
-    assert targets[6] == (5, 0)
+    assert targets[:11] == [(12, 0)] * 11
+    assert targets[11] == (5, 0)
 
 
 def test_worker_claim_skips_resource_inside_enemy_core_exclusion() -> None:
@@ -5913,6 +5951,18 @@ def test_expedition_staging_resolves_duplicate_ring_targets() -> None:
         manhattan(turn.core.position, goal) == EXPEDITION_STAGING_RADIUS
         for goal in goals.values()
     )
+
+
+def test_expedition_staging_ring_clears_the_screen_and_the_worker_lane() -> None:
+    """The camp sits outside the screen, inside the local ring, off the recall ring."""
+
+    vanguards, rangers = AggressiveStrategy._symmetric_defense_offsets()
+    screen_radii = {abs(dx) + abs(dy) for dx, dy in (*vanguards, *rangers)}
+    local_radius = StrategyConfig().resource_patrol_radius * 2
+
+    assert max(screen_radii) < EXPEDITION_STAGING_RADIUS
+    assert EXPEDITION_STAGING_RADIUS != SYMMETRIC_PATROL_RECALL_RADIUS
+    assert local_radius > EXPEDITION_STAGING_RADIUS
 
 
 def test_expedition_staging_uses_extended_path_search() -> None:
