@@ -19,6 +19,7 @@ from arena_hero_bot.geometry import add, adjacent_positions, manhattan
 from arena_hero_bot.memory import EnemySighting, UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
+    CLAIM_STALL_BUDGET,
     DEFENSE_ROLE,
     EXPEDITION_STAGING_PATH_EXPANSIONS,
     EXPEDITION_STAGING_RADIUS,
@@ -5413,7 +5414,7 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
     )
 
     targets = []
-    for tick in range(101, 133):
+    for tick in range(101, 101 + CLAIM_STALL_BUDGET + 4):
         # The Worker is pinned at (3, 0) every Tick, so it never closes on the
         # cell it claimed - the stall the budget exists to bound.
         report = strategy.decide(
@@ -5436,8 +5437,8 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
         )
 
     # Held for the budget, then released to the cell one step away.
-    assert targets[:28] == [(12, 0)] * 28
-    assert targets[28:] == [(4, 0), (4, 0), (4, 0), (4, 0)]
+    assert targets[:CLAIM_STALL_BUDGET] == [(12, 0)] * CLAIM_STALL_BUDGET
+    assert targets[CLAIM_STALL_BUDGET:] == [(4, 0)] * 4
 
 
 def test_a_worker_queueing_on_the_doorstep_keeps_its_claim() -> None:
@@ -5489,7 +5490,7 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
         UnitGoal((12, 0), 100, "resource-claim-v1", last_progress_position=(3, 0)),
     )
 
-    positions = [(3, 0), (4, 0), (5, 0)] + [(4, 0)] * 29
+    positions = [(3, 0), (4, 0), (5, 0)] + [(4, 0)] * (CLAIM_STALL_BUDGET + 1)
     targets = []
     for tick, position in enumerate(positions, start=101):
         report = strategy.decide(
@@ -5511,8 +5512,8 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
             )
         )
 
-    assert targets[:31] == [(12, 0)] * 31
-    assert targets[31] == (5, 0)
+    assert targets[: CLAIM_STALL_BUDGET + 3] == [(12, 0)] * (CLAIM_STALL_BUDGET + 3)
+    assert targets[CLAIM_STALL_BUDGET + 3] == (5, 0)
 
 
 def test_worker_claim_skips_resource_inside_enemy_core_exclusion() -> None:
