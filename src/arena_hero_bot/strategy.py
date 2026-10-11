@@ -72,11 +72,14 @@ RESOURCE_CLAIM_TTL = 4
 # crowded approach four more non-closing Ticks before the greedy pass hands it
 # away.  The first window at twenty still had a small number of unharvested
 # approaches released after the budget while more than eight cells out, so
-# give those approaches four more Ticks as well.  A genuinely walled-off cell
+# give those approaches four more Ticks as well.  The first window at
+# twenty-four still had two unharvested approaches released after the budget
+# while more than eight cells out and without a same-Tick handoff, so give
+# those approaches four more Ticks as well.  A genuinely walled-off cell
 # is already handled by the static-route check and
 # ``UNREACHABLE_CLAIM_COOLDOWN``, so this budget only has to bound a hopeless
 # route, not ordinary traffic.
-CLAIM_STALL_BUDGET = 24
+CLAIM_STALL_BUDGET = 28
 # A Worker this close to its claimed cell has effectively arrived.  Traffic on
 # the doorstep, or the cell being momentarily occupied, must not read as a
 # stalled approach: the Worker is about to step on and observe the cell, and an
