@@ -62,16 +62,17 @@ RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
 # A held claim is only released when its approach has stopped paying, not when
-# the Worker is briefly blocked.  Measured on the 2026-10-10 restock day:
+# the Worker is briefly blocked.  Measured on the 2026-10-10 restock day,
 # Workers re-picked their claimed cell 7.1 times per delivered load against 3.5
 # on 10-08, and the outbound leg grew from 56 to 84 MOVE steps for a
-# destination that was still only ~32 cells away.  Four consecutive
-# non-closing Ticks released an approach that was still reachable, and the
-# greedy pass then handed the Worker a different cell 25-30 cells away.  A
-# genuinely walled-off cell is already handled by the static-route check and
-# ``UNREACHABLE_CLAIM_COOLDOWN``, so this budget only has to bound a hopeless
-# route, not a crowded one.
-CLAIM_STALL_BUDGET = 8
+# destination that was still only ~32 cells away.  The first live window after
+# the budget was raised to eight still showed 6.46 switches per load, with 449
+# switches while the old target was more than eight cells away.  Give a
+# crowded approach four more non-closing Ticks before the greedy pass hands it
+# away.  A genuinely walled-off cell is already handled by the static-route
+# check and ``UNREACHABLE_CLAIM_COOLDOWN``, so this budget only has to bound a
+# hopeless route, not ordinary traffic.
+CLAIM_STALL_BUDGET = 12
 # A Worker this close to its claimed cell has effectively arrived.  Traffic on
 # the doorstep, or the cell being momentarily occupied, must not read as a
 # stalled approach: the Worker is about to step on and observe the cell, and an
