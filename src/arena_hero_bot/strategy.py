@@ -7296,20 +7296,20 @@ class AggressiveStrategy:
         Fill the configured economy and local formation first, then complete
         the next staged 2V+2R squad. Already departed expeditions, including
         remnants, do not participate in production balancing. Emergency combat
-        decided by the existing threat logic still buys the type that best
-        balances the local roster, and the early resource-guard sequence is
-        preserved so a freshly respawned Core always establishes its first
-        combat unit before widening the economy.
+        decided by the existing threat logic still spends this Tick -- with
+        ``strict_preference=False`` so a cheaper candidate is accepted -- but
+        takes its type from the same formation and staging gaps as routine
+        growth, and the early resource-guard sequence is preserved so a freshly
+        respawned Core always establishes its first combat unit before widening
+        the economy.
         """
 
         if self._emergency_combat_mode(turn):
-            candidates = (
-                (UnitType.RANGER, UnitType.VANGUARD)
-                if len(turn.rangers) * 2 < len(turn.vanguards)
-                else (UnitType.VANGUARD, UnitType.RANGER)
-            )
             return self._affordable_spawn(
-                turn, resources, candidates, strict_preference=False
+                turn,
+                resources,
+                self._expedition_need_candidates(turn),
+                strict_preference=False,
             )
         if self._needs_resource_guard(turn):
             if not turn.vanguards:
@@ -7321,6 +7321,26 @@ class AggressiveStrategy:
             return self._affordable_spawn(
                 turn, resources, candidates, strict_preference=True
             )
+        if len(turn.workers) < self.config.target_workers:
+            candidates = (UnitType.WORKER,)
+        else:
+            candidates = self._expedition_need_candidates(turn)
+        return self._affordable_spawn(
+            turn, resources, candidates, strict_preference=True
+        )
+
+    def _expedition_need_candidates(self, turn: Turn) -> tuple[UnitType, ...]:
+        """Return the preferred Unit types for the live formation and squad.
+
+        Emergency production shares this order instead of the bare "twice as
+        many Rangers as Vanguards" roster balance, which ignores the local
+        ``4V+24R`` quota and the ``2V+2R`` squad forming at the staging ring.
+        On 2026-10-11 (tick 417622) two enemy Vanguards inside the alert radius
+        put the fleet in emergency mode while the ring already staged five
+        Vanguards and no Ranger: the balance rule bought a sixth surplus
+        Vanguard, and the next expedition still needed two Rangers.
+        """
+
         self._ensure_unit_roles(turn)
         vanguards = sum(
             self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
@@ -7335,37 +7355,28 @@ class AggressiveStrategy:
             for unit in turn.rangers
         )
         formation_vanguards, formation_rangers, _, _ = self._formation_quota()
-        if len(turn.workers) < self.config.target_workers:
-            candidates = (UnitType.WORKER,)
-        elif vanguards < formation_vanguards or rangers < formation_rangers:
+        if vanguards < formation_vanguards or rangers < formation_rangers:
             # Fill local formation gaps before recruiting an expedition,
             # retaining the existing priority for a larger Ranger shortage.
             vanguard_short = max(0, formation_vanguards - vanguards)
             ranger_short = max(0, formation_rangers - rangers)
             if vanguard_short <= 0:
-                candidates = (UnitType.RANGER,)
-            elif ranger_short <= 0:
-                candidates = (UnitType.VANGUARD,)
-            elif ranger_short >= 2 * vanguard_short:
-                candidates = (UnitType.RANGER, UnitType.VANGUARD)
-            else:
-                candidates = (UnitType.VANGUARD, UnitType.RANGER)
-        else:
-            # Only units still available for a new squad count. Faraway
-            # remnants cannot fill a missing slot at the staging ring.
-            staged_vanguards = sum(
-                unit.id in self._staged_ids for unit in turn.vanguards
-            )
-            staged_rangers = sum(unit.id in self._staged_ids for unit in turn.rangers)
-            vanguard_short = max(0, EXPEDITION_SQUAD_VANGUARDS - staged_vanguards)
-            ranger_short = max(0, EXPEDITION_SQUAD_RANGERS - staged_rangers)
-            candidates = (
-                (UnitType.RANGER, UnitType.VANGUARD)
-                if ranger_short > vanguard_short
-                else (UnitType.VANGUARD, UnitType.RANGER)
-            )
-        return self._affordable_spawn(
-            turn, resources, candidates, strict_preference=True
+                return (UnitType.RANGER,)
+            if ranger_short <= 0:
+                return (UnitType.VANGUARD,)
+            if ranger_short >= 2 * vanguard_short:
+                return (UnitType.RANGER, UnitType.VANGUARD)
+            return (UnitType.VANGUARD, UnitType.RANGER)
+        # Only units still available for a new squad count. Faraway remnants
+        # cannot fill a missing slot at the staging ring.
+        staged_vanguards = sum(unit.id in self._staged_ids for unit in turn.vanguards)
+        staged_rangers = sum(unit.id in self._staged_ids for unit in turn.rangers)
+        vanguard_short = max(0, EXPEDITION_SQUAD_VANGUARDS - staged_vanguards)
+        ranger_short = max(0, EXPEDITION_SQUAD_RANGERS - staged_rangers)
+        return (
+            (UnitType.RANGER, UnitType.VANGUARD)
+            if ranger_short > vanguard_short
+            else (UnitType.VANGUARD, UnitType.RANGER)
         )
 
     def _normal_growth_on_cooldown(self, context: _TurnContext) -> bool:

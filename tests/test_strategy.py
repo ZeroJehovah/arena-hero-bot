@@ -5891,6 +5891,40 @@ def test_expedition_spawn_alternates_surplus_when_formation_full() -> None:
     )
 
 
+def test_expedition_spawn_under_attack_fills_the_ranger_gap() -> None:
+    """A threatened Core must not buy melee the formation has no post for.
+
+    2026-10-11 tick 417622: two enemy Vanguards inside the alert radius put
+    the fleet in emergency mode, the local 4V+16R ring was full, and the
+    staging ring held five Vanguards but no Ranger -- yet the bare "twice as
+    many Rangers as Vanguards" balance rule spawned a sixth surplus Vanguard
+    while the next 2V+2R squad still needed two Rangers.
+    """
+
+    strategy = _expedition_strategy(expedition_config(target_workers=16))
+
+    vanguards = [
+        unit(number, "VANGUARD", position=(number, 2)) for number in range(2, 11)
+    ]
+    rangers = [unit(number, "RANGER", position=(number, 3)) for number in range(50, 74)]
+    workers = [
+        unit(number, "WORKER", position=(number, 4)) for number in range(100, 116)
+    ]
+    attackers = [
+        unit(230, "VANGUARD", controlled=False, position=(0, 6)),
+        unit(231, "VANGUARD", controlled=False, position=(1, 6)),
+    ]
+
+    turn = make_turn(
+        resources=10_000,
+        objects=[core(), *vanguards, *rangers, *workers, *attackers],
+    )
+
+    assert strategy._emergency_combat_mode(turn)
+    assert strategy._expedition_need_candidates(turn)[0] is UnitType.RANGER
+    assert strategy._choose_spawn(turn, turn.resources) is UnitType.RANGER
+
+
 def test_expedition_stages_surplus_units_at_ring_edge() -> None:
     strategy = _expedition_strategy()
 
