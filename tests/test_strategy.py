@@ -5413,7 +5413,7 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
     )
 
     targets = []
-    for tick in range(101, 116):
+    for tick in range(101, 120):
         # The Worker is pinned at (3, 0) every Tick, so it never closes on the
         # cell it claimed - the stall the budget exists to bound.
         report = strategy.decide(
@@ -5436,8 +5436,8 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
         )
 
     # Held for the budget, then released to the cell one step away.
-    assert targets[:12] == [(12, 0)] * 12
-    assert targets[12:] == [(4, 0), (4, 0), (4, 0)]
+    assert targets[:16] == [(12, 0)] * 16
+    assert targets[16:] == [(4, 0), (4, 0), (4, 0)]
 
 
 def test_a_worker_queueing_on_the_doorstep_keeps_its_claim() -> None:
@@ -5489,7 +5489,7 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
         UnitGoal((12, 0), 100, "resource-claim-v1", last_progress_position=(3, 0)),
     )
 
-    positions = [(3, 0), (4, 0), (5, 0)] + [(4, 0)] * 13
+    positions = [(3, 0), (4, 0), (5, 0)] + [(4, 0)] * 17
     targets = []
     for tick, position in enumerate(positions, start=101):
         report = strategy.decide(
@@ -5511,8 +5511,8 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
             )
         )
 
-    assert targets[:15] == [(12, 0)] * 15
-    assert targets[15] == (5, 0)
+    assert targets[:19] == [(12, 0)] * 19
+    assert targets[19] == (5, 0)
 
 
 def test_worker_claim_skips_resource_inside_enemy_core_exclusion() -> None:

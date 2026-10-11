@@ -67,12 +67,13 @@ RESOURCE_CLAIM_TTL = 4
 # on 10-08, and the outbound leg grew from 56 to 84 MOVE steps for a
 # destination that was still only ~32 cells away.  The first live window after
 # the budget was raised to eight still showed 6.46 switches per load, with 449
-# switches while the old target was more than eight cells away.  Give a
+# switches while the old target was more than eight cells away.  The next live
+# window still showed 215 switches only after the twelve-Tick bound, so give a
 # crowded approach four more non-closing Ticks before the greedy pass hands it
 # away.  A genuinely walled-off cell is already handled by the static-route
 # check and ``UNREACHABLE_CLAIM_COOLDOWN``, so this budget only has to bound a
 # hopeless route, not ordinary traffic.
-CLAIM_STALL_BUDGET = 12
+CLAIM_STALL_BUDGET = 16
 # A Worker this close to its claimed cell has effectively arrived.  Traffic on
 # the doorstep, or the cell being momentarily occupied, must not read as a
 # stalled approach: the Worker is about to step on and observe the cell, and an
