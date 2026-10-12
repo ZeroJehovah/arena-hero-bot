@@ -82,7 +82,10 @@ RESOURCE_CLAIM_TTL = 4
 # three unharvested approaches released after 29, 33, and 37 Ticks without a
 # same-Tick handoff and while the old cell was more than eight cells away;
 # give those approaches twelve more Ticks before releasing them.
-CLAIM_STALL_BUDGET = 40
+# The first window at forty still had eleven unharvested approaches released
+# after the budget, with the longest lasting 89 Ticks; give slow approaches
+# another bounded interval before the greedy pass hands them away.
+CLAIM_STALL_BUDGET = 64
 # A Worker this close to its claimed cell has effectively arrived.  Traffic on
 # the doorstep, or the cell being momentarily occupied, must not read as a
 # stalled approach: the Worker is about to step on and observe the cell, and an
