@@ -4867,6 +4867,11 @@ class AggressiveStrategy:
                     for member in (left, right)
                 }
                 if unit.id not in broken_members:
+                    yield_cell = self._expedition_unstack_cell(
+                        unit, turn, members, bearing
+                    )
+                    if yield_cell is not None:
+                        return yield_cell
                     return unit.position
             # The member's immediate links can be intact while another link
             # is open. Follow its local leader instead of independently
@@ -4877,6 +4882,60 @@ class AggressiveStrategy:
                 else unit.position
             )
         return None
+
+    def _expedition_unstack_cell(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+        members: frozenset[UUID],
+        bearing: Position,
+    ) -> Position | None:
+        """Free a full transit cell while a fixed expedition link reconnects.
+
+        A detached endpoint may need to pass through a cell occupied by two
+        connected teammates.  Let one deterministic occupant step into a
+        forward, non-full neighbour; this preserves shared movement capacity
+        without treating teammates as permanent path blockers.
+        """
+
+        squad_units = [
+            member
+            for member in (*turn.vanguards, *turn.rangers)
+            if member.id in members
+        ]
+        occupants = sorted(
+            (member for member in squad_units if member.position == unit.position),
+            key=lambda member: member.id.bytes,
+        )
+        if len(occupants) < 2 or unit.id != occupants[-1].id:
+            return None
+
+        occupancy: dict[Position, int] = {}
+        for member in (*turn.vanguards, *turn.rangers):
+            occupancy[member.position] = occupancy.get(member.position, 0) + 1
+        static = overlay_blockers(
+            self._rock_map(turn),
+            self.memory.contested_positions,
+            {enemy.position for enemy in turn.visible_enemies},
+        )
+        core_position = turn.core.position if turn.core is not None else None
+        candidates = [
+            cell
+            for cell in adjacent_positions(unit.position)
+            if cell not in static
+            and cell != core_position
+            and occupancy.get(cell, 0) < 2
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda cell: (
+                -(cell[0] * bearing[0] + cell[1] * bearing[1]),
+                occupancy.get(cell, 0),
+                cell,
+            ),
+        )
 
     def _expedition_close_cell(
         self,

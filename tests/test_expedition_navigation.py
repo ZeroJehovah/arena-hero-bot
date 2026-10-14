@@ -2,6 +2,7 @@
 
 from collections import Counter
 from dataclasses import replace
+from uuid import UUID
 
 import pytest
 
@@ -433,6 +434,44 @@ def test_rejoining_member_does_not_orbit_away_from_its_forward_link():
     decisions = {item.actor_id: item for item in report.decisions}
     assert decisions[object_id(2)].action == "WAIT"
     assert decisions[object_id(3)].action == "WAIT"
+
+
+def test_broken_expedition_link_unstacks_a_full_transit_cell():
+    rocks = {
+        (12625, -16440),
+        (12625, -16438),
+        (12626, -16438),
+        (12627, -16437),
+        (12629, -16440),
+        (12629, -16438),
+        (12629, -16436),
+    }
+    strategy = _strategy((0, -1), obstacles=rocks)
+    strategy.memory.expedition_squads = [
+        replace(
+            strategy.memory.expedition_squads[0],
+            serial=4,
+            regroup_order=tuple(object_id(number) for number in (2, 3, 4, 5)),
+        )
+    ]
+    strategy._expedition_regroup_orders[strategy._expedition_squads[0][0]] = tuple(
+        UUID(object_id(number)) for number in (2, 3, 4, 5)
+    )
+    objects = [
+        core(position=(-30, -30)),
+        unit(2, "VANGUARD", position=(12628, -16436)),
+        unit(3, "VANGUARD", position=(12625, -16439)),
+        unit(4, "RANGER", position=(12628, -16438)),
+        unit(5, "RANGER", position=(12628, -16438)),
+    ]
+
+    turn = make_turn(tick=100, resources=10_000, objects=objects)
+    report = strategy.decide(turn)
+    decisions = {item.actor_id: item for item in report.decisions}
+
+    assert decisions[object_id(5)].action == "MOVE"
+    assert decisions[object_id(5)].target == (12628, -16439)
+    assert decisions[object_id(4)].action == "WAIT"
 
 
 def test_trapped_rejoining_member_waits_without_greedy_orbit():
