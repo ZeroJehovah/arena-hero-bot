@@ -2745,6 +2745,7 @@ class AggressiveStrategy:
         path_expansions: int = 4096,
         require_path: bool = False,
         extra_blockers: Container[Position] | None = None,
+        avoid_recent: bool = True,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -2801,7 +2802,7 @@ class AggressiveStrategy:
             unit.position,
             goal,
             blocked=blocked,
-            recent=self.memory.recent_positions(str(unit.id)),
+            recent=(self.memory.recent_positions(str(unit.id)) if avoid_recent else ()),
             direction_offset=self._direction_offset(unit.id),
             max_expansions=max_expansions,
             allow_goal=allow_goal,
@@ -4488,6 +4489,7 @@ class AggressiveStrategy:
             reason="close up so the expedition's line of sight stays connected",
             path_expansions=EXPEDITION_REJOIN_PATH_EXPANSIONS,
             require_path=True,
+            avoid_recent=False,
         ):
             self._record_wait(unit, context, "no safe route to rejoin the expedition")
         return True

@@ -401,6 +401,37 @@ def test_long_rejoin_requires_a_complete_route_with_a_bounded_larger_budget(
     assert calls and all(budget == 8192 and required for budget, required in calls)
 
 
+def test_rejoining_member_does_not_orbit_away_from_its_forward_link():
+    strategy = _strategy()
+    turn = make_turn(
+        resources=10_000,
+        objects=[
+            core(position=(-30, -30)),
+            unit(2, "VANGUARD", position=(0, 0)),
+            unit(3, "VANGUARD", position=(1, 0)),
+            unit(4, "RANGER", position=(2, 0)),
+            unit(5, "RANGER", position=(8, 0)),
+        ],
+    )
+
+    # The forward link is seven cells away.  These old cells are the short
+    # A-B loop that made the complete rejoin path choose a step away from its
+    # target when the generic recent-position penalty was applied.
+    strategy.memory.position_history[object_id(4)] = [
+        (2, 0),
+        (3, 0),
+        (2, 0),
+        (3, 0),
+        (2, 0),
+    ]
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction.value == "RIGHT"
+
+
 def test_trapped_rejoining_member_waits_without_greedy_orbit():
     rocks = set(adjacent_positions((0, 0)))
     strategy = _strategy(obstacles=rocks)
