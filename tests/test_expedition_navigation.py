@@ -425,11 +425,14 @@ def test_rejoining_member_does_not_orbit_away_from_its_forward_link():
         (2, 0),
     ]
 
-    strategy.decide(turn)
+    report = strategy.decide(turn)
 
     action = turn.plan.unit_actions[turn.rangers[0].id]
     assert action.type == "MOVE"
     assert action.direction.value == "RIGHT"
+    decisions = {item.actor_id: item for item in report.decisions}
+    assert decisions[object_id(2)].action == "WAIT"
+    assert decisions[object_id(3)].action == "WAIT"
 
 
 def test_trapped_rejoining_member_waits_without_greedy_orbit():

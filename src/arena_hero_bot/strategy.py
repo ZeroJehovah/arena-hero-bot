@@ -4854,6 +4854,20 @@ class AggressiveStrategy:
             manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
             for left, right in pairwise(ordered)
         ):
+            pursuit = self._expedition_pursuits.get(members)
+            if pursuit is None or pursuit.target_id is None:
+                # Only the two ends of a broken fixed link need to move.  If
+                # every already-connected member also enters the same narrow
+                # approach, two arrivals can consume its capacity before the
+                # actual laggard reaches the link and make the chain orbit.
+                broken_members = {
+                    member.id
+                    for left, right in pairwise(ordered)
+                    if manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
+                    for member in (left, right)
+                }
+                if unit.id not in broken_members:
+                    return unit.position
             # The member's immediate links can be intact while another link
             # is open. Follow its local leader instead of independently
             # chasing a distant enemy on the other side of the broken chain.
