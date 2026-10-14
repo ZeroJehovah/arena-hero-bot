@@ -4587,21 +4587,38 @@ class AggressiveStrategy:
     def _decide_expedition_ranger(self, ranger: Ranger, context: _TurnContext) -> bool:
         pursuit = self._expedition_pursuit_for(ranger)
         visible = self._visible_combat_targets(ranger, context.turn)
-        target = None
-        if pursuit is not None and pursuit.target_id is not None:
-            target = next(
-                (enemy for enemy in visible if str(enemy.id) == pursuit.target_id),
-                None,
-            )
-        if target is None:
-            target = self._best_visible_target(ranger.position, context.turn, visible)
         if not visible and self._regroup_quiet_expedition(ranger, context):
             return True
         if pursuit is None or pursuit.target_id is None:
             return False
-        target = next(
+        pursued_target = next(
             (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
         )
+        # Pursuit is a travel objective, not permission to ignore other
+        # hostiles already on a legal firing ray. Keep focus when it can be
+        # shot, then use the same damage ledger as the defensive Rangers.
+        obstacles = self._rock_map(context.turn)
+        friendly_positions = self._predicted_friendly_positions(context)
+        shootable = [
+            (enemy, shot_cell)
+            for enemy in visible
+            if (
+                shot_cell := self._ranger_shot_cell(
+                    ranger, enemy, context.turn, obstacles, friendly_positions
+                )
+            )
+            is not None
+        ]
+        target = context.damage_ledger.select(
+            tuple(enemy for enemy, _cell in shootable),
+            pursued_target,
+            ranger.position,
+            None,
+        )
+        if target is None:
+            target = pursued_target or self._best_visible_target(
+                ranger.position, context.turn, visible
+            )
         if target is not None:
             if (
                 isinstance(target, UnitView)
@@ -4643,12 +4660,9 @@ class AggressiveStrategy:
                     reason="advance on visible expedition target",
                 ):
                     return True
-            shot_cell = self._ranger_shot_cell(
-                ranger,
-                target,
-                context.turn,
-                self.memory.obstacles,
-                self._predicted_friendly_positions(context),
+            shot_cell = next(
+                (cell for enemy, cell in shootable if enemy.id == target.id),
+                None,
             )
             if shot_cell is not None:
                 ranger.shoot(target, expected_cell=shot_cell)
@@ -4683,16 +4697,6 @@ class AggressiveStrategy:
     ) -> bool:
         pursuit = self._expedition_pursuit_for(vanguard)
         visible = self._visible_combat_targets(vanguard, context.turn)
-        if pursuit is None or pursuit.target_id is None:
-            if not visible and self._regroup_quiet_expedition(vanguard, context):
-                return True
-            target = self._best_visible_target(vanguard.position, context.turn, visible)
-            return target is not None and self._expedition_close_to_engage(
-                vanguard, target, context, offensive=True
-            )
-        pursued_target = next(
-            (enemy for enemy in visible if str(enemy.id) == pursuit.target_id), None
-        )
         if any(
             weight >= SWEEP_LIKELY_WEIGHT
             for _targets, weight in self._sweep_groups(
@@ -4702,11 +4706,25 @@ class AggressiveStrategy:
             return False
         if not visible and self._regroup_quiet_expedition(vanguard, context):
             return True
-        target = pursued_target
-        if target is not None and self._expedition_close_to_engage(
-            vanguard, target, context, offensive=True
-        ):
-            return True
+        # Engage the nearest local intercept before trying to pass a melee
+        # screen in pursuit of its ranged units. The durable squad target
+        # still guides travel when no local engagement can be reached.
+        targets = sorted(
+            visible,
+            key=lambda enemy: (
+                manhattan(vanguard.position, self._intercept_cell(enemy, context)),
+                -self._combat_target_priority(enemy),
+                -self._enemy_score(enemy, vanguard.position, context.turn),
+                str(enemy.id),
+            ),
+        )
+        for target in targets:
+            if self._expedition_close_to_engage(
+                vanguard, target, context, offensive=True
+            ):
+                return True
+        if pursuit is None or pursuit.target_id is None:
+            return False
         goal = self._expedition_chase_goal(vanguard, context)
         return goal is not None and self._move(
             vanguard,
