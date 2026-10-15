@@ -4788,12 +4788,60 @@ class AggressiveStrategy:
             manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
             for left, right in pairwise(ordered)
         ):
+            connected = self._connected_expedition_order(ordered)
+            if connected is not None:
+                self._expedition_regroup_orders[members] = tuple(
+                    member.id for member in connected
+                )
+                return connected
+        if any(
+            manhattan(left.position, right.position) > EXPEDITION_LINK_RADIUS
+            for left, right in pairwise(ordered)
+        ):
             self._expedition_regroup_orders[members] = tuple(
                 member.id for member in ordered
             )
         else:
             self._expedition_regroup_orders.pop(members, None)
         return ordered
+
+    def _connected_expedition_order(
+        self, ordered: list[Ranger | Vanguard]
+    ) -> list[Ranger | Vanguard] | None:
+        """Find a deterministic connected chain when projection order breaks.
+
+        A change in heading can make the projection order disconnected even
+        though the same live members still have a valid chain. Preserve that
+        chain instead of making the first member alternate between both ends.
+        Expeditions contain at most four members, so this bounded search stays
+        tiny and keeps the UUID order deterministic.
+        """
+
+        def extend(
+            chain: list[Ranger | Vanguard],
+            remaining: tuple[Ranger | Vanguard, ...],
+        ) -> list[Ranger | Vanguard] | None:
+            if not remaining:
+                return chain
+            tail = chain[-1]
+            for index, candidate in enumerate(remaining):
+                if (
+                    manhattan(tail.position, candidate.position)
+                    > EXPEDITION_LINK_RADIUS
+                ):
+                    continue
+                result = extend(
+                    [*chain, candidate], remaining[:index] + remaining[index + 1 :]
+                )
+                if result is not None:
+                    return result
+            return None
+
+        for index, start in enumerate(ordered):
+            result = extend([start], tuple(ordered[:index] + ordered[index + 1 :]))
+            if result is not None:
+                return result
+        return None
 
     def _expedition_rendezvous_goal(
         self,

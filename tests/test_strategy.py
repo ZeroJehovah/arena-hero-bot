@@ -21,6 +21,7 @@ from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
     CLAIM_STALL_BUDGET,
     DEFENSE_ROLE,
+    EXPEDITION_LINK_RADIUS,
     EXPEDITION_STAGING_PATH_EXPANSIONS,
     EXPEDITION_STAGING_RADIUS,
     RANGER_VISION_RADIUS,
@@ -6493,6 +6494,36 @@ def test_expedition_same_bearing_projection_uses_stable_neighbor_order() -> None
     # neighbour.  Without the tie-break, the middle member sees no leader and
     # waits forever for the tail while the same-projection member waits for it.
     assert strategy._expedition_rendezvous_goal(middle, turn) == (11, 5)
+
+
+def test_heading_change_keeps_a_connected_expedition_chain() -> None:
+    strategy = _expedition_strategy()
+    members = frozenset(UUID(int=number) for number in range(2, 6))
+    strategy._expedition_squads = [(members, (-1, -1))]
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "VANGUARD", position=(4, 0)),
+            unit(3, "VANGUARD", position=(2, -5)),
+            unit(4, "RANGER", position=(4, -4)),
+            unit(5, "RANGER", position=(0, -4)),
+        ]
+    )
+
+    initial = strategy._ordered_expedition_members(turn, members, (-1, -1))
+    assert [member.id for member in initial] == [
+        UUID(int=2),
+        UUID(int=4),
+        UUID(int=3),
+        UUID(int=5),
+    ]
+
+    turned = strategy._ordered_expedition_members(turn, members, (0, -1))
+    assert [member.id for member in turned[:2]] == [UUID(int=2), UUID(int=4)]
+    assert all(
+        manhattan(left.position, right.position) <= EXPEDITION_LINK_RADIUS
+        for left, right in pairwise(turned)
+    )
 
 
 def test_expedition_close_cell_spreads_members_beside_the_leader() -> None:
