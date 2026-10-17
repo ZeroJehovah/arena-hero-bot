@@ -1194,6 +1194,33 @@ def test_visible_resource_does_not_preempt_nearer_remembered_site() -> None:
     assert claim.target == (2, 0)
 
 
+def test_fresh_remembered_resource_beats_equivalent_stale_site() -> None:
+    config = StrategyConfig(target_workers=12, max_population=None)
+    memory = WorldMemory()
+    memory.resource_cells = {
+        (0, 20): 0,
+        (20, 0): 699,
+    }
+
+    turn = make_turn(
+        tick=700,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0)),
+        ],
+    )
+
+    report = decide(turn, memory=memory, config=config)
+
+    claim = next(
+        item
+        for item in report.decisions
+        if item.reason == "claim nearest unassigned known resource"
+    )
+    assert claim.target == (20, 0)
+    assert (0, 20) in memory.resource_cells
+
+
 def test_live_workers_use_one_scout_for_remote_visible_resources() -> None:
     turn = make_turn(
         objects=[

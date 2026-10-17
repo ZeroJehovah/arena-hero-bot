@@ -112,6 +112,13 @@ REMOTE_RETURN_WEIGHT = 258
 # Keep the established local-ring round-trip price independent of the remote
 # fallback tuning above; local pairing also covers unreachable-route guards.
 LOCAL_RETURN_WEIGHT = 3
+# A remembered site remains eligible for the long memory TTL, but evidence past
+# the replenishment/absence plateau should not tie with a recently confirmed
+# site.  Keep this bounded so stale memory is a fallback rather than a hard
+# deletion, and so it cannot turn a remote site into an unbounded penalty.
+RESOURCE_STALE_SELECTION_BUCKET = RESOURCE_RECHECK_FLOOR * 4
+RESOURCE_STALE_SELECTION_WEIGHT = 64
+RESOURCE_STALE_SELECTION_MAX = 8
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -6319,7 +6326,17 @@ class AggressiveStrategy:
             # Worker walk to the farther side of the ring for a small approach
             # saving and then pay the whole distance again with cargo.  Keep
             # every known site eligible and let the same soft round-trip cost
-            # cover local, outer-band, and remote targets.
+            # cover local, outer-band, and remote targets.  Old remembered
+            # sites add a bounded freshness cost after the evidence plateau;
+            # they remain candidates when fresher sites are unavailable.
+            resource_age = max(
+                0,
+                turn.tick - self.memory.resource_cells.get(resource, turn.tick),
+            )
+            stale_buckets = min(
+                resource_age // RESOURCE_STALE_SELECTION_BUCKET,
+                RESOURCE_STALE_SELECTION_MAX,
+            )
             return (
                 approach
                 + (
@@ -6327,7 +6344,8 @@ class AggressiveStrategy:
                     if core_distance > self.config.resource_patrol_radius * 2
                     else LOCAL_RETURN_WEIGHT
                 )
-                * core_distance,
+                * core_distance
+                + stale_buckets * RESOURCE_STALE_SELECTION_WEIGHT,
                 approach,
                 worker.id,
                 resource,
