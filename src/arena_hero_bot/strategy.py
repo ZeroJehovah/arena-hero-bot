@@ -5011,18 +5011,22 @@ class AggressiveStrategy:
             self.memory.contested_positions,
             {enemy.position for enemy in turn.visible_enemies},
         )
-        teammates = {
-            member.id: member.position for member in (*turn.vanguards, *turn.rangers)
-        }
         squad = self._expedition_squad_for(unit.id)
-        members, bearing = squad if squad is not None else (frozenset(), (0, 0))
-        occupied_by_team = {teammates[mid] for mid in members if mid in teammates}
+        _, bearing = squad if squad is not None else (frozenset(), (0, 0))
+        occupancy: dict[Position, int] = {}
+        for member in (*turn.vanguards, *turn.rangers):
+            occupancy[member.position] = occupancy.get(member.position, 0) + 1
+        if turn.core is not None:
+            occupancy[turn.core.position] = occupancy.get(turn.core.position, 0) + 1
         core_position = turn.core.position if turn.core is not None else None
         candidates = [
             cell
             for cell in adjacent_positions(leader)
             if cell not in static
-            and cell not in occupied_by_team
+            # A single teammate may share a transit/arrival cell. Only a
+            # genuinely full cell is unavailable; excluding every teammate
+            # position makes the chosen goal flip as the line advances.
+            and occupancy.get(cell, 0) < 2
             and cell != unit.position
             and cell != core_position
         ]

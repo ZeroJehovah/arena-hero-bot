@@ -474,6 +474,70 @@ def test_broken_expedition_link_unstacks_a_full_transit_cell():
     assert decisions[object_id(4)].action == "WAIT"
 
 
+def test_two_broken_expedition_links_do_not_orbit_when_teammates_move():
+    # This is the compact form of a live rock pocket where both rear members
+    # repeatedly changed their adjacent rendezvous cell as the other Ranger
+    # moved away.  The fixed link order must still let both ends reconnect.
+    rocks = {
+        (2, -5),
+        (3, -4),
+        (0, -3),
+        (1, -3),
+        (2, -2),
+        (-2, -1),
+        (1, -1),
+        (-3, 0),
+        (5, 0),
+        (0, 1),
+        (3, 1),
+        (1, 2),
+        (1, 3),
+        (-2, 5),
+    }
+    strategy = _strategy((1, 1), obstacles=rocks)
+    members = frozenset(UUID(object_id(number)) for number in range(2, 6))
+    order = tuple(UUID(object_id(number)) for number in (4, 3, 5, 2))
+    strategy._expedition_regroup_orders[members] = order
+    strategy.memory.expedition_squads = [
+        replace(
+            strategy.memory.expedition_squads[0],
+            regroup_order=tuple(str(member) for member in order),
+        )
+    ]
+    objects = [
+        core(position=(-30, -30)),
+        unit(2, "VANGUARD", position=(-1, 3)),
+        unit(3, "VANGUARD", position=(0, 0)),
+        unit(4, "RANGER", position=(2, -4), hp=2),
+        unit(5, "RANGER", position=(1, 0), hp=2),
+    ]
+    seen = {object_id(number): set() for number in range(2, 6)}
+
+    for tick in range(100, 140):
+        turn = make_turn(
+            tick=tick,
+            resources=10_000,
+            objects=objects,
+            obstacles=rocks,
+        )
+        strategy.decide(turn)
+        next_positions = {}
+        for member in turn.units:
+            position = member.position
+            action = turn.plan.unit_actions.get(member.id)
+            if action is not None and action.type == "MOVE":
+                position = add(position, action.direction)
+            next_positions[str(member.id)] = position
+
+        assert not (set(next_positions.values()) & rocks)
+        assert max(Counter(next_positions.values()).values()) <= 2
+        for member in objects[1:]:
+            member["position"] = list(next_positions[member["id"]])
+            seen[member["id"]].add(next_positions[member["id"]])
+
+    assert all(len(positions) >= 8 for positions in seen.values())
+
+
 def test_trapped_rejoining_member_waits_without_greedy_orbit():
     rocks = set(adjacent_positions((0, 0)))
     strategy = _strategy(obstacles=rocks)
