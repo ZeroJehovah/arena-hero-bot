@@ -528,7 +528,7 @@ def test_worker_can_enter_resource_cell_occupied_by_guard() -> None:
     assert arrived.plan.unit_actions[arrived.workers[0].id].type == "HARVEST"
 
 
-def test_worker_keeps_unconfirmed_resource_claim_after_vision_flicker() -> None:
+def test_worker_keeps_recent_resource_goal_across_missing_observation() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)
 
@@ -542,14 +542,16 @@ def test_worker_keeps_unconfirmed_resource_claim_after_vision_flicker() -> None:
 
     second = make_turn(
         tick=101,
-        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 0))],
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 1))],
     )
     report = strategy.decide(second)
     action = second.plan.unit_actions[second.workers[0].id]
     assert action.type == "MOVE"
-    claim = next(item for item in report.decisions if item.actor_id == object_id(2))
-    assert claim.reason == "claim nearest unassigned known resource"
-    assert claim.target == (0, 2)
+    assert action.direction is Direction.DOWN
+    assert any(
+        item.reason == "continue toward recently seen resource"
+        for item in report.decisions
+    )
 
     third = make_turn(
         tick=102,
@@ -560,7 +562,7 @@ def test_worker_keeps_unconfirmed_resource_claim_after_vision_flicker() -> None:
     assert third.plan.unit_actions[third.workers[0].id].type == "HARVEST"
 
 
-def test_worker_keeps_known_resource_claim_while_making_progress() -> None:
+def test_worker_renews_resource_goal_while_making_progress() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)
 
@@ -576,20 +578,20 @@ def test_worker_keeps_known_resource_claim_while_making_progress() -> None:
 
     progressed = make_turn(
         tick=105,
-        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 4))],
+        objects=[core(position=(10, 10)), unit(2, "WORKER", position=(0, 5))],
     )
     report = strategy.decide(progressed)
     action = progressed.plan.unit_actions[progressed.workers[0].id]
 
     assert action.type == "MOVE"
-    claim = next(item for item in report.decisions if item.actor_id == object_id(2))
-    assert claim.reason == "claim nearest unassigned known resource"
-    assert claim.target == (0, 6)
+    assert any(
+        item.reason == "continue toward recently seen resource"
+        for item in report.decisions
+    )
     renewed = memory.goal_for(object_id(2))
     assert renewed is not None
     assert renewed.position == (0, 6)
-    assert renewed.assigned_tick == 100
-    assert renewed.last_progress_position == (0, 4)
+    assert renewed.assigned_tick == 105
 
 
 def test_worker_releases_empty_resource_goal_on_arrival() -> None:
@@ -1192,7 +1194,7 @@ def test_visible_resource_does_not_preempt_nearer_remembered_site() -> None:
     assert claim.target == (2, 0)
 
 
-def test_remembered_resource_age_does_not_change_pairing_cost() -> None:
+def test_fresh_remembered_resource_beats_equivalent_stale_site() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
     memory.resource_cells = {
@@ -1215,7 +1217,7 @@ def test_remembered_resource_age_does_not_change_pairing_cost() -> None:
         for item in report.decisions
         if item.reason == "claim nearest unassigned known resource"
     )
-    assert claim.target == (0, 20)
+    assert claim.target == (20, 0)
     assert (0, 20) in memory.resource_cells
 
 
@@ -1524,57 +1526,74 @@ def test_whole_crew_returns_to_a_remembered_cell_inside_the_harvest_radius() -> 
     assert decision.target == (20, 0)
 
 
-def test_an_emptied_cell_and_its_persisted_claim_are_dropped_immediately() -> None:
+def test_an_emptied_cell_stops_drawing_claims_without_being_forgotten() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory, config)
-    memory.resource_cells[(20, 0)] = 100
-    memory.set_goal(
-        object_id(2),
-        UnitGoal(
-            (20, 0),
-            100,
-            "resource-claim-v1",
-            last_progress_position=(10, 0),
-        ),
-    )
 
-    # A second Worker confirms that the target is empty at close range. The
-    # first Worker's persisted claim must be gone before a new plan is built.
-    report = strategy.decide(
+    strategy.decide(
         make_turn(
-            tick=101,
-            objects=[
-                core(),
-                unit(2, "WORKER", position=(0, 0)),
-                unit(3, "WORKER", position=(19, 0)),
-            ],
+            tick=100,
+            objects=[core(), unit(2, "WORKER", position=(20, 0))],
+            resource_cells=[(20, 0)],
         )
     )
+    assert memory.remembered_resource_cells(100) == frozenset({(20, 0)})
 
-    assert memory.resource_cells == {}
-    goal = memory.goal_for(object_id(2))
-    assert goal is None or goal.purpose != "resource-claim-v1"
-    assert goal is None or goal.position != (20, 0)
+    # The Worker is standing beside the cell and it holds nothing, so another
+    # round trip would be wasted.  The site stays on the map for later: cells
+    # confirmed empty from this range were seen holding a resource again.
+    report = strategy.decide(
+        make_turn(tick=101, objects=[core(), unit(2, "WORKER", position=(21, 0))])
+    )
+
+    assert memory.resource_cells == {(20, 0): 100}
+    assert memory.remembered_resource_cells(101) == frozenset()
     decision = next(item for item in report.decisions if item.actor_id == object_id(2))
-    assert decision.reason != "continue toward recently seen resource"
-    assert decision.target != (20, 0)
+    assert decision.reason != "claim nearest unassigned known resource"
 
 
-def test_remembered_cells_without_close_empty_confirmation_remain_candidates() -> None:
+def test_a_rested_site_is_rechecked_once_it_beats_a_blind_sweep() -> None:
+    """A resting site still outranks the unknown cells a Worker sweeps instead."""
+
+    from arena_hero_bot.memory import RESOURCE_RECHECK_FLOOR
+
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
-    memory.resource_cells[(20, 0)] = 100
     strategy = AggressiveStrategy(memory, config)
 
-    report = strategy.decide(
+    strategy.decide(
         make_turn(
-            tick=20_000,
+            tick=100,
+            objects=[core(), unit(2, "WORKER", position=(20, 0))],
+            resource_cells=[(20, 0)],
+        )
+    )
+    strategy.decide(
+        make_turn(tick=101, objects=[core(), unit(2, "WORKER", position=(21, 0))])
+    )
+    assert memory.remembered_resource_cells(101) == frozenset()
+
+    # One Tick short of the floor the site is still resting, so the Worker has
+    # nothing to claim and falls back to the patrol ring.
+    early = strategy.decide(
+        make_turn(
+            tick=100 + RESOURCE_RECHECK_FLOOR,
             objects=[core(), unit(2, "WORKER", position=(0, 1))],
         )
     )
+    decision = next(item for item in early.decisions if item.actor_id == object_id(2))
+    assert decision.reason != "claim nearest unassigned known resource"
 
-    decision = next(item for item in report.decisions if item.actor_id == object_id(2))
+    # Past it the site is worth a second look, and a second look at a known
+    # site beats sweeping unknown cells by roughly ten to one.
+    late = strategy.decide(
+        make_turn(
+            tick=101 + RESOURCE_RECHECK_FLOOR,
+            objects=[core(), unit(2, "WORKER", position=(0, 1))],
+        )
+    )
+    decision = next(item for item in late.decisions if item.actor_id == object_id(2))
     assert decision.reason == "claim nearest unassigned known resource"
     assert decision.target == (20, 0)
 
@@ -1620,13 +1639,14 @@ def test_idle_workers_reach_past_the_harvest_ring_only_when_it_is_swept() -> Non
 
 
 def test_known_sites_are_claimed_nearest_first_in_one_unbounded_pool() -> None:
-    """All unconfirmed sites share one pool ordered by round-trip cost."""
+    """A single unbounded recheck pool prefers the nearest known sites first."""
 
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
     inner = [(10, y) for y in range(12)]
     outer = (40, 0)
     memory.resource_cells = dict.fromkeys([*inner, outer], 100)
+    memory.resource_absences = dict.fromkeys([*inner, outer], 0)
     strategy = AggressiveStrategy(memory, config)
 
     turn = make_turn(
@@ -1647,13 +1667,14 @@ def test_known_sites_are_claimed_nearest_first_in_one_unbounded_pool() -> None:
     assert set(claims) == {(10, 0), (10, 1)}
 
 
-def test_nearest_unconfirmed_site_wins_without_absence_tiers() -> None:
+def test_remembered_site_precedes_recheck_site() -> None:
     config = StrategyConfig(target_workers=12, max_population=None)
     memory = WorldMemory()
     memory.resource_cells = {
         (60, 0): 100,
         (10, 0): 100,
     }
+    memory.resource_absences[(10, 0)] = 0
     strategy = AggressiveStrategy(memory, config)
 
     turn = make_turn(
@@ -1667,7 +1688,7 @@ def test_nearest_unconfirmed_site_wins_without_absence_tiers() -> None:
         for item in report.decisions
         if item.reason == "claim nearest unassigned known resource"
     )
-    assert claim.target == (10, 0)
+    assert claim.target == (60, 0)
 
 
 def test_local_known_sites_include_the_loaded_return_in_pairing_cost() -> None:

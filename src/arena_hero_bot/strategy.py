@@ -47,8 +47,8 @@ from .geometry import (
     overlay_blockers,
 )
 from .memory import (
-    RESOURCE_CLAIM_PURPOSE,
     RESOURCE_MEMORY_LIMIT,
+    RESOURCE_RECHECK_FLOOR,
     EnemySighting,
     ExpeditionSquad,
     UnitGoal,
@@ -57,6 +57,7 @@ from .memory import (
 from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
+RESOURCE_CLAIM_PURPOSE = "resource-claim-v1"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
@@ -103,10 +104,6 @@ SIMPLIFIED_PATH_EXPANSIONS = 1024
 # service the known resource pool instead of paying a full Worker of income
 # for continuous long-range scouting.
 RESOURCE_SCOUT_INTERVAL = 12
-# Keep one Worker refreshing an old known-site map.  This is a scouting
-# cadence, not a resource recheck: the scout walks toward unexplored ground and
-# no remembered cell is revalidated merely because it is old.
-RESOURCE_SCOUT_STALE_AGE = 128
 # A remote claim is still valid, but its loaded return to the Core is the
 # limiting leg of a refill cycle.  Count that leg with a higher weight for sites outside
 # the local patrol ring; this remains a soft preference and never removes a
@@ -115,6 +112,13 @@ REMOTE_RETURN_WEIGHT = 258
 # Keep the established local-ring round-trip price independent of the remote
 # fallback tuning above; local pairing also covers unreachable-route guards.
 LOCAL_RETURN_WEIGHT = 3
+# A remembered site remains eligible for the long memory TTL, but evidence past
+# the replenishment/absence plateau should not tie with a recently confirmed
+# site.  Keep this bounded so stale memory is a fallback rather than a hard
+# deletion, and so it cannot turn a remote site into an unbounded penalty.
+RESOURCE_STALE_SELECTION_BUCKET = RESOURCE_RECHECK_FLOOR * 4
+RESOURCE_STALE_SELECTION_WEIGHT = 64
+RESOURCE_STALE_SELECTION_MAX = 8
 RESOURCE_PATROL_SPACING = 6
 COMBAT_PATROL_SPACING = 12
 DEFENSIVE_PERIMETER_MIN_RADIUS = 2
@@ -1702,9 +1706,8 @@ class AggressiveStrategy:
             # The claim is walled off rather than merely crowded, so every
             # approach to it is an orbit: the route never closes, the Worker
             # never stands on the cell, no absence is ever recorded, and the
-            # cell therefore stays the nearest candidate forever.  Exclude the
-            # unreachable claim and fall through to patrol, which already
-            # avoids remembered danger.
+            # cell therefore stays the nearest candidate forever.  Rest it and
+            # fall through to patrol, which already avoids remembered danger.
             self._release_unreachable_claim(worker, assigned_resource, context)
             assigned_resource = None
 
@@ -1776,10 +1779,11 @@ class AggressiveStrategy:
                 ) < manhattan(progress_reference, resource_goal.position)
                 if age <= RESOURCE_CLAIM_TTL or progressing:
                     if worker.position == resource_goal.position:
-                        # Arrival is already a close observation.  If the cell
-                        # was empty, memory has deleted it and cleared this
-                        # goal; keep this release as a defensive fallback so a
-                        # Worker is never pinned to a target it already reached.
+                        # Arrival is already a close observation, so an empty
+                        # site is resting in memory.  Do not pin the Worker
+                        # there for the whole recheck floor; the cooldown is a
+                        # preference and the Worker can patrol another known
+                        # site in this same Tick.
                         self.memory.clear_goal(str(worker.id))
                         self._claim_stalls.pop(worker.id, None)
                     else:
@@ -6221,7 +6225,7 @@ class AggressiveStrategy:
         # route a Worker into one.  The pairing below only measured distance, so
         # a cell inside a disk stayed the nearest candidate for the Workers
         # beside it and every claim on it became an orbit around the rim - one
-        # that never arrives, so it never records the absence that would forget
+        # that never arrives, so it never records the absence that would rest
         # the cell.  Take those cells out of the contest instead, together with
         # the ones a route has just failed to reach.  A cell a Worker already
         # stands on stays in: arrival harvests it.
@@ -6234,19 +6238,23 @@ class AggressiveStrategy:
             set(turn.resource_cells) - hostile - unreachable - blocked_resources
         )
         remembered_resources = (
-            set(self.memory.remembered_resource_cells())
+            set(self.memory.remembered_resource_cells(turn.tick))
             - hostile
             - unreachable
             - blocked_resources
             - visible_resources
         )
         resources = visible_resources | remembered_resources
-        if (
-            self._preserves_resources()
-            and not resources
-            and self._unbounded_growth()
-            and workers
-        ):
+        rechecks = (
+            set(self.memory.resource_cells_worth_rechecking(turn.tick))
+            - hostile
+            - unreachable
+            - blocked_resources
+            - resources
+        )
+        if not self._preserves_resources():
+            rechecks = set()
+        elif not resources and not rechecks and self._unbounded_growth() and workers:
             # With no known site anywhere, keep one deterministic Worker as a
             # bounded resource scout.  The other Workers fall through to the
             # local patrol ring instead of walking in lockstep.
@@ -6256,18 +6264,19 @@ class AggressiveStrategy:
                 workers = {scout.id: scout}
             else:
                 workers = {}
+        stale_candidates = resources | rechecks
         if (
             self._unbounded_growth()
             and len(workers) > 1
-            and resources
+            and stale_candidates
             and turn.tick % RESOURCE_SCOUT_INTERVAL == 0
             and (
                 (
                     not visible_resources
                     and all(
                         turn.tick - self.memory.resource_cells.get(resource, turn.tick)
-                        >= RESOURCE_SCOUT_STALE_AGE
-                        for resource in resources
+                        >= RESOURCE_RECHECK_FLOOR
+                        for resource in stale_candidates
                     )
                 )
                 or len(self.memory.resource_cells) >= RESOURCE_MEMORY_LIMIT
@@ -6303,6 +6312,8 @@ class AggressiveStrategy:
         known = visible_resources | remembered_resources
         if known:
             pools.append(known)
+        if rechecks:
+            pools.append(rechecks)
         self._hold_existing_claims(workers, pools, assignments)
 
         def assignment_key(
@@ -6319,7 +6330,17 @@ class AggressiveStrategy:
             # Worker walk to the farther side of the ring for a small approach
             # saving and then pay the whole distance again with cargo.  Keep
             # every known site eligible and let the same soft round-trip cost
-            # cover local, outer-band, and remote targets.
+            # cover local, outer-band, and remote targets.  Old remembered
+            # sites add a bounded freshness cost after the evidence plateau;
+            # they remain candidates when fresher sites are unavailable.
+            resource_age = max(
+                0,
+                turn.tick - self.memory.resource_cells.get(resource, turn.tick),
+            )
+            stale_buckets = min(
+                resource_age // RESOURCE_STALE_SELECTION_BUCKET,
+                RESOURCE_STALE_SELECTION_MAX,
+            )
             return (
                 approach
                 + (
@@ -6327,16 +6348,17 @@ class AggressiveStrategy:
                     if core_distance > self.config.resource_patrol_radius * 2
                     else LOCAL_RETURN_WEIGHT
                 )
-                * core_distance,
+                * core_distance
+                + stale_buckets * RESOURCE_STALE_SELECTION_WEIGHT,
                 approach,
                 worker.id,
                 resource,
             )
 
         for pool in pools:
-            # Within the candidate pool the nearest/shortest round-trip Worker
-            # pairing wins, so the fleet does not cross itself or overpay for a
-            # remote return.
+            # Freshest evidence and local range come first; within one pool,
+            # the nearest/shortest-round-trip Worker pairing still wins so the
+            # fleet does not cross itself or overpay for a remote return.
             while workers and pool:
                 _, _, worker_id, resource = min(
                     (
@@ -6447,7 +6469,7 @@ class AggressiveStrategy:
 
         A swap is not the reassignment ``_hold_existing_claims`` refuses.
         That guard protects the *cell*: an abandoned approach never confirms
-        what is there, so nothing feeds back into resource memory.  A
+        what is there, so nothing feeds back into the recheck machinery.  A
         swap keeps every claimed cell claimed and only trades who walks to it,
         so both approaches still terminate in an observation.
         """
@@ -6490,9 +6512,10 @@ class AggressiveStrategy:
 
         Holding a claim can cost distance on the Tick it is held, because the
         pairing it refuses really is the shorter one.  It buys something worth
-        more than the detour: an approach that terminates in an observation.
-        An abandoned approach never confirms its cell, so it feeds nothing back
-        into resource memory.
+        more at a 1.8% refill rate: an approach that terminates in an
+        observation.  An abandoned approach never confirms its cell, so it
+        feeds nothing back into the absence and recheck machinery that decides
+        where the next Worker goes.
 
         The bound is only against *abandonment*.  When another Worker takes
         the released cell the approach is handed off rather than dropped, and
@@ -6504,11 +6527,11 @@ class AggressiveStrategy:
         land, and ``CLAIM_STALL_BUDGET`` is sized for a hopeless route rather
         than for a few Ticks of congestion.
 
-        Arrival needs no special case.  A Worker reaching an empty cell records
-        the absence before this runs, which deletes the cell and its goal, so
-        the observation itself releases the claim.  Only a Worker that cannot
-        close the distance needs a bound, which is what the stall budget
-        provides.
+        Arrival needs no special case.  A Worker reaching an empty cell
+        records the absence before this runs, which takes the cell out of
+        every pool for RESOURCE_RECHECK_FLOOR Ticks, so the observation itself
+        releases the claim.  Only a Worker that cannot close the distance
+        needs a bound, which is what the stall budget provides.
         """
 
         stalls = self._claim_stalls

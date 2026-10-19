@@ -339,7 +339,7 @@ def test_resource_cells_survive_leaving_vision_and_round_trip(tmp_path) -> None:
             resource_cells=[(30, 0), (0, 20)],
         )
     )
-    assert memory.remembered_resource_cells() == frozenset({(30, 0), (0, 20)})
+    assert memory.remembered_resource_cells(999) == frozenset({(30, 0), (0, 20)})
 
     # The Worker walked away; neither cell is visible and neither is disproven.
     # The Core counts as an observer too, so both cells are kept clear of
@@ -348,20 +348,20 @@ def test_resource_cells_survive_leaving_vision_and_round_trip(tmp_path) -> None:
     memory.observe(
         make_turn(tick=51, objects=[core(), unit(2, "WORKER", position=(9, 9))])
     )
-    assert memory.remembered_resource_cells() == frozenset({(30, 0), (0, 20)})
+    assert memory.remembered_resource_cells(999) == frozenset({(30, 0), (0, 20)})
 
     path = tmp_path / "memory.json"
     memory.save(path)
-    assert WorldMemory.load(path).remembered_resource_cells() == frozenset(
+    assert WorldMemory.load(path).remembered_resource_cells(999) == frozenset(
         {(30, 0), (0, 20)}
     )
 
 
-def test_an_emptied_cell_is_forgotten_immediately() -> None:
+def test_an_emptied_cell_rests_instead_of_being_forgotten() -> None:
+    from arena_hero_bot.memory import RESOURCE_ABSENCE_COOLDOWN
+
     memory = WorldMemory()
     memory.observe(make_turn(tick=50, objects=[core()], resource_cells=[(20, 0)]))
-    memory.set_goal(object_id(2), UnitGoal((20, 0), 50, "resource-claim-v1"))
-    memory.set_goal(object_id(3), UnitGoal((20, 0), 50, "explore-center-v3"))
 
     # Two cells away is already too far to believe an absence: in the recording
     # a cell reported empty from one cell away held a resource again 5.5% of the
@@ -369,34 +369,33 @@ def test_an_emptied_cell_is_forgotten_immediately() -> None:
     memory.observe(
         make_turn(tick=51, objects=[core(), unit(2, "WORKER", position=(22, 0))])
     )
-    assert memory.remembered_resource_cells() == frozenset({(20, 0)})
+    assert memory.remembered_resource_cells(51) == frozenset({(20, 0)})
 
-    # Adjacent and empty.  That observation is authoritative: a former
-    # resource cell has no documented advantage over any other eligible cell,
-    # so the coordinate is deleted rather than cached for a later guess.
+    # Adjacent and empty.  The site is rested, not deleted - an empty cell is
+    # not a dead cell, and roughly a third of them regrow after 500 Ticks.
     memory.observe(
         make_turn(tick=52, objects=[core(), unit(2, "WORKER", position=(21, 0))])
     )
-    assert memory.resource_cells == {}
-    assert memory.remembered_resource_cells() == frozenset()
-    assert memory.goal_for(object_id(2)) is None
-    assert memory.goal_for(object_id(3)) == UnitGoal((20, 0), 50, "explore-center-v3")
-    memory.observe(
-        make_turn(tick=100_000, objects=[core(), unit(2, "WORKER", position=(0, 0))])
+    assert memory.resource_cells == {(20, 0): 50}
+    assert memory.remembered_resource_cells(52) == frozenset()
+    assert (
+        memory.remembered_resource_cells(52 + RESOURCE_ABSENCE_COOLDOWN) == frozenset()
     )
-    assert memory.remembered_resource_cells() == frozenset()
+    assert memory.remembered_resource_cells(
+        53 + RESOURCE_ABSENCE_COOLDOWN
+    ) == frozenset({(20, 0)})
 
 
-def test_seeing_a_resource_again_records_it_anew() -> None:
+def test_seeing_a_resource_again_clears_its_rest_immediately() -> None:
     memory = WorldMemory()
     memory.observe(make_turn(tick=50, objects=[core()], resource_cells=[(20, 0)]))
     memory.observe(
         make_turn(tick=51, objects=[core(), unit(2, "WORKER", position=(21, 0))])
     )
-    assert memory.remembered_resource_cells() == frozenset()
+    assert memory.remembered_resource_cells(51) == frozenset()
 
-    # A live sighting is authoritative even after the coordinate was deleted,
-    # so the cell re-enters memory with the new observation tick.
+    # Reporting flickers, so a cell can vanish for a Tick and come straight
+    # back.  A live sighting is authoritative and outranks the rest period.
     memory.observe(
         make_turn(
             tick=52,
@@ -404,32 +403,7 @@ def test_seeing_a_resource_again_records_it_anew() -> None:
             resource_cells=[(20, 0)],
         )
     )
-    assert memory.resource_cells == {(20, 0): 52}
-    assert memory.remembered_resource_cells() == frozenset({(20, 0)})
-
-
-def test_loading_legacy_absence_does_not_resurrect_the_cell(tmp_path) -> None:
-    memory = WorldMemory()
-    memory.resource_cells = {(20, 0): 50, (30, 0): 50}
-    memory.set_goal(
-        object_id(2),
-        UnitGoal((20, 0), 50, "resource-claim-v1"),
-    )
-    memory.set_goal(
-        object_id(3),
-        UnitGoal((20, 0), 50, "explore-center-v3"),
-    )
-    path = tmp_path / "memory.json"
-    memory.save(path)
-
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["resource_absences"] = [{"position": [20, 0], "tick": 51}]
-    path.write_text(json.dumps(raw), encoding="utf-8")
-
-    loaded = WorldMemory.load(path)
-    assert loaded.resource_cells == {(30, 0): 50}
-    assert loaded.goal_for(object_id(2)) is None
-    assert loaded.goal_for(object_id(3)) == UnitGoal((20, 0), 50, "explore-center-v3")
+    assert memory.remembered_resource_cells(52) == frozenset({(20, 0)})
 
 
 def test_stale_resource_cells_expire_and_memory_stays_bounded() -> None:
@@ -438,13 +412,13 @@ def test_stale_resource_cells_expire_and_memory_stays_bounded() -> None:
     memory = WorldMemory()
     memory.observe(make_turn(tick=10, objects=[core()], resource_cells=[(40, 0)]))
     memory.observe(make_turn(tick=10 + RESOURCE_MEMORY_TTL, objects=[core()]))
-    assert memory.remembered_resource_cells() == frozenset({(40, 0)})
+    assert memory.remembered_resource_cells(999) == frozenset({(40, 0)})
     memory.observe(make_turn(tick=11 + RESOURCE_MEMORY_TTL, objects=[core()]))
-    assert memory.remembered_resource_cells() == frozenset()
+    assert memory.remembered_resource_cells(999) == frozenset()
 
     crowd = [(x, 500) for x in range(RESOURCE_MEMORY_LIMIT + 40)]
     memory.observe(make_turn(tick=9000, objects=[core()], resource_cells=crowd))
-    assert len(memory.remembered_resource_cells()) == RESOURCE_MEMORY_LIMIT
+    assert len(memory.remembered_resource_cells(999)) == RESOURCE_MEMORY_LIMIT
 
 
 def test_enemy_drift_detects_a_one_cell_reversal() -> None:
