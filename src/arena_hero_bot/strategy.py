@@ -5677,14 +5677,11 @@ class AggressiveStrategy:
             return None
         target = self.memory.core_home_position
         obstacles = self._rock_map(context.turn)
-        footprint_offsets = (
-            *self._symmetric_defense_offsets()[0],
-            *self._symmetric_defense_offsets()[1],
-        )
-        if target is None or any(
-            (target[0] + dx, target[1] + dy) in obstacles
-            for dx, dy in footprint_offsets
-        ):
+        # A single blocked guard post is tolerated: the post assignment below
+        # moves that guard to the nearest free cell, which the live junction
+        # home needs for its one rock-covered Ranger slot.  Recompute only when
+        # the Core itself would have to stand on a rock.
+        if target is None or target in obstacles:
             target = self._symmetric_home_candidate(context)
             self.memory.core_home_position = target
         if target is None or core.position == target:
@@ -5766,19 +5763,26 @@ class AggressiveStrategy:
             }
             assignments: dict[UUID, Position] = {}
             vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+            obstacles = self._rock_map(context.turn)
+            at_home = core_position == self.memory.core_home_position
             for unit_type, offsets in (
                 (UnitType.VANGUARD, vanguard_offsets),
                 (UnitType.RANGER, ranger_offsets),
             ):
                 # Friendly traffic can pass through a guard.  Do not nudge
                 # individual posts away from pocket exits or occupied cells.
+                posts = (
+                    _place_defense_posts(core_position, offsets, obstacles)
+                    if at_home
+                    else tuple(
+                        (core_position[0] + dx, core_position[1] + dy)
+                        for dx, dy in offsets
+                    )
+                )
                 assignments.update(
                     _assign_fixed_defense_posts(
                         tuple(unit for unit in guards if unit.unit_type is unit_type),
-                        tuple(
-                            (core_position[0] + dx, core_position[1] + dy)
-                            for dx, dy in offsets
-                        ),
+                        posts,
                         previous,
                     )
                 )
@@ -8261,6 +8265,49 @@ def _assign_fixed_defense_posts(
         assigned[unit.id] = post
         available.remove(post)
     return assigned
+
+
+def _place_defense_posts(
+    center: Position,
+    offsets: tuple[Position, ...],
+    obstacles: set[Position],
+) -> tuple[Position, ...]:
+    """Return the fixed posts, moving blocked slots to the nearest free cell."""
+
+    used: set[Position] = set()
+    posts: list[Position] = []
+    for dx, dy in offsets:
+        post = (center[0] + dx, center[1] + dy)
+        if post in obstacles or post in used:
+            post = _nearest_free_post(post, center, obstacles, used)
+        posts.append(post)
+        used.add(post)
+    return tuple(posts)
+
+
+def _nearest_free_post(
+    post: Position,
+    center: Position,
+    obstacles: set[Position],
+    used: set[Position],
+) -> Position:
+    """Pick a deterministic nearby cell for a post covered by a rock."""
+
+    radius = manhattan(post, center)
+    candidates = []
+    for dx in range(-3, 4):
+        for dy in range(-3, 4):
+            candidate = (post[0] + dx, post[1] + dy)
+            if candidate in obstacles or candidate in used or candidate == center:
+                continue
+            candidates.append(
+                (
+                    abs(dx) + abs(dy),
+                    abs(manhattan(candidate, center) - radius),
+                    candidate,
+                )
+            )
+    return min(candidates)[-1] if candidates else post
 
 
 def _ring_is_covered(

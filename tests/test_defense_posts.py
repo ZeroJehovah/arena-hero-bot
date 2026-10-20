@@ -64,6 +64,33 @@ def test_initial_posts_restore_symmetry_without_moving_stationed_guards(center):
         assert offsets == {(-x, -y) for x, y in offsets}
 
 
+def test_blocked_post_falls_back_to_nearest_free_cell():
+    center = (-416, 672)
+    guards = _stationed_units(center)
+    blocked = (center[0], center[1] + 8)
+    blocked_guard = next(
+        guard for guard in guards if tuple(guard["position"]) == blocked
+    )
+    blocked_guard["position"] = [blocked[0] + 1, blocked[1]]
+    turn = make_turn(
+        objects=[core(position=center), *guards],
+        obstacles=[blocked],
+    )
+    strategy = _strategy(WorldMemory(core_home_position=center))
+
+    strategy.decide(turn)
+
+    posts = {tuple(position) for position in strategy.memory.defense_posts.values()}
+    vanguards, rangers = AggressiveStrategy._symmetric_defense_offsets()
+    expected = {(center[0] + dx, center[1] + dy) for dx, dy in (*vanguards, *rangers)}
+    assert len(posts) == 20
+    assert blocked not in posts
+    assert expected - {blocked} <= posts
+    displaced = posts - expected
+    assert len(displaced) == 1
+    assert manhattan(next(iter(displaced)), blocked) == 1
+
+
 def test_defender_returns_to_original_post_after_combat_and_restart(tmp_path):
     strategy = _strategy()
     guards = _stationed_units()
