@@ -33,6 +33,7 @@ from arena_hero_bot.strategy import (
     _clear_manhattan_path,
     _defensive_ring_offsets,
     _ExpeditionPursuit,
+    _four_block_outer_ring,
     _resource_patrol_offsets,
     _TurnContext,
 )
@@ -7112,9 +7113,10 @@ def test_symmetric_posture_demotes_excess_legacy_defenders() -> None:
     assert len(strategy._patrol_ids(turn)) == 8
 
 
-def test_symmetric_patrol_teams_stay_in_separate_quadrants() -> None:
-    strategy = _expedition_strategy(
-        expedition_config(target_workers=16, offensive_patrol_radius=20)
+def test_symmetric_patrol_teams_share_one_clockwise_ring() -> None:
+    strategy = AggressiveStrategy(
+        WorldMemory(core_home_position=(0, 0)),
+        expedition_config(target_workers=16),
     )
     vanguards = [
         unit(100 + number, "VANGUARD", position=(0, 0)) for number in range(12)
@@ -7123,15 +7125,16 @@ def test_symmetric_patrol_teams_stay_in_separate_quadrants() -> None:
     turn = make_turn(resources=0, objects=[core(), *vanguards, *rangers])
     strategy._reconcile_unit_roles(turn)
 
-    signs = {1: (1, -1), 2: (1, 1), 3: (-1, 1), 4: (-1, -1)}
-    for team, (sx, sy) in signs.items():
-        members = strategy._patrol_team_members(team, turn)
-        assert len(members) == 2
-        for member in members:
-            assert member.unit_type is UnitType.RANGER
-            goal, _ = strategy._combat_patrol_goal(member, turn)
-            assert goal[0] * sx >= 0
-            assert goal[1] * sy >= 0
+    route = _four_block_outer_ring((0, 0), set())
+    goals = {
+        member.id: strategy._combat_patrol_goal(member, turn)[0]
+        for member in (*turn.rangers, *turn.vanguards)
+        if member.id in strategy._patrol_ids(turn)
+    }
+
+    assert len(goals) == 8
+    assert len(set(goals.values())) == 8
+    assert all(goal in route for goal in goals.values())
 
 
 def test_combat_units_plan_first_ordered_by_core_distance() -> None:

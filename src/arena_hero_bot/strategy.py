@@ -58,7 +58,9 @@ from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
+WORKER_BLOCK_PATROL_PURPOSE = "worker-block-patrol-v1"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
+PATROL_RING_PURPOSE = "combat-ring-patrol-v1"
 RESOURCE_CLAIM_TTL = 4
 # A held claim is only released when its approach has stopped paying, not when
 # the Worker is briefly blocked.  Measured on the 2026-10-10 restock day,
@@ -94,6 +96,14 @@ CLAIM_STALL_BUDGET = 72
 # empty one is released by that close observation itself.
 CLAIM_ARRIVAL_SLACK = 2
 UNREACHABLE_CLAIM_COOLDOWN = 128
+# A patrol target can be geometrically present but sealed by the remembered
+# rock map.  Remember a failed route for the same bounded interval as a failed
+# resource claim so every Worker does not retry the same corner each Tick.
+UNREACHABLE_PATROL_COOLDOWN = 128
+# How many oldest-first targets one Worker may route-check before accepting a
+# nearby fallback.  Within one connected 32x32 block the first candidate almost
+# always succeeds; the bound protects a badly fragmented map.
+WORKER_PATROL_ROUTE_ATTEMPTS = 24
 # Once combat has consumed the soft planning budget the remaining units switch
 # to shorter path searches so the full Turn still fits inside the command
 # window before the hard planning_time_limit cuts in.
@@ -222,13 +232,17 @@ EXPEDITION_LINK_RADIUS = 4
 
 # Revised live posture.  The legacy constants above remain available for
 # explicit small test configurations; ``target_workers >= 16`` selects this
-# formation: four cardinal Vanguard posts, sixteen Ranger posts, and four
-# two-Ranger quadrant patrol teams. Surplus Vanguards join expedition staging.
+# formation: four cardinal Vanguard posts, sixteen Ranger posts, and eight
+# patrol Rangers sharing one clockwise ring around four 32x32 resource blocks.
+# Surplus Vanguards join expedition staging.
 SYMMETRIC_FORMATION_VANGUARDS = 4
 SYMMETRIC_FORMATION_RANGERS = 24
 SYMMETRIC_PATROL_TEAM_COUNT = 4
 SYMMETRIC_DEFENSE_VANGUARDS = 4
 SYMMETRIC_DEFENSE_RANGERS = 16
+SYMMETRIC_RESOURCE_BLOCK_SIZE = 32
+SYMMETRIC_WORKERS_PER_BLOCK = 4
+SYMMETRIC_PATROL_RING_UNITS = 8
 SYMMETRIC_CORE_RADIUS = 6
 CORE_QUEUE_RADIUS = 4
 
@@ -364,6 +378,23 @@ class _DefensiveLayout:
     assignments: dict[UUID, Position]
 
 
+@dataclass(frozen=True, slots=True)
+class _ResourceBlock:
+    """One fixed 32x32 economy region around the four-block Core junction."""
+
+    index: int
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+
+    def contains(self, position: Position) -> bool:
+        return (
+            self.min_x <= position[0] <= self.max_x
+            and self.min_y <= position[1] <= self.max_y
+        )
+
+
 class AggressiveStrategy:
     """Seek combat early while retaining a minimal resource engine."""
 
@@ -398,6 +429,10 @@ class AggressiveStrategy:
         # the raid state below: a restart forgets it and the next Tick simply
         # re-matches every Worker once.
         self._claim_stalls: dict[UUID, int] = {}
+        # Patrol routes that could not be completed under the current static
+        # map.  This is deliberately ephemeral: a restart should re-check the
+        # route against the latest obstacle observations.
+        self._unreachable_patrol_cells: dict[Position, int] = {}
         # Set for the current Tick only by ``_assign_resources`` when a
         # Worker is deliberately left out of known-site pairing.  Keeping the
         # identity here lets the selected Worker be non-minimal without
@@ -440,6 +475,10 @@ class AggressiveStrategy:
         self._expedition_routes: dict[frozenset[UUID], ExplorationRoute] = {}
         self._expedition_regroup_orders: dict[frozenset[UUID], tuple[UUID, ...]] = {}
         self._expedition_navigation_turn: Turn | None = None
+        self._patrol_ring_cache: tuple[int, Position, tuple[Position, ...]] | None = (
+            None
+        )
+        self._patrol_ring_phase_tick = -1
         self._expedition_serial = max(
             self.memory.next_expedition_serial,
             max((squad.serial for squad in self.memory.expedition_squads), default=0),
@@ -1807,7 +1846,14 @@ class AggressiveStrategy:
                 self.memory.clear_goal(str(worker.id))
 
         if self._preserves_resources():
-            if (
+            worker_block = self._worker_resource_block(worker)
+            if worker_block is not None:
+                goal = self._worker_block_patrol_goal(worker, context)
+                reason = (
+                    f"patrol assigned resource block {worker_block.index + 1} "
+                    "for unseen resources"
+                )
+            elif (
                 self._is_resource_scout(worker, context.turn)
                 and context.threat.level is ThreatLevel.NORMAL
             ):
@@ -2957,7 +3003,7 @@ class AggressiveStrategy:
         return tuple(
             enemy
             for enemy in turn.visible_enemies
-            if self._combat_target_is_local(unit, enemy.position)
+            if self._combat_target_is_local(unit, enemy.position, turn)
             or (
                 escorting
                 and isinstance(enemy, UnitView)
@@ -3679,8 +3725,43 @@ class AggressiveStrategy:
         self,
         unit: Ranger | Vanguard,
         target: Position,
+        turn: Turn | None = None,
     ) -> bool:
-        return manhattan(unit.position, target) <= _combat_vision_radius(unit)
+        if manhattan(unit.position, target) <= _combat_vision_radius(unit):
+            return True
+        if (
+            turn is None
+            or not self._symmetric_posture()
+            or self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
+            is None
+        ):
+            return False
+        return (
+            self._patrol_ring_distance(unit.position, target, turn)
+            <= self.config.combat_alert_radius
+        )
+
+    def _patrol_ring_distance(
+        self,
+        origin: Position,
+        target: Position,
+        turn: Turn,
+    ) -> int:
+        """Measure patrol proximity along the clockwise edge, not the interior."""
+
+        route = self._patrol_ring_route(turn)
+        if len(route) < 2:
+            return manhattan(origin, target)
+        origin_index = min(
+            range(len(route)),
+            key=lambda index: (manhattan(origin, route[index]), index),
+        )
+        target_index = min(
+            range(len(route)),
+            key=lambda index: (manhattan(target, route[index]), index),
+        )
+        direct = abs(origin_index - target_index)
+        return min(direct, len(route) - direct)
 
     def _defensive_memory_targets(
         self,
@@ -3707,7 +3788,7 @@ class AggressiveStrategy:
         targets: list[EnemySighting] = []
         for enemy in recent_enemies:
             if self._is_combat_memory_target(enemy):
-                if self._combat_target_is_local(unit, enemy.position) or (
+                if self._combat_target_is_local(unit, enemy.position, context.turn) or (
                     converging
                     and core is not None
                     and manhattan(core.position, enemy.position) <= pursuit_radius
@@ -6020,11 +6101,13 @@ class AggressiveStrategy:
         unit: Ranger | Vanguard,
         turn: Turn,
     ) -> tuple[Position, str]:
-        """Choose a waypoint for the Unit's independent quadrant patrol team."""
+        """Choose a waypoint on the unified patrol route."""
 
         core = turn.core
         if core is None:
             return unit.position, "no Core available for offensive patrol"
+        if self._symmetric_posture():
+            return self._symmetric_combat_patrol_goal(unit, turn)
         team = self._patrol_team_for(unit.id, turn)
         if team is None:
             return unit.position, "no patrol team assigned"
@@ -6139,6 +6222,122 @@ class AggressiveStrategy:
         self.memory.set_goal(unit_id, goal)
         return patrol_position, "search outward for enemy units and Cores"
 
+    def _patrol_ring_route(self, turn: Turn) -> tuple[Position, ...]:
+        """Return the traversable clockwise outer edge of the four blocks."""
+
+        home = self.memory.core_home_position
+        if home is None:
+            return ()
+        cached = self._patrol_ring_cache
+        if cached is not None and cached[0] == turn.tick and cached[1] == home:
+            return cached[2]
+        route = _four_block_outer_ring(home, self._rock_map(turn))
+        self._patrol_ring_cache = (turn.tick, home, route)
+        return route
+
+    def _reconcile_patrol_ring_slots(self, turn: Turn) -> dict[UUID, int]:
+        """Keep each patrol Ranger's ring slot durable across casualties."""
+
+        if not self._symmetric_posture():
+            return {}
+        self._ensure_unit_roles(turn)
+        members = sorted(
+            (
+                unit
+                for unit in (*turn.vanguards, *turn.rangers)
+                if self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
+                is not None
+            ),
+            key=lambda unit: unit.id.bytes,
+        )
+        slots: dict[UUID, int] = {}
+        used: set[int] = set()
+        for member in members:
+            slot = self.memory.patrol_ring_slots.get(str(member.id))
+            if (
+                slot is not None
+                and 0 <= slot < SYMMETRIC_PATROL_RING_UNITS
+                and slot not in used
+            ):
+                slots[member.id] = slot
+                used.add(slot)
+        for member in members:
+            if member.id in slots:
+                continue
+            slot = next(
+                candidate
+                for candidate in range(SYMMETRIC_PATROL_RING_UNITS)
+                if candidate not in used
+            )
+            slots[member.id] = slot
+            used.add(slot)
+        self.memory.patrol_ring_slots = {
+            str(unit_id): slot for unit_id, slot in slots.items()
+        }
+        home = self.memory.core_home_position
+        if home is not None and self.memory.patrol_ring_origin != home:
+            self.memory.patrol_ring_origin = home
+            self.memory.patrol_ring_phase = 0
+            self._patrol_ring_phase_tick = -1
+        return slots
+
+    def _advance_patrol_ring_phase(
+        self,
+        turn: Turn,
+        route: tuple[Position, ...],
+        slots: dict[UUID, int],
+    ) -> None:
+        """Advance only after every member reaches its current ring slot."""
+
+        if self._patrol_ring_phase_tick == turn.tick or not route or not slots:
+            return
+        live = {unit.id: unit for unit in (*turn.vanguards, *turn.rangers)}
+        phase = self.memory.patrol_ring_phase % len(route)
+        live_slots = [
+            (unit_id, slot) for unit_id, slot in slots.items() if unit_id in live
+        ]
+        if live_slots and all(
+            live[unit_id].position
+            == route[
+                (
+                    _ring_slot_index(slot, SYMMETRIC_PATROL_RING_UNITS, len(route))
+                    + phase
+                )
+                % len(route)
+            ]
+            for unit_id, slot in live_slots
+        ):
+            phase = (phase + 1) % len(route)
+        self.memory.patrol_ring_phase = phase
+        self._patrol_ring_phase_tick = turn.tick
+
+    def _symmetric_combat_patrol_goal(
+        self,
+        unit: Ranger | Vanguard,
+        turn: Turn,
+    ) -> tuple[Position, str]:
+        """Follow the shared clockwise ring with an evenly spaced durable slot."""
+
+        route = self._patrol_ring_route(turn)
+        slots = self._reconcile_patrol_ring_slots(turn)
+        slot = slots.get(unit.id)
+        if not route or slot is None:
+            return unit.position, "hold while the four-block patrol ring is unavailable"
+        self._advance_patrol_ring_phase(turn, route, slots)
+        route_index = (
+            _ring_slot_index(slot, SYMMETRIC_PATROL_RING_UNITS, len(route))
+            + self.memory.patrol_ring_phase
+        ) % len(route)
+        patrol_position = route[route_index]
+        goal = UnitGoal(
+            position=patrol_position,
+            assigned_tick=turn.tick,
+            purpose=PATROL_RING_PURPOSE,
+            last_progress_position=unit.position,
+        )
+        self.memory.set_goal(str(unit.id), goal)
+        return patrol_position, "follow the clockwise four-block patrol ring"
+
     def _enemy_score(
         self,
         enemy: CoreView | UnitView,
@@ -6204,16 +6403,204 @@ class AggressiveStrategy:
     def _ranger_range(origin: Position, target: Position) -> int:
         return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
-    def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
-        """Assign known resource cells to the nearest empty Worker.
+    def _resource_blocks(self) -> tuple[_ResourceBlock, ...]:
+        """Return the four fixed economy regions around the persisted junction."""
 
-        Every cell currently visible or remembered as having held a resource
-        is a valid target, regardless of how far it sits from the Core.
-        Enemy and unreachable cells stay excluded so a Worker does not walk
-        into a known threat or a walled-off route.
+        if not self._symmetric_posture():
+            return ()
+        home = self.memory.core_home_position
+        return () if home is None else _four_resource_blocks(home)
+
+    def _worker_resource_block(self, worker: Worker) -> _ResourceBlock | None:
+        """Return a Worker's durable block identity, if the live scheme is active."""
+
+        block_index = self.memory.worker_blocks.get(str(worker.id))
+        return next(
+            (block for block in self._resource_blocks() if block.index == block_index),
+            None,
+        )
+
+    def _reconcile_worker_blocks(self, turn: Turn) -> dict[UUID, _ResourceBlock]:
+        """Keep Worker/block identities stable and fill vacancies deterministically."""
+
+        blocks = self._resource_blocks()
+        if not blocks:
+            return {}
+        ordered = sorted(turn.workers, key=lambda worker: worker.id.bytes)
+        rank = {worker.id: index for index, worker in enumerate(ordered)}
+        counts = [0] * len(blocks)
+        assignments: dict[UUID, _ResourceBlock] = {}
+        pending: list[Worker] = []
+        valid_indexes = {block.index for block in blocks}
+        for worker in ordered:
+            block_index = self.memory.worker_blocks.get(str(worker.id))
+            if (
+                block_index in valid_indexes
+                and counts[block_index] < SYMMETRIC_WORKERS_PER_BLOCK
+            ):
+                assignments[worker.id] = blocks[block_index]
+                counts[block_index] += 1
+            else:
+                pending.append(worker)
+
+        for worker in pending:
+            available = [
+                block.index
+                for block in blocks
+                if counts[block.index] < SYMMETRIC_WORKERS_PER_BLOCK
+            ]
+            candidates = available or [block.index for block in blocks]
+            preferred = rank[worker.id] % len(blocks)
+            block_index = min(
+                candidates,
+                key=lambda index: (counts[index], (index - preferred) % len(blocks)),
+            )
+            assignments[worker.id] = blocks[block_index]
+            counts[block_index] += 1
+
+        self.memory.worker_blocks = {
+            str(worker_id): block.index for worker_id, block in assignments.items()
+        }
+        allowed_cells = {
+            position for block in blocks for position in _resource_block_cells(block)
+        }
+        self.memory.worker_visit_ticks = {
+            position: tick
+            for position, tick in self.memory.worker_visit_ticks.items()
+            if position in allowed_cells
+        }
+        return assignments
+
+    def _assign_block_resources(self, turn: Turn) -> dict[UUID, Position]:
+        """Pair each Worker only with resources inside its fixed 32x32 block."""
+
+        block_by_worker = self._reconcile_worker_blocks(turn)
+        if not block_by_worker:
+            return {}
+        workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
+        self._unreachable_claims = {
+            cell: seen_tick
+            for cell, seen_tick in self._unreachable_claims.items()
+            if turn.tick - seen_tick < UNREACHABLE_CLAIM_COOLDOWN
+        }
+        self._unreachable_patrol_cells = {
+            cell: seen_tick
+            for cell, seen_tick in self._unreachable_patrol_cells.items()
+            if turn.tick - seen_tick < UNREACHABLE_PATROL_COOLDOWN
+        }
+        unreachable = (
+            self._worker_threat_exclusion_cells(turn)
+            | set(self._unreachable_claims)
+            | set(self._unreachable_patrol_cells)
+        ) - {worker.position for worker in workers.values()}
+        hostile = {enemy.position for enemy in turn.visible_enemies}
+        blocked_resources = self._rock_map(turn)
+        visible_resources = (
+            set(turn.resource_cells) - hostile - unreachable - blocked_resources
+        )
+        remembered_resources = (
+            set(self.memory.remembered_resource_cells())
+            - hostile
+            - unreachable
+            - blocked_resources
+            - visible_resources
+        )
+
+        # A resource claim made before the four-block policy went live may
+        # point outside this Worker's identity.  Drop it now; otherwise the
+        # later resource-goal fallback would keep walking toward that stale
+        # cross-block target even after the assignment pool excluded it.
+        for worker in workers.values():
+            goal = self.memory.goal_for(str(worker.id))
+            block = block_by_worker[worker.id]
+            if (
+                goal is not None
+                and goal.purpose == RESOURCE_CLAIM_PURPOSE
+                and not block.contains(goal.position)
+            ):
+                self.memory.clear_goal(str(worker.id))
+                self._claim_stalls.pop(worker.id, None)
+
+        assignments: dict[UUID, Position] = {}
+        for block in self._resource_blocks():
+            block_workers = {
+                worker_id: worker
+                for worker_id, worker in workers.items()
+                if block_by_worker[worker_id].index == block.index
+            }
+            known = {
+                resource
+                for resource in visible_resources | remembered_resources
+                if block.contains(resource)
+            }
+            local_assignments: dict[UUID, Position] = {}
+            pools: list[set[Position]] = [known] if known else []
+            self._hold_existing_claims(
+                block_workers,
+                pools,
+                local_assignments,
+                clear_missing=False,
+            )
+
+            def assignment_key(
+                worker: Worker,
+                resource: Position,
+            ) -> tuple[int, int, UUID, Position]:
+                approach = manhattan(worker.position, resource)
+                loaded_return = (
+                    manhattan(turn.core.position, resource)
+                    if turn.core is not None
+                    else 0
+                )
+                return approach + loaded_return, approach, worker.id, resource
+
+            while block_workers and known:
+                _, _, worker_id, resource = min(
+                    assignment_key(worker, resource)
+                    for worker in block_workers.values()
+                    for resource in known
+                )
+                local_assignments[worker_id] = resource
+                block_workers.pop(worker_id)
+                known.remove(resource)
+            self._uncross_claims(turn, local_assignments)
+            assignments.update(local_assignments)
+
+        self._prioritize_underfoot_resource_claims(
+            turn,
+            visible_resources,
+            assignments,
+            force_underfoot=True,
+        )
+        # Holding a claim is already reflected in ``assignments``.  Anything
+        # left pointing at a different resource belongs to another Worker (or
+        # has become unreachable) and must not fall through to the legacy
+        # resource-goal continuation branch below.
+        for worker in workers.values():
+            goal = self.memory.goal_for(str(worker.id))
+            if (
+                goal is not None
+                and goal.purpose == RESOURCE_CLAIM_PURPOSE
+                and assignments.get(worker.id) != goal.position
+            ):
+                self.memory.clear_goal(str(worker.id))
+                self._claim_stalls.pop(worker.id, None)
+        for worker_id in set(self._claim_stalls) - set(assignments):
+            del self._claim_stalls[worker_id]
+        return assignments
+
+    def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
+        """Assign known resource cells to empty Workers.
+
+        The live four-block posture dispatches to a per-identity block pool.
+        Legacy configurations retain the global nearest/round-trip pairing.
+        Enemy and unreachable cells stay excluded in both paths so a Worker
+        does not walk into a known threat or a walled-off route.
         """
 
         self._resource_scout_id = None
+        if self._resource_blocks():
+            return self._assign_block_resources(turn)
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
         self._unreachable_claims = {
             cell: seen_tick
@@ -6365,6 +6752,8 @@ class AggressiveStrategy:
         turn: Turn,
         visible_resources: set[Position],
         assignments: dict[UUID, Position],
+        *,
+        force_underfoot: bool = False,
     ) -> None:
         """Swap a live underfoot resource with its current claimant.
 
@@ -6399,7 +6788,8 @@ class AggressiveStrategy:
             if owner is None:
                 held = self.memory.goal_for(str(harvester.id))
                 if (
-                    held is not None
+                    not force_underfoot
+                    and held is not None
                     and held.purpose == RESOURCE_CLAIM_PURPOSE
                     and current_claim == held.position
                 ):
@@ -6482,6 +6872,8 @@ class AggressiveStrategy:
         workers: dict[UUID, Worker],
         pools: list[set[Position]],
         assignments: dict[UUID, Position],
+        *,
+        clear_missing: bool = True,
     ) -> None:
         """Keep a Worker on the cell it already claimed while it closes in.
 
@@ -6537,9 +6929,10 @@ class AggressiveStrategy:
             assignments[worker.id] = goal.position
             workers.pop(worker.id)
             pool.remove(goal.position)
-        for worker_id in set(stalls) - set(assignments):
-            # Drops both released claims and Workers that no longer exist.
-            del stalls[worker_id]
+        if clear_missing:
+            for worker_id in set(stalls) - set(assignments):
+                # Drops both released claims and Workers that no longer exist.
+                del stalls[worker_id]
 
     def _resource_scout(
         self,
@@ -7329,6 +7722,130 @@ class AggressiveStrategy:
         self.memory.set_goal(unit_id, goal)
         return goal.position
 
+    def _worker_block_patrol_goal(
+        self,
+        worker: Worker,
+        context: _TurnContext,
+    ) -> Position:
+        """Sweep the Worker's own block by least-recently-arrived cell."""
+
+        turn = context.turn
+        block = self._worker_resource_block(worker)
+        if block is None:
+            return self._resource_patrol_goal(worker, turn, context)
+        obstacles = self._rock_map(turn)
+        unit_id = str(worker.id)
+        purpose = f"{WORKER_BLOCK_PATROL_PURPOSE}-{block.index}"
+        current = self.memory.goal_for(unit_id)
+        claimed_positions = {
+            goal.position
+            for other in turn.workers
+            if other.id != worker.id
+            if (goal := self.memory.goal_for(str(other.id))) is not None
+            and goal.purpose.startswith(WORKER_BLOCK_PATROL_PURPOSE)
+        }
+        service_cells = (
+            {
+                (turn.core.position[0] + dx, turn.core.position[1] + dy)
+                for dx in range(-CORE_QUEUE_RADIUS, CORE_QUEUE_RADIUS + 1)
+                for dy in range(-CORE_QUEUE_RADIUS, CORE_QUEUE_RADIUS + 1)
+                if abs(dx) + abs(dy) <= CORE_QUEUE_RADIUS
+            }
+            if turn.core is not None
+            else set()
+        )
+        defense_cells = set(self.memory.defense_posts.values())
+        unavailable_layers: tuple[Container[Position], ...] = (
+            obstacles,
+            service_cells,
+            defense_cells,
+            context.enemy_positions,
+            self._worker_threat_exclusion_cells(turn),
+            self._unreachable_patrol_cells,
+        )
+
+        def usable(position: Position) -> bool:
+            return (
+                block.contains(position)
+                and all(position not in layer for layer in unavailable_layers)
+                and position not in claimed_positions
+                and self._predicted_friendly_occupancy(position, context) < 2
+            )
+
+        if (
+            current is not None
+            and current.purpose == purpose
+            and worker.position != current.position
+            and usable(current.position)
+            and self._has_static_route(
+                worker,
+                current.position,
+                context,
+                allow_goal=True,
+            )
+        ):
+            if current.last_progress_position is None:
+                current = UnitGoal(
+                    position=current.position,
+                    assigned_tick=current.assigned_tick,
+                    purpose=current.purpose,
+                    last_progress_position=worker.position,
+                )
+                self.memory.set_goal(unit_id, current)
+            if turn.tick - current.assigned_tick <= self.config.exploration_goal_ttl:
+                return current.position
+            progress_reference = current.last_progress_position
+            if progress_reference is not None and manhattan(
+                worker.position, current.position
+            ) < manhattan(progress_reference, current.position):
+                renewed = UnitGoal(
+                    position=current.position,
+                    assigned_tick=turn.tick,
+                    purpose=current.purpose,
+                    last_progress_position=worker.position,
+                )
+                self.memory.set_goal(unit_id, renewed)
+                return renewed.position
+
+        other_positions = [
+            other.position for other in turn.workers if other.id != worker.id
+        ] + list(claimed_positions)
+        candidates = [
+            position
+            for position in _resource_block_cells(block)
+            if position != worker.position and usable(position)
+        ]
+        candidates.sort(
+            key=lambda position: (
+                self.memory.worker_visit_ticks.get(position, -1),
+                -min(
+                    (manhattan(position, other) for other in other_positions),
+                    default=0,
+                ),
+                manhattan(worker.position, position),
+                position,
+            )
+        )
+        patrol_position = worker.position
+        for candidate in candidates[:WORKER_PATROL_ROUTE_ATTEMPTS]:
+            if self._has_static_route(
+                worker,
+                candidate,
+                context,
+                allow_goal=True,
+            ):
+                patrol_position = candidate
+                break
+            self._unreachable_patrol_cells[candidate] = turn.tick
+        goal = UnitGoal(
+            position=patrol_position,
+            assigned_tick=turn.tick,
+            purpose=purpose,
+            last_progress_position=worker.position,
+        )
+        self.memory.set_goal(unit_id, goal)
+        return goal.position
+
     def _remembered_worker_danger_positions(
         self,
         turn: Turn,
@@ -7924,6 +8441,89 @@ def _resource_patrol_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
         columns = coordinates if row % 2 == 0 else reversed(coordinates)
         route.extend((dx, dy) for dx in columns if (dx, dy) != (0, 0))
     return tuple(route)
+
+
+def _four_resource_blocks(home: Position) -> tuple[_ResourceBlock, ...]:
+    """Return the four res-refresh blocks touching ``home`` at one corner."""
+
+    size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    return (
+        _ResourceBlock(
+            index=0,
+            min_x=home[0] - size,
+            max_x=home[0] - 1,
+            min_y=home[1] - size,
+            max_y=home[1] - 1,
+        ),
+        _ResourceBlock(
+            index=1,
+            min_x=home[0],
+            max_x=home[0] + size - 1,
+            min_y=home[1] - size,
+            max_y=home[1] - 1,
+        ),
+        _ResourceBlock(
+            index=2,
+            min_x=home[0] - size,
+            max_x=home[0] - 1,
+            min_y=home[1],
+            max_y=home[1] + size - 1,
+        ),
+        _ResourceBlock(
+            index=3,
+            min_x=home[0],
+            max_x=home[0] + size - 1,
+            min_y=home[1],
+            max_y=home[1] + size - 1,
+        ),
+    )
+
+
+def _resource_block_cells(block: _ResourceBlock) -> tuple[Position, ...]:
+    """Return a block's cells in stable row-major order."""
+
+    return tuple(
+        (x, y)
+        for y in range(block.min_y, block.max_y + 1)
+        for x in range(block.min_x, block.max_x + 1)
+    )
+
+
+def _four_block_outer_ring(
+    home: Position,
+    obstacles: Container[Position],
+) -> tuple[Position, ...]:
+    """Return the free cells on the clockwise edge of the 64x64 union.
+
+    Coordinates follow the game's integer grid with increasing y treated as
+    north for direction naming.  The route is top-left to top-right, down the
+    right edge, right-to-left along the bottom, then up the left edge.  Rocks
+    remove their own waypoint; the filtered order stays clockwise and the local
+    pathfinder detours through the adjacent interior cell.
+    """
+
+    min_x = home[0] - SYMMETRIC_RESOURCE_BLOCK_SIZE
+    max_x = home[0] + SYMMETRIC_RESOURCE_BLOCK_SIZE - 1
+    min_y = home[1] - SYMMETRIC_RESOURCE_BLOCK_SIZE
+    max_y = home[1] + SYMMETRIC_RESOURCE_BLOCK_SIZE - 1
+    edge = (
+        ((x, max_y) for x in range(min_x, max_x + 1)),
+        ((max_x, y) for y in range(max_y - 1, min_y - 1, -1)),
+        ((x, min_y) for x in range(max_x - 1, min_x - 1, -1)),
+        ((min_x, y) for y in range(min_y + 1, max_y)),
+    )
+    return tuple(
+        position
+        for segment in edge
+        for position in segment
+        if position not in obstacles
+    )
+
+
+def _ring_slot_index(slot: int, slot_count: int, route_length: int) -> int:
+    """Round a durable ring slot to the nearest evenly spaced path index."""
+
+    return (slot * route_length + slot_count // 2) // slot_count
 
 
 def _combat_vision_radius(unit: Ranger | Vanguard) -> int:

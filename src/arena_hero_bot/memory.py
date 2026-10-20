@@ -18,6 +18,7 @@ ENEMY_DRIFT_MAX_GAP = 3
 CONTESTED_CELL_TTL = 80
 RESOURCE_MEMORY_TTL = 65536
 RESOURCE_MEMORY_LIMIT = 2048
+WORKER_VISIT_LIMIT = 4096
 RESOURCE_ABSENCE_RADIUS = 1
 RESOURCE_CLAIM_PURPOSE = "resource-claim-v1"
 _ABSENCE_OFFSETS = tuple(
@@ -128,6 +129,19 @@ class WorldMemory:
     # Selected once for the new symmetric defensive posture and retained
     # across restarts while the Core walks there.
     core_home_position: Position | None = None
+    # The four-block economy is a durable identity assignment, separate from
+    # combat roles.  A replacement Worker fills a vacancy in its own region
+    # instead of following the nearest live resource across a block boundary.
+    worker_blocks: dict[str, int] = field(default_factory=dict)
+    # Arrival ticks, not merely sightings, drive the least-recently-visited
+    # patrol sweep.  Keeping this separate from ``resource_cells`` preserves
+    # confirmed-empty deletion while still restoring local coverage.
+    worker_visit_ticks: dict[Position, int] = field(default_factory=dict)
+    # The eight patrol Rangers share one clockwise ring.  Slots and phase are
+    # durable so a restart does not collapse the formation onto one corner.
+    patrol_ring_slots: dict[str, int] = field(default_factory=dict)
+    patrol_ring_phase: int = 0
+    patrol_ring_origin: Position | None = None
     last_tick: int = 0
 
     def observe(self, turn: Turn) -> None:
@@ -184,6 +198,14 @@ class WorldMemory:
             if not history or history[-1] != unit.position:
                 history.append(unit.position)
                 del history[:-POSITION_HISTORY_LIMIT]
+        for worker in turn.workers:
+            self.worker_visit_ticks[worker.position] = turn.tick
+        if len(self.worker_visit_ticks) > WORKER_VISIT_LIMIT:
+            retained = sorted(
+                self.worker_visit_ticks.items(),
+                key=lambda item: (item[1], item[0]),
+            )[-WORKER_VISIT_LIMIT:]
+            self.worker_visit_ticks = dict(retained)
         if turn.core is not None:
             core_id = str(turn.core.id)
             history = self.position_history.setdefault(core_id, [])
@@ -199,6 +221,18 @@ class WorldMemory:
             unit_id: position
             for unit_id, position in self.defense_posts.items()
             if unit_id in active_ids
+        }
+        live_worker_ids = {str(worker.id) for worker in turn.workers}
+        self.worker_blocks = {
+            unit_id: block
+            for unit_id, block in self.worker_blocks.items()
+            if unit_id in live_worker_ids
+        }
+        live_combat_ids = {str(unit.id) for unit in (*turn.vanguards, *turn.rangers)}
+        self.patrol_ring_slots = {
+            unit_id: slot
+            for unit_id, slot in self.patrol_ring_slots.items()
+            if unit_id in live_combat_ids
         }
 
     def observe_exploration(self, turn: Turn) -> None:
@@ -517,6 +551,18 @@ class WorldMemory:
                 if self.core_home_position is not None
                 else None
             ),
+            "worker_blocks": dict(sorted(self.worker_blocks.items())),
+            "worker_visit_ticks": [
+                {"position": list(position), "tick": tick}
+                for position, tick in sorted(self.worker_visit_ticks.items())
+            ],
+            "patrol_ring_slots": dict(sorted(self.patrol_ring_slots.items())),
+            "patrol_ring_phase": self.patrol_ring_phase,
+            "patrol_ring_origin": (
+                list(self.patrol_ring_origin)
+                if self.patrol_ring_origin is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -652,6 +698,20 @@ class WorldMemory:
                 raw.get("last_normal_growth_resources")
             ),
             core_home_position=_optional_position(raw.get("core_home_position")),
+            worker_blocks={
+                str(unit_id): int(block)
+                for unit_id, block in raw.get("worker_blocks", {}).items()
+            },
+            worker_visit_ticks={
+                _position(value["position"]): int(value["tick"])
+                for value in raw.get("worker_visit_ticks", [])
+            },
+            patrol_ring_slots={
+                str(unit_id): int(slot)
+                for unit_id, slot in raw.get("patrol_ring_slots", {}).items()
+            },
+            patrol_ring_phase=int(raw.get("patrol_ring_phase", 0)),
+            patrol_ring_origin=_optional_position(raw.get("patrol_ring_origin")),
             last_tick=int(raw.get("last_tick", 0)),
         )
 
