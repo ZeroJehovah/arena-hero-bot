@@ -51,6 +51,19 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
     assert loaded.recent_positions(str(turn.core.id)) == ()
 
 
+def test_cached_obstacle_rows_include_later_observations(tmp_path) -> None:
+    path = tmp_path / "memory.json"
+    memory = WorldMemory()
+    memory.observe(make_turn(tick=10, objects=[core()], obstacles=[(1, 1)]))
+    memory.save(path)
+
+    loaded = WorldMemory.load(path)
+    loaded.observe(make_turn(tick=11, objects=[core()], obstacles=[(2, 2)]))
+    loaded.save(path)
+
+    assert WorldMemory.load(path).obstacles == {(1, 1), (2, 2)}
+
+
 def test_unit_roles_and_expeditions_round_trip(tmp_path) -> None:
     memory = WorldMemory(
         unit_roles={object_id(2): "defense", object_id(3): "patrol-2"},

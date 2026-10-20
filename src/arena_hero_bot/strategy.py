@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Container
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import lru_cache
 from itertools import pairwise
 from math import atan2
 from time import monotonic
@@ -4311,16 +4312,21 @@ class AggressiveStrategy:
                 blocked.update(adjacent_positions(enemy.position))
         alive = {unit.id: unit for unit in (*turn.vanguards, *turn.rangers)}
         navigators: dict[frozenset[UUID], ExpeditionNavigator] = {}
+        navigators_by_radius: dict[int, ExpeditionNavigator] = {}
         reservations: dict[frozenset[UUID], set[Position]] = {}
         for members, _bearing in self._expedition_squads:
             live_members = [alive[mid] for mid in members if mid in alive]
             if not live_members:
                 continue
-            navigator = ExpeditionNavigator(
-                self.memory.exploration,
-                obstacles,
-                blocked,
-                max(_combat_vision_radius(member) for member in live_members),
+            radius = max(_combat_vision_radius(member) for member in live_members)
+            navigator = navigators_by_radius.setdefault(
+                radius,
+                ExpeditionNavigator(
+                    self.memory.exploration,
+                    obstacles,
+                    blocked,
+                    radius,
+                ),
             )
             navigators[members] = navigator
             reservations[members] = navigator.reservation(
@@ -8561,6 +8567,7 @@ def _four_resource_blocks(home: Position) -> tuple[_ResourceBlock, ...]:
     )
 
 
+@lru_cache(maxsize=16)
 def _resource_block_cells(block: _ResourceBlock) -> tuple[Position, ...]:
     """Return a block's cells in stable row-major order."""
 

@@ -145,12 +145,22 @@ class WorldMemory:
     patrol_ring_phase: int = 0
     patrol_ring_origin: Position | None = None
     last_tick: int = 0
+    # Reuse the exact obstacle rows loaded from disk and append newly observed
+    # rocks.  With millions of explored cells, rebuilding and sorting the
+    # complete list every Tick costs more CPU than strategy planning itself.
+    _obstacle_rows: list[list[int]] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def observe(self, turn: Turn) -> None:
         """Apply one complete authoritative Turn to persistent memory."""
 
         self.last_tick = turn.tick
-        self.obstacles.update(turn.obstacle_cells)
+        new_obstacles = set(turn.obstacle_cells) - self.obstacles
+        if new_obstacles:
+            self.obstacles.update(new_obstacles)
+            if self._obstacle_rows is not None:
+                self._obstacle_rows.extend([x, y] for x, y in new_obstacles)
         self.observe_exploration(turn)
         self._observe_resource_cells(turn)
         destroyed_enemy_ids = {
@@ -476,13 +486,22 @@ class WorldMemory:
         )
         temporary.replace(path)
 
+    def _obstacle_snapshot(self) -> list[list[int]]:
+        """Return cached obstacle rows, rebuilding only after an untracked change."""
+
+        rows = self._obstacle_rows
+        if rows is None or len(rows) != len(self.obstacles):
+            rows = [[x, y] for x, y in self.obstacles]
+            self._obstacle_rows = rows
+        return rows
+
     def to_dict(self) -> dict[str, Any]:
         """Return the stable on-disk representation."""
 
         return {
             "schema_version": SCHEMA_VERSION,
             "last_tick": self.last_tick,
-            "obstacles": sorted([list(position) for position in self.obstacles]),
+            "obstacles": self._obstacle_snapshot(),
             "enemies": {
                 key: asdict(value) for key, value in sorted(self.enemies.items())
             },
@@ -614,7 +633,7 @@ class WorldMemory:
                     and goal.position in absent_cells
                 )
             }
-        return cls(
+        memory = cls(
             obstacles={_position(position) for position in raw.get("obstacles", [])},
             enemies={
                 key: EnemySighting(
@@ -722,6 +741,10 @@ class WorldMemory:
             patrol_ring_origin=_optional_position(raw.get("patrol_ring_origin")),
             last_tick=int(raw.get("last_tick", 0)),
         )
+        obstacle_rows = raw.get("obstacles", [])
+        if len(obstacle_rows) == len(memory.obstacles):
+            memory._obstacle_rows = obstacle_rows
+        return memory
 
 
 def _exploration_route(raw: dict[str, Any]) -> ExplorationRoute:

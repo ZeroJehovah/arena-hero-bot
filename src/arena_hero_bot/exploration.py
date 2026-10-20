@@ -46,13 +46,26 @@ def _supercover(dx: int, dy: int) -> tuple[Position, ...]:
 
 
 @lru_cache(maxsize=6)
-def _vision_rays(radius: int) -> tuple[tuple[Position, tuple[Position, ...]], ...]:
-    return tuple(
-        ((dx, dy), _supercover(dx, dy))
+def _vision_layout(
+    radius: int,
+) -> tuple[tuple[Position, ...], tuple[tuple[Position, int], ...]]:
+    """Return vision offsets and each endpoint's occluding-cell bit mask."""
+
+    offsets = tuple(
+        (dx, dy)
         for dx in range(-radius, radius + 1)
         for dy in range(-radius, radius + 1)
         if abs(dx) + abs(dy) <= radius
     )
+    indexes = {offset: index for index, offset in enumerate(offsets)}
+    rays = tuple(
+        (
+            offset,
+            sum(1 << indexes[cell] for cell in _supercover(*offset)),
+        )
+        for offset in offsets
+    )
+    return offsets, rays
 
 
 def visible_cells(
@@ -66,10 +79,14 @@ def visible_cells(
     """
 
     x, y = origin
+    offsets, rays = _vision_layout(radius)
+    blocked = sum(
+        1 << index
+        for index, (dx, dy) in enumerate(offsets)
+        if (x + dx, y + dy) in obstacles
+    )
     return frozenset(
-        (x + dx, y + dy)
-        for (dx, dy), ray in _vision_rays(radius)
-        if all((x + rx, y + ry) not in obstacles for rx, ry in ray)
+        (x + dx, y + dy) for (dx, dy), ray_mask in rays if not ray_mask & blocked
     )
 
 
