@@ -141,6 +141,7 @@ class WorldMemory:
     # durable so a restart does not collapse the formation onto one corner.
     patrol_ring_slots: dict[str, int] = field(default_factory=dict)
     patrol_ring_slots_initialized: bool = False
+    patrol_ring_layout_version: int = 0
     patrol_ring_phase: int = 0
     patrol_ring_origin: Position | None = None
     last_tick: int = 0
@@ -559,6 +560,7 @@ class WorldMemory:
             ],
             "patrol_ring_slots": dict(sorted(self.patrol_ring_slots.items())),
             "patrol_ring_slots_initialized": self.patrol_ring_slots_initialized,
+            "patrol_ring_layout_version": self.patrol_ring_layout_version,
             "patrol_ring_phase": self.patrol_ring_phase,
             "patrol_ring_origin": (
                 list(self.patrol_ring_origin)
@@ -715,6 +717,7 @@ class WorldMemory:
             patrol_ring_slots_initialized=bool(
                 raw.get("patrol_ring_slots_initialized", False)
             ),
+            patrol_ring_layout_version=int(raw.get("patrol_ring_layout_version", 0)),
             patrol_ring_phase=int(raw.get("patrol_ring_phase", 0)),
             patrol_ring_origin=_optional_position(raw.get("patrol_ring_origin")),
             last_tick=int(raw.get("last_tick", 0)),

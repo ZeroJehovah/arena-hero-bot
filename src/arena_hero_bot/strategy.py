@@ -61,6 +61,7 @@ RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 WORKER_BLOCK_PATROL_PURPOSE = "worker-block-patrol-v1"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 PATROL_RING_PURPOSE = "combat-ring-patrol-v1"
+PATROL_RING_LAYOUT_VERSION = 2
 RESOURCE_CLAIM_TTL = 4
 # A held claim is only released when its approach has stopped paying, not when
 # the Worker is briefly blocked.  Measured on the 2026-10-10 restock day,
@@ -6242,6 +6243,7 @@ class AggressiveStrategy:
             self.memory.patrol_ring_phase = 0
             self.memory.patrol_ring_slots = {}
             self.memory.patrol_ring_slots_initialized = False
+            self.memory.patrol_ring_layout_version = 0
             self._patrol_ring_phase_tick = -1
         members = sorted(
             (
@@ -6255,7 +6257,10 @@ class AggressiveStrategy:
         slots: dict[UUID, int] = {}
         route = self._patrol_ring_route(turn)
         if (
-            not self.memory.patrol_ring_slots_initialized
+            (
+                not self.memory.patrol_ring_slots_initialized
+                or self.memory.patrol_ring_layout_version < PATROL_RING_LAYOUT_VERSION
+            )
             and len(route) >= SYMMETRIC_PATROL_RING_UNITS
             and members
         ):
@@ -6294,6 +6299,7 @@ class AggressiveStrategy:
             for position, member in enumerate(ranked_members):
                 slots[member.id] = (position + shift) % SYMMETRIC_PATROL_RING_UNITS
             self.memory.patrol_ring_slots_initialized = True
+            self.memory.patrol_ring_layout_version = PATROL_RING_LAYOUT_VERSION
         else:
             used: set[int] = set()
             for member in members:
@@ -6593,6 +6599,7 @@ class AggressiveStrategy:
                 if block.contains(resource)
             }
             local_assignments: dict[UUID, Position] = {}
+            block_worker_ids = frozenset(block_workers)
             pools: list[set[Position]] = [known] if known else []
             self._hold_existing_claims(
                 block_workers,
@@ -6623,14 +6630,24 @@ class AggressiveStrategy:
                 block_workers.pop(worker_id)
                 known.remove(resource)
             self._uncross_claims(turn, local_assignments)
+            # A Worker can cross a block boundary while returning cargo or
+            # converging after the migration.  The underfoot shortcut must not
+            # turn that transit into a cross-block harvest: visible resources
+            # are offered only to the Workers whose durable identity owns this
+            # block.
+            self._prioritize_underfoot_resource_claims(
+                turn,
+                {
+                    resource
+                    for resource in visible_resources
+                    if block.contains(resource)
+                },
+                local_assignments,
+                force_underfoot=True,
+                eligible_worker_ids=block_worker_ids,
+            )
             assignments.update(local_assignments)
 
-        self._prioritize_underfoot_resource_claims(
-            turn,
-            visible_resources,
-            assignments,
-            force_underfoot=True,
-        )
         # Holding a claim is already reflected in ``assignments``.  Anything
         # left pointing at a different resource belongs to another Worker (or
         # has become unreachable) and must not fall through to the legacy
@@ -6813,6 +6830,7 @@ class AggressiveStrategy:
         assignments: dict[UUID, Position],
         *,
         force_underfoot: bool = False,
+        eligible_worker_ids: frozenset[UUID] | None = None,
     ) -> None:
         """Swap a live underfoot resource with its current claimant.
 
@@ -6824,7 +6842,12 @@ class AggressiveStrategy:
         Worker from dropping an approach that no other Worker will finish.
         """
 
-        workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
+        workers = {
+            worker.id: worker
+            for worker in turn.workers
+            if worker.cargo == 0
+            and (eligible_worker_ids is None or worker.id in eligible_worker_ids)
+        }
         for resource in sorted(visible_resources):
             underfoot = sorted(
                 (worker for worker in workers.values() if worker.position == resource),

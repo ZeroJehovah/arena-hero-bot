@@ -162,6 +162,29 @@ def test_underfoot_resource_overrides_a_held_cross_cell_claim() -> None:
     assert assignments[UUID(worker["id"])] == tuple(worker["position"])
 
 
+def test_underfoot_resource_in_another_block_is_not_claimed() -> None:
+    memory = WorldMemory(core_home_position=HOME)
+    strategy = _strategy(memory)
+    foreign_block = next(
+        block for block in _four_resource_blocks(HOME) if block.index == 1
+    )
+    worker = unit(
+        301,
+        "WORKER",
+        position=(foreign_block.min_x + 7, foreign_block.min_y + 9),
+    )
+    memory.worker_blocks[worker["id"]] = 0
+    turn = make_turn(
+        objects=[core(position=HOME), worker],
+        resource_cells=[tuple(worker["position"])],
+    )
+
+    assignments = strategy._assign_resources(turn)
+
+    assert assignments == {}
+    assert memory.worker_blocks[worker["id"]] == 0
+
+
 def test_worker_patrol_chooses_oldest_reachable_cell_and_persists_visits(
     tmp_path,
 ) -> None:
@@ -365,7 +388,8 @@ def test_first_ring_assignment_preserves_circular_order_with_minimal_travel() ->
         second_objects.append(copied)
     second = make_turn(tick=101, objects=second_objects)
     memory.patrol_ring_slots = {}
-    memory.patrol_ring_slots_initialized = False
+    memory.patrol_ring_slots_initialized = True
+    memory.patrol_ring_layout_version = 0
     memory.patrol_ring_phase = 0
 
     slots = strategy._reconcile_patrol_ring_slots(second)
@@ -376,6 +400,7 @@ def test_first_ring_assignment_preserves_circular_order_with_minimal_travel() ->
         member = next(item for item in second.rangers if item.id == member_id)
         total_distance += manhattan(member.position, target)
     assert total_distance == 0
+    assert memory.patrol_ring_layout_version == 2
 
 
 def test_patrol_goal_identities_are_durable_across_restart(tmp_path) -> None:
