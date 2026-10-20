@@ -6263,9 +6263,16 @@ class AggressiveStrategy:
             # minimizes the first convergence distance.  Random UUID order can
             # send opposite-side Rangers across the square before the ring has
             # any members on station.
-            member_indices = sorted(
-                _nearest_ring_index(member.position, route) for member in members
+            ranked_members = sorted(
+                members,
+                key=lambda member: (
+                    _nearest_ring_index(member.position, route),
+                    member.id.bytes,
+                ),
             )
+            member_indices = [
+                _nearest_ring_index(member.position, route) for member in ranked_members
+            ]
             shift = min(
                 range(SYMMETRIC_PATROL_RING_UNITS),
                 key=lambda candidate: (
@@ -6284,7 +6291,7 @@ class AggressiveStrategy:
                     candidate,
                 ),
             )
-            for position, member in enumerate(members):
+            for position, member in enumerate(ranked_members):
                 slots[member.id] = (position + shift) % SYMMETRIC_PATROL_RING_UNITS
             self.memory.patrol_ring_slots_initialized = True
         else:

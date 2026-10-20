@@ -354,7 +354,7 @@ def test_first_ring_assignment_preserves_circular_order_with_minimal_travel() ->
     route = _four_block_outer_ring(HOME, set())
     positions = {
         member_id: route[_ring_slot_index(slot, 8, len(route))]
-        for slot, member_id in enumerate(patrol_ids)
+        for slot, member_id in enumerate(reversed(patrol_ids))
     }
     second_objects = [core(position=HOME)]
     for item in (*vanguards, *rangers):
