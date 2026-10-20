@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
     PATROL_RING_PURPOSE,
@@ -334,6 +335,47 @@ def test_ring_contact_alert_uses_clockwise_path_distance() -> None:
     assert strategy._patrol_ring_distance(route[0], route[10], second) == 10
     assert strategy._combat_target_is_local(member, route[10], second)
     assert not strategy._combat_target_is_local(member, route[20], second)
+
+
+def test_first_ring_assignment_preserves_circular_order_with_minimal_travel() -> None:
+    memory = WorldMemory(core_home_position=HOME)
+    strategy = _strategy(memory)
+    vanguards = [
+        unit(100 + number, "VANGUARD", position=(HOME[0] - 1, HOME[1] - 1))
+        for number in range(12)
+    ]
+    rangers = [
+        unit(200 + number, "RANGER", position=(HOME[0] - 1, HOME[1] - 1))
+        for number in range(24)
+    ]
+    first = make_turn(objects=[core(position=HOME), *vanguards, *rangers])
+    strategy._reconcile_unit_roles(first)
+    patrol_ids = sorted(strategy._patrol_ids(first), key=lambda value: value.bytes)
+    route = _four_block_outer_ring(HOME, set())
+    positions = {
+        member_id: route[_ring_slot_index(slot, 8, len(route))]
+        for slot, member_id in enumerate(patrol_ids)
+    }
+    second_objects = [core(position=HOME)]
+    for item in (*vanguards, *rangers):
+        copied = dict(item)
+        member_id = UUID(item["id"])
+        if member_id in positions:
+            copied["position"] = list(positions[member_id])
+        second_objects.append(copied)
+    second = make_turn(tick=101, objects=second_objects)
+    memory.patrol_ring_slots = {}
+    memory.patrol_ring_slots_initialized = False
+    memory.patrol_ring_phase = 0
+
+    slots = strategy._reconcile_patrol_ring_slots(second)
+
+    total_distance = 0
+    for member_id, slot in slots.items():
+        target = route[_ring_slot_index(slot, 8, len(route))]
+        member = next(item for item in second.rangers if item.id == member_id)
+        total_distance += manhattan(member.position, target)
+    assert total_distance == 0
 
 
 def test_patrol_goal_identities_are_durable_across_restart(tmp_path) -> None:

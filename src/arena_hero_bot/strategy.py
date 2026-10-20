@@ -3752,16 +3752,11 @@ class AggressiveStrategy:
         route = self._patrol_ring_route(turn)
         if len(route) < 2:
             return manhattan(origin, target)
-        origin_index = min(
-            range(len(route)),
-            key=lambda index: (manhattan(origin, route[index]), index),
+        return _ring_index_distance(
+            _nearest_ring_index(origin, route),
+            _nearest_ring_index(target, route),
+            len(route),
         )
-        target_index = min(
-            range(len(route)),
-            key=lambda index: (manhattan(target, route[index]), index),
-        )
-        direct = abs(origin_index - target_index)
-        return min(direct, len(route) - direct)
 
     def _defensive_memory_targets(
         self,
@@ -6241,6 +6236,13 @@ class AggressiveStrategy:
         if not self._symmetric_posture():
             return {}
         self._ensure_unit_roles(turn)
+        home = self.memory.core_home_position
+        if home is not None and self.memory.patrol_ring_origin != home:
+            self.memory.patrol_ring_origin = home
+            self.memory.patrol_ring_phase = 0
+            self.memory.patrol_ring_slots = {}
+            self.memory.patrol_ring_slots_initialized = False
+            self._patrol_ring_phase_tick = -1
         members = sorted(
             (
                 unit
@@ -6251,34 +6253,84 @@ class AggressiveStrategy:
             key=lambda unit: unit.id.bytes,
         )
         slots: dict[UUID, int] = {}
-        used: set[int] = set()
-        for member in members:
-            slot = self.memory.patrol_ring_slots.get(str(member.id))
-            if (
-                slot is not None
-                and 0 <= slot < SYMMETRIC_PATROL_RING_UNITS
-                and slot not in used
-            ):
+        route = self._patrol_ring_route(turn)
+        if (
+            not self.memory.patrol_ring_slots_initialized
+            and len(route) >= SYMMETRIC_PATROL_RING_UNITS
+            and members
+        ):
+            # Preserve circular order while choosing the global rotation that
+            # minimizes the first convergence distance.  Random UUID order can
+            # send opposite-side Rangers across the square before the ring has
+            # any members on station.
+            member_indices = sorted(
+                _nearest_ring_index(member.position, route) for member in members
+            )
+            shift = min(
+                range(SYMMETRIC_PATROL_RING_UNITS),
+                key=lambda candidate: (
+                    sum(
+                        _ring_index_distance(
+                            member_index,
+                            _ring_slot_index(
+                                (position + candidate) % SYMMETRIC_PATROL_RING_UNITS,
+                                SYMMETRIC_PATROL_RING_UNITS,
+                                len(route),
+                            ),
+                            len(route),
+                        )
+                        for position, member_index in enumerate(member_indices)
+                    ),
+                    candidate,
+                ),
+            )
+            for position, member in enumerate(members):
+                slots[member.id] = (position + shift) % SYMMETRIC_PATROL_RING_UNITS
+            self.memory.patrol_ring_slots_initialized = True
+        else:
+            used: set[int] = set()
+            for member in members:
+                slot = self.memory.patrol_ring_slots.get(str(member.id))
+                if (
+                    slot is not None
+                    and 0 <= slot < SYMMETRIC_PATROL_RING_UNITS
+                    and slot not in used
+                ):
+                    slots[member.id] = slot
+                    used.add(slot)
+            for member in members:
+                if member.id in slots:
+                    continue
+                vacant = [
+                    candidate
+                    for candidate in range(SYMMETRIC_PATROL_RING_UNITS)
+                    if candidate not in used
+                ]
+                slot = min(
+                    vacant,
+                    key=lambda candidate: (
+                        (
+                            manhattan(
+                                member.position,
+                                route[
+                                    _ring_slot_index(
+                                        candidate,
+                                        SYMMETRIC_PATROL_RING_UNITS,
+                                        len(route),
+                                    )
+                                ],
+                            )
+                            if route
+                            else candidate
+                        ),
+                        candidate,
+                    ),
+                )
                 slots[member.id] = slot
                 used.add(slot)
-        for member in members:
-            if member.id in slots:
-                continue
-            slot = next(
-                candidate
-                for candidate in range(SYMMETRIC_PATROL_RING_UNITS)
-                if candidate not in used
-            )
-            slots[member.id] = slot
-            used.add(slot)
         self.memory.patrol_ring_slots = {
             str(unit_id): slot for unit_id, slot in slots.items()
         }
-        home = self.memory.core_home_position
-        if home is not None and self.memory.patrol_ring_origin != home:
-            self.memory.patrol_ring_origin = home
-            self.memory.patrol_ring_phase = 0
-            self._patrol_ring_phase_tick = -1
         return slots
 
     def _advance_patrol_ring_phase(
@@ -8524,6 +8576,22 @@ def _ring_slot_index(slot: int, slot_count: int, route_length: int) -> int:
     """Round a durable ring slot to the nearest evenly spaced path index."""
 
     return (slot * route_length + slot_count // 2) // slot_count
+
+
+def _nearest_ring_index(position: Position, route: tuple[Position, ...]) -> int:
+    """Return the closest route index, breaking ties by clockwise order."""
+
+    return min(
+        range(len(route)),
+        key=lambda index: (manhattan(position, route[index]), index),
+    )
+
+
+def _ring_index_distance(left: int, right: int, route_length: int) -> int:
+    """Return the shorter distance around a cyclic route."""
+
+    direct = abs(left - right)
+    return min(direct, route_length - direct)
 
 
 def _combat_vision_radius(unit: Ranger | Vanguard) -> int:

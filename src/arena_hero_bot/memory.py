@@ -140,6 +140,7 @@ class WorldMemory:
     # The eight patrol Rangers share one clockwise ring.  Slots and phase are
     # durable so a restart does not collapse the formation onto one corner.
     patrol_ring_slots: dict[str, int] = field(default_factory=dict)
+    patrol_ring_slots_initialized: bool = False
     patrol_ring_phase: int = 0
     patrol_ring_origin: Position | None = None
     last_tick: int = 0
@@ -557,6 +558,7 @@ class WorldMemory:
                 for position, tick in sorted(self.worker_visit_ticks.items())
             ],
             "patrol_ring_slots": dict(sorted(self.patrol_ring_slots.items())),
+            "patrol_ring_slots_initialized": self.patrol_ring_slots_initialized,
             "patrol_ring_phase": self.patrol_ring_phase,
             "patrol_ring_origin": (
                 list(self.patrol_ring_origin)
@@ -710,6 +712,9 @@ class WorldMemory:
                 str(unit_id): int(slot)
                 for unit_id, slot in raw.get("patrol_ring_slots", {}).items()
             },
+            patrol_ring_slots_initialized=bool(
+                raw.get("patrol_ring_slots_initialized", False)
+            ),
             patrol_ring_phase=int(raw.get("patrol_ring_phase", 0)),
             patrol_ring_origin=_optional_position(raw.get("patrol_ring_origin")),
             last_tick=int(raw.get("last_tick", 0)),
