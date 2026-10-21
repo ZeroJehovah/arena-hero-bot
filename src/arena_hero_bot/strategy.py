@@ -283,6 +283,11 @@ SYMMETRIC_RANGER_OFFSETS: tuple[Position, ...] = (
     (10, -5),
 )
 CORE_QUEUE_RADIUS = 4
+# A moving Core must not have its next cell occupied when the four-Tick move
+# completes.  Economy traffic therefore stays outside this radius while a
+# migration is in progress.  Nearby economy units step outward until clear;
+# loaded Workers farther out wait rather than chasing the moving destination.
+CORE_MIGRATION_CLEAR_RADIUS = 2
 
 
 class _MoveIntent(StrEnum):
@@ -1643,31 +1648,31 @@ class AggressiveStrategy:
             )
             return
 
-        if worker.cargo > 0:
-            self.memory.clear_goal(str(worker.id))
-            if core.view.state is CoreState.MOVING:
-                destination = core.view.destination
-                if (
-                    destination is not None
-                    and worker.position != destination
-                    and self._move(
-                        worker,
-                        destination,
-                        context,
-                        reason=(
-                            "stage carried resources at migrating Core destination"
-                        ),
-                        allow_goal=True,
-                    )
+        if core.view.state is CoreState.MOVING:
+            if manhattan(worker.position, core.position) <= CORE_MIGRATION_CLEAR_RADIUS:
+                if self._move_to_moving_core_hold(
+                    worker,
+                    context,
+                    reason="clear the moving Core approach with economy unit",
                 ):
                     return
                 self._record_wait(
                     worker,
                     context,
-                    "Core migration is in progress; wait before depositing cargo",
+                    "hold outside the moving Core approach",
+                )
+                return
+            if worker.cargo > 0:
+                self.memory.clear_goal(str(worker.id))
+                self._record_wait(
+                    worker,
+                    context,
+                    "hold cargo clear of the moving Core",
                 )
                 return
 
+        if worker.cargo > 0:
+            self.memory.clear_goal(str(worker.id))
             if worker.position == core.position:
                 if (
                     context.remaining_resource_space > 0
@@ -2033,6 +2038,72 @@ class AggressiveStrategy:
             context.standing_reserved.discard(goal)
         return False
 
+    def _move_to_moving_core_hold(
+        self,
+        unit: Unit,
+        context: _TurnContext,
+        *,
+        reason: str,
+    ) -> bool:
+        """Move a nearby economy unit one step out of the moving Core's path."""
+
+        if self._has_unit_action(unit, context):
+            return False
+        core = context.turn.core
+        if core is None or core.view.state is not CoreState.MOVING:
+            return False
+        blockers = self._static_blockers(unit, context)
+        move_direction = core.view.move_direction
+        forward_x, forward_y = (
+            move_direction.delta if move_direction is not None else (0, 0)
+        )
+        current_distance = manhattan(unit.position, core.position)
+        candidates: list[tuple[Position, int, int, int]] = []
+        for position in adjacent_positions(unit.position):
+            if (
+                position == core.position
+                or position == core.view.destination
+                or position in blockers
+                or position in context.enemy_positions
+                or position in context.reserved
+                or self._predicted_friendly_occupancy(position, context) >= 2
+            ):
+                continue
+            offset_x = position[0] - core.position[0]
+            offset_y = position[1] - core.position[1]
+            forward = offset_x * forward_x + offset_y * forward_y
+            lateral = abs(offset_x * forward_y - offset_y * forward_x)
+            candidates.append(
+                (
+                    position,
+                    manhattan(position, core.position),
+                    forward,
+                    lateral,
+                )
+            )
+        if not candidates:
+            return False
+        goal = min(
+            candidates,
+            key=lambda candidate: (
+                candidate[1] <= current_distance,
+                candidate[2] > 0,
+                -candidate[1],
+                -candidate[3],
+                candidate[0],
+            ),
+        )[0]
+        direction = direction_between(unit.position, goal)
+        if direction is None:
+            return False
+        return self._queue_move(
+            unit,
+            direction,
+            context,
+            reason=reason,
+            target=goal,
+        )
+
     def _move_core_unit_via_neighbor(
         self,
         unit: Unit,
@@ -2306,6 +2377,14 @@ class AggressiveStrategy:
                     action="START_MOVE",
                     reason="relocate Core to the selected symmetric-defense home",
                     target=add(core.position, direction),
+                )
+            else:
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="WAIT",
+                    reason="wait for a clear Core migration step",
+                    target=core.position,
                 )
             return
 
@@ -2934,6 +3013,17 @@ class AggressiveStrategy:
             destination in self.memory.obstacles
             or destination in context.turn.obstacle_cells
         ):
+            return False
+        core = context.turn.core
+        if (
+            core is not None
+            and core.view.state is CoreState.MOVING
+            and destination == core.view.destination
+        ):
+            # The server resolves a four-Tick Core move as one occupancy
+            # check.  Never let another unit queue into the destination while
+            # that move is in flight, even if it could legally overlap on a
+            # single intermediate Tick.
             return False
         predicted = self._predicted_friendly_occupancy(destination, context)
         if intent is _MoveIntent.STAND:
@@ -5928,13 +6018,33 @@ class AggressiveStrategy:
             | set(context.occupied)
             | context.reserved
         ) - {core.position}
-        return next_step(
+        direction = next_step(
             core.position,
             target,
             blocked=blocked,
             recent=self.memory.recent_positions(str(core.id)),
             direction_offset=self._direction_offset(core.id),
         )
+        if direction is None:
+            return None
+        # Do not spend a four-Tick move walking away just because every
+        # immediate homeward cell is temporarily occupied by the economy.
+        # Static progress cells should remain available; wait for friendly
+        # traffic to clear.  A terrain detour is still allowed when no
+        # monotonic static step exists at all.
+        current_distance = manhattan(core.position, target)
+        static_progress = [
+            position
+            for position in adjacent_positions(core.position)
+            if position not in obstacles
+            and position not in context.turn.resource_cells
+            and manhattan(position, target) < current_distance
+        ]
+        if static_progress and manhattan(add(core.position, direction), target) >= (
+            current_distance
+        ):
+            return None
+        return direction
 
     def _defensive_perimeter_assignments(
         self,

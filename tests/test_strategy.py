@@ -2631,7 +2631,7 @@ def test_core_stays_receptive_while_worker_returns_cargo() -> None:
     assert turn.plan.core_action is None
 
 
-def test_worker_stages_cargo_at_migrating_core_destination() -> None:
+def test_worker_with_cargo_clears_migrating_core_destination() -> None:
     turn = make_turn(
         objects=[
             core(
@@ -2650,9 +2650,11 @@ def test_worker_stages_cargo_at_migrating_core_destination() -> None:
 
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction is Direction.LEFT
+    next_position = add(turn.workers[0].position, action.direction)
+    assert manhattan(next_position, (0, 0)) > 2
+    assert next_position != (1, 0)
     assert any(
-        item.reason == "stage carried resources at migrating Core destination"
+        item.reason == "clear the moving Core approach with economy unit"
         for item in report.decisions
     )
 
@@ -2675,12 +2677,84 @@ def test_worker_never_deposits_while_core_is_migrating() -> None:
 
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction is Direction.RIGHT
     assert action.type != "DEPOSIT"
+    next_position = add(turn.workers[0].position, action.direction)
+    assert next_position != (1, 0)
+    assert next_position != (0, 0)
     assert any(
-        item.reason == "stage carried resources at migrating Core destination"
+        item.reason == "clear the moving Core approach with economy unit"
         for item in report.decisions
     )
+
+
+def test_worker_holds_far_cargo_while_core_is_migrating() -> None:
+    turn = make_turn(
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(5, 0), cargo=1),
+        ]
+    )
+
+    report = decide(turn)
+
+    assert turn.workers[0].id not in turn.plan.unit_actions
+    assert any(
+        item.reason == "hold cargo clear of the moving Core"
+        for item in report.decisions
+    )
+
+
+def test_friendly_unit_cannot_queue_into_moving_core_destination() -> None:
+    turn = make_turn(
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+        ]
+    )
+    strategy = AggressiveStrategy(WorldMemory(), StrategyConfig(target_workers=2))
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={(0, 0), (2, 0)},
+        enemy_positions=set(),
+    )
+
+    assert not strategy._queue_move(
+        turn.workers[0],
+        Direction.LEFT,
+        context,
+        reason="test blocked Core destination",
+        target=(1, 0),
+    )
+
+
+def test_core_waits_instead_of_backtracking_when_homeward_cells_are_occupied() -> None:
+    memory = WorldMemory(
+        core_home_position=(1, 1),
+        core_layout_version=CORE_LAYOUT_VERSION,
+    )
+    strategy = AggressiveStrategy(memory, StrategyConfig(target_workers=2))
+    turn = make_turn(objects=[core(position=(0, 0))])
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={(0, 0), (1, 0), (0, 1)},
+        enemy_positions=set(),
+    )
+
+    assert strategy._core_home_direction(context) is None
 
 
 def test_population_cap_stops_production() -> None:
