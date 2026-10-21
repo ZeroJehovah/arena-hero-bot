@@ -2540,11 +2540,29 @@ class AggressiveStrategy:
                     target=add(core.position, direction),
                 )
             else:
+                blocked_by_loaded_worker = any(
+                    worker.cargo > 0
+                    and manhattan(worker.position, core.position)
+                    <= CORE_MIGRATION_CLEAR_RADIUS
+                    for worker in context.turn.workers
+                )
+                if blocked_by_loaded_worker:
+                    # A loaded Worker holds at the moving Core approach so it
+                    # cannot overtake the Core.  If that Worker occupies the
+                    # only legal next step, waiting for the eight-step batch
+                    # would deadlock both actors.  Open a deposit halt now.
+                    self.memory.core_migration_pause_until_tick = max(
+                        self.memory.core_migration_pause_until_tick,
+                        context.turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
+                    )
+                    reason = "hold for a loaded Worker blocking the Core approach"
+                else:
+                    reason = "wait for a clear Core migration step"
                 context.report.add(
                     actor_id=str(core.id),
                     actor_kind="CORE",
                     action="WAIT",
-                    reason="wait for a clear Core migration step",
+                    reason=reason,
                     target=core.position,
                 )
             return
