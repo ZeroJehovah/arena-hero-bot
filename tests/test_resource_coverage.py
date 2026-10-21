@@ -1,21 +1,26 @@
-"""Durable single-chunk Worker quadrants and chunk-edge patrol coverage."""
+"""Single-chunk Worker sightline patrol and chunk-edge combat coverage."""
 
 from __future__ import annotations
 
+import json
 from uuid import UUID
 
+from arena_hero_bot.exploration import visible_cells
 from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
     PATROL_RING_PURPOSE,
     RESOURCE_CLAIM_PURPOSE,
-    WORKER_BLOCK_PATROL_PURPOSE,
+    WORKER_PATROL_PURPOSE,
     AggressiveStrategy,
     StrategyConfig,
+    _resource_block_cells,
     _ring_slot_index,
     _single_chunk_outer_ring,
-    _single_chunk_resource_blocks,
+    _single_chunk_patrol_sectors,
+    _single_chunk_resource_block,
+    _worker_patrol_sector_index,
 )
 
 from .factories import core, make_turn, unit
@@ -48,19 +53,30 @@ def _workers() -> list[dict]:
     ]
 
 
-def test_resource_quadrants_share_one_centered_chunk() -> None:
-    blocks = _single_chunk_resource_blocks(HOME)
+def test_patrol_sectors_tile_one_centered_chunk_into_sixteen_cells() -> None:
+    chunk = _single_chunk_resource_block(HOME)
+    sectors = _single_chunk_patrol_sectors(HOME)
 
-    assert [block.index for block in blocks] == [0, 1, 2, 3]
-    assert {
-        (block.min_x, block.max_x, block.min_y, block.max_y) for block in blocks
-    } == {
-        (-416, -401, 640, 655),
-        (-400, -385, 640, 655),
-        (-416, -401, 656, 671),
-        (-400, -385, 656, 671),
-    }
-    assert sum(block.contains(HOME) for block in blocks) == 1
+    assert (chunk.min_x, chunk.max_x, chunk.min_y, chunk.max_y) == (
+        -416,
+        -385,
+        640,
+        671,
+    )
+    assert [sector.index for sector in sectors] == list(range(16))
+    first = (sectors[0].index, sectors[0].min_x, sectors[0].max_x)
+    assert first == (0, -416, -409)
+    assert (sectors[5].index, sectors[5].min_x, sectors[5].min_y) == (
+        5,
+        -408,
+        648,
+    )
+    assert (sectors[15].index, sectors[15].max_x, sectors[15].max_y) == (
+        15,
+        -385,
+        671,
+    )
+    assert len({(sector.min_x, sector.min_y) for sector in sectors}) == 16
 
 
 def test_home_selection_chooses_the_least_blocked_nearby_chunk_center() -> None:
@@ -90,17 +106,17 @@ def test_outer_ring_is_a_single_124_cell_clockwise_chunk_edge() -> None:
     assert route[-1] == (-416, 670)
 
 
-def test_worker_assignments_are_four_per_block_and_survive_replacements() -> None:
+def test_worker_sectors_are_one_each_and_survive_replacements() -> None:
     strategy = _strategy()
     workers = _workers()
     first = make_turn(objects=[core(position=HOME), *workers])
 
     strategy._assign_resources(first)
 
-    blocks = strategy.memory.worker_blocks
-    assert sorted(blocks.values()) == [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
-    survivor_blocks = dict(blocks)
-    dead_id = next(worker["id"] for worker in workers if blocks[worker["id"]] == 2)
+    sectors = strategy.memory.worker_sectors
+    assert sorted(sectors.values()) == list(range(16))
+    survivor_sectors = dict(sectors)
+    dead_id = next(worker["id"] for worker in workers if sectors[worker["id"]] == 2)
     survivors = [worker for worker in workers if worker["id"] != dead_id]
     replacement = unit(999, "WORKER", position=(HOME[0] - 12, HOME[1] + 4))
     second = make_turn(
@@ -110,35 +126,46 @@ def test_worker_assignments_are_four_per_block_and_survive_replacements() -> Non
 
     strategy._assign_resources(second)
 
-    updated = strategy.memory.worker_blocks
+    updated = strategy.memory.worker_sectors
     for worker in survivors:
-        assert updated[worker["id"]] == survivor_blocks[worker["id"]]
+        assert updated[worker["id"]] == survivor_sectors[worker["id"]]
     assert updated[replacement["id"]] == 2
-    assert sorted(updated.values()) == [
-        0,
-        0,
-        0,
-        0,
-        1,
-        1,
-        1,
-        1,
-        2,
-        2,
-        2,
-        2,
-        3,
-        3,
-        3,
-        3,
-    ]
+    assert sorted(updated.values()) == list(range(16))
 
 
-def test_workers_never_claim_resources_outside_their_assigned_block() -> None:
+def test_legacy_worker_blocks_migrate_to_fresh_patrol_sectors(tmp_path) -> None:
+    workers = _workers()
+    memory = WorldMemory(core_home_position=HOME)
+    memory.worker_sectors = {
+        worker["id"]: index % 4 for index, worker in enumerate(workers)
+    }
+    path = tmp_path / "memory.json"
+    memory.save(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["worker_blocks"] = raw.pop("worker_sectors")
+    raw["worker_sector_layout_version"] = 0
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    restored = WorldMemory.load(path)
+    strategy = _strategy(restored)
+    turn = make_turn(objects=[core(position=HOME), *workers])
+    strategy._reconcile_worker_sectors(turn)
+
+    assert restored.worker_sector_layout_version == 1
+    assert sorted(restored.worker_sectors.values()) == list(range(16))
+
+
+def test_workers_claim_any_resource_inside_the_chunk_but_none_outside() -> None:
     strategy = _strategy()
     workers = _workers()
-    blocks = _single_chunk_resource_blocks(HOME)
-    resources = [(block.min_x + 5, block.min_y + 5) for block in blocks] + [(100, 100)]
+    chunk = _single_chunk_resource_block(HOME)
+    resources = [
+        (chunk.min_x + 1, chunk.min_y + 1),
+        (chunk.max_x - 1, chunk.min_y + 1),
+        (chunk.min_x + 1, chunk.max_y - 1),
+        (chunk.max_x - 1, chunk.max_y - 1),
+        (100, 100),
+    ]
     turn = make_turn(
         objects=[core(position=HOME), *workers],
         resource_cells=resources,
@@ -147,13 +174,7 @@ def test_workers_never_claim_resources_outside_their_assigned_block() -> None:
     assignments = strategy._assign_resources(turn)
 
     assert len(assignments) == 4
-    for worker_id, resource in assignments.items():
-        block = next(
-            block
-            for block in blocks
-            if block.index == strategy.memory.worker_blocks[str(worker_id)]
-        )
-        assert block.contains(resource)
+    assert all(chunk.contains(resource) for resource in assignments.values())
     assert (100, 100) not in assignments.values()
 
 
@@ -180,18 +201,17 @@ def test_underfoot_resource_overrides_a_held_cross_cell_claim() -> None:
     assert assignments[UUID(worker["id"])] == tuple(worker["position"])
 
 
-def test_underfoot_resource_in_another_block_is_not_claimed() -> None:
+def test_underfoot_resource_in_another_patrol_sector_is_claimed() -> None:
     memory = WorldMemory(core_home_position=HOME)
     strategy = _strategy(memory)
-    foreign_block = next(
-        block for block in _single_chunk_resource_blocks(HOME) if block.index == 1
-    )
+    foreign_sector = _single_chunk_patrol_sectors(HOME)[15]
     worker = unit(
         301,
         "WORKER",
-        position=(foreign_block.min_x + 7, foreign_block.min_y + 9),
+        position=(foreign_sector.min_x + 2, foreign_sector.min_y + 3),
     )
-    memory.worker_blocks[worker["id"]] = 0
+    memory.worker_sector_layout_version = 1
+    memory.worker_sectors[worker["id"]] = 0
     turn = make_turn(
         objects=[core(position=HOME), worker],
         resource_cells=[tuple(worker["position"])],
@@ -199,41 +219,40 @@ def test_underfoot_resource_in_another_block_is_not_claimed() -> None:
 
     assignments = strategy._assign_resources(turn)
 
-    assert assignments == {}
-    assert memory.worker_blocks[worker["id"]] == 0
+    assert assignments == {UUID(worker["id"]): tuple(worker["position"])}
+    assert memory.worker_sectors[worker["id"]] == 0
 
 
-def test_worker_patrol_chooses_oldest_reachable_cell_and_persists_visits(
+def test_worker_patrol_chooses_stale_sightline_and_persists_coverage(
     tmp_path,
 ) -> None:
     memory = WorldMemory(core_home_position=HOME)
     strategy = _strategy(memory)
     worker = unit(301, "WORKER", position=(HOME[0] - 10, HOME[1] - 10))
-    turn = make_turn(objects=[core(position=HOME), worker])
-    strategy._assign_resources(turn)
-    block = next(
-        block
-        for block in _single_chunk_resource_blocks(HOME)
-        if block.index == memory.worker_blocks[worker["id"]]
-    )
-    target = (block.min_x + 7, block.min_y + 9)
-    for x in range(block.min_x, block.max_x + 1):
-        for y in range(block.min_y, block.max_y + 1):
-            memory.worker_visit_ticks[(x, y)] = 100
-    memory.worker_visit_ticks[target] = 5
+    first = make_turn(tick=100, objects=[core(position=HOME), worker])
+    strategy.decide(first)
+    chunk = _single_chunk_resource_block(HOME)
+    target = (chunk.max_x - 3, chunk.max_y - 3)
+    target_view = visible_cells(target, 3, set()) & set(_resource_block_cells(chunk))
+    for x in range(chunk.min_x, chunk.max_x + 1):
+        for y in range(chunk.min_y, chunk.max_y + 1):
+            memory.worker_seen_ticks[(x, y)] = 181
+    for position in target_view:
+        memory.worker_seen_ticks[position] = 5
 
-    strategy.decide(turn)
+    second = make_turn(tick=182, objects=[core(position=HOME), worker])
+    strategy.decide(second)
 
     goal = memory.goal_for(worker["id"])
     assert goal is not None
-    assert goal.purpose == f"{WORKER_BLOCK_PATROL_PURPOSE}-{block.index}"
-    assert goal.position == target
-    assert memory.worker_visit_ticks[tuple(worker["position"])] == 100
+    assert goal.purpose == WORKER_PATROL_PURPOSE
+    assert goal.position in target_view
+    assert memory.worker_seen_ticks[tuple(worker["position"])] == 182
     path = tmp_path / "memory.json"
     memory.save(path)
     restored = WorldMemory.load(path)
-    assert restored.worker_blocks == memory.worker_blocks
-    assert restored.worker_visit_ticks[target] == 5
+    assert restored.worker_sectors == memory.worker_sectors
+    assert restored.worker_seen_ticks[target] == 5
 
 
 def test_visible_resource_interrupts_worker_block_patrol() -> None:
@@ -244,7 +263,7 @@ def test_visible_resource_interrupts_worker_block_patrol() -> None:
     strategy.decide(peaceful)
     patrol_goal = memory.goal_for(worker["id"])
     assert patrol_goal is not None
-    assert patrol_goal.purpose.startswith(WORKER_BLOCK_PATROL_PURPOSE)
+    assert patrol_goal.purpose == WORKER_PATROL_PURPOSE
 
     resource = (HOME[0] - 13, HOME[1] - 12)
     interrupted = make_turn(
@@ -322,7 +341,7 @@ def test_ring_slots_are_eight_flagship_phases_and_move_clockwise_together() -> N
         assert goal == expected
 
 
-def test_all_worker_patrol_targets_are_unique_and_inside_their_blocks() -> None:
+def test_all_worker_patrol_targets_are_unique_and_cover_every_sector() -> None:
     memory = WorldMemory(core_home_position=HOME)
     strategy = _strategy(memory)
     workers = _workers()
@@ -330,21 +349,41 @@ def test_all_worker_patrol_targets_are_unique_and_inside_their_blocks() -> None:
 
     strategy.decide(turn)
 
-    blocks = _single_chunk_resource_blocks(HOME)
+    chunk = _single_chunk_resource_block(HOME)
     targets: dict[str, tuple[int, int]] = {}
     for worker in workers:
         goal = memory.goal_for(worker["id"])
         assert goal is not None
         targets[worker["id"]] = goal.position
     assert len(set(targets.values())) == len(targets)
-    for worker_id, target in targets.items():
-        block = next(
-            block for block in blocks if block.index == memory.worker_blocks[worker_id]
-        )
-        assert block.contains(target)
+    assert all(chunk.contains(target) for target in targets.values())
+    assert sorted(
+        _worker_patrol_sector_index(chunk, target) for target in targets.values()
+    ) == list(range(16))
+    for worker_id in targets:
         goal = memory.goal_for(worker_id)
         assert goal is not None
-        assert goal.purpose.startswith(WORKER_BLOCK_PATROL_PURPOSE)
+        assert goal.purpose == WORKER_PATROL_PURPOSE
+
+
+def test_idle_workers_still_fill_distinct_sectors_when_four_are_returning() -> None:
+    memory = WorldMemory(core_home_position=HOME)
+    strategy = _strategy(memory)
+    workers = _workers()
+    for worker in workers[-4:]:
+        worker["cargo"] = 1
+    turn = make_turn(objects=[core(position=HOME), *workers])
+
+    strategy.decide(turn)
+
+    chunk = _single_chunk_resource_block(HOME)
+    patrol_sectors = []
+    for worker in workers[:12]:
+        goal = memory.goal_for(worker["id"])
+        assert goal is not None
+        assert goal.purpose == WORKER_PATROL_PURPOSE
+        patrol_sectors.append(_worker_patrol_sector_index(chunk, goal.position))
+    assert len(set(patrol_sectors)) == 12
 
 
 def test_ring_contact_alert_uses_clockwise_path_distance() -> None:

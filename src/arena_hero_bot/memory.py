@@ -18,7 +18,9 @@ ENEMY_DRIFT_MAX_GAP = 3
 CONTESTED_CELL_TTL = 80
 RESOURCE_MEMORY_TTL = 65536
 RESOURCE_MEMORY_LIMIT = 2048
-WORKER_VISIT_LIMIT = 4096
+WORKER_COVERAGE_SIZE = 32
+WORKER_COVERAGE_LIMIT = WORKER_COVERAGE_SIZE**2
+WORKER_SECTOR_LAYOUT_VERSION = 1
 RESOURCE_ABSENCE_RADIUS = 1
 RESOURCE_CLAIM_PURPOSE = "resource-claim-v1"
 _ABSENCE_OFFSETS = tuple(
@@ -27,6 +29,7 @@ _ABSENCE_OFFSETS = tuple(
     for dy in range(-RESOURCE_ABSENCE_RADIUS, RESOURCE_ABSENCE_RADIUS + 1)
     if abs(dx) + abs(dy) <= RESOURCE_ABSENCE_RADIUS
 )
+_VISION_RADII = {UnitType.WORKER: 3, UnitType.VANGUARD: 4, UnitType.RANGER: 5}
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,18 +132,19 @@ class WorldMemory:
     # Selected once for the new symmetric defensive posture and retained
     # across restarts while the Core walks there.
     core_home_position: Position | None = None
-    # Version 3 moves the economy from four chunks meeting at a junction into
-    # four quadrants of one chunk.  Keep the marker durable so a restart during
-    # migration does not choose a second home or renumber current assignments.
+    # Version 3 isolates the economy to one centered 32x32 chunk.  Keep the
+    # marker durable so a restart during migration does not choose a second
+    # home or discard the current sector allocation.
     core_layout_version: int = 0
-    # The four-quadrant economy is a durable identity assignment, separate from
-    # combat roles.  A replacement Worker fills a vacancy in its own quadrant
-    # instead of following the nearest live resource across the chunk.
-    worker_blocks: dict[str, int] = field(default_factory=dict)
-    # Arrival ticks, not merely sightings, drive the least-recently-visited
-    # patrol sweep.  Keeping this separate from ``resource_cells`` preserves
-    # confirmed-empty deletion while still restoring local coverage.
-    worker_visit_ticks: dict[Position, int] = field(default_factory=dict)
+    # Workers have one preferred 8x8 sector among the sixteen in the active
+    # resource chunk.  This is a soft patrol identity, not a resource-claim
+    # restriction; every Worker may harvest anywhere in the chunk.
+    worker_sectors: dict[str, int] = field(default_factory=dict)
+    worker_sector_layout_version: int = 0
+    # Exact per-cell vision ages for the active 32x32 resource chunk.  Unlike
+    # the bounded exploration atlas, this map is small enough to retain the
+    # last authoritative sighting of every cell and drive Worker coverage.
+    worker_seen_ticks: dict[Position, int] = field(default_factory=dict)
     # The eight patrol Rangers share one clockwise ring.  Slots and phase are
     # durable so a restart does not collapse the formation onto one corner.
     patrol_ring_slots: dict[str, int] = field(default_factory=dict)
@@ -166,6 +170,7 @@ class WorldMemory:
             if self._obstacle_rows is not None:
                 self._obstacle_rows.extend([x, y] for x, y in new_obstacles)
         self.observe_exploration(turn)
+        self._observe_worker_coverage(turn)
         self._observe_resource_cells(turn)
         destroyed_enemy_ids = {
             str(event.target_id)
@@ -214,14 +219,6 @@ class WorldMemory:
             if not history or history[-1] != unit.position:
                 history.append(unit.position)
                 del history[:-POSITION_HISTORY_LIMIT]
-        for worker in turn.workers:
-            self.worker_visit_ticks[worker.position] = turn.tick
-        if len(self.worker_visit_ticks) > WORKER_VISIT_LIMIT:
-            retained = sorted(
-                self.worker_visit_ticks.items(),
-                key=lambda item: (item[1], item[0]),
-            )[-WORKER_VISIT_LIMIT:]
-            self.worker_visit_ticks = dict(retained)
         if turn.core is not None:
             core_id = str(turn.core.id)
             history = self.position_history.setdefault(core_id, [])
@@ -239,9 +236,9 @@ class WorldMemory:
             if unit_id in active_ids
         }
         live_worker_ids = {str(worker.id) for worker in turn.workers}
-        self.worker_blocks = {
-            unit_id: block
-            for unit_id, block in self.worker_blocks.items()
+        self.worker_sectors = {
+            unit_id: sector
+            for unit_id, sector in self.worker_sectors.items()
             if unit_id in live_worker_ids
         }
         live_combat_ids = {str(unit.id) for unit in (*turn.vanguards, *turn.rangers)}
@@ -256,11 +253,9 @@ class WorldMemory:
 
         if self.exploration.last_tick == turn.tick:
             return
-        radii = {UnitType.WORKER: 3, UnitType.VANGUARD: 4, UnitType.RANGER: 5}
-        observers = [(unit.position, radii[unit.unit_type]) for unit in turn.units]
-        if turn.core is not None:
-            observers.append((turn.core.position, 5))
-        obstacles = self.obstacles | set(turn.obstacle_cells)
+        observers = self._vision_observers(turn)
+        # observe() has already merged this Turn's rocks into durable memory.
+        obstacles = self.obstacles
         if not self.exploration.tiles and self.position_history:
             # Old memory has no empty-ground atlas. Seed only the short paths
             # actually observed by surviving units, not imagined travel lines
@@ -269,10 +264,54 @@ class WorldMemory:
             for unit in turn.units:
                 for position in self.position_history.get(str(unit.id), ()):
                     cells.update(
-                        visible_cells(position, radii[unit.unit_type], obstacles)
+                        visible_cells(
+                            position, _VISION_RADII[unit.unit_type], obstacles
+                        )
                     )
             self.exploration.mark(cells, turn.tick - 1)
         self.exploration.observe(observers, obstacles, turn.tick)
+
+    @staticmethod
+    def _vision_observers(turn: Turn) -> list[tuple[Position, int]]:
+        """Return every friendly observer and its authoritative vision radius."""
+
+        observers = [
+            (unit.position, _VISION_RADII[unit.unit_type]) for unit in turn.units
+        ]
+        if turn.core is not None:
+            observers.append((turn.core.position, 5))
+        return observers
+
+    def _observe_worker_coverage(self, turn: Turn) -> None:
+        """Record the last actual sighting of every cell in the active chunk."""
+
+        home = self.core_home_position
+        if home is None:
+            return
+        min_x = (home[0] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
+        min_y = (home[1] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
+        block = {
+            (x, y)
+            for x in range(min_x, min_x + WORKER_COVERAGE_SIZE)
+            for y in range(min_y, min_y + WORKER_COVERAGE_SIZE)
+        }
+        obstacles = self.obstacles
+        seen: set[Position] = set()
+        for position, radius in self._vision_observers(turn):
+            seen.update(visible_cells(position, radius, obstacles) & block)
+        for position in seen:
+            self.worker_seen_ticks[position] = turn.tick
+        self.worker_seen_ticks = {
+            position: tick
+            for position, tick in self.worker_seen_ticks.items()
+            if position in block
+        }
+        if len(self.worker_seen_ticks) > WORKER_COVERAGE_LIMIT:
+            retained = sorted(
+                self.worker_seen_ticks.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:WORKER_COVERAGE_LIMIT]
+            self.worker_seen_ticks = dict(retained)
 
     def _closely_observed_cells(self, turn: Turn) -> set[Position]:
         """Return the cells close enough this Tick to trust an absence."""
@@ -577,10 +616,11 @@ class WorldMemory:
                 else None
             ),
             "core_layout_version": self.core_layout_version,
-            "worker_blocks": dict(sorted(self.worker_blocks.items())),
-            "worker_visit_ticks": [
+            "worker_sectors": dict(sorted(self.worker_sectors.items())),
+            "worker_sector_layout_version": self.worker_sector_layout_version,
+            "worker_seen_ticks": [
                 {"position": list(position), "tick": tick}
-                for position, tick in sorted(self.worker_visit_ticks.items())
+                for position, tick in sorted(self.worker_seen_ticks.items())
             ],
             "patrol_ring_slots": dict(sorted(self.patrol_ring_slots.items())),
             "patrol_ring_slots_initialized": self.patrol_ring_slots_initialized,
@@ -727,13 +767,18 @@ class WorldMemory:
             ),
             core_home_position=_optional_position(raw.get("core_home_position")),
             core_layout_version=int(raw.get("core_layout_version", 0)),
-            worker_blocks={
+            worker_sectors={
                 str(unit_id): int(block)
-                for unit_id, block in raw.get("worker_blocks", {}).items()
+                for unit_id, block in raw.get(
+                    "worker_sectors", raw.get("worker_blocks", {})
+                ).items()
             },
-            worker_visit_ticks={
+            worker_sector_layout_version=int(
+                raw.get("worker_sector_layout_version", 0)
+            ),
+            worker_seen_ticks={
                 _position(value["position"]): int(value["tick"])
-                for value in raw.get("worker_visit_ticks", [])
+                for value in raw.get("worker_seen_ticks", [])
             },
             patrol_ring_slots={
                 str(unit_id): int(slot)

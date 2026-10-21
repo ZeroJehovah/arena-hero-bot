@@ -50,6 +50,7 @@ from .geometry import (
 from .memory import (
     RESOURCE_CLAIM_PURPOSE,
     RESOURCE_MEMORY_LIMIT,
+    WORKER_SECTOR_LAYOUT_VERSION,
     EnemySighting,
     ExpeditionSquad,
     UnitGoal,
@@ -59,7 +60,8 @@ from .models import DecisionReport
 
 EXPLORATION_PURPOSE = "explore-center-v3"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
-WORKER_BLOCK_PATROL_PURPOSE = "worker-block-patrol-v1"
+WORKER_PATROL_PURPOSE = "worker-cover-patrol-v2"
+LEGACY_WORKER_PATROL_PURPOSE = "worker-block-patrol-v1"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 PATROL_RING_PURPOSE = "combat-ring-patrol-v1"
 PATROL_RING_LAYOUT_VERSION = 3
@@ -107,6 +109,13 @@ UNREACHABLE_PATROL_COOLDOWN = 128
 # nearby fallback.  Within one connected 32x32 block the first candidate almost
 # always succeeds; the bound protects a badly fragmented map.
 WORKER_PATROL_ROUTE_ATTEMPTS = 24
+WORKER_PATROL_SECTOR_SIZE = 8
+WORKER_PATROL_SECTOR_COUNT = 16
+# Cap old sightings so a very stale region cannot dominate forever; a cell
+# without any recorded sighting still outranks every known recent sightline.
+WORKER_PATROL_AGE_CAP = 512
+WORKER_PATROL_SECTOR_PENALTY = 0.65
+WORKER_PATROL_PREFERRED_BONUS = 1.1
 # Once combat has consumed the soft planning budget the remaining units switch
 # to shorter path searches so the full Turn still fits inside the command
 # window before the hard planning_time_limit cuts in.
@@ -244,7 +253,6 @@ SYMMETRIC_PATROL_TEAM_COUNT = 4
 SYMMETRIC_DEFENSE_VANGUARDS = 4
 SYMMETRIC_DEFENSE_RANGERS = 16
 SYMMETRIC_RESOURCE_BLOCK_SIZE = 32
-SYMMETRIC_WORKERS_PER_BLOCK = 4
 SYMMETRIC_PATROL_RING_UNITS = 8
 SYMMETRIC_CORE_RADIUS = 13
 # The clear-terrain template covers a radius-20 Manhattan disk.  On a remembered
@@ -481,6 +489,10 @@ class AggressiveStrategy:
         # map.  This is deliberately ephemeral: a restart should re-check the
         # route against the latest obstacle observations.
         self._unreachable_patrol_cells: dict[Position, int] = {}
+        # Exact vision sets for the current Worker planning pass.  The resource
+        # chunk has only 1024 cells, and all sixteen Workers score the same
+        # obstacle map, so caching these discs avoids rebuilding them per Unit.
+        self._worker_view_cache: dict[Position, frozenset[Position]] = {}
         # Set for the current Tick only by ``_assign_resources`` when a
         # Worker is deliberately left out of known-site pairing.  Keeping the
         # identity here lets the selected Worker be non-minimal without
@@ -575,6 +587,7 @@ class AggressiveStrategy:
         self._record_combat_kills(turn)
         self._record_sweep_results(turn)
         self.memory.observe(turn)
+        self._worker_view_cache = {}
         if self.config.expedition_mode:
             self._reconcile_unit_roles(turn)
             if self._symmetric_posture():
@@ -1896,13 +1909,10 @@ class AggressiveStrategy:
                 self.memory.clear_goal(str(worker.id))
 
         if self._preserves_resources():
-            worker_block = self._worker_resource_block(worker)
-            if worker_block is not None:
+            chunk = self._resource_chunk()
+            if chunk is not None:
                 goal = self._worker_block_patrol_goal(worker, context)
-                reason = (
-                    f"patrol assigned resource block {worker_block.index + 1} "
-                    "for unseen resources"
-                )
+                reason = "patrol least-seen coverage in the resource chunk"
             elif (
                 self._is_resource_scout(worker, context.turn)
                 and context.threat.level is ThreatLevel.NORMAL
@@ -5997,8 +6007,10 @@ class AggressiveStrategy:
         self.memory.core_layout_version = CORE_LAYOUT_VERSION
         self.memory.defense_posts.clear()
         self.memory.defense_anchor = None
-        self.memory.worker_blocks.clear()
-        self.memory.worker_visit_ticks.clear()
+        self.memory.worker_sectors.clear()
+        self.memory.worker_sector_layout_version = 0
+        self.memory.worker_seen_ticks.clear()
+        self._worker_view_cache.clear()
         self.memory.patrol_ring_slots.clear()
         self.memory.patrol_ring_slots_initialized = False
         self.memory.patrol_ring_layout_version = 0
@@ -6762,80 +6774,77 @@ class AggressiveStrategy:
     def _ranger_range(origin: Position, target: Position) -> int:
         return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
-    def _resource_blocks(self) -> tuple[_ResourceBlock, ...]:
-        """Return the four quadrants of the persisted resource chunk."""
+    def _resource_chunk(self) -> _ResourceBlock | None:
+        """Return the active 32x32 economy chunk, if the live posture is active."""
+
+        if not self._symmetric_posture():
+            return None
+        home = self.memory.core_home_position
+        return None if home is None else _single_chunk_resource_block(home)
+
+    def _resource_patrol_sectors(self) -> tuple[_ResourceBlock, ...]:
+        """Return the sixteen soft 8x8 Worker patrol sectors."""
 
         if not self._symmetric_posture():
             return ()
         home = self.memory.core_home_position
-        return () if home is None else _single_chunk_resource_blocks(home)
+        return () if home is None else _single_chunk_patrol_sectors(home)
 
-    def _worker_resource_block(self, worker: Worker) -> _ResourceBlock | None:
-        """Return a Worker's durable quadrant identity, if the scheme is active."""
+    def _reconcile_worker_sectors(self, turn: Turn) -> dict[UUID, _ResourceBlock]:
+        """Keep one preferred patrol sector per Worker across replacements."""
 
-        block_index = self.memory.worker_blocks.get(str(worker.id))
-        return next(
-            (block for block in self._resource_blocks() if block.index == block_index),
-            None,
-        )
-
-    def _reconcile_worker_blocks(self, turn: Turn) -> dict[UUID, _ResourceBlock]:
-        """Keep Worker identities stable and fill quadrant vacancies."""
-
-        blocks = self._resource_blocks()
-        if not blocks:
+        sectors = self._resource_patrol_sectors()
+        if not sectors:
             return {}
+        if self.memory.worker_sector_layout_version != WORKER_SECTOR_LAYOUT_VERSION:
+            self.memory.worker_sectors.clear()
+            self.memory.worker_sector_layout_version = WORKER_SECTOR_LAYOUT_VERSION
+
         ordered = sorted(turn.workers, key=lambda worker: worker.id.bytes)
-        rank = {worker.id: index for index, worker in enumerate(ordered)}
-        counts = [0] * len(blocks)
+        valid_indexes = {sector.index for sector in sectors}
+        counts = [0] * len(sectors)
         assignments: dict[UUID, _ResourceBlock] = {}
         pending: list[Worker] = []
-        valid_indexes = {block.index for block in blocks}
         for worker in ordered:
-            block_index = self.memory.worker_blocks.get(str(worker.id))
-            if (
-                block_index in valid_indexes
-                and counts[block_index] < SYMMETRIC_WORKERS_PER_BLOCK
-            ):
-                assignments[worker.id] = blocks[block_index]
-                counts[block_index] += 1
+            sector_index = self.memory.worker_sectors.get(str(worker.id))
+            if sector_index in valid_indexes and counts[sector_index] < 1:
+                assignments[worker.id] = sectors[sector_index]
+                counts[sector_index] += 1
             else:
                 pending.append(worker)
 
         for worker in pending:
-            available = [
-                block.index
-                for block in blocks
-                if counts[block.index] < SYMMETRIC_WORKERS_PER_BLOCK
-            ]
-            candidates = available or [block.index for block in blocks]
-            preferred = rank[worker.id] % len(blocks)
-            block_index = min(
-                candidates,
-                key=lambda index: (counts[index], (index - preferred) % len(blocks)),
+            sector = min(
+                sectors,
+                key=lambda candidate: (
+                    counts[candidate.index],
+                    manhattan(worker.position, _resource_block_center(candidate)),
+                    candidate.index,
+                ),
             )
-            assignments[worker.id] = blocks[block_index]
-            counts[block_index] += 1
+            assignments[worker.id] = sector
+            counts[sector.index] += 1
 
-        self.memory.worker_blocks = {
-            str(worker_id): block.index for worker_id, block in assignments.items()
+        self.memory.worker_sectors = {
+            str(worker_id): sector.index for worker_id, sector in assignments.items()
         }
-        allowed_cells = {
-            position for block in blocks for position in _resource_block_cells(block)
-        }
-        self.memory.worker_visit_ticks = {
-            position: tick
-            for position, tick in self.memory.worker_visit_ticks.items()
-            if position in allowed_cells
-        }
+        chunk = self._resource_chunk()
+        if chunk is not None:
+            allowed_cells = set(_resource_block_cells(chunk))
+            self.memory.worker_seen_ticks = {
+                position: tick
+                for position, tick in self.memory.worker_seen_ticks.items()
+                if position in allowed_cells
+            }
         return assignments
 
-    def _assign_block_resources(self, turn: Turn) -> dict[UUID, Position]:
-        """Pair each Worker only with resources inside its fixed quadrant."""
+    def _assign_chunk_resources(self, turn: Turn) -> dict[UUID, Position]:
+        """Pair every empty Worker with the nearest resource in the live chunk."""
 
-        block_by_worker = self._reconcile_worker_blocks(turn)
-        if not block_by_worker:
+        chunk = self._resource_chunk()
+        if chunk is None:
             return {}
+        self._reconcile_worker_sectors(turn)
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
         self._unreachable_claims = {
             cell: seen_tick
@@ -6854,93 +6863,70 @@ class AggressiveStrategy:
         ) - {worker.position for worker in workers.values()}
         hostile = {enemy.position for enemy in turn.visible_enemies}
         blocked_resources = self._rock_map(turn)
-        visible_resources = (
-            set(turn.resource_cells) - hostile - unreachable - blocked_resources
-        )
+        visible_resources = {
+            resource
+            for resource in set(turn.resource_cells) - hostile - unreachable
+            if resource not in blocked_resources and chunk.contains(resource)
+        }
         remembered_resources = (
-            set(self.memory.remembered_resource_cells())
+            {
+                resource
+                for resource in self.memory.remembered_resource_cells()
+                if chunk.contains(resource) and resource not in blocked_resources
+            }
             - hostile
             - unreachable
-            - blocked_resources
             - visible_resources
         )
 
-        # A resource claim made before the four-quadrant policy went live may
-        # point outside this Worker's identity.  Drop it now; otherwise the
-        # later resource-goal fallback would keep walking toward that stale
-        # cross-block target even after the assignment pool excluded it.
+        # Drop claims outside the active chunk.  Within the chunk every Worker
+        # is eligible regardless of its preferred patrol sector.
         for worker in workers.values():
             goal = self.memory.goal_for(str(worker.id))
-            block = block_by_worker[worker.id]
             if (
                 goal is not None
                 and goal.purpose == RESOURCE_CLAIM_PURPOSE
-                and not block.contains(goal.position)
+                and not chunk.contains(goal.position)
             ):
                 self.memory.clear_goal(str(worker.id))
                 self._claim_stalls.pop(worker.id, None)
 
         assignments: dict[UUID, Position] = {}
-        for block in self._resource_blocks():
-            block_workers = {
-                worker_id: worker
-                for worker_id, worker in workers.items()
-                if block_by_worker[worker_id].index == block.index
-            }
-            known = {
-                resource
-                for resource in visible_resources | remembered_resources
-                if block.contains(resource)
-            }
-            local_assignments: dict[UUID, Position] = {}
-            block_worker_ids = frozenset(block_workers)
-            pools: list[set[Position]] = [known] if known else []
-            self._hold_existing_claims(
-                block_workers,
-                pools,
-                local_assignments,
-                clear_missing=False,
-            )
+        known = visible_resources | remembered_resources
+        pools: list[set[Position]] = [known] if known else []
+        self._hold_existing_claims(
+            workers,
+            pools,
+            assignments,
+            clear_missing=False,
+        )
 
-            def assignment_key(
-                worker: Worker,
-                resource: Position,
-            ) -> tuple[int, int, UUID, Position]:
-                approach = manhattan(worker.position, resource)
-                loaded_return = (
-                    manhattan(turn.core.position, resource)
-                    if turn.core is not None
-                    else 0
+        while workers and known:
+            _, _, worker_id, resource = min(
+                (
+                    manhattan(worker.position, resource)
+                    + (
+                        manhattan(turn.core.position, resource)
+                        if turn.core is not None
+                        else 0
+                    ),
+                    manhattan(worker.position, resource),
+                    worker.id,
+                    resource,
                 )
-                return approach + loaded_return, approach, worker.id, resource
-
-            while block_workers and known:
-                _, _, worker_id, resource = min(
-                    assignment_key(worker, resource)
-                    for worker in block_workers.values()
-                    for resource in known
-                )
-                local_assignments[worker_id] = resource
-                block_workers.pop(worker_id)
-                known.remove(resource)
-            self._uncross_claims(turn, local_assignments)
-            # A Worker can cross a quadrant boundary while returning cargo or
-            # converging after the migration.  The underfoot shortcut must not
-            # turn that transit into a cross-block harvest: visible resources
-            # are offered only to the Workers whose durable identity owns this
-            # block.
-            self._prioritize_underfoot_resource_claims(
-                turn,
-                {
-                    resource
-                    for resource in visible_resources
-                    if block.contains(resource)
-                },
-                local_assignments,
-                force_underfoot=True,
-                eligible_worker_ids=block_worker_ids,
+                for worker in workers.values()
+                for resource in known
             )
-            assignments.update(local_assignments)
+            assignments[worker_id] = resource
+            workers.pop(worker_id)
+            known.remove(resource)
+        self._uncross_claims(turn, assignments)
+        self._prioritize_underfoot_resource_claims(
+            turn,
+            visible_resources,
+            assignments,
+            force_underfoot=True,
+        )
 
         # Holding a claim is already reflected in ``assignments``.  Anything
         # left pointing at a different resource belongs to another Worker (or
@@ -6962,15 +6948,15 @@ class AggressiveStrategy:
     def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
         """Assign known resource cells to empty Workers.
 
-        The live single-chunk posture dispatches to a per-identity quadrant pool.
+        The live single-chunk posture dispatches to one block-wide pool.
         Legacy configurations retain the global nearest/round-trip pairing.
         Enemy and unreachable cells stay excluded in both paths so a Worker
         does not walk into a known threat or a walled-off route.
         """
 
         self._resource_scout_id = None
-        if self._resource_blocks():
-            return self._assign_block_resources(turn)
+        if self._resource_chunk() is not None:
+            return self._assign_chunk_resources(turn)
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
         self._unreachable_claims = {
             cell: seen_tick
@@ -8098,28 +8084,67 @@ class AggressiveStrategy:
         self.memory.set_goal(unit_id, goal)
         return goal.position
 
+    def _worker_patrol_view(
+        self,
+        position: Position,
+        block_cells: frozenset[Position],
+        obstacles: set[Position],
+    ) -> frozenset[Position]:
+        """Return the traversable resource-chunk cells visible from one post."""
+
+        cached = self._worker_view_cache.get(position)
+        if cached is None:
+            cached = visible_cells(position, 3, obstacles) & block_cells
+            self._worker_view_cache[position] = cached
+        return cached
+
     def _worker_block_patrol_goal(
         self,
         worker: Worker,
         context: _TurnContext,
     ) -> Position:
-        """Sweep the Worker's own chunk quadrant by least-recently-arrived cell."""
+        """Cover the chunk by stale sightlines, with soft 8x8 sector balance."""
 
         turn = context.turn
-        block = self._worker_resource_block(worker)
-        if block is None:
+        chunk = self._resource_chunk()
+        if chunk is None:
             return self._resource_patrol_goal(worker, turn, context)
         obstacles = self._rock_map(turn)
         unit_id = str(worker.id)
-        purpose = f"{WORKER_BLOCK_PATROL_PURPOSE}-{block.index}"
+        purpose = WORKER_PATROL_PURPOSE
         current = self.memory.goal_for(unit_id)
-        claimed_positions = {
-            goal.position
+        block_cells = frozenset(_resource_block_cells(chunk)) - obstacles
+        patrol_goals = [
+            (other, goal)
             for other in turn.workers
             if other.id != worker.id
             if (goal := self.memory.goal_for(str(other.id))) is not None
-            and goal.purpose.startswith(WORKER_BLOCK_PATROL_PURPOSE)
+            and _is_worker_patrol_goal(goal)
+        ]
+        claimed_positions = {goal.position for _other, goal in patrol_goals}
+        other_positions = {
+            other.position for other in turn.workers if other.id != worker.id
         }
+        reserved_views: set[Position] = set()
+        sector_loads = [0] * WORKER_PATROL_SECTOR_COUNT
+        for _other, goal in patrol_goals:
+            reserved_views.update(
+                self._worker_patrol_view(goal.position, block_cells, obstacles)
+            )
+            sector_index = _worker_patrol_sector_index(chunk, goal.position)
+            if 0 <= sector_index < WORKER_PATROL_SECTOR_COUNT:
+                sector_loads[sector_index] += 1
+
+        def age(position: Position) -> int:
+            seen_tick = self.memory.worker_seen_ticks.get(position)
+            if seen_tick is None:
+                return WORKER_PATROL_AGE_CAP
+            return min(WORKER_PATROL_AGE_CAP, max(0, turn.tick - seen_tick))
+
+        def marginal_gain(position: Position) -> int:
+            view = self._worker_patrol_view(position, block_cells, obstacles)
+            return sum(age(cell) for cell in view if cell not in reserved_views)
+
         service_cells = (
             {
                 (turn.core.position[0] + dx, turn.core.position[1] + dy)
@@ -8142,17 +8167,25 @@ class AggressiveStrategy:
 
         def usable(position: Position) -> bool:
             return (
-                block.contains(position)
+                chunk.contains(position)
                 and all(position not in layer for layer in unavailable_layers)
                 and position not in claimed_positions
+                and position not in other_positions
                 and self._predicted_friendly_occupancy(position, context) < 2
             )
 
+        current_gain = (
+            marginal_gain(current.position)
+            if current is not None and _is_worker_patrol_goal(current)
+            else 0
+        )
         if (
             current is not None
             and current.purpose == purpose
             and worker.position != current.position
+            and current_gain > 0
             and usable(current.position)
+            and not self._near_remembered_worker_danger(current.position, turn)
             and self._has_static_route(
                 worker,
                 current.position,
@@ -8183,27 +8216,48 @@ class AggressiveStrategy:
                 self.memory.set_goal(unit_id, renewed)
                 return renewed.position
 
-        other_positions = [
-            other.position for other in turn.workers if other.id != worker.id
-        ] + list(claimed_positions)
         candidates = [
             position
-            for position in _resource_block_cells(block)
+            for position in _resource_block_cells(chunk)
             if position != worker.position and usable(position)
         ]
-        candidates.sort(
-            key=lambda position: (
-                self.memory.worker_visit_ticks.get(position, -1),
-                -min(
-                    (manhattan(position, other) for other in other_positions),
-                    default=0,
-                ),
-                manhattan(worker.position, position),
-                position,
+        preferred_sector = self.memory.worker_sectors.get(unit_id)
+        scored: list[tuple[int, float, int, int, int, int, Position]] = []
+        for position in candidates:
+            gain = marginal_gain(position)
+            distance = manhattan(worker.position, position)
+            sector_index = _worker_patrol_sector_index(chunk, position)
+            load = (
+                sector_loads[sector_index]
+                if 0 <= sector_index < WORKER_PATROL_SECTOR_COUNT
+                else 0
             )
-        )
+            score = gain / (4 + distance)
+            score /= 1 + WORKER_PATROL_SECTOR_PENALTY * load
+            if sector_index == preferred_sector:
+                score *= WORKER_PATROL_PREFERRED_BONUS
+            scored.append(
+                (
+                    int(load == 0 and gain > 0),
+                    score,
+                    -load,
+                    int(sector_index == preferred_sector),
+                    gain,
+                    -distance,
+                    position,
+                )
+            )
+        scored.sort(reverse=True)
         patrol_position = worker.position
-        for candidate in candidates[:WORKER_PATROL_ROUTE_ATTEMPTS]:
+        for (
+            _empty_sector,
+            _score,
+            _load,
+            _preferred,
+            _gain,
+            _distance,
+            candidate,
+        ) in scored[:WORKER_PATROL_ROUTE_ATTEMPTS]:
             if self._has_static_route(
                 worker,
                 candidate,
@@ -8819,6 +8873,60 @@ def _resource_patrol_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
     return tuple(route)
 
 
+def _single_chunk_resource_block(home: Position) -> _ResourceBlock:
+    """Return the full 32x32 economy chunk containing ``home``."""
+
+    size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    min_x = (home[0] // size) * size
+    min_y = (home[1] // size) * size
+    return _ResourceBlock(
+        index=0,
+        min_x=min_x,
+        max_x=min_x + size - 1,
+        min_y=min_y,
+        max_y=min_y + size - 1,
+    )
+
+
+def _single_chunk_patrol_sectors(home: Position) -> tuple[_ResourceBlock, ...]:
+    """Return sixteen row-major 8x8 patrol sectors inside ``home``'s chunk."""
+
+    chunk = _single_chunk_resource_block(home)
+    size = WORKER_PATROL_SECTOR_SIZE
+    return tuple(
+        _ResourceBlock(
+            index=row * 4 + column,
+            min_x=chunk.min_x + column * size,
+            max_x=chunk.min_x + (column + 1) * size - 1,
+            min_y=chunk.min_y + row * size,
+            max_y=chunk.min_y + (row + 1) * size - 1,
+        )
+        for row in range(4)
+        for column in range(4)
+    )
+
+
+def _resource_block_center(block: _ResourceBlock) -> Position:
+    return (
+        block.min_x + (block.max_x - block.min_x) // 2,
+        block.min_y + (block.max_y - block.min_y) // 2,
+    )
+
+
+def _worker_patrol_sector_index(chunk: _ResourceBlock, position: Position) -> int:
+    if not chunk.contains(position):
+        return -1
+    column = (position[0] - chunk.min_x) // WORKER_PATROL_SECTOR_SIZE
+    row = (position[1] - chunk.min_y) // WORKER_PATROL_SECTOR_SIZE
+    return row * 4 + column
+
+
+def _is_worker_patrol_goal(goal: UnitGoal) -> bool:
+    return goal.purpose in {WORKER_PATROL_PURPOSE, LEGACY_WORKER_PATROL_PURPOSE} or (
+        goal.purpose.startswith(f"{LEGACY_WORKER_PATROL_PURPOSE}-")
+    )
+
+
 def _single_chunk_resource_blocks(home: Position) -> tuple[_ResourceBlock, ...]:
     """Return the four 16x16 quadrants of ``home``'s 32x32 chunk."""
 
@@ -8838,7 +8946,7 @@ def _single_chunk_resource_blocks(home: Position) -> tuple[_ResourceBlock, ...]:
     )
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=32)
 def _resource_block_cells(block: _ResourceBlock) -> tuple[Position, ...]:
     """Return a block's cells in stable row-major order."""
 
