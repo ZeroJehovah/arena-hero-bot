@@ -10,6 +10,7 @@ from arena_hero import (
     SpawnAction,
     Turn,
     UnitType,
+    UnitView,
     core_resource_capacity,
     unit_cost,
 )
@@ -5371,6 +5372,77 @@ def test_garrison_guards_stay_on_the_ring_through_an_emergency() -> None:
     assert any(reasons[number] != PERIMETER_REASON for number in (7, 8))
 
 
+def test_massed_core_assault_pulls_the_far_side_into_the_fight() -> None:
+    # Three nearby fighters are more than the local garrison can answer alone.
+    # A Ranger on the far side must receive the shared contact picture even
+    # though every attacker is outside its own five-cell vision.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, 10)),
+            unit(4, "RANGER", position=(-1, 10)),
+            unit(5, "RANGER", position=(1, 10)),
+            unit(7, "RANGER", position=(-2, 10)),
+            unit(8, "RANGER", position=(2, 10)),
+            unit(10, "RANGER", position=(0, 9)),
+            unit(30, "RANGER", controlled=False, position=(0, 3)),
+            unit(31, "RANGER", controlled=False, position=(1, 3)),
+            unit(32, "VANGUARD", controlled=False, position=(0, 4)),
+        ],
+    )
+
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    report = strategy.decide(turn)
+
+    reasons = _reasons_by_number(report)
+    assert strategy._all_hands_defense(
+        turn,
+        strategy._tactical_enemies(
+            turn,
+            strategy.memory.recent_enemies(turn.tick, config.enemy_memory_ttl),
+        ),
+    )
+    ranger = next(item for item in turn.rangers if item.id == UUID(int=2))
+    assert strategy._visible_combat_targets(
+        ranger,
+        turn,
+        shared_defense=True,
+    )
+    assert all(reasons[number] != PERIMETER_REASON for number in (2, 4, 5)), reasons
+    assert "close firing angle on" in reasons[2]
+    action = turn.plan.unit_actions[ranger.id]
+    assert action.type == "MOVE"
+    destination = add(ranger.position, action.direction)
+    assert manhattan(destination, (1, 3)) < manhattan(ranger.position, (1, 3))
+    assert all(
+        not strategy._enemy_can_attack_position(enemy, destination, set())
+        for enemy in turn.visible_enemies
+        if isinstance(enemy, UnitView)
+    )
+
+
+def test_two_contacts_do_not_empty_the_far_side_of_the_ring() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, 10)),
+            unit(4, "RANGER", position=(-1, 10)),
+            unit(5, "RANGER", position=(1, 10)),
+            unit(30, "RANGER", controlled=False, position=(0, 3)),
+            unit(31, "RANGER", controlled=False, position=(1, 3)),
+        ],
+    )
+
+    report = decide(turn, config=config)
+
+    reasons = _reasons_by_number(report)
+    assert [reasons[number] for number in (2, 4, 5)] == [PERIMETER_REASON] * 3
+
+
 AWAY_POSITIONS = {3: (14, 0), 6: (15, 0), 9: (14, 1), 12: (14, -1)}
 HOME_POSITIONS = {3: (0, 1), 6: (1, 0), 9: (2, 0), 12: (3, 0)}
 
@@ -6349,6 +6421,39 @@ def test_expedition_members_never_heal_or_retreat() -> None:
         enemy_positions=set(),
     )
     assert not strategy._recover_if_critical(ranger_view, maximum_hp=2, context=context)
+
+
+def test_massed_core_assault_does_not_recall_an_expedition_member() -> None:
+    strategy = _expedition_strategy()
+    strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(20, 0)),
+            unit(30, "RANGER", controlled=False, position=(0, 3)),
+            unit(31, "RANGER", controlled=False, position=(1, 3)),
+            unit(32, "VANGUARD", controlled=False, position=(0, 4)),
+        ]
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={item.position for item in turn.visible_enemies},
+        all_hands_defense=True,
+    )
+
+    ranger = turn.rangers[0]
+    strategy._decide_ranger(ranger, context, (), offensive=True)
+
+    decision = next(
+        item for item in context.report.decisions if item.actor_id == str(ranger.id)
+    )
+    assert "Core" not in decision.reason
+    action = turn.plan.unit_actions.get(ranger.id)
+    if action is not None and action.type == "MOVE":
+        destination = add(ranger.position, action.direction)
+        assert manhattan(destination, (0, 0)) >= manhattan(ranger.position, (0, 0))
 
 
 def test_expedition_breaks_a_short_combat_route_loop() -> None:

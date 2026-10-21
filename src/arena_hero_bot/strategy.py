@@ -180,6 +180,7 @@ EARLY_COMBAT_MIN_UNITS = 2
 EARLY_COMBAT_GUARD_WORKERS = 4
 GARRISON_MIN_GUARDS = 3
 GARRISON_ROSTER_SHARE = 4
+ALL_HANDS_DEFENSE_MIN_ENEMIES = 3
 RAID_ABORT_SCAN_RADIUS = 6
 # Active-offense ("expedition") posture: a fixed formation saturates the Core
 # neighbourhood while everything built beyond it is sent out on independent,
@@ -407,6 +408,7 @@ class _TurnContext:
     perimeter_intercept_ids: frozenset[UUID] = field(default_factory=frozenset)
     perimeter_intercept_anchor: Position | None = None
     emergency: bool = False
+    all_hands_defense: bool = False
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
 
@@ -622,6 +624,10 @@ class AggressiveStrategy:
             self._emergency_combat_mode(turn, recent_enemies)
             or threat.requires_coordination
         )
+        all_hands_defense = emergency and self._all_hands_defense(
+            turn,
+            tactical_enemies,
+        )
         report = DecisionReport(
             tick=turn.tick,
             visible_enemies=len(turn.visible_enemies),
@@ -690,6 +696,7 @@ class AggressiveStrategy:
             perimeter_intercept_ids=perimeter_intercept_ids,
             perimeter_intercept_anchor=perimeter_anchor,
             emergency=emergency,
+            all_hands_defense=all_hands_defense,
             garrison_ids=garrison_ids,
             raid_ids=raid_ids,
         )
@@ -881,6 +888,7 @@ class AggressiveStrategy:
             context.turn,
             fleet_wide=(context.emergency and ranger.id not in context.garrison_ids)
             or ranger.id in context.raid_ids,
+            shared_defense=(context.all_hands_defense and not expedition_member),
             intercept_ids=context.intruder_intercept_ids,
             converge_ids=context.perimeter_intercept_ids,
         )
@@ -1149,9 +1157,8 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
-        if self._is_expedition_member(
-            vanguard, context.turn
-        ) and self._decide_expedition_vanguard(vanguard, context):
+        expedition_member = self._is_expedition_member(vanguard, context.turn)
+        if expedition_member and self._decide_expedition_vanguard(vanguard, context):
             return
         remote_assault = (
             context.combat_assault
@@ -1171,6 +1178,7 @@ class AggressiveStrategy:
             context.turn,
             fleet_wide=(context.emergency and vanguard.id not in context.garrison_ids)
             or vanguard.id in context.raid_ids,
+            shared_defense=(context.all_hands_defense and not expedition_member),
             intercept_ids=context.intruder_intercept_ids,
             converge_ids=context.perimeter_intercept_ids,
         )
@@ -3411,6 +3419,7 @@ class AggressiveStrategy:
         turn: Turn,
         *,
         fleet_wide: bool = False,
+        shared_defense: bool = False,
         intercept_ids: frozenset[UUID] = frozenset(),
         converge_ids: frozenset[UUID] = frozenset(),
     ) -> tuple[CoreView | UnitView, ...]:
@@ -3425,6 +3434,11 @@ class AggressiveStrategy:
         to the roaming squad too, which meant a single Worker sighting forty
         cells out pulled the whole roaming third onto it -- exactly the
         open-ended commitment the movement leash exists to prevent.
+
+        ``shared_defense`` carries the same contact picture to the whole local
+        formation when a massed assault is already converging on the Core.  It
+        only advertises hostile fighters inside the defensive leash; it never
+        widens the movement leash or assigns an expedition member back home.
 
         ``converge_ids`` is the same narrow grant for a lone fighter already
         inside the defensive leash.  Surrounding an equal-speed target needs
@@ -3451,6 +3465,14 @@ class AggressiveStrategy:
             )
             or (
                 converging
+                and isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and core is not None
+                and manhattan(core.position, enemy.position)
+                <= self.config.combat_pursuit_radius
+            )
+            or (
+                shared_defense
                 and isinstance(enemy, UnitView)
                 and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
                 and core is not None
@@ -4016,6 +4038,38 @@ class AggressiveStrategy:
             and manhattan(core.position, enemy.position) <= 12
         )
         return len(nearby_combat) >= 3
+
+    def _all_hands_defense(
+        self,
+        turn: Turn,
+        tactical_enemies: tuple[EnemySighting, ...],
+    ) -> bool:
+        """Share a massed Core assault with every local combat unit.
+
+        The fixed garrison exists to avoid pulling the whole ring after a
+        single contact.  It must not keep the far side idle while three or
+        more fighters converge on the Core: the defenders already on station
+        cannot win that exchange alone.  Recent sightings provide a little
+        hysteresis when enemy vision flickers, while the Core-relative radius
+        keeps this a local defensive response rather than a distant chase.
+        """
+
+        core = turn.core
+        if core is None:
+            return False
+        nearby_ids = {
+            enemy.object_id
+            for enemy in tactical_enemies
+            if enemy.kind == "UNIT"
+            and enemy.unit_type
+            in {
+                UnitType.VANGUARD.value,
+                UnitType.RANGER.value,
+            }
+            and manhattan(core.position, enemy.position)
+            <= self.config.combat_alert_radius
+        }
+        return len(nearby_ids) >= ALL_HANDS_DEFENSE_MIN_ENEMIES
 
     def _decline_ranger_duel(
         self,
@@ -7159,6 +7213,19 @@ class AggressiveStrategy:
                 )
             )
         ]
+        if not candidates and defensive and context.all_hands_defense:
+            # A massed firing line can cover every range-three cell around
+            # the current target.  Close to a safe overwatch cell at range
+            # four or five instead: outside Ranger reach, but ready to take
+            # the first firing lane that opens.  New enemy attack sources
+            # remain prohibited by the same test above.
+            candidates = self._all_hands_overwatch_cells(
+                target_position,
+                ranger.position,
+                context,
+                obstacles,
+                current_attackers,
+            )
         if not candidates:
             return None
         return min(
@@ -7170,6 +7237,47 @@ class AggressiveStrategy:
                 position,
             ),
         )
+
+    def _all_hands_overwatch_cells(
+        self,
+        target: Position,
+        origin: Position,
+        context: _TurnContext,
+        obstacles: set[Position] | frozenset[Position],
+        current_attackers: set[str],
+    ) -> list[Position]:
+        """Find safe approach cells just outside a crowded firing line."""
+
+        offsets = (
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+            (0, 1),
+            (-1, 1),
+            (-1, 0),
+        )
+        return [
+            position
+            for distance in (RANGER_STANDOFF_RANGE + 1, RANGER_VISION_RADIUS)
+            for dx, dy in offsets
+            for position in ((target[0] + dx * distance, target[1] + dy * distance),)
+            if position not in obstacles
+            and position not in context.enemy_positions
+            and manhattan(origin, position) < manhattan(origin, target)
+            and not (
+                {
+                    str(enemy.id)
+                    for enemy in self._visible_attackers_at(
+                        position,
+                        context.turn,
+                        obstacles,
+                    )
+                }
+                - current_attackers
+            )
+        ]
 
     @staticmethod
     def _ranger_range(origin: Position, target: Position) -> int:
