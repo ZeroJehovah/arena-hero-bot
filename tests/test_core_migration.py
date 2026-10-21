@@ -196,6 +196,27 @@ def test_migration_skips_pause_when_the_economy_is_empty() -> None:
     assert memory.core_migration_pause_until_tick == -1
 
 
+def test_core_steps_into_a_cell_with_one_friendly_unit() -> None:
+    memory = WorldMemory(
+        core_home_position=(3, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 0)),
+        ],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
+
+
 def test_loaded_worker_blocking_core_step_opens_immediate_deposit_halt() -> None:
     core_object = core()
     memory = WorldMemory(
@@ -210,8 +231,9 @@ def test_loaded_worker_blocking_core_step_opens_immediate_deposit_halt() -> None
         objects=[
             core_object,
             unit(2, "WORKER", position=(1, 0), cargo=1),
+            unit(3, "WORKER", position=(1, 0)),
         ],
-        obstacles=[(0, 1), (0, -1), (-1, 0)],
+        obstacles=[(0, 1), (0, -1), (-1, 0), (1, 1), (1, -1), (2, 0)],
     )
 
     report = _strategy(memory).decide(turn)
@@ -240,8 +262,9 @@ def test_critical_unit_blocking_core_step_opens_immediate_service_halt() -> None
         objects=[
             core_object,
             unit(2, "RANGER", position=(1, 0), hp=1),
+            unit(3, "WORKER", position=(1, 0)),
         ],
-        obstacles=[(0, 1), (0, -1), (-1, 0)],
+        obstacles=[(0, 1), (0, -1), (-1, 0), (1, 1), (1, -1), (2, 0)],
     )
 
     report = _strategy(memory).decide(turn)

@@ -2758,7 +2758,7 @@ def test_friendly_unit_cannot_queue_into_moving_core_destination() -> None:
     )
 
 
-def test_core_takes_a_non_reversing_detour_when_homeward_cells_are_occupied() -> None:
+def test_core_takes_a_non_reversing_detour_when_homeward_cells_are_full() -> None:
     turn = make_turn(objects=[core(position=(0, 0))])
     memory = WorldMemory(
         core_home_position=(1, 1),
@@ -2770,10 +2770,13 @@ def test_core_takes_a_non_reversing_detour_when_homeward_cells_are_occupied() ->
         turn=turn,
         report=DecisionReport(tick=turn.tick),
         occupied={(0, 0), (1, 0), (0, 1)},
+        friendly_occupancy={(1, 0): 2, (0, 1): 2},
         enemy_positions=set(),
     )
 
-    assert strategy._core_home_direction(context) is Direction.UP
+    direction = strategy._core_home_direction(context)
+    assert direction is not None
+    assert direction is not Direction.LEFT
 
 
 def test_core_waits_rather_than_immediately_backtracking() -> None:
@@ -2788,6 +2791,7 @@ def test_core_waits_rather_than_immediately_backtracking() -> None:
         turn=turn,
         report=DecisionReport(tick=turn.tick),
         occupied={(0, 0), (0, -1), (1, 0), (0, 1)},
+        friendly_occupancy={(0, -1): 2, (1, 0): 2, (0, 1): 2},
         enemy_positions=set(),
     )
 

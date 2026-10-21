@@ -6235,10 +6235,16 @@ class AggressiveStrategy:
             self._commit_symmetric_home(target)
         if target is None or core.position == target:
             return None
+        occupied_to_capacity = {
+            position
+            for position in context.occupied
+            if self._predicted_friendly_occupancy(position, context) >= 2
+        }
         blocked = (
             obstacles
             | set(context.turn.resource_cells)
-            | set(context.occupied)
+            | context.enemy_positions
+            | occupied_to_capacity
             | context.reserved
         ) - {core.position}
         recent = self.memory.recent_positions(str(core.id))
