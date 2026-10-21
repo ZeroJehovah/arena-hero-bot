@@ -22,7 +22,6 @@ from arena_hero_bot.migration import (
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
     CORE_MIGRATION_PAUSE_MAX_TICKS,
-    CORE_MIGRATION_PAUSE_MIN_TICKS,
     AggressiveStrategy,
     StrategyConfig,
     _resource_block_center_cells,
@@ -147,7 +146,7 @@ def test_committed_migration_resets_identity_and_tuning_state() -> None:
         strategy.request_core_migration((0, 0))
 
 
-def test_migration_batch_waits_for_economy_then_resumes() -> None:
+def test_arrival_deposit_and_next_core_move_share_a_tick() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -156,31 +155,18 @@ def test_migration_batch_waits_for_economy_then_resumes() -> None:
     )
     strategy = _strategy(memory)
     workers = _workers()
-    workers[0]["cargo"] = 1
+    workers[0] = unit(100, "WORKER", position=(0, 0), cargo=1)
     turn = make_turn(tick=100, objects=[core(), *workers])
 
-    report = strategy.decide(turn)
+    strategy.decide(turn)
 
-    assert turn.plan.core_action is None
-    assert any(
-        item.reason == "hold the migration batch for Worker deposits"
-        for item in report.decisions
-    )
-    assert (
-        memory.core_migration_pause_until_tick == 100 + CORE_MIGRATION_PAUSE_MAX_TICKS
-    )
-
-    resumed = make_turn(
-        tick=100 + CORE_MIGRATION_PAUSE_MIN_TICKS,
-        objects=[core(), *_workers()],
-    )
-    strategy.decide(resumed)
-    assert resumed.plan.core_action is not None
-    assert resumed.plan.core_action.type == "START_MOVE"
+    assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
     assert memory.core_migration_pause_until_tick == -1
 
 
-def test_migration_skips_pause_when_the_economy_is_empty() -> None:
+def test_migration_does_not_pause_every_eight_steps() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -217,7 +203,7 @@ def test_core_steps_into_a_cell_with_one_friendly_unit() -> None:
     assert turn.plan.core_action.direction.value == "RIGHT"
 
 
-def test_loaded_worker_blocking_core_step_opens_immediate_deposit_halt() -> None:
+def test_unstaged_loaded_worker_opens_a_short_arrival_wait() -> None:
     core_object = core()
     memory = WorldMemory(
         core_home_position=(3, 0),
@@ -239,11 +225,9 @@ def test_loaded_worker_blocking_core_step_opens_immediate_deposit_halt() -> None
     report = _strategy(memory).decide(turn)
 
     assert turn.plan.core_action is None
-    assert memory.core_migration_pause_until_tick == (
-        100 + CORE_MIGRATION_PAUSE_MAX_TICKS
-    )
+    assert memory.core_migration_pause_until_tick == 101
     assert any(
-        item.reason == "hold for a loaded Worker blocking the Core approach"
+        item.reason == "wait briefly for a loaded Worker to enter the service cell"
         for item in report.decisions
     )
 
@@ -310,40 +294,7 @@ def test_migration_pause_clears_non_service_unit_from_core_cell() -> None:
     )
 
 
-def test_migration_pause_waits_for_the_loaded_queue_to_drain() -> None:
-    memory = WorldMemory(
-        core_home_position=(8, 0),
-        core_layout_version=CORE_LAYOUT_VERSION,
-        core_migration_last_position=(1, 0),
-        core_migration_steps_since_pause=7,
-    )
-    strategy = _strategy(memory)
-    loaded = [unit(2, "WORKER", position=(1, 0), cargo=1)]
-    start = make_turn(tick=100, objects=[core(), *loaded])
-
-    strategy.decide(start)
-
-    still_loaded = make_turn(
-        tick=100 + CORE_MIGRATION_PAUSE_MIN_TICKS,
-        objects=[core(), *loaded],
-    )
-    report = strategy.decide(still_loaded)
-    assert still_loaded.plan.core_action is None
-    assert any(
-        item.reason == "hold the migration batch for Worker deposits"
-        for item in report.decisions
-    )
-
-    capped = make_turn(
-        tick=100 + CORE_MIGRATION_PAUSE_MAX_TICKS,
-        objects=[core(), *loaded],
-    )
-    strategy.decide(capped)
-    assert capped.plan.core_action is not None
-    assert capped.plan.core_action.type == "START_MOVE"
-
-
-def test_loaded_worker_deposits_during_migration_pause() -> None:
+def test_loaded_worker_deposits_on_arrival_without_a_pause() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -355,9 +306,12 @@ def test_loaded_worker_deposits_during_migration_pause() -> None:
     _strategy(memory).decide(turn)
 
     assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert memory.core_migration_pause_until_tick == -1
 
 
-def test_loaded_worker_follows_moving_core_and_holds_close() -> None:
+def test_loaded_worker_stages_at_moving_core_destination() -> None:
     moving = make_turn(
         objects=[
             core(
@@ -388,9 +342,11 @@ def test_loaded_worker_follows_moving_core_and_holds_close() -> None:
         ]
     )
     report = _strategy(WorldMemory()).decide(near)
-    assert near.workers[0].id not in near.plan.unit_actions
+    action = near.plan.unit_actions[near.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction.value == "LEFT"
     assert any(
-        item.reason == "hold loaded cargo at the moving Core approach"
+        item.reason == "stage carried resources at the Core arrival cell"
         for item in report.decisions
     )
 

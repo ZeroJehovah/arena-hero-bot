@@ -297,16 +297,13 @@ CORE_QUEUE_RADIUS = 4
 # exclusion disk.  The explicit destination check below remains authoritative
 # throughout the four-Tick move.
 CORE_MIGRATION_CLEAR_RADIUS = 1
-# A moving Core cannot receive deposits.  Break long walks into eight-cell
-# batches with recurring stops: one Worker can enter the Core service cell at
-# a time, so a fixed eight-Tick pause leaves most of a loaded economy group
-# blocked.  Stay for at least eight Ticks, resume as soon as no Worker carries
-# cargo, and cap the halt at 32 Ticks so even a full 16-Worker group can keep
-# making progress.  The schedule is persisted because a pause commonly spans
-# snapshots that contain a MOVING Core.
-CORE_MIGRATION_STEP_BATCH = 8
-CORE_MIGRATION_PAUSE_MIN_TICKS = 8
-CORE_MIGRATION_PAUSE_MAX_TICKS = 32
+# A moving Core cannot receive deposits, but deposits resolve before the Core
+# action.  A loaded Worker staged on the arrival cell can therefore deposit and
+# begin the next four-Tick migration in the same Tick.  Keep a four-Tick
+# fallback halt for exceptional traffic or healing blocks; normal migration no
+# longer waits after a fixed number of steps.
+CORE_MIGRATION_PAUSE_MIN_TICKS = 1
+CORE_MIGRATION_PAUSE_MAX_TICKS = 4
 # While the Core is between homes, keep the eight patrol Rangers on a compact
 # ring around its current cell instead of teleporting their duty to the final
 # chunk edge.
@@ -765,10 +762,10 @@ class AggressiveStrategy:
             return True
 
         deadlined = False
-        if self._migration_pause_active(turn):
-            # Clear combat or unloaded units before Ranger/Vanguard planning.
-            # A full Core service cell otherwise blocks the entire deposit
-            # window even though those units have no service action pending.
+        if turn.core is not None and self._core_migration_in_progress(turn.core.view):
+            # Preserve the arrival-cell service slot before combat planning.
+            # On a NORMAL arrival Tick the loaded Worker can deposit and the
+            # Core can still begin its next four-Tick move in the same plan.
             self._prepare_core_departure(context)
         combat_units = [
             unit
@@ -1683,19 +1680,37 @@ class AggressiveStrategy:
             return
 
         if self._core_migration_in_progress(core.view):
-            if (
-                self._core_approach_locked(context.turn)
-                and manhattan(worker.position, core.position)
-                <= CORE_MIGRATION_CLEAR_RADIUS
-            ):
-                if worker.cargo > 0:
-                    self.memory.clear_goal(str(worker.id))
+            if worker.cargo > 0 and not self._core_accepts_deposits(context.turn):
+                self.memory.clear_goal(str(worker.id))
+                arrival = core.view.destination or core.position
+                if worker.position == arrival:
                     self._record_wait(
                         worker,
                         context,
-                        "hold loaded cargo at the moving Core approach",
+                        "wait at the Core arrival cell for in-transit delivery",
                     )
                     return
+                if self._move(
+                    worker,
+                    arrival,
+                    context,
+                    reason="stage carried resources at the Core arrival cell",
+                    allow_goal=True,
+                    intent=_MoveIntent.INBOUND,
+                ):
+                    return
+                self._record_wait(
+                    worker,
+                    context,
+                    "wait for a path to the Core arrival cell",
+                )
+                return
+            if (
+                self._core_approach_locked(context.turn)
+                and not (worker.cargo > 0 and self._core_accepts_deposits(context.turn))
+                and manhattan(worker.position, core.position)
+                <= CORE_MIGRATION_CLEAR_RADIUS
+            ):
                 if self._move_to_moving_core_hold(
                     worker,
                     context,
@@ -1706,32 +1721,6 @@ class AggressiveStrategy:
                     worker,
                     context,
                     "hold outside the moving Core approach",
-                )
-                return
-            if worker.cargo > 0 and not self._core_accepts_deposits(context.turn):
-                self.memory.clear_goal(str(worker.id))
-                if manhattan(worker.position, core.position) <= (
-                    CORE_MIGRATION_CLEAR_RADIUS + 1
-                ):
-                    self._record_wait(
-                        worker,
-                        context,
-                        "hold loaded cargo at the moving Core approach",
-                    )
-                    return
-                if self._move(
-                    worker,
-                    core.position,
-                    context,
-                    reason="follow the moving Core to its next deposit halt",
-                    allow_goal=True,
-                    intent=_MoveIntent.INBOUND,
-                ):
-                    return
-                self._record_wait(
-                    worker,
-                    context,
-                    "wait at the moving Core approach for the next deposit halt",
                 )
                 return
 
@@ -2027,7 +2016,7 @@ class AggressiveStrategy:
         return home is not None and core.position != home
 
     def _observe_core_migration(self, turn: Turn) -> None:
-        """Advance the durable walk-pause schedule from authoritative cells."""
+        """Track migration progress and release fallback service halts."""
 
         core = turn.core
         home = self.memory.core_home_position
@@ -2044,9 +2033,8 @@ class AggressiveStrategy:
             and turn.tick >= pause_started + CORE_MIGRATION_PAUSE_MIN_TICKS
             and all(worker.cargo == 0 for worker in turn.workers)
         ):
-            # A load normally clears in two Ticks per Worker because only one
-            # extra entity fits on the Core service cell.  Do not spend the
-            # full drain budget when every Worker is already empty.
+            # Fallback halts exist only to clear a blocked approach or service
+            # cell.  Release them as soon as the queue is empty.
             self.memory.core_migration_pause_until_tick = -1
 
         previous = self.memory.core_migration_last_position
@@ -2058,22 +2046,12 @@ class AggressiveStrategy:
         if manhattan(previous, core.position) == 1:
             self.memory.core_migration_steps_since_pause += 1
         else:
-            # Respawning or any non-cardinal jump starts a fresh batch.  The
-            # next ordinary Core step will establish the new route baseline.
+            # Respawning or any non-cardinal jump resets the progress baseline.
             self.memory.core_migration_steps_since_pause = 0
         self.memory.core_migration_last_position = core.position
-        if self.memory.core_migration_steps_since_pause >= CORE_MIGRATION_STEP_BATCH:
-            self.memory.core_migration_steps_since_pause = 0
-            # Without cargo a halt cannot produce a deposit; keep walking and
-            # let the next batch stop only when the economy has work to unload.
-            if any(worker.cargo > 0 for worker in turn.workers):
-                self.memory.core_migration_pause_until_tick = max(
-                    self.memory.core_migration_pause_until_tick,
-                    turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
-                )
 
     def _migration_pause_active(self, turn: Turn) -> bool:
-        """Return whether the current migration batch is stopped for deposits."""
+        """Return whether an exceptional migration service halt is active."""
 
         core = turn.core
         home = self.memory.core_home_position
@@ -2085,15 +2063,10 @@ class AggressiveStrategy:
         )
 
     def _core_accepts_deposits(self, turn: Turn) -> bool:
-        """Whether a stationary Core can receive cargo on this command Tick."""
+        """Whether the Core is stationary for this command Tick."""
 
         core = turn.core
-        if core is None or core.view.state is not CoreState.NORMAL:
-            return False
-        home = self.memory.core_home_position
-        return (
-            home is None or core.position == home or self._migration_pause_active(turn)
-        )
+        return core is not None and core.view.state is CoreState.NORMAL
 
     def _core_approach_locked(self, turn: Turn) -> bool:
         """Keep the moving Core's immediate approach clear outside pause Ticks."""
@@ -2372,7 +2345,7 @@ class AggressiveStrategy:
                 ),
                 None,
             )
-        migration_deposit_waiting = self._migration_pause_active(context.turn) and any(
+        migration_service_window = self._core_migration_in_progress(core.view) and any(
             worker.cargo > 0 for worker in context.turn.workers
         )
         for unit in sorted(core_units, key=lambda candidate: candidate.id.bytes):
@@ -2386,7 +2359,7 @@ class AggressiveStrategy:
                 unit.cargo > 0 and context.remaining_resource_space <= 0
             )
             extra_service_unit = (
-                service_candidate is not None or migration_deposit_waiting
+                service_candidate is not None or migration_service_window
             )
             if not (
                 critical_without_service or full_loaded_worker or extra_service_unit
@@ -2535,7 +2508,35 @@ class AggressiveStrategy:
                     actor_id=str(core.id),
                     actor_kind="CORE",
                     action="WAIT",
-                    reason="hold the migration batch for Worker deposits",
+                    reason="hold an exceptional migration service halt",
+                    target=core.position,
+                )
+                return
+            loaded_workers = [
+                worker for worker in context.turn.workers if worker.cargo > 0
+            ]
+            service_ready = any(
+                worker.position == core.position for worker in loaded_workers
+            )
+            if service_ready:
+                self.memory.core_migration_pause_until_tick = -1
+            elif loaded_workers and self.memory.core_migration_pause_until_tick == -1:
+                nearest = min(
+                    manhattan(worker.position, core.position)
+                    for worker in loaded_workers
+                )
+                wait_ticks = min(
+                    CORE_MIGRATION_PAUSE_MAX_TICKS,
+                    max(1, nearest),
+                )
+                self.memory.core_migration_pause_until_tick = (
+                    context.turn.tick + wait_ticks
+                )
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="WAIT",
+                    reason="wait briefly for a loaded Worker to enter the service cell",
                     target=core.position,
                 )
                 return
@@ -2563,11 +2564,9 @@ class AggressiveStrategy:
                     for unit in context.turn.units
                 )
                 if blocked_by_loaded_worker or blocked_by_critical_unit:
-                    # A loaded Worker holds at the moving Core approach so it
-                    # cannot overtake the Core.  A critical unit also needs to
-                    # enter for healing.  If either occupies the only legal
-                    # next step, waiting for the eight-step batch would
-                    # deadlock both actors.  Open a service halt now.
+                    # A loaded Worker or critical unit can occupy the only
+                    # legal next step.  Open a short fallback halt so it can
+                    # service or clear the approach without stalling migration.
                     self.memory.core_migration_pause_until_tick = max(
                         self.memory.core_migration_pause_until_tick,
                         context.turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
@@ -3215,15 +3214,30 @@ class AggressiveStrategy:
         ):
             return False
         core = context.turn.core
-        if (
+        moving_core_destination = (
             core is not None
             and core.view.state is CoreState.MOVING
             and destination == core.view.destination
-        ):
-            return False
-        if (
+        )
+        stationary_core_service = (
+            core is not None
+            and core.view.state is CoreState.NORMAL
+            and destination == core.position
+            and isinstance(unit, Worker)
+            and unit.cargo > 0
+        )
+        predicted = self._predicted_friendly_occupancy(destination, context)
+        if moving_core_destination:
+            # The Core occupies one of the destination cell's two slots.  Only
+            # a loaded Worker may reserve the other slot for the arrival Tick.
+            if predicted >= 1:
+                return False
+            if not isinstance(unit, Worker) or unit.cargo <= 0:
+                return False
+        elif (
             core is not None
             and self._core_approach_locked(context.turn)
+            and not stationary_core_service
             and manhattan(destination, core.position) <= CORE_MIGRATION_CLEAR_RADIUS
             and manhattan(destination, core.position)
             <= manhattan(unit.position, core.position)
@@ -3233,7 +3247,6 @@ class AggressiveStrategy:
             # inside may still move outward; nobody may enter or move laterally
             # within it.
             return False
-        predicted = self._predicted_friendly_occupancy(destination, context)
         if intent is _MoveIntent.STAND:
             if predicted != 0:
                 return False

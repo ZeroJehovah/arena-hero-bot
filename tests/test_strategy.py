@@ -2631,7 +2631,7 @@ def test_core_stays_receptive_while_worker_returns_cargo() -> None:
     assert turn.plan.core_action is None
 
 
-def test_loaded_worker_holds_outside_migrating_core_destination() -> None:
+def test_loaded_worker_reserves_migrating_core_destination() -> None:
     turn = make_turn(
         objects=[
             core(
@@ -2648,14 +2648,16 @@ def test_loaded_worker_holds_outside_migrating_core_destination() -> None:
 
     report = decide(turn)
 
-    assert turn.workers[0].id not in turn.plan.unit_actions
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
     assert any(
-        item.reason == "hold loaded cargo at the moving Core approach"
+        item.reason == "stage carried resources at the Core arrival cell"
         for item in report.decisions
     )
 
 
-def test_worker_never_deposits_while_core_is_migrating() -> None:
+def test_worker_does_not_deposit_while_core_is_moving() -> None:
     turn = make_turn(
         objects=[
             core(
@@ -2671,9 +2673,11 @@ def test_worker_never_deposits_while_core_is_migrating() -> None:
 
     report = decide(turn)
 
-    assert turn.workers[0].id not in turn.plan.unit_actions
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.RIGHT
     assert any(
-        item.reason == "hold loaded cargo at the moving Core approach"
+        item.reason == "stage carried resources at the Core arrival cell"
         for item in report.decisions
     )
 
@@ -2698,12 +2702,12 @@ def test_worker_follows_far_cargo_toward_a_migrating_core() -> None:
     assert action.type == "MOVE"
     assert action.direction is Direction.LEFT
     assert any(
-        item.reason == "follow the moving Core to its next deposit halt"
+        item.reason == "stage carried resources at the Core arrival cell"
         for item in report.decisions
     )
 
 
-def test_loaded_worker_holds_between_migration_steps() -> None:
+def test_loaded_worker_approaches_stationary_core_service_cell() -> None:
     turn = make_turn(
         objects=[
             core(position=(0, 0)),
@@ -2715,20 +2719,18 @@ def test_loaded_worker_holds_between_migration_steps() -> None:
         core_layout_version=CORE_LAYOUT_VERSION,
     )
 
-    report = decide(
+    decide(
         turn,
         memory=memory,
         config=StrategyConfig(target_workers=16, expedition_mode=True),
     )
 
-    assert turn.workers[0].id not in turn.plan.unit_actions
-    assert any(
-        item.reason == "hold loaded cargo at the moving Core approach"
-        for item in report.decisions
-    )
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
 
 
-def test_friendly_unit_cannot_queue_into_moving_core_destination() -> None:
+def test_one_loaded_worker_can_reserve_moving_core_destination() -> None:
     turn = make_turn(
         objects=[
             core(
@@ -2749,11 +2751,42 @@ def test_friendly_unit_cannot_queue_into_moving_core_destination() -> None:
         enemy_positions=set(),
     )
 
+    assert strategy._queue_move(
+        turn.workers[0],
+        Direction.LEFT,
+        context,
+        reason="test Core destination service slot",
+        target=(1, 0),
+    )
+
+
+def test_second_unit_cannot_overfill_moving_core_destination() -> None:
+    turn = make_turn(
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+            unit(3, "WORKER", position=(1, 0), cargo=1),
+        ]
+    )
+    strategy = AggressiveStrategy(WorldMemory(), StrategyConfig(target_workers=2))
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={(0, 0), (1, 0), (2, 0)},
+        enemy_positions=set(),
+    )
+
     assert not strategy._queue_move(
         turn.workers[0],
         Direction.LEFT,
         context,
-        reason="test blocked Core destination",
+        reason="test full Core destination",
         target=(1, 0),
     )
 
@@ -7064,7 +7097,7 @@ def test_symmetric_posture_selects_and_starts_migration_to_clear_home() -> None:
     )
 
 
-def test_symmetric_posture_migrates_while_worker_returns_cargo() -> None:
+def test_symmetric_posture_waits_briefly_for_nearby_cargo() -> None:
     config = expedition_config(target_workers=16)
     memory = WorldMemory(core_home_position=(0, 4))
     strategy = AggressiveStrategy(memory, config)
@@ -7076,9 +7109,10 @@ def test_symmetric_posture_migrates_while_worker_returns_cargo() -> None:
 
     report = strategy.decide(turn)
 
-    assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
-    assert any("symmetric-defense home" in item.reason for item in report.decisions)
+    assert turn.plan.core_action is None
+    assert any(
+        "wait briefly for a loaded Worker" in item.reason for item in report.decisions
+    )
 
 
 def test_core_at_symmetric_home_returns_to_normal_healing() -> None:
