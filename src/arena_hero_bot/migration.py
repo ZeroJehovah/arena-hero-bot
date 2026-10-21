@@ -89,19 +89,39 @@ def resource_block_quota(block: Position) -> int:
     """Return the natural-resource quota for one 32x32 block."""
 
     ring = resource_block_ring(block)
+    return _resource_quota_at_ring(ring)
+
+
+def _resource_quota_at_ring(ring: int) -> int:
     return max(2, (16 * 8) // (8 + ring))
 
 
 def next_resource_tier_ring(current_ring: int) -> int | None:
     """Return the highest inner ring whose quota exceeds the current one."""
 
-    current_quota = max(2, (16 * 8) // (8 + current_ring))
+    current_quota = _resource_quota_at_ring(current_ring)
     higher = [
         ring
         for ring in range(current_ring)
-        if max(2, (16 * 8) // (8 + ring)) > current_quota
+        if _resource_quota_at_ring(ring) > current_quota
     ]
     return max(higher) if higher else None
+
+
+def resource_quota_outer_ring(target_quota: int) -> int | None:
+    """Return the outermost ring that still provides ``target_quota``.
+
+    Moving to that ring crosses the fewest outer cells while guaranteeing the
+    requested quota.  The tier boundaries are intentionally the same ones the
+    game uses: ring 34 still has quota 3, ring 24 has quota 4.
+    """
+
+    if target_quota <= 2:
+        return None
+    rings = [
+        ring for ring in range(128) if _resource_quota_at_ring(ring) >= target_quota
+    ]
+    return max(rings) if rings else None
 
 
 def _blocks_on_ring(ring: int) -> tuple[Position, ...]:
@@ -142,6 +162,66 @@ def plan_next_resource_tier(
     target_ring = next_resource_tier_ring(current_ring)
     if target_ring is None:
         return None
+    target_quota = _resource_quota_at_ring(target_ring)
+    return _plan_quota_tier(
+        memory,
+        origin=origin,
+        current_block=current_block,
+        current_ring=current_ring,
+        target_ring=target_ring,
+        target_quota=target_quota,
+    )
+
+
+def plan_resource_quota(
+    memory: WorldMemory,
+    target_quota: int,
+    *,
+    current_position: Position | None = None,
+) -> MigrationPlan | None:
+    """Pick the outermost center ring that guarantees ``target_quota``.
+
+    Unlike :func:`plan_next_resource_tier`, this accepts an explicit campaign
+    stage target.  A Core still outside quota 2 territory can therefore aim
+    directly at the quota-3 boundary, and a later stage can switch to quota 4
+    without first pretending it had already reached the intermediate ring.
+    """
+
+    origin = (
+        current_position
+        or memory.core_migration_last_position
+        or memory.core_home_position
+    )
+    if origin is None:
+        return None
+    current_block = resource_block_index(origin)
+    current_ring = resource_block_ring(current_block)
+    current_quota = _resource_quota_at_ring(current_ring)
+    if target_quota <= current_quota:
+        return None
+    target_ring = resource_quota_outer_ring(target_quota)
+    if target_ring is None or target_ring >= current_ring:
+        return None
+    return _plan_quota_tier(
+        memory,
+        origin=origin,
+        current_block=current_block,
+        current_ring=current_ring,
+        target_ring=target_ring,
+        target_quota=target_quota,
+    )
+
+
+def _plan_quota_tier(
+    memory: WorldMemory,
+    *,
+    origin: Position,
+    current_block: Position,
+    current_ring: int,
+    target_ring: int,
+    target_quota: int,
+) -> MigrationPlan | None:
+    """Search the center cells of one quota-boundary block ring."""
 
     blocked = memory.obstacles | set(memory.resource_cells)
     candidates: list[tuple[int, int, int, int, Position, Position]] = []
@@ -205,7 +285,7 @@ def plan_next_resource_tier(
         current_quota=resource_block_quota(current_block),
         target_block=block,
         target_ring=target_ring,
-        target_quota=resource_block_quota(block),
+        target_quota=target_quota,
         target=target,
         estimated_cells=distance,
         block_rocks=block_rocks,

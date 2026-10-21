@@ -261,6 +261,20 @@ SYMMETRIC_DEFENSE_RANGERS = 16
 SYMMETRIC_RESOURCE_BLOCK_SIZE = 32
 SYMMETRIC_PATROL_RING_UNITS = 8
 SYMMETRIC_CORE_RADIUS = 13
+# Campaign posture replaces the old fixed 4V+24R roster with four explicit
+# stages.  The first two stages build the economy and a Ranger-only local
+# screen; only a completed stage-2 formation is allowed to train expeditions.
+CAMPAIGN_PHASE_NONE = 0
+CAMPAIGN_PHASE_STAGE1 = 1
+CAMPAIGN_PHASE_STAGE2 = 2
+CAMPAIGN_PHASE_STAGE3 = 3
+CAMPAIGN_PHASE_STAGE4 = 4
+CAMPAIGN_STAGE1_WORKERS = 12
+CAMPAIGN_STAGE1_DEFENSE_RANGERS = 8
+CAMPAIGN_STAGE2_WORKERS = 16
+CAMPAIGN_STAGE2_DEFENSE_RANGERS = 20
+CAMPAIGN_STAGE2_PATROL_RANGERS = 8
+CAMPAIGN_LEG_CELLS = 32
 # The clear-terrain template covers a radius-20 Manhattan disk.  On a remembered
 # rock map the same roster is reflowed inside successively smaller rings until
 # every traversable cell inside the ring is visible.  Ten is the floor at which
@@ -369,6 +383,7 @@ class StrategyConfig:
     planning_time_limit: float = 10.0
     planning_soft_budget: float = 3.5
     expedition_mode: bool = False
+    campaign_mode: bool = False
 
 
 @dataclass(slots=True)
@@ -483,7 +498,14 @@ class AggressiveStrategy:
         # Obstacle-aware symmetric posts are expensive to optimize.  Cache both
         # their ring radius and the local rock fingerprint that produced them.
         self._symmetric_defense_cache: (
-            tuple[Position, tuple[Position, ...], tuple[Position, ...], int] | None
+            tuple[
+                Position,
+                tuple[Position, ...],
+                tuple[Position, ...],
+                int,
+                int,
+            ]
+            | None
         ) = None
         # The roaming squad, cached against the roster it was drawn from so
         # membership only changes when a combat unit is built or dies.
@@ -606,8 +628,12 @@ class AggressiveStrategy:
         self._record_sweep_results(turn)
         self.memory.observe(turn)
         self._worker_view_cache = {}
+        if self.config.campaign_mode:
+            self._observe_campaign_state(turn)
         if self.config.expedition_mode:
             self._reconcile_unit_roles(turn)
+            if self.config.campaign_mode:
+                self._advance_campaign_phase(turn)
             if self._symmetric_posture():
                 self._ensure_symmetric_layout(turn)
             self._observe_core_migration(turn)
@@ -2095,6 +2121,18 @@ class AggressiveStrategy:
             return
         if manhattan(previous, core.position) == 1:
             self.memory.core_migration_steps_since_pause += 1
+            if self.config.campaign_mode:
+                self.memory.campaign_leg_steps += 1
+                # One completed Core step consumes four move Ticks.  Reserve
+                # the following Tick for one deposit/heal service action so a
+                # normal campaign cycle is exactly five Ticks per cell.
+                self.memory.core_migration_pause_until_tick = max(
+                    self.memory.core_migration_pause_until_tick,
+                    turn.tick + 1,
+                )
+                if self.memory.campaign_leg_steps >= CAMPAIGN_LEG_CELLS:
+                    self.memory.campaign_leg_steps = 0
+                    self.memory.campaign_resting = True
         else:
             # Respawning or any non-cardinal jump resets the progress baseline.
             self.memory.core_migration_steps_since_pause = 0
@@ -2132,6 +2170,8 @@ class AggressiveStrategy:
         self.memory.core_migration_last_position = None
         self.memory.core_migration_steps_since_pause = 0
         self.memory.core_migration_pause_until_tick = -1
+        self.memory.campaign_leg_steps = 0
+        self.memory.campaign_resting = False
 
     def _core_queue_positions(
         self,
@@ -2553,6 +2593,22 @@ class AggressiveStrategy:
             and home not in self._rock_map(context.turn)
         )
         if self._symmetric_posture() and not nearby_enemy and not at_home:
+            if self.config.campaign_mode and self.memory.campaign_resting:
+                if self._campaign_rest_complete(context.turn):
+                    self.memory.campaign_resting = False
+                    self.memory.campaign_leg_steps = 0
+                else:
+                    context.report.add(
+                        actor_id=str(core.id),
+                        actor_kind="CORE",
+                        action="WAIT",
+                        reason=(
+                            "finish the 32-cell campaign rest: drain cargo and "
+                            "refill the current stage roster"
+                        ),
+                        target=core.position,
+                    )
+                    return
             if self._migration_pause_active(context.turn):
                 context.report.add(
                     actor_id=str(core.id),
@@ -4439,9 +4495,17 @@ class AggressiveStrategy:
     def _symmetric_posture(self) -> bool:
         """Whether the revised 16-Worker live formation is active."""
 
-        return self.config.expedition_mode and self.config.target_workers >= 16
+        return self.config.campaign_mode or (
+            self.config.expedition_mode and self.config.target_workers >= 16
+        )
 
     def _patrol_team_count(self) -> int:
+        if self.config.campaign_mode:
+            return (
+                SYMMETRIC_PATROL_TEAM_COUNT
+                if self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
+                else 0
+            )
         return (
             SYMMETRIC_PATROL_TEAM_COUNT
             if self._symmetric_posture()
@@ -4449,12 +4513,32 @@ class AggressiveStrategy:
         )
 
     def _patrol_team_quota(self) -> tuple[int, int]:
+        if self.config.campaign_mode:
+            return (
+                (0, PATROL_TEAM_RANGERS)
+                if self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
+                else (0, 0)
+            )
         return (
             0 if self._symmetric_posture() else PATROL_TEAM_VANGUARDS,
             PATROL_TEAM_RANGERS,
         )
 
     def _formation_quota(self) -> tuple[int, int, int, int]:
+        if self.config.campaign_mode:
+            if self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1:
+                return (
+                    0,
+                    CAMPAIGN_STAGE1_DEFENSE_RANGERS,
+                    0,
+                    CAMPAIGN_STAGE1_DEFENSE_RANGERS,
+                )
+            return (
+                0,
+                CAMPAIGN_STAGE2_DEFENSE_RANGERS + CAMPAIGN_STAGE2_PATROL_RANGERS,
+                0,
+                CAMPAIGN_STAGE2_DEFENSE_RANGERS,
+            )
         if self._symmetric_posture():
             return (
                 SYMMETRIC_FORMATION_VANGUARDS,
@@ -4468,6 +4552,11 @@ class AggressiveStrategy:
             DEFENSE_VANGUARDS,
             DEFENSE_RANGERS,
         )
+
+    def _expedition_squad_quota(self) -> tuple[int, int]:
+        if self.config.campaign_mode:
+            return 0, EXPEDITION_SQUAD_VANGUARDS + EXPEDITION_SQUAD_RANGERS
+        return EXPEDITION_SQUAD_VANGUARDS, EXPEDITION_SQUAD_RANGERS
 
     def _reconcile_unit_roles(self, turn: Turn) -> None:
         """Assign stable combat identities without reshuffling live units.
@@ -4526,7 +4615,7 @@ class AggressiveStrategy:
             anchor = self.memory.defense_anchor or (
                 turn.core.position if turn.core is not None else (0, 0)
             )
-            vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+            vanguard_offsets, ranger_offsets = self._symmetric_defense_layout_offsets()
             for unit_type, quota, offsets in (
                 (UnitType.VANGUARD, defense_vanguards, vanguard_offsets),
                 (UnitType.RANGER, defense_rangers, ranger_offsets),
@@ -4686,6 +4775,8 @@ class AggressiveStrategy:
         """Return the stable patrol team owning ``unit_id``."""
 
         if not self.config.expedition_mode:
+            if self._patrol_team_count() <= 0:
+                return None
             offensive = sorted(self._offensive_ids(turn), key=lambda value: value.bytes)
             if unit_id in offensive:
                 return offensive.index(unit_id) % self._patrol_team_count() + 1
@@ -4783,13 +4874,13 @@ class AggressiveStrategy:
             key=lambda unit_id: unit_id.bytes,
         )
 
+        squad_vanguards, squad_rangers = self._expedition_squad_quota()
         while (
-            len(staged_vanguards) >= EXPEDITION_SQUAD_VANGUARDS
-            and len(staged_rangers) >= EXPEDITION_SQUAD_RANGERS
+            len(staged_vanguards) >= squad_vanguards
+            and len(staged_rangers) >= squad_rangers
         ):
             members = frozenset(
-                staged_vanguards[:EXPEDITION_SQUAD_VANGUARDS]
-                + staged_rangers[:EXPEDITION_SQUAD_RANGERS]
+                staged_vanguards[:squad_vanguards] + staged_rangers[:squad_rangers]
             )
             bearing = self._expedition_bearing(core)
             self._expedition_squads.append((members, bearing))
@@ -4800,8 +4891,8 @@ class AggressiveStrategy:
             role = f"{EXPEDITION_ROLE_PREFIX}{self._expedition_serial}"
             for member_id in members:
                 self.memory.unit_roles[str(member_id)] = role
-            del staged_vanguards[:EXPEDITION_SQUAD_VANGUARDS]
-            del staged_rangers[:EXPEDITION_SQUAD_RANGERS]
+            del staged_vanguards[:squad_vanguards]
+            del staged_rangers[:squad_rangers]
         self._staged_ids = frozenset(staged_vanguards) | frozenset(staged_rangers)
         self._persist_expedition_pursuits()
         self.memory.next_expedition_serial = self._expedition_serial
@@ -6253,6 +6344,15 @@ class AggressiveStrategy:
 
         return SYMMETRIC_VANGUARD_OFFSETS, SYMMETRIC_RANGER_OFFSETS
 
+    def _symmetric_defense_layout_offsets(
+        self,
+    ) -> tuple[tuple[Position, ...], tuple[Position, ...]]:
+        """Return guard-role offsets for the active local formation."""
+
+        if self.config.campaign_mode:
+            return (), (*SYMMETRIC_VANGUARD_OFFSETS, *SYMMETRIC_RANGER_OFFSETS)
+        return self._symmetric_defense_offsets()
+
     def _symmetric_defense_posts(
         self,
         center: Position,
@@ -6269,18 +6369,26 @@ class AggressiveStrategy:
             and (center[0] + dx, center[1] + dy) in obstacles
         )
         cached = self._symmetric_defense_cache
-        if cached is not None and cached[0] == center and cached[1] == local_obstacles:
+        vanguard_slots = 0 if self.config.campaign_mode else SYMMETRIC_DEFENSE_VANGUARDS
+        if (
+            cached is not None
+            and cached[0] == center
+            and cached[1] == local_obstacles
+            and cached[4] == vanguard_slots
+        ):
             return cached[2], cached[3]
         local_obstacle_set = set(local_obstacles)
         posts, coverage_radius = _optimized_symmetric_defense_posts(
             center,
             local_obstacle_set,
+            vanguard_slots=vanguard_slots,
         )
         self._symmetric_defense_cache = (
             center,
             local_obstacles,
             posts,
             coverage_radius,
+            vanguard_slots,
         )
         return posts, coverage_radius
 
@@ -6299,6 +6407,168 @@ class AggressiveStrategy:
         )
         if target is not None:
             self._commit_symmetric_home(target)
+
+    def _observe_campaign_state(self, turn: Turn) -> None:
+        """Reset the operation around a new Core and restore its campaign phase.
+
+        A destroyed Core invalidates every positional identity: the old
+        defensive posts, patrol ring, expedition routes and final resource
+        target all belong to a different part of the world.  The replacement
+        Core must first work in the chunk where it spawns.  A service restart
+        with the same Core keeps the persisted phase and destination.
+        """
+
+        core = turn.core
+        if core is None:
+            return
+        core_id = str(core.id)
+        if self.memory.campaign_last_core_id == core_id and self.memory.campaign_phase:
+            return
+
+        previous_home = self.memory.core_home_position
+        self.memory.core_home_position = None
+        obstacles = self._rock_map(turn)
+        resources = set(turn.resource_cells) | set(self.memory.resource_cells)
+        occupied = {unit.position for unit in turn.units}
+        target = next(
+            (
+                position
+                for position in sorted(
+                    _resource_block_center_cells(core.position),
+                    key=lambda cell: (
+                        cell in obstacles,
+                        cell in resources,
+                        cell in occupied,
+                        manhattan(cell, core.position),
+                        cell,
+                    ),
+                )
+                if position not in obstacles
+                and position not in resources
+                and position not in occupied
+            ),
+            None,
+        )
+        if target is None:
+            target = self._symmetric_home_candidate_from(
+                core.position,
+                obstacles,
+                resources,
+                occupied,
+            )
+        if target is None:
+            target = previous_home
+
+        self.memory.unit_roles.clear()
+        self.memory.unit_roles_initialized = False
+        self.memory.expedition_squads.clear()
+        self._expedition_squads.clear()
+        self._expedition_serial_by_members.clear()
+        self._expedition_pursuits.clear()
+        self._expedition_routes.clear()
+        self._expedition_regroup_orders.clear()
+        self._staged_ids = frozenset()
+        self.memory.campaign_last_core_id = core_id
+        self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE1
+        self.memory.campaign_leg_steps = 0
+        self.memory.campaign_resting = False
+        self._commit_symmetric_home(target)
+        if target is not None:
+            from .migration import resource_block_index, resource_block_quota
+
+            self.memory.campaign_target_quota = resource_block_quota(
+                resource_block_index(target)
+            )
+        else:
+            self.memory.campaign_target_quota = 2
+
+    def _advance_campaign_phase(self, turn: Turn) -> None:
+        """Advance only on completed composition; casualties never demote."""
+
+        phase = self.memory.campaign_phase
+        workers = len(turn.workers)
+        defense_rangers = self._campaign_defense_rangers(turn)
+        patrol_rangers = self._campaign_patrol_rangers(turn)
+        if (
+            phase == CAMPAIGN_PHASE_STAGE1
+            and workers >= CAMPAIGN_STAGE1_WORKERS
+            and defense_rangers >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
+        ):
+            self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE2
+            self._campaign_retarget(turn, 3)
+        if (
+            self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE2
+            and workers >= CAMPAIGN_STAGE2_WORKERS
+            and defense_rangers >= CAMPAIGN_STAGE2_DEFENSE_RANGERS
+            and patrol_rangers >= CAMPAIGN_STAGE2_PATROL_RANGERS
+        ):
+            self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE3
+            self._campaign_retarget(turn, 4)
+        if self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE3:
+            from .migration import resource_block_index, resource_block_quota
+
+            core = turn.core
+            if (
+                core is not None
+                and core.position == self.memory.core_home_position
+                and resource_block_quota(resource_block_index(core.position)) >= 4
+            ):
+                self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE4
+                self.memory.campaign_target_quota = 4
+
+    def _campaign_retarget(self, turn: Turn, target_quota: int) -> None:
+        """Select the outermost block ring that guarantees the next quota."""
+
+        from .migration import (
+            plan_resource_quota,
+            resource_block_index,
+            resource_block_quota,
+        )
+
+        core = turn.core
+        if core is None:
+            return
+        if resource_block_quota(resource_block_index(core.position)) >= target_quota:
+            self.memory.campaign_target_quota = target_quota
+            return
+        plan = plan_resource_quota(
+            self.memory,
+            target_quota,
+            current_position=core.position,
+        )
+        if plan is not None:
+            self.memory.campaign_target_quota = target_quota
+            self._commit_symmetric_home(plan.target)
+
+    def _campaign_defense_rangers(self, turn: Turn) -> int:
+        return sum(
+            self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
+            for unit in turn.rangers
+        )
+
+    def _campaign_patrol_rangers(self, turn: Turn) -> int:
+        return sum(
+            self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
+            is not None
+            for unit in turn.rangers
+        )
+
+    def _campaign_rest_complete(self, turn: Turn) -> bool:
+        """Return whether a 32-cell halt has neither cargo nor roster debt."""
+
+        if any(worker.cargo > 0 for worker in turn.workers):
+            return False
+        if self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1:
+            return (
+                len(turn.workers) >= CAMPAIGN_STAGE1_WORKERS
+                and self._campaign_defense_rangers(turn)
+                >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
+            )
+        return (
+            len(turn.workers) >= CAMPAIGN_STAGE2_WORKERS
+            and self._campaign_defense_rangers(turn) >= CAMPAIGN_STAGE2_DEFENSE_RANGERS
+            and self._campaign_patrol_rangers(turn) >= CAMPAIGN_STAGE2_PATROL_RANGERS
+        )
 
     def _symmetric_home_candidate_from(
         self,
@@ -6347,7 +6617,7 @@ class AggressiveStrategy:
         _, _, _, chunk_x, chunk_y = min(ranked_chunks)
         min_x = chunk_x * size
         min_y = chunk_y * size
-        vanguards, rangers = self._symmetric_defense_offsets()
+        vanguards, rangers = self._symmetric_defense_layout_offsets()
         offsets = (*vanguards, *rangers)
         center_cells = (
             (min_x + size // 2 - 1, min_y + size // 2 - 1),
@@ -6556,24 +6826,31 @@ class AggressiveStrategy:
                     obstacles,
                 )
             else:
-                vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+                vanguard_offsets, ranger_offsets = (
+                    self._symmetric_defense_layout_offsets()
+                )
                 posts = tuple(
                     (core_position[0] + dx, core_position[1] + dy)
                     for dx, dy in (*vanguard_offsets, *ranger_offsets)
                 )
                 coverage_radius = SYMMETRIC_DEFENSE_MAX_RADIUS
-            split = SYMMETRIC_DEFENSE_VANGUARDS
-            for unit_type, type_posts in (
-                (UnitType.VANGUARD, posts[:split]),
-                (UnitType.RANGER, posts[split:]),
-            ):
-                assignments.update(
-                    _assign_fixed_defense_posts(
-                        tuple(unit for unit in guards if unit.unit_type is unit_type),
-                        type_posts,
-                        previous,
+            if self.config.campaign_mode:
+                assignments = _assign_fixed_defense_posts(guards, posts, previous)
+            else:
+                split = SYMMETRIC_DEFENSE_VANGUARDS
+                for unit_type, type_posts in (
+                    (UnitType.VANGUARD, posts[:split]),
+                    (UnitType.RANGER, posts[split:]),
+                ):
+                    assignments.update(
+                        _assign_fixed_defense_posts(
+                            tuple(
+                                unit for unit in guards if unit.unit_type is unit_type
+                            ),
+                            type_posts,
+                            previous,
+                        )
                     )
-                )
             self.memory.defense_posts = {
                 str(unit_id): position for unit_id, position in assignments.items()
             }
@@ -8902,6 +9179,17 @@ class AggressiveStrategy:
         the economy.
         """
 
+        if self.config.campaign_mode:
+            self._ensure_unit_roles(turn)
+            candidates = self._campaign_spawn_candidates(turn)
+            if candidates is None:
+                return None
+            return self._affordable_spawn(
+                turn,
+                resources,
+                candidates,
+                strict_preference=True,
+            )
         if self._emergency_combat_mode(turn):
             return self._affordable_spawn(
                 turn,
@@ -8927,6 +9215,35 @@ class AggressiveStrategy:
             turn, resources, candidates, strict_preference=True
         )
 
+    def _campaign_spawn_candidates(self, turn: Turn) -> tuple[UnitType, ...] | None:
+        """Return the exact next stage slot, or ``None`` when fully staffed."""
+
+        workers = len(turn.workers)
+        defense = self._campaign_defense_rangers(turn)
+        patrol = self._campaign_patrol_rangers(turn)
+        if (
+            self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1
+            and defense == 0
+            and self._emergency_combat_mode(turn)
+        ):
+            # The requested opening is twelve Workers, but a Core already
+            # taking fire with no ranged answer is not a viable economy.
+            # This exception disappears after the first defensive Ranger.
+            return (UnitType.RANGER,)
+        if self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1:
+            if workers < CAMPAIGN_STAGE1_WORKERS:
+                return (UnitType.WORKER,)
+            if defense < CAMPAIGN_STAGE1_DEFENSE_RANGERS:
+                return (UnitType.RANGER,)
+            return None
+        if workers < CAMPAIGN_STAGE2_WORKERS:
+            return (UnitType.WORKER,)
+        if defense < CAMPAIGN_STAGE2_DEFENSE_RANGERS:
+            return (UnitType.RANGER,)
+        if patrol < CAMPAIGN_STAGE2_PATROL_RANGERS:
+            return (UnitType.RANGER,)
+        return (UnitType.RANGER,)
+
     def _expedition_need_candidates(self, turn: Turn) -> tuple[UnitType, ...]:
         """Return the preferred Unit types for the live formation and squad.
 
@@ -8940,6 +9257,8 @@ class AggressiveStrategy:
         """
 
         self._ensure_unit_roles(turn)
+        if self.config.campaign_mode:
+            return self._campaign_spawn_candidates(turn) or (UnitType.RANGER,)
         vanguards = sum(
             self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
             or self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
@@ -8969,8 +9288,9 @@ class AggressiveStrategy:
         # cannot fill a missing slot at the staging ring.
         staged_vanguards = sum(unit.id in self._staged_ids for unit in turn.vanguards)
         staged_rangers = sum(unit.id in self._staged_ids for unit in turn.rangers)
-        vanguard_short = max(0, EXPEDITION_SQUAD_VANGUARDS - staged_vanguards)
-        ranger_short = max(0, EXPEDITION_SQUAD_RANGERS - staged_rangers)
+        squad_vanguards, squad_rangers = self._expedition_squad_quota()
+        vanguard_short = max(0, squad_vanguards - staged_vanguards)
+        ranger_short = max(0, squad_rangers - staged_rangers)
         return (
             (UnitType.RANGER, UnitType.VANGUARD)
             if ranger_short > vanguard_short
@@ -9010,6 +9330,10 @@ class AggressiveStrategy:
         # combat unit so the fleet can coordinate.  That is not, by itself,
         # a reason to spend the high-tier stockpile: only a damaged Core or
         # an enemy in its local alert ring should bypass this reserve floor.
+        if self.config.campaign_mode and (
+            self.memory.campaign_phase < CAMPAIGN_PHASE_STAGE3
+        ):
+            return False
         if self._emergency_combat_mode(
             context.turn
         ) or not self._growth_slowdown_active(context.turn):
@@ -9199,6 +9523,13 @@ class AggressiveStrategy:
 
         if not self._unbounded_growth():
             return 0
+        if self.config.campaign_mode and (
+            self.memory.campaign_phase < CAMPAIGN_PHASE_STAGE3
+        ):
+            # Until the stage-2 local formation is complete, every affordable
+            # unit is progress.  A stockpile here delays the exact Workers and
+            # Rangers that make the next migration safe.
+            return 0
         core = turn.core
         if core is None:
             return max(0, self.config.safety_reserve)
@@ -9314,6 +9645,9 @@ class AggressiveStrategy:
         return self.config.max_population is None and self.config.resource_target <= 0
 
     def _spawn_reason(self, unit_type: UnitType) -> str:
+        if self.config.campaign_mode:
+            phase = self.memory.campaign_phase
+            return f"fill campaign stage {phase} slot with {unit_type.value.lower()}"
         if self.config.expedition_mode:
             return f"build active-offense {unit_type.value.lower()} roster"
         if self._unbounded_growth():
@@ -9890,15 +10224,15 @@ def _visible_from_symmetric_posts(
     center: Position,
     posts: tuple[Position, ...],
     obstacles: set[Position],
+    *,
+    vanguard_slots: int = SYMMETRIC_DEFENSE_VANGUARDS,
 ) -> set[Position]:
     """Union Core and role-specific guard vision for one fixed post set."""
 
     visible = set(visible_cells(center, RANGER_VISION_RADIUS, obstacles))
     for index, post in enumerate(posts):
         vision = (
-            VANGUARD_VISION_RADIUS
-            if index < SYMMETRIC_DEFENSE_VANGUARDS
-            else RANGER_VISION_RADIUS
+            VANGUARD_VISION_RADIUS if index < vanguard_slots else RANGER_VISION_RADIUS
         )
         visible.update(visible_cells(post, vision, obstacles))
     return visible
@@ -9909,6 +10243,8 @@ def _uncovered_symmetric_cells(
     posts: tuple[Position, ...],
     obstacles: set[Position],
     radius: int,
+    *,
+    vanguard_slots: int = SYMMETRIC_DEFENSE_VANGUARDS,
 ) -> set[Position]:
     """Return traversable cells inside one defense disk that remain unseen."""
 
@@ -9917,7 +10253,12 @@ def _uncovered_symmetric_cells(
         for dx, dy in _manhattan_disk_offsets(radius)
         if (center[0] + dx, center[1] + dy) not in obstacles
     }
-    return target - _visible_from_symmetric_posts(center, posts, obstacles)
+    return target - _visible_from_symmetric_posts(
+        center,
+        posts,
+        obstacles,
+        vanguard_slots=vanguard_slots,
+    )
 
 
 def _symmetric_posts_cover(
@@ -9925,6 +10266,8 @@ def _symmetric_posts_cover(
     posts: tuple[Position, ...],
     obstacles: set[Position],
     radius: int,
+    *,
+    vanguard_slots: int = SYMMETRIC_DEFENSE_VANGUARDS,
 ) -> bool:
     """Return whether the complete guard ring is legal and gap-free."""
 
@@ -9935,7 +10278,13 @@ def _symmetric_posts_cover(
             post not in obstacles and manhattan(post, center) <= radius
             for post in posts
         )
-        and not _uncovered_symmetric_cells(center, posts, obstacles, radius)
+        and not _uncovered_symmetric_cells(
+            center,
+            posts,
+            obstacles,
+            radius,
+            vanguard_slots=vanguard_slots,
+        )
     )
 
 
@@ -9949,6 +10298,8 @@ def _search_symmetric_defense_posts(
     center: Position,
     obstacles: set[Position],
     radius: int,
+    *,
+    vanguard_slots: int = SYMMETRIC_DEFENSE_VANGUARDS,
 ) -> tuple[Position, ...]:
     """Lay out 4V+16R inside one ring with bounded deterministic improvement.
 
@@ -9996,21 +10347,19 @@ def _search_symmetric_defense_posts(
                 if cell in cell_index
             )
             vanguard_candidates.append((position, vanguard_mask))
+    total_slots = SYMMETRIC_DEFENSE_VANGUARDS + SYMMETRIC_DEFENSE_RANGERS
+    ranger_slots = total_slots - vanguard_slots
     if (
-        len(vanguard_candidates) < SYMMETRIC_DEFENSE_VANGUARDS
-        or len(ranger_candidates) < SYMMETRIC_DEFENSE_RANGERS
+        len(vanguard_candidates) < vanguard_slots
+        or len(ranger_candidates) < ranger_slots
     ):
         return _symmetric_template_posts(center)
 
     chosen: list[tuple[Position, int]] = []
     used: set[Position] = set()
     union = core_union
-    for slot in range(SYMMETRIC_DEFENSE_VANGUARDS + SYMMETRIC_DEFENSE_RANGERS):
-        candidates = (
-            vanguard_candidates
-            if slot < SYMMETRIC_DEFENSE_VANGUARDS
-            else ranger_candidates
-        )
+    for slot in range(total_slots):
+        candidates = vanguard_candidates if slot < vanguard_slots else ranger_candidates
         best: tuple[int, int, int, Position, int] | None = None
         for position, mask in candidates:
             if position in used:
@@ -10043,11 +10392,7 @@ def _search_symmetric_defense_posts(
         state = (state * 1_664_525 + 1_013_904_223) & 0xFFFFFFFF
         slot = state % len(chosen)
         state = (state * 1_664_525 + 1_013_904_223) & 0xFFFFFFFF
-        candidates = (
-            vanguard_candidates
-            if slot < SYMMETRIC_DEFENSE_VANGUARDS
-            else ranger_candidates
-        )
+        candidates = vanguard_candidates if slot < vanguard_slots else ranger_candidates
         replacement: tuple[Position, int] | None = None
         for _attempt in range(8):
             position, mask = candidates[state % len(candidates)]
@@ -10088,6 +10433,8 @@ def _search_symmetric_defense_posts(
 def _optimized_symmetric_defense_posts(
     center: Position,
     obstacles: set[Position],
+    *,
+    vanguard_slots: int = SYMMETRIC_DEFENSE_VANGUARDS,
 ) -> tuple[tuple[Position, ...], int]:
     """Find the largest gap-free guard disk and maximize its outward vision."""
 
@@ -10097,6 +10444,7 @@ def _optimized_symmetric_defense_posts(
         template,
         obstacles,
         SYMMETRIC_DEFENSE_MAX_RADIUS,
+        vanguard_slots=vanguard_slots,
     ):
         return template, SYMMETRIC_DEFENSE_MAX_RADIUS
 
@@ -10106,11 +10454,27 @@ def _optimized_symmetric_defense_posts(
         SYMMETRIC_DEFENSE_MIN_RADIUS - 1,
         -1,
     ):
-        posts = _search_symmetric_defense_posts(center, obstacles, radius)
-        missing = _uncovered_symmetric_cells(center, posts, obstacles, radius)
+        posts = _search_symmetric_defense_posts(
+            center,
+            obstacles,
+            radius,
+            vanguard_slots=vanguard_slots,
+        )
+        missing = _uncovered_symmetric_cells(
+            center,
+            posts,
+            obstacles,
+            radius,
+            vanguard_slots=vanguard_slots,
+        )
         if not missing:
             return posts, radius
-        visible = _visible_from_symmetric_posts(center, posts, obstacles)
+        visible = _visible_from_symmetric_posts(
+            center,
+            posts,
+            obstacles,
+            vanguard_slots=vanguard_slots,
+        )
         key = (len(missing), -len(visible), -radius, posts)
         if best_failure is None or key[:3] < best_failure[:3]:
             best_failure = key

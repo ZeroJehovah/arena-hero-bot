@@ -142,6 +142,15 @@ class WorldMemory:
     core_migration_last_position: Position | None = None
     core_migration_steps_since_pause: int = 0
     core_migration_pause_until_tick: int = -1
+    # Campaign state survives restarts.  ``campaign_phase`` is the highest
+    # stage reached, not a live roster count: losing Units must not move the
+    # whole operation back to an earlier resource tier.  The phase is reset
+    # only when the Core itself is replaced.
+    campaign_phase: int = 0
+    campaign_target_quota: int = 0
+    campaign_last_core_id: str | None = None
+    campaign_leg_steps: int = 0
+    campaign_resting: bool = False
     # Workers have one preferred 8x8 sector among the sixteen in the active
     # resource chunk.  This is a soft patrol identity, not a resource-claim
     # restriction; every Worker may harvest anywhere in the chunk.
@@ -636,6 +645,11 @@ class WorldMemory:
             ),
             "core_migration_steps_since_pause": self.core_migration_steps_since_pause,
             "core_migration_pause_until_tick": self.core_migration_pause_until_tick,
+            "campaign_phase": self.campaign_phase,
+            "campaign_target_quota": self.campaign_target_quota,
+            "campaign_last_core_id": self.campaign_last_core_id,
+            "campaign_leg_steps": self.campaign_leg_steps,
+            "campaign_resting": self.campaign_resting,
             "worker_sectors": dict(sorted(self.worker_sectors.items())),
             "worker_sector_layout_version": self.worker_sector_layout_version,
             "worker_seen_ticks": [
@@ -796,6 +810,15 @@ class WorldMemory:
             core_migration_pause_until_tick=int(
                 raw.get("core_migration_pause_until_tick", -1)
             ),
+            campaign_phase=int(raw.get("campaign_phase", 0)),
+            campaign_target_quota=int(raw.get("campaign_target_quota", 0)),
+            campaign_last_core_id=(
+                str(raw["campaign_last_core_id"])
+                if raw.get("campaign_last_core_id") is not None
+                else None
+            ),
+            campaign_leg_steps=int(raw.get("campaign_leg_steps", 0)),
+            campaign_resting=bool(raw.get("campaign_resting", False)),
             worker_sectors={
                 str(unit_id): int(block)
                 for unit_id, block in raw.get(

@@ -85,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--campaign-mode",
+        action="store_true",
+        help=(
+            "stage-gated campaign: mine the spawn chunk, build the 12W+8R and "
+            "16W+20R+8R formations, then migrate through quota-3/quota-4 chunks"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -130,6 +138,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_population=max_population,
         resource_target=args.resource_target,
         expedition_mode=args.expedition_mode,
+        campaign_mode=args.campaign_mode,
     )
     try:
         run_bot(runtime, strategy_config=strategy)
