@@ -7,6 +7,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+from .geometry import manhattan
 from .memory import WorldMemory
 from .migration import (
     load_migration_request,
@@ -71,6 +72,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         plan = None
     else:
         request = load_migration_request(request_path)
+        progress = memory.core_migration_last_position or memory.core_home_position
+        destination = (
+            request.target if request is not None else memory.core_home_position
+        )
+        remaining = (
+            manhattan(progress, destination)
+            if progress is not None and destination is not None
+            else None
+        )
         print(
             json.dumps(
                 {
@@ -86,6 +96,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "requested_at": request.requested_at
                     if request is not None
                     else None,
+                    "last_core_position": (
+                        list(progress) if progress is not None else None
+                    ),
+                    "remaining_estimated_cells": remaining,
+                    "steps_since_pause": memory.core_migration_steps_since_pause,
+                    "pause_until_tick": memory.core_migration_pause_until_tick,
                 },
                 ensure_ascii=False,
                 indent=2,

@@ -270,3 +270,5 @@ def test_migration_cli_plans_requests_and_reports(tmp_path: Path, capsys) -> Non
     migration_cli.main(["--data-dir", str(tmp_path), "status"])
     status = json.loads(capsys.readouterr().out)
     assert status["requested_target"] == request["target"]
+    assert status["last_core_position"] == [-400, 655]
+    assert status["remaining_estimated_cells"] > 0
