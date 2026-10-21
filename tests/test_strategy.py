@@ -2710,6 +2710,33 @@ def test_worker_holds_far_cargo_while_core_is_migrating() -> None:
     )
 
 
+def test_worker_clears_normal_core_waiting_between_migration_steps() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(0, 0)),
+            unit(2, "WORKER", position=(1, 0), cargo=1),
+        ]
+    )
+    memory = WorldMemory(
+        core_home_position=(5, 5),
+        core_layout_version=CORE_LAYOUT_VERSION,
+    )
+
+    report = decide(
+        turn,
+        memory=memory,
+        config=StrategyConfig(target_workers=16, expedition_mode=True),
+    )
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert add(turn.workers[0].position, action.direction) != (1, 0)
+    assert any(
+        item.reason == "clear the moving Core approach with economy unit"
+        for item in report.decisions
+    )
+
+
 def test_friendly_unit_cannot_queue_into_moving_core_destination() -> None:
     turn = make_turn(
         objects=[
@@ -7142,13 +7169,19 @@ def test_symmetric_posts_allow_workers_through_occupied_pocket_exits() -> None:
         resources=0,
         objects=[
             core(),
-            unit(2, "WORKER", position=(-7, 0), cargo=1),
+            unit(2, "WORKER", position=(-7, 0)),
             *vanguards,
             *rangers,
         ],
         obstacles=obstacles,
     )
-    strategy = AggressiveStrategy(WorldMemory(), config)
+    strategy = AggressiveStrategy(
+        WorldMemory(
+            core_home_position=(15, -16),
+            core_layout_version=CORE_LAYOUT_VERSION,
+        ),
+        config,
+    )
 
     report = strategy.decide(turn)
 

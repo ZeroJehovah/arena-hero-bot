@@ -9,7 +9,11 @@ import pytest
 import arena_hero_bot.strategy as strategy_module
 from arena_hero_bot.geometry import add, adjacent_positions, manhattan, next_step
 from arena_hero_bot.memory import ExpeditionSquad, WorldMemory
-from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig
+from arena_hero_bot.strategy import (
+    CORE_LAYOUT_VERSION,
+    AggressiveStrategy,
+    StrategyConfig,
+)
 
 from .factories import core, make_turn, object_id, unit
 
@@ -48,6 +52,7 @@ def _members(bearing=(1, 0)):
 def test_regrouping_expedition_leaves_core_even_when_approaches_are_full(hp):
     template = _strategy((1, -1))
     template.memory.core_home_position = (0, 0)
+    template.memory.core_layout_version = CORE_LAYOUT_VERSION
     template.memory.expedition_squads = [
         replace(
             template.memory.expedition_squads[0],

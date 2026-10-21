@@ -1648,7 +1648,7 @@ class AggressiveStrategy:
             )
             return
 
-        if core.view.state is CoreState.MOVING:
+        if self._core_migration_in_progress(core.view):
             if manhattan(worker.position, core.position) <= CORE_MIGRATION_CLEAR_RADIUS:
                 if self._move_to_moving_core_hold(
                     worker,
@@ -1955,6 +1955,16 @@ class AggressiveStrategy:
         actions = getattr(builder, "unit_actions", {})
         return unit.id in context.planned_ids or unit.id in actions
 
+    def _core_migration_in_progress(self, core: CoreView) -> bool:
+        """Return whether the Core still has to travel to its persisted home."""
+
+        if core.state is CoreState.MOVING:
+            return True
+        if not self._symmetric_posture():
+            return False
+        home = self.memory.core_home_position
+        return home is not None and core.position != home
+
     def _core_queue_positions(
         self,
         unit: Unit,
@@ -2050,7 +2060,7 @@ class AggressiveStrategy:
         if self._has_unit_action(unit, context):
             return False
         core = context.turn.core
-        if core is None or core.view.state is not CoreState.MOVING:
+        if core is None or not self._core_migration_in_progress(core.view):
             return False
         blockers = self._static_blockers(unit, context)
         move_direction = core.view.move_direction
@@ -3017,13 +3027,15 @@ class AggressiveStrategy:
         core = context.turn.core
         if (
             core is not None
-            and core.view.state is CoreState.MOVING
-            and destination == core.view.destination
+            and self._core_migration_in_progress(core.view)
+            and manhattan(destination, core.position) <= CORE_MIGRATION_CLEAR_RADIUS
+            and manhattan(destination, core.position)
+            <= manhattan(unit.position, core.position)
         ):
-            # The server resolves a four-Tick Core move as one occupancy
-            # check.  Never let another unit queue into the destination while
-            # that move is in flight, even if it could legally overlap on a
-            # single intermediate Tick.
+            # Keep the Core's approach bubble clear through both the four-Tick
+            # MOVING phase and the NORMAL tick between steps.  Units already
+            # inside may still move outward; nobody may enter or move laterally
+            # within it.
             return False
         predicted = self._predicted_friendly_occupancy(destination, context)
         if intent is _MoveIntent.STAND:
