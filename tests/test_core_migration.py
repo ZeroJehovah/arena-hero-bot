@@ -21,6 +21,8 @@ from arena_hero_bot.migration import (
 )
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
+    CORE_MIGRATION_PAUSE_MAX_TICKS,
+    CORE_MIGRATION_PAUSE_MIN_TICKS,
     AggressiveStrategy,
     StrategyConfig,
     _resource_block_center_cells,
@@ -162,12 +164,51 @@ def test_migration_batch_waits_for_economy_then_resumes() -> None:
         item.reason == "hold the migration batch for Worker deposits"
         for item in report.decisions
     )
-    assert memory.core_migration_pause_until_tick == 108
+    assert (
+        memory.core_migration_pause_until_tick == 100 + CORE_MIGRATION_PAUSE_MAX_TICKS
+    )
 
-    resumed = make_turn(tick=108, objects=[core(), *_workers()])
+    resumed = make_turn(
+        tick=100 + CORE_MIGRATION_PAUSE_MIN_TICKS,
+        objects=[core(), *_workers()],
+    )
     strategy.decide(resumed)
     assert resumed.plan.core_action is not None
     assert resumed.plan.core_action.type == "START_MOVE"
+    assert memory.core_migration_pause_until_tick == -1
+
+
+def test_migration_pause_waits_for_the_loaded_queue_to_drain() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(1, 0),
+        core_migration_steps_since_pause=7,
+    )
+    strategy = _strategy(memory)
+    loaded = [unit(2, "WORKER", position=(1, 0), cargo=1)]
+    start = make_turn(tick=100, objects=[core(), *loaded])
+
+    strategy.decide(start)
+
+    still_loaded = make_turn(
+        tick=100 + CORE_MIGRATION_PAUSE_MIN_TICKS,
+        objects=[core(), *loaded],
+    )
+    report = strategy.decide(still_loaded)
+    assert still_loaded.plan.core_action is None
+    assert any(
+        item.reason == "hold the migration batch for Worker deposits"
+        for item in report.decisions
+    )
+
+    capped = make_turn(
+        tick=100 + CORE_MIGRATION_PAUSE_MAX_TICKS,
+        objects=[core(), *loaded],
+    )
+    strategy.decide(capped)
+    assert capped.plan.core_action is not None
+    assert capped.plan.core_action.type == "START_MOVE"
 
 
 def test_loaded_worker_deposits_during_migration_pause() -> None:

@@ -298,12 +298,15 @@ CORE_QUEUE_RADIUS = 4
 # throughout the four-Tick move.
 CORE_MIGRATION_CLEAR_RADIUS = 1
 # A moving Core cannot receive deposits.  Break long walks into eight-cell
-# batches with eight-Tick stops: at one Core cell per four Ticks this costs at
-# most 20% travel speed while giving Workers recurring windows to close and
-# unload.  The schedule is persisted because a pause commonly spans snapshots
-# that contain a MOVING Core.
+# batches with recurring stops: one Worker can enter the Core service cell at
+# a time, so a fixed eight-Tick pause leaves most of a loaded economy group
+# blocked.  Stay for at least eight Ticks, resume as soon as no Worker carries
+# cargo, and cap the halt at 32 Ticks so even a full 16-Worker group can keep
+# making progress.  The schedule is persisted because a pause commonly spans
+# snapshots that contain a MOVING Core.
 CORE_MIGRATION_STEP_BATCH = 8
-CORE_MIGRATION_PAUSE_TICKS = 8
+CORE_MIGRATION_PAUSE_MIN_TICKS = 8
+CORE_MIGRATION_PAUSE_MAX_TICKS = 32
 # While the Core is between homes, keep the eight patrol Rangers on a compact
 # ring around its current cell instead of teleporting their duty to the final
 # chunk edge.
@@ -2029,6 +2032,18 @@ class AggressiveStrategy:
             self._reset_core_migration_progress()
             return
 
+        pause_until = self.memory.core_migration_pause_until_tick
+        pause_started = pause_until - CORE_MIGRATION_PAUSE_MAX_TICKS
+        if (
+            turn.tick < pause_until
+            and turn.tick >= pause_started + CORE_MIGRATION_PAUSE_MIN_TICKS
+            and all(worker.cargo == 0 for worker in turn.workers)
+        ):
+            # A load normally clears in two Ticks per Worker because only one
+            # extra entity fits on the Core service cell.  Do not spend the
+            # full drain budget when every Worker is already empty.
+            self.memory.core_migration_pause_until_tick = -1
+
         previous = self.memory.core_migration_last_position
         if previous is None:
             self.memory.core_migration_last_position = core.position
@@ -2046,7 +2061,7 @@ class AggressiveStrategy:
             self.memory.core_migration_steps_since_pause = 0
             self.memory.core_migration_pause_until_tick = max(
                 self.memory.core_migration_pause_until_tick,
-                turn.tick + CORE_MIGRATION_PAUSE_TICKS,
+                turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
             )
 
     def _migration_pause_active(self, turn: Turn) -> bool:
