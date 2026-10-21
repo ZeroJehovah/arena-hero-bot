@@ -9379,6 +9379,17 @@ class AggressiveStrategy:
         if (
             self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1
             and defense == 0
+            and self._needs_resource_guard(turn)
+        ):
+            # Campaign mode keeps the twelve-Worker opening, but it must
+            # retain the low-capacity respawn guard: after the first Worker,
+            # a fresh Core cannot safely spend its next five resources on a
+            # second Worker with no combat answer.  Once this one Ranger
+            # exists, the normal stage-1 Worker quota resumes.
+            return (UnitType.RANGER,)
+        if (
+            self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1
+            and defense == 0
             and self._emergency_combat_mode(turn)
         ):
             # The requested opening is twelve Workers, but a Core already
