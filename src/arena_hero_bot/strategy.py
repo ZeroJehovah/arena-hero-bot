@@ -6849,7 +6849,14 @@ class AggressiveStrategy:
             last_progress_position=unit.position,
         )
         self.memory.set_goal(str(unit.id), goal)
-        return patrol_position, "follow the clockwise resource-chunk edge"
+        reason = (
+            "follow the clockwise Core patrol ring"
+            if turn.core is not None
+            and self.memory.core_home_position is not None
+            and turn.core.position != self.memory.core_home_position
+            else "follow the clockwise resource-chunk edge"
+        )
+        return patrol_position, reason
 
     def _enemy_score(
         self,
