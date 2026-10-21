@@ -155,7 +155,9 @@ def test_migration_batch_waits_for_economy_then_resumes() -> None:
         core_migration_steps_since_pause=7,
     )
     strategy = _strategy(memory)
-    turn = make_turn(tick=100, objects=[core(), *_workers()])
+    workers = _workers()
+    workers[0]["cargo"] = 1
+    turn = make_turn(tick=100, objects=[core(), *workers])
 
     report = strategy.decide(turn)
 
@@ -175,6 +177,22 @@ def test_migration_batch_waits_for_economy_then_resumes() -> None:
     strategy.decide(resumed)
     assert resumed.plan.core_action is not None
     assert resumed.plan.core_action.type == "START_MOVE"
+    assert memory.core_migration_pause_until_tick == -1
+
+
+def test_migration_skips_pause_when_the_economy_is_empty() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(1, 0),
+        core_migration_steps_since_pause=7,
+    )
+
+    turn = make_turn(tick=100, objects=[core(), *_workers()])
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
     assert memory.core_migration_pause_until_tick == -1
 
 

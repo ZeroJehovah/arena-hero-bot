@@ -2059,10 +2059,13 @@ class AggressiveStrategy:
         self.memory.core_migration_last_position = core.position
         if self.memory.core_migration_steps_since_pause >= CORE_MIGRATION_STEP_BATCH:
             self.memory.core_migration_steps_since_pause = 0
-            self.memory.core_migration_pause_until_tick = max(
-                self.memory.core_migration_pause_until_tick,
-                turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
-            )
+            # Without cargo a halt cannot produce a deposit; keep walking and
+            # let the next batch stop only when the economy has work to unload.
+            if any(worker.cargo > 0 for worker in turn.workers):
+                self.memory.core_migration_pause_until_tick = max(
+                    self.memory.core_migration_pause_until_tick,
+                    turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
+                )
 
     def _migration_pause_active(self, turn: Turn) -> bool:
         """Return whether the current migration batch is stopped for deposits."""
