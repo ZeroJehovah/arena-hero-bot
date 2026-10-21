@@ -424,6 +424,7 @@ class _TurnContext:
     perimeter_intercept_anchor: Position | None = None
     emergency: bool = False
     all_hands_defense: bool = False
+    volley_aims: dict[str, list[Position]] = field(default_factory=dict)
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
 
@@ -930,10 +931,10 @@ class AggressiveStrategy:
             offensive=offensive,
         )
         shootable = [
-            (enemy, shot_cell)
+            (enemy, shot_cells)
             for enemy in firing_pool
             if (
-                shot_cell := self._ranger_shot_cell(
+                shot_cells := self._ranger_shot_cells(
                     ranger,
                     enemy,
                     context.turn,
@@ -948,9 +949,16 @@ class AggressiveStrategy:
         # after movement, so the incoming shot lands before the next decision;
         # at the Core's edge that used to turn a defensive Ranger's final shot
         # into a preventable death during Core migration.
+        #
+        # A legal shot is different from an exposed one: the firing branch
+        # below already refuses a shot that would take survivable return
+        # fire.  Withdrawing before that check made a wounded defender walk
+        # away from the Core while enemies it could have killed were hitting
+        # it.
         if (
             not expedition_member
             and ranger.hp <= 1
+            and not shootable
             and context.threat.level
             in {ThreatLevel.PRE_EVADE, ThreatLevel.ENGAGED, ThreatLevel.BREAKOUT}
             and self._recover_if_critical(
@@ -983,15 +991,15 @@ class AggressiveStrategy:
                 ranger.position,
                 context.turn.core.position if context.turn.core is not None else None,
             )
-            shot_cell = next(
+            shot_cells = next(
                 (
-                    cell
-                    for candidate, cell in shootable
+                    cells
+                    for candidate, cells in shootable
                     if target is not None and candidate.id == target.id
                 ),
-                None,
+                (),
             )
-            if target is None or shot_cell is None:
+            if target is None or not shot_cells:
                 shootable = []
             else:
                 if not expedition_member and self._decline_ranger_duel(
@@ -1038,6 +1046,7 @@ class AggressiveStrategy:
                 if (
                     isinstance(target, UnitView)
                     and target.unit_type is not UnitType.WORKER
+                    and self._standoff_leaves_return_fire(target, ranger.position)
                 ):
                     standoff = self._ranger_approach_goal(
                         ranger,
@@ -1066,6 +1075,11 @@ class AggressiveStrategy:
                         )
                     ):
                         return
+                shot_cell = self._volley_aim_cell(
+                    context,
+                    target,
+                    shot_cells,
+                )
                 ranger.shoot(target, expected_cell=shot_cell)
                 context.damage_ledger.record(target)
                 context.report.add(
@@ -1079,7 +1093,9 @@ class AggressiveStrategy:
                             else f"supporting fire at {self._enemy_label(target)}"
                         )
                         + (
-                            " with one-cell lead"
+                            " covering a possible approach cell"
+                            if shot_cell != shot_cells[0]
+                            else " with one-cell lead"
                             if shot_cell != target.position
                             else ""
                         )
@@ -1158,6 +1174,8 @@ class AggressiveStrategy:
                 reason=f"hunt last seen {remembered.kind.lower()}",
                 avoid_new_threats=True,
             ):
+                return
+            if self._close_on_massed_assault(ranger, visible_enemies, context):
                 return
 
         goal, reason = self._idle_combat_goal(
@@ -4133,6 +4151,66 @@ class AggressiveStrategy:
         }
         return len(nearby_ids) >= ALL_HANDS_DEFENSE_MIN_ENEMIES
 
+    def _close_on_massed_assault(
+        self,
+        ranger: Ranger,
+        enemies: tuple[CoreView | UnitView, ...],
+        context: _TurnContext,
+    ) -> bool:
+        """Walk an idle defender toward a massed assault it cannot yet shoot.
+
+        Sharing the contact picture is not enough on its own.  A defender on
+        the far side of the ring often has no legal firing cell at all,
+        because the enemy formation covers every range-one-to-three cell
+        around the target with its own firing lines.  Its last-seen memory
+        also refuses targets outside local vision, so the unit falls through
+        to its static post and waits out the whole fight.  Replaying the Core
+        loss at Tick ``475541`` shows exactly that: two defenders seventeen
+        cells away held the ring while the Core was shot down.
+
+        Closing the distance is safe because every step is checked for new
+        enemy firing lines, so the unit stops at the edge of the hostile
+        coverage instead of walking into it.  From there it can take the
+        first lane that opens.  This only ever runs under all-hands defence,
+        which is already restricted to three or more fighters inside the
+        defensive leash.
+        """
+
+        if not context.all_hands_defense:
+            return False
+        core = context.turn.core
+        if core is None:
+            return False
+        combat = tuple(
+            enemy
+            for enemy in enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(core.position, enemy.position)
+            <= self.config.combat_pursuit_radius
+        )
+        if not combat:
+            return False
+        anchor = min(
+            combat,
+            key=lambda enemy: (manhattan(core.position, enemy.position), str(enemy.id)),
+        )
+        if (
+            self._ranger_range(ranger.position, anchor.position)
+            <= RANGER_STANDOFF_RANGE + 1
+        ):
+            # Already inside the fight; the geometry has to open a lane, and
+            # crowding the anchor from here would only block a better shooter.
+            return False
+        return self._move_within_leash(
+            ranger,
+            anchor.position,
+            context,
+            offensive=False,
+            reason="close on the massed assault",
+            avoid_new_threats=True,
+        )
+
     def _decline_ranger_duel(
         self,
         ranger: Ranger,
@@ -4257,12 +4335,32 @@ class AggressiveStrategy:
         obstacles: set[Position] | frozenset[Position],
         friendly_positions: Container[Position] = (),
     ) -> Position | None:
-        # Movement resolves before the shot. Prefer a repeated straight or
-        # two-cell patrol track over extrapolating just the last direction.
-        # The looser ``drift`` estimate also works across flickering vision.
-        # At range 1 the target is close enough
-        # to stall or collide, so the standing cell is still the better guess
-        # there; from range 2 outwards the lead is preferred.
+        cells = self._ranger_shot_cells(
+            ranger, enemy, turn, obstacles, friendly_positions
+        )
+        return cells[0] if cells else None
+
+    def _ranger_shot_cells(
+        self,
+        ranger: Ranger,
+        enemy: CoreView | UnitView,
+        turn: Turn,
+        obstacles: set[Position] | frozenset[Position],
+        friendly_positions: Container[Position] = (),
+    ) -> tuple[Position, ...]:
+        """Return every legal aim cell, most likely cell first.
+
+        Movement resolves before the shot. Prefer a repeated straight or
+        two-cell patrol track over extrapolating just the last direction.
+        The looser ``drift`` estimate also works across flickering vision.
+        At range 1 the target is close enough
+        to stall or collide, so the standing cell is still the better guess
+        there; from range 2 outwards the lead is preferred.
+
+        The ordered tail keeps the cells the target can plausibly step into
+        next, so a volley can hedge instead of stacking every arrow on the
+        same prediction (``_volley_aim_cell``).
+        """
         strict = self.memory.predicted_enemy_position(str(enemy.id), turn.tick)
         drift = self.memory.enemy_drift_position(str(enemy.id), turn.tick, 1)
         predicted = strict or drift
@@ -4303,23 +4401,80 @@ class AggressiveStrategy:
                     )
                 )
                 cells.extend(approach)
-            for cell in dict.fromkeys(cells):
+            return tuple(
+                cell
+                for cell in dict.fromkeys(cells)
                 if self._line_of_fire_clear(
                     ranger.position,
                     cell,
                     obstacles,
                     friendly_positions,
-                ):
-                    return cell
-            return None
+                )
+            )
         if self._line_of_fire_clear(
             ranger.position,
             enemy.position,
             obstacles,
             friendly_positions,
         ):
-            return enemy.position
-        return None
+            return (enemy.position,)
+        return ()
+
+    @staticmethod
+    def _standoff_leaves_return_fire(
+        target: UnitView,
+        position: Position,
+    ) -> bool:
+        """Whether stepping to max range could actually deny return fire.
+
+        Against an enemy Ranger, range one, two and three are all inside its
+        own three-cell reach, so a defensive Ranger that retreats to maximum
+        range spends its whole Tick moving and still eats the same volley
+        next Turn.  Replaying 2026-10-21 shows this was the single largest
+        source of "should have fired but did not": of the stand-off moves
+        that had a legal shot available, most were against Rangers that could
+        already hit the shooter from max range.
+
+        A Vanguard has a one-cell reach, so only an adjacent one can be
+        escaped; from two cells away the step protects nothing either.
+        """
+
+        if target.unit_type is UnitType.VANGUARD:
+            return manhattan(target.position, position) == 1
+        return False
+
+    def _volley_aim_cell(
+        self,
+        context: _TurnContext,
+        target: CoreView | UnitView,
+        cells: tuple[Position, ...],
+    ) -> Position:
+        """Choose this Ranger's aim cell for the Tick.
+
+        A moving target is only hit by an accurate prediction, and in the
+        live logs every shooter of a volley used the same predicted cell.
+        When the prediction is wrong the whole volley lands on empty ground
+        even though a different shooter could have covered the cell the
+        target actually stepped into.  Keep enough arrows on the most likely
+        cell to destroy the target (so a correct prediction still kills it),
+        then let the remaining shooters cover the other cells it can step
+        into.  A stationary Core keeps the single predicted cell.
+        """
+
+        if len(cells) == 1 or not isinstance(target, UnitView):
+            return cells[0]
+        claims = context.volley_aims.setdefault(str(target.id), [])
+        primary = cells[0]
+        quota = max(1, context.damage_ledger.capacity(target))
+        if claims.count(primary) < quota:
+            claims.append(primary)
+            return primary
+        for cell in cells[1:]:
+            if cell not in claims:
+                claims.append(cell)
+                return cell
+        claims.append(primary)
+        return primary
 
     def _combat_target_is_local(
         self,

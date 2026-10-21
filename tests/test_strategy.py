@@ -2130,7 +2130,28 @@ def test_returning_ranger_does_not_close_on_nearby_enemy_fire() -> None:
     assert action.direction is not Direction.UP
 
 
-def test_ranger_disengages_to_max_range_against_enemy_unit() -> None:
+def test_ranger_disengages_from_an_adjacent_vanguard() -> None:
+    # A Vanguard only reaches one cell, so stepping out of its reach is the
+    # one stand-off that actually denies return fire.
+    turn = make_turn(
+        objects=[
+            core(position=(100, 100)),
+            unit(2, "RANGER", position=(0, 1)),
+            unit(3, "VANGUARD", controlled=False, position=(0, 2)),
+        ],
+    )
+
+    report = decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "MOVE"
+    assert any("max-range firing line" in item.reason for item in report.decisions)
+
+
+def test_ranger_fires_instead_of_stepping_back_from_an_enemy_ranger() -> None:
+    # Both cells are inside the enemy's three-cell reach, so the step denies
+    # no damage and spends the Tick: replaying 2026-10-21 showed this was the
+    # largest source of sacrificed defensive shots.
     turn = make_turn(
         objects=[
             core(position=(100, 100)),
@@ -2142,8 +2163,8 @@ def test_ranger_disengages_to_max_range_against_enemy_unit() -> None:
     report = decide(turn)
 
     action = turn.plan.unit_actions[turn.rangers[0].id]
-    assert action.type == "MOVE"
-    assert any("max-range firing line" in item.reason for item in report.decisions)
+    assert action.type == "SHOOT"
+    assert all("max-range firing line" not in item.reason for item in report.decisions)
 
 
 def test_critical_vanguard_fights_before_withdrawing_during_core_assault() -> None:
