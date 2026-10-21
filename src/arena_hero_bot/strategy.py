@@ -765,6 +765,11 @@ class AggressiveStrategy:
             return True
 
         deadlined = False
+        if self._migration_pause_active(turn):
+            # Clear combat or unloaded units before Ranger/Vanguard planning.
+            # A full Core service cell otherwise blocks the entire deposit
+            # window even though those units have no service action pending.
+            self._prepare_core_departure(context)
         combat_units = [
             unit
             for unit in (*turn.rangers, *turn.vanguards)
@@ -2367,6 +2372,9 @@ class AggressiveStrategy:
                 ),
                 None,
             )
+        migration_deposit_waiting = self._migration_pause_active(context.turn) and any(
+            worker.cargo > 0 for worker in context.turn.workers
+        )
         for unit in sorted(core_units, key=lambda candidate: candidate.id.bytes):
             if unit is service_candidate:
                 continue
@@ -2377,7 +2385,9 @@ class AggressiveStrategy:
             full_loaded_worker = isinstance(unit, Worker) and (
                 unit.cargo > 0 and context.remaining_resource_space <= 0
             )
-            extra_service_unit = service_candidate is not None
+            extra_service_unit = (
+                service_candidate is not None or migration_deposit_waiting
+            )
             if not (
                 critical_without_service or full_loaded_worker or extra_service_unit
             ):

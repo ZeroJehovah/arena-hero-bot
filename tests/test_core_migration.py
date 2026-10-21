@@ -226,6 +226,37 @@ def test_loaded_worker_blocking_core_step_opens_immediate_deposit_halt() -> None
     )
 
 
+def test_migration_pause_clears_non_service_unit_from_core_cell() -> None:
+    memory = WorldMemory(
+        core_home_position=(3, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+        core_migration_steps_since_pause=5,
+        core_migration_pause_until_tick=200,
+    )
+    ranger_object = unit(3, "RANGER", position=(0, 0))
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            ranger_object,
+            unit(2, "WORKER", position=(1, 0), cargo=1),
+        ],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    ranger = next(unit for unit in turn.rangers if str(unit.id) == ranger_object["id"])
+    action = turn.plan.unit_actions.get(ranger.id)
+    assert action is not None
+    assert action.type == "MOVE"
+    assert any(
+        item.actor_id == ranger_object["id"]
+        and item.reason == "leave Core service cell for unique traffic"
+        for item in report.decisions
+    )
+
+
 def test_migration_pause_waits_for_the_loaded_queue_to_drain() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
