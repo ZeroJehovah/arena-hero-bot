@@ -297,11 +297,10 @@ CORE_QUEUE_RADIUS = 4
 # exclusion disk.  The explicit destination check below remains authoritative
 # throughout the four-Tick move.
 CORE_MIGRATION_CLEAR_RADIUS = 1
-# A moving Core cannot receive deposits, but deposits resolve before the Core
-# action.  A loaded Worker staged on the arrival cell can therefore deposit and
-# begin the next four-Tick migration in the same Tick.  Keep a four-Tick
-# fallback halt for exceptional traffic or healing blocks; normal migration no
-# longer waits after a fixed number of steps.
+# A moving Core cannot receive deposits.  Keep one arrival Tick for a staged
+# Worker to unload, then resume immediately on the following Tick.  A four-Tick
+# fallback halt remains available for exceptional traffic or healing blocks;
+# normal migration no longer waits after a fixed number of steps.
 CORE_MIGRATION_PAUSE_MIN_TICKS = 1
 CORE_MIGRATION_PAUSE_MAX_TICKS = 4
 # While the Core is between homes, keep the eight patrol Rangers on a compact
@@ -764,8 +763,8 @@ class AggressiveStrategy:
         deadlined = False
         if turn.core is not None and self._core_migration_in_progress(turn.core.view):
             # Preserve the arrival-cell service slot before combat planning.
-            # On a NORMAL arrival Tick the loaded Worker can deposit and the
-            # Core can still begin its next four-Tick move in the same plan.
+            # On a NORMAL arrival Tick the loaded Worker deposits while the
+            # Core waits; the next plan starts the following four-Tick move.
             self._prepare_core_departure(context)
         combat_units = [
             unit
@@ -2519,7 +2518,15 @@ class AggressiveStrategy:
                 worker.position == core.position for worker in loaded_workers
             )
             if service_ready:
-                self.memory.core_migration_pause_until_tick = -1
+                self.memory.core_migration_pause_until_tick = context.turn.tick + 1
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="WAIT",
+                    reason="hold one Tick for the arrival-cell deposit",
+                    target=core.position,
+                )
+                return
             elif loaded_workers and self.memory.core_migration_pause_until_tick == -1:
                 nearest = min(
                     manhattan(worker.position, core.position)

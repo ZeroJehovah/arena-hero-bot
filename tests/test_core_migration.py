@@ -146,7 +146,7 @@ def test_committed_migration_resets_identity_and_tuning_state() -> None:
         strategy.request_core_migration((0, 0))
 
 
-def test_arrival_deposit_and_next_core_move_share_a_tick() -> None:
+def test_arrival_deposit_uses_one_tick_before_next_core_move() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -161,9 +161,15 @@ def test_arrival_deposit_and_next_core_move_share_a_tick() -> None:
     strategy.decide(turn)
 
     assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
-    assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
-    assert memory.core_migration_pause_until_tick == -1
+    assert turn.plan.core_action is None
+    assert memory.core_migration_pause_until_tick == 101
+
+    workers[0]["cargo"] = 0
+    resumed = make_turn(tick=101, objects=[core(), *workers])
+    strategy.decide(resumed)
+
+    assert resumed.plan.core_action is not None
+    assert resumed.plan.core_action.type == "START_MOVE"
 
 
 def test_migration_does_not_pause_every_eight_steps() -> None:
@@ -294,7 +300,7 @@ def test_migration_pause_clears_non_service_unit_from_core_cell() -> None:
     )
 
 
-def test_loaded_worker_deposits_on_arrival_without_a_pause() -> None:
+def test_loaded_worker_deposits_during_the_arrival_tick() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -306,9 +312,8 @@ def test_loaded_worker_deposits_on_arrival_without_a_pause() -> None:
     _strategy(memory).decide(turn)
 
     assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
-    assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
-    assert memory.core_migration_pause_until_tick == -1
+    assert turn.plan.core_action is None
+    assert memory.core_migration_pause_until_tick == turn.tick + 1
 
 
 def test_loaded_worker_stages_at_moving_core_destination() -> None:
