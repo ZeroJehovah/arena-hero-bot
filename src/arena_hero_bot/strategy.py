@@ -6018,32 +6018,32 @@ class AggressiveStrategy:
             | set(context.occupied)
             | context.reserved
         ) - {core.position}
+        recent = self.memory.recent_positions(str(core.id))
         direction = next_step(
             core.position,
             target,
             blocked=blocked,
-            recent=self.memory.recent_positions(str(core.id)),
+            recent=recent,
             direction_offset=self._direction_offset(core.id),
         )
-        if direction is None:
-            return None
-        # Do not spend a four-Tick move walking away just because every
-        # immediate homeward cell is temporarily occupied by the economy.
-        # Static progress cells should remain available; wait for friendly
-        # traffic to clear.  A terrain detour is still allowed when no
-        # monotonic static step exists at all.
-        current_distance = manhattan(core.position, target)
-        static_progress = [
-            position
-            for position in adjacent_positions(core.position)
-            if position not in obstacles
-            and position not in context.turn.resource_cells
-            and manhattan(position, target) < current_distance
-        ]
-        if static_progress and manhattan(add(core.position, direction), target) >= (
-            current_distance
+        if (
+            direction is not None
+            and recent
+            and add(core.position, direction) == recent[0]
         ):
-            return None
+            # Patrol and defense units can pause on the one cell the Core needs
+            # next.  Wait or take a non-reversing detour, but never begin an
+            # A-B-A loop while the destination is crowded.
+            detour = next_step(
+                core.position,
+                target,
+                blocked=blocked | {recent[0]},
+                recent=recent[1:],
+                direction_offset=self._direction_offset(core.id),
+            )
+            if detour is None or add(core.position, detour) == recent[0]:
+                return None
+            return detour
         return direction
 
     def _defensive_perimeter_assignments(
