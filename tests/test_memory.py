@@ -543,3 +543,22 @@ def test_worker_coverage_records_actual_vision_not_just_arrival(tmp_path) -> Non
     memory.save(path)
     restored = WorldMemory.load(path)
     assert restored.worker_seen_ticks == memory.worker_seen_ticks
+
+
+def test_worker_coverage_follows_the_moving_core_not_the_final_home() -> None:
+    memory = WorldMemory(core_home_position=(64, 0))
+
+    memory.observe(
+        make_turn(
+            tick=20,
+            objects=[core(position=(16, 16)), unit(2, "WORKER", position=(23, 16))],
+        )
+    )
+
+    assert memory.worker_seen_ticks[(20, 16)] == 20
+    assert memory.worker_seen_ticks[(26, 16)] == 20
+    assert (64, 16) not in memory.worker_seen_ticks
+    assert all(
+        position[0] // 32 == 0 and position[1] // 32 == 0
+        for position in memory.worker_seen_ticks
+    )

@@ -291,11 +291,18 @@ class WorldMemory:
     def _observe_worker_coverage(self, turn: Turn) -> None:
         """Record the last actual sighting of every cell in the active chunk."""
 
-        home = self.core_home_position
-        if home is None:
+        # During a long migration the economy follows the Core's current
+        # chunk, not the persisted final home.  Anchoring coverage to the
+        # destination made the table empty for the whole walk: the current
+        # chunk filter then discarded those destination observations every
+        # Tick.  Keep coverage in lockstep with the live economy anchor.
+        anchor = (
+            turn.core.position if turn.core is not None else self.core_home_position
+        )
+        if anchor is None:
             return
-        min_x = (home[0] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
-        min_y = (home[1] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
+        min_x = (anchor[0] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
+        min_y = (anchor[1] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
         block = {
             (x, y)
             for x in range(min_x, min_x + WORKER_COVERAGE_SIZE)
