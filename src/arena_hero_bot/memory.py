@@ -129,9 +129,13 @@ class WorldMemory:
     # Selected once for the new symmetric defensive posture and retained
     # across restarts while the Core walks there.
     core_home_position: Position | None = None
-    # The four-block economy is a durable identity assignment, separate from
-    # combat roles.  A replacement Worker fills a vacancy in its own region
-    # instead of following the nearest live resource across a block boundary.
+    # Version 3 moves the economy from four chunks meeting at a junction into
+    # four quadrants of one chunk.  Keep the marker durable so a restart during
+    # migration does not choose a second home or renumber current assignments.
+    core_layout_version: int = 0
+    # The four-quadrant economy is a durable identity assignment, separate from
+    # combat roles.  A replacement Worker fills a vacancy in its own quadrant
+    # instead of following the nearest live resource across the chunk.
     worker_blocks: dict[str, int] = field(default_factory=dict)
     # Arrival ticks, not merely sightings, drive the least-recently-visited
     # patrol sweep.  Keeping this separate from ``resource_cells`` preserves
@@ -572,6 +576,7 @@ class WorldMemory:
                 if self.core_home_position is not None
                 else None
             ),
+            "core_layout_version": self.core_layout_version,
             "worker_blocks": dict(sorted(self.worker_blocks.items())),
             "worker_visit_ticks": [
                 {"position": list(position), "tick": tick}
@@ -721,6 +726,7 @@ class WorldMemory:
                 raw.get("last_normal_growth_resources")
             ),
             core_home_position=_optional_position(raw.get("core_home_position")),
+            core_layout_version=int(raw.get("core_layout_version", 0)),
             worker_blocks={
                 str(unit_id): int(block)
                 for unit_id, block in raw.get("worker_blocks", {}).items()

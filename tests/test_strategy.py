@@ -20,6 +20,7 @@ from arena_hero_bot.memory import EnemySighting, UnitGoal, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
     CLAIM_STALL_BUDGET,
+    CORE_LAYOUT_VERSION,
     DEFENSE_ROLE,
     EXPEDITION_LINK_RADIUS,
     EXPEDITION_STAGING_PATH_EXPANSIONS,
@@ -33,8 +34,9 @@ from arena_hero_bot.strategy import (
     _clear_manhattan_path,
     _defensive_ring_offsets,
     _ExpeditionPursuit,
-    _four_block_outer_ring,
     _resource_patrol_offsets,
+    _single_chunk_outer_ring,
+    _single_chunk_resource_blocks,
     _TurnContext,
 )
 
@@ -6964,7 +6966,7 @@ def test_symmetric_posture_migrates_while_worker_returns_cargo() -> None:
     assert any("symmetric-defense home" in item.reason for item in report.decisions)
 
 
-def test_symmetric_posture_keeps_home_with_one_blocked_guard_post() -> None:
+def test_symmetric_layout_migrates_a_legacy_junction_home() -> None:
     config = expedition_config(target_workers=16)
     home = (-416, 672)
     memory = WorldMemory(core_home_position=home)
@@ -6980,7 +6982,14 @@ def test_symmetric_posture_keeps_home_with_one_blocked_guard_post() -> None:
 
     strategy.decide(turn)
 
-    assert memory.core_home_position == home
+    assert memory.core_layout_version == CORE_LAYOUT_VERSION
+    selected_home = memory.core_home_position
+    assert selected_home is not None
+    assert selected_home != home
+    assert any(
+        block.contains(selected_home)
+        for block in _single_chunk_resource_blocks(selected_home)
+    )
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "START_MOVE"
 
@@ -7011,7 +7020,7 @@ def test_symmetric_posture_assigns_four_cardinal_vanguards_and_sixteen_rangers()
         (assignments[UUID(unit["id"])][0], assignments[UUID(unit["id"])][1])
         for unit in vanguards
         if UUID(unit["id"]) in assignments
-    } == {(0, -6), (6, 0), (0, 6), (-6, 0)}
+    } == {(0, -5), (5, 0), (0, 5), (-5, 0)}
     assert (
         len(
             {
@@ -7053,7 +7062,7 @@ def test_symmetric_posts_allow_workers_through_occupied_pocket_exits() -> None:
     layout = strategy._defensive_layout
     assert layout is not None
     assert set(layout.assignments.values()) == set(vanguard_offsets + ranger_offsets)
-    assert {(-6, 0), (-8, 0)} <= set(layout.assignments.values())
+    assert {(-5, 0), (-15, 0)} <= set(layout.assignments.values())
     worker_decision = next(
         item for item in report.decisions if item.actor_id == object_id(2)
     )
@@ -7125,7 +7134,7 @@ def test_symmetric_patrol_teams_share_one_clockwise_ring() -> None:
     turn = make_turn(resources=0, objects=[core(), *vanguards, *rangers])
     strategy._reconcile_unit_roles(turn)
 
-    route = _four_block_outer_ring((0, 0), set())
+    route = _single_chunk_outer_ring((0, 0), set())
     goals = {
         member.id: strategy._combat_patrol_goal(member, turn)[0]
         for member in (*turn.rangers, *turn.vanguards)

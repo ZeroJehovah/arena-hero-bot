@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
 from itertools import pairwise
-from math import atan2
+from math import atan2, exp
 from time import monotonic
 from uuid import UUID
 
@@ -35,7 +35,7 @@ from .combat_policy import (
     ThreatAssessment,
     ThreatLevel,
 )
-from .exploration import ExpeditionNavigator, ExplorationRoute
+from .exploration import ExpeditionNavigator, ExplorationRoute, visible_cells
 from .geometry import (
     DIRECTIONS,
     add,
@@ -62,7 +62,8 @@ RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
 WORKER_BLOCK_PATROL_PURPOSE = "worker-block-patrol-v1"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 PATROL_RING_PURPOSE = "combat-ring-patrol-v1"
-PATROL_RING_LAYOUT_VERSION = 2
+PATROL_RING_LAYOUT_VERSION = 3
+CORE_LAYOUT_VERSION = 3
 RESOURCE_CLAIM_TTL = 4
 # A held claim is only released when its approach has stopped paying, not when
 # the Worker is briefly blocked.  Measured on the 2026-10-10 restock day,
@@ -234,8 +235,8 @@ EXPEDITION_LINK_RADIUS = 4
 
 # Revised live posture.  The legacy constants above remain available for
 # explicit small test configurations; ``target_workers >= 16`` selects this
-# formation: four cardinal Vanguard posts, sixteen Ranger posts, and eight
-# patrol Rangers sharing one clockwise ring around four 32x32 resource blocks.
+# formation: four Vanguard posts, sixteen Ranger posts, and eight patrol Rangers
+# sharing one clockwise edge around the single 32x32 resource chunk.
 # Surplus Vanguards join expedition staging.
 SYMMETRIC_FORMATION_VANGUARDS = 4
 SYMMETRIC_FORMATION_RANGERS = 24
@@ -245,7 +246,42 @@ SYMMETRIC_DEFENSE_RANGERS = 16
 SYMMETRIC_RESOURCE_BLOCK_SIZE = 32
 SYMMETRIC_WORKERS_PER_BLOCK = 4
 SYMMETRIC_PATROL_RING_UNITS = 8
-SYMMETRIC_CORE_RADIUS = 6
+SYMMETRIC_CORE_RADIUS = 13
+# The clear-terrain template covers a radius-20 Manhattan disk.  On a remembered
+# rock map the same roster is reflowed inside successively smaller rings until
+# every traversable cell inside the ring is visible.  Ten is the floor at which
+# the Core still has enough depth for the four Vanguards and sixteen Rangers.
+SYMMETRIC_DEFENSE_MAX_RADIUS = 20
+SYMMETRIC_DEFENSE_MIN_RADIUS = 10
+SYMMETRIC_DEFENSE_SEARCH_ITERATIONS = 24_000
+# Compare the four central chunk cells over the band the ring actually has to
+# defend.  A wider probe would favor open outward-facing cells while ignoring
+# the rocks closest to the Vanguard screen.
+SYMMETRIC_HOME_CLEAR_RADIUS = 14
+SYMMETRIC_VANGUARD_OFFSETS: tuple[Position, ...] = (
+    (0, -5),
+    (5, 0),
+    (0, 5),
+    (-5, 0),
+)
+SYMMETRIC_RANGER_OFFSETS: tuple[Position, ...] = (
+    (2, -3),
+    (-2, -3),
+    (-2, 3),
+    (2, 3),
+    (15, 0),
+    (10, 5),
+    (5, 10),
+    (0, 15),
+    (-5, 10),
+    (-10, 5),
+    (-15, 0),
+    (-10, -5),
+    (-5, -10),
+    (0, -15),
+    (5, -10),
+    (10, -5),
+)
 CORE_QUEUE_RADIUS = 4
 
 
@@ -382,7 +418,7 @@ class _DefensiveLayout:
 
 @dataclass(frozen=True, slots=True)
 class _ResourceBlock:
-    """One fixed 32x32 economy region around the four-block Core junction."""
+    """One fixed 16x16 quadrant of the selected resource chunk."""
 
     index: int
     min_x: int
@@ -413,6 +449,11 @@ class AggressiveStrategy:
         # stores each Unit's exact post in WorldMemory so assignments survive
         # combat, casualties, and service restarts.
         self._defensive_layout: _DefensiveLayout | None = None
+        # Obstacle-aware symmetric posts are expensive to optimize.  Cache both
+        # their ring radius and the local rock fingerprint that produced them.
+        self._symmetric_defense_cache: (
+            tuple[Position, tuple[Position, ...], tuple[Position, ...], int] | None
+        ) = None
         # The roaming squad, cached against the roster it was drawn from so
         # membership only changes when a combat unit is built or dies.
         self._offensive_squad: tuple[frozenset[UUID], frozenset[UUID]] | None = None
@@ -531,6 +572,8 @@ class AggressiveStrategy:
         self.memory.observe(turn)
         if self.config.expedition_mode:
             self._reconcile_unit_roles(turn)
+            if self._symmetric_posture():
+                self._ensure_symmetric_layout(turn)
             self._update_expeditions(turn)
             self._refresh_expedition_pursuits(turn)
             self._refresh_expedition_navigation(turn)
@@ -3980,6 +4023,15 @@ class AggressiveStrategy:
                 (UnitType.RANGER, defense_rangers, ranger_offsets),
             ):
                 posts = {(anchor[0] + dx, anchor[1] + dy) for dx, dy in offsets}
+                preferred_posts = set(posts)
+                if unit_type is UnitType.VANGUARD:
+                    # Legacy garrisons used a radius-6 cross.  Keep those four
+                    # UUID owners through the move to the new radius-20 layout;
+                    # UUID order must not decide which Vanguard survives.
+                    preferred_posts.update(
+                        (anchor[0] + dx, anchor[1] + dy)
+                        for dx, dy in ((0, -6), (6, 0), (0, 6), (-6, 0))
+                    )
                 assigned = sorted(
                     (
                         unit_id
@@ -3987,9 +4039,9 @@ class AggressiveStrategy:
                         if role == DEFENSE_ROLE
                         and live_units[unit_id].unit_type is unit_type
                     ),
-                    key=lambda unit_id, posts=posts: (
-                        self.memory.defense_posts.get(unit_id) not in posts,
-                        live_units[unit_id].position not in posts,
+                    key=lambda unit_id, preferred_posts=preferred_posts: (
+                        self.memory.defense_posts.get(unit_id) not in preferred_posts,
+                        live_units[unit_id].position not in preferred_posts,
                         UUID(unit_id).bytes,
                     ),
                 )
@@ -5682,75 +5734,180 @@ class AggressiveStrategy:
     def _symmetric_defense_offsets() -> tuple[
         tuple[Position, ...], tuple[Position, ...]
     ]:
-        """Return four cardinal Vanguard posts and sixteen mirrored Ranger posts."""
+        """Return the clear-terrain radius-20 guard template.
 
-        vanguards = (
-            (0, -6),
-            (6, 0),
-            (0, 6),
-            (-6, 0),
+        Four Vanguards close the near ring while four inner and twelve outer
+        Rangers fill the disk between them.  The complete 20-guard footprint
+        covers every traversable cell of a radius-20 Manhattan disk when no
+        rocks interrupt the supercover sight lines.
+        """
+
+        return SYMMETRIC_VANGUARD_OFFSETS, SYMMETRIC_RANGER_OFFSETS
+
+    def _symmetric_defense_posts(
+        self,
+        center: Position,
+        obstacles: set[Position],
+    ) -> tuple[tuple[Position, ...], int]:
+        """Return obstacle-aware guard posts and their fully covered radius."""
+
+        radius = SYMMETRIC_DEFENSE_MAX_RADIUS + RANGER_VISION_RADIUS + 1
+        local_obstacles = tuple(
+            (center[0] + dx, center[1] + dy)
+            for dx in range(-(radius + 1), radius + 2)
+            for dy in range(-(radius + 1), radius + 2)
+            if abs(dx) + abs(dy) <= radius + 1
+            and (center[0] + dx, center[1] + dy) in obstacles
         )
-        rangers = (
-            (0, -8),
-            (0, -10),
-            (6, -6),
-            (8, -8),
-            (8, 0),
-            (10, 0),
-            (6, 6),
-            (8, 8),
-            (0, 8),
-            (0, 10),
-            (-6, 6),
-            (-8, 8),
-            (-8, 0),
-            (-10, 0),
-            (-6, -6),
-            (-8, -8),
+        cached = self._symmetric_defense_cache
+        if cached is not None and cached[0] == center and cached[1] == local_obstacles:
+            return cached[2], cached[3]
+        local_obstacle_set = set(local_obstacles)
+        posts, coverage_radius = _optimized_symmetric_defense_posts(
+            center,
+            local_obstacle_set,
         )
-        return vanguards, rangers
+        self._symmetric_defense_cache = (
+            center,
+            local_obstacles,
+            posts,
+            coverage_radius,
+        )
+        return posts, coverage_radius
+
+    def _ensure_symmetric_layout(self, turn: Turn) -> None:
+        """Migrate legacy four-junction memory to one centered resource chunk."""
+
+        if self.memory.core_layout_version >= CORE_LAYOUT_VERSION:
+            return
+        if turn.core is None:
+            return
+        target = self._symmetric_home_candidate_from(
+            turn.core.position,
+            self._rock_map(turn),
+            set(turn.resource_cells) | set(self.memory.resource_cells),
+            {unit.position for unit in turn.units},
+        )
+        if target is not None:
+            self._commit_symmetric_home(target)
+
+    def _symmetric_home_candidate_from(
+        self,
+        core_position: Position,
+        obstacles: set[Position],
+        resources: set[Position],
+        occupied: set[Position],
+    ) -> Position | None:
+        """Choose the least obstructed nearby chunk and its best center cell."""
+
+        origin = self.memory.core_home_position or core_position
+        base_x = origin[0] // SYMMETRIC_RESOURCE_BLOCK_SIZE
+        base_y = origin[1] // SYMMETRIC_RESOURCE_BLOCK_SIZE
+        size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+        chunks = tuple(
+            (chunk_x, chunk_y)
+            for chunk_y in range(base_y - 1, base_y + 2)
+            for chunk_x in range(base_x - 1, base_x + 2)
+        )
+        ranked_chunks: list[tuple[int, int, int, int, int]] = []
+        for chunk_x, chunk_y in chunks:
+            min_x = chunk_x * size
+            max_x = min_x + size - 1
+            min_y = chunk_y * size
+            max_y = min_y + size - 1
+            blocked = sum(
+                (x, y) in obstacles
+                for x in range(min_x, max_x + 1)
+                for y in range(min_y, max_y + 1)
+            )
+            known_resources = sum(
+                (x, y) in resources
+                for x in range(min_x, max_x + 1)
+                for y in range(min_y, max_y + 1)
+            )
+            chunk_center = (min_x + size // 2, min_y + size // 2)
+            ranked_chunks.append(
+                (
+                    blocked,
+                    -known_resources,
+                    manhattan(chunk_center, core_position),
+                    chunk_x,
+                    chunk_y,
+                )
+            )
+        _, _, _, chunk_x, chunk_y = min(ranked_chunks)
+        min_x = chunk_x * size
+        min_y = chunk_y * size
+        vanguards, rangers = self._symmetric_defense_offsets()
+        offsets = (*vanguards, *rangers)
+        center_cells = (
+            (min_x + size // 2 - 1, min_y + size // 2 - 1),
+            (min_x + size // 2, min_y + size // 2 - 1),
+            (min_x + size // 2 - 1, min_y + size // 2),
+            (min_x + size // 2, min_y + size // 2),
+        )
+        radius = SYMMETRIC_HOME_CLEAR_RADIUS
+        candidates: list[tuple[int, int, int, Position]] = []
+        for position in center_cells:
+            if position in obstacles or position in resources or position in occupied:
+                continue
+            clear_nearby = sum(
+                (position[0] + dx, position[1] + dy) not in obstacles
+                for dx in range(-radius, radius + 1)
+                for dy in range(-radius, radius + 1)
+                if abs(dx) + abs(dy) <= radius
+            )
+            blocked_posts = sum(
+                (position[0] + dx, position[1] + dy) in obstacles for dx, dy in offsets
+            )
+            candidates.append(
+                (
+                    -clear_nearby,
+                    blocked_posts,
+                    manhattan(position, core_position),
+                    position,
+                )
+            )
+        if candidates:
+            return min(candidates)[-1]
+        return next(
+            (position for position in center_cells if position not in obstacles),
+            None,
+        )
+
+    def _commit_symmetric_home(self, target: Position | None) -> None:
+        """Commit one layout migration without changing combat identities."""
+
+        if target is None:
+            return
+        self.memory.core_home_position = target
+        self.memory.core_layout_version = CORE_LAYOUT_VERSION
+        self.memory.defense_posts.clear()
+        self.memory.defense_anchor = None
+        self.memory.worker_blocks.clear()
+        self.memory.worker_visit_ticks.clear()
+        self.memory.patrol_ring_slots.clear()
+        self.memory.patrol_ring_slots_initialized = False
+        self.memory.patrol_ring_layout_version = 0
+        self.memory.patrol_ring_phase = 0
+        self.memory.patrol_ring_origin = None
+        self._defensive_layout = None
+        self._symmetric_defense_cache = None
+        self._patrol_ring_cache = None
+        self._patrol_ring_phase_tick = -1
 
     def _symmetric_home_candidate(self, context: _TurnContext) -> Position | None:
-        """Pick the nearest clear center with the complete symmetric footprint."""
+        """Pick the best center of a nearby 32x32 resource chunk."""
 
         core = context.turn.core
         if core is None:
             return None
-        vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
-        offsets = (*vanguard_offsets, *ranger_offsets)
-        obstacles = self._rock_map(context.turn)
-        resources = set(context.turn.resource_cells) | set(self.memory.resource_cells)
-        occupied = set(context.occupied) - {core.position}
-        candidates: list[tuple[int, int, int, Position]] = []
-        for dx in range(-24, 25):
-            for dy in range(-24, 25):
-                if not (dx or dy):
-                    continue
-                position = (core.position[0] + dx, core.position[1] + dy)
-                footprint = {(position[0] + ox, position[1] + oy) for ox, oy in offsets}
-                blocked = len(footprint & obstacles)
-                if blocked:
-                    continue
-                if (
-                    position in obstacles
-                    or position in resources
-                    or position in occupied
-                ):
-                    continue
-                local_obstacles = sum(
-                    (position[0] + ox, position[1] + oy) in obstacles
-                    for ox in range(-2, 3)
-                    for oy in range(-2, 3)
-                )
-                nearby_resources = sum(
-                    manhattan(position, resource)
-                    <= self.config.resource_outreach_radius
-                    for resource in resources
-                )
-                candidates.append(
-                    (local_obstacles, -nearby_resources, abs(dx) + abs(dy), position)
-                )
-        return min(candidates)[-1] if candidates else None
+        return self._symmetric_home_candidate_from(
+            core.position,
+            self._rock_map(context.turn),
+            set(context.turn.resource_cells) | set(self.memory.resource_cells),
+            set(context.occupied),
+        )
 
     def _core_home_direction(self, context: _TurnContext) -> Direction | None:
         """Walk the Core to the persisted clear center for the new formation."""
@@ -5760,13 +5917,9 @@ class AggressiveStrategy:
             return None
         target = self.memory.core_home_position
         obstacles = self._rock_map(context.turn)
-        # A single blocked guard post is tolerated: the post assignment below
-        # moves that guard to the nearest free cell, which the live junction
-        # home needs for its one rock-covered Ranger slot.  Recompute only when
-        # the Core itself would have to stand on a rock.
         if target is None or target in obstacles:
             target = self._symmetric_home_candidate(context)
-            self.memory.core_home_position = target
+            self._commit_symmetric_home(target)
         if target is None or core.position == target:
             return None
         blocked = (
@@ -5845,27 +5998,29 @@ class AggressiveStrategy:
                 for unit_id, position in self.memory.defense_posts.items()
             }
             assignments: dict[UUID, Position] = {}
-            vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
             obstacles = self._rock_map(context.turn)
             at_home = core_position == self.memory.core_home_position
-            for unit_type, offsets in (
-                (UnitType.VANGUARD, vanguard_offsets),
-                (UnitType.RANGER, ranger_offsets),
-            ):
-                # Friendly traffic can pass through a guard.  Do not nudge
-                # individual posts away from pocket exits or occupied cells.
-                posts = (
-                    _place_defense_posts(core_position, offsets, obstacles)
-                    if at_home
-                    else tuple(
-                        (core_position[0] + dx, core_position[1] + dy)
-                        for dx, dy in offsets
-                    )
+            if at_home:
+                posts, coverage_radius = self._symmetric_defense_posts(
+                    core_position,
+                    obstacles,
                 )
+            else:
+                vanguard_offsets, ranger_offsets = self._symmetric_defense_offsets()
+                posts = tuple(
+                    (core_position[0] + dx, core_position[1] + dy)
+                    for dx, dy in (*vanguard_offsets, *ranger_offsets)
+                )
+                coverage_radius = SYMMETRIC_DEFENSE_MAX_RADIUS
+            split = SYMMETRIC_DEFENSE_VANGUARDS
+            for unit_type, type_posts in (
+                (UnitType.VANGUARD, posts[:split]),
+                (UnitType.RANGER, posts[split:]),
+            ):
                 assignments.update(
                     _assign_fixed_defense_posts(
                         tuple(unit for unit in guards if unit.unit_type is unit_type),
-                        posts,
+                        type_posts,
                         previous,
                     )
                 )
@@ -5877,7 +6032,7 @@ class AggressiveStrategy:
                 core_id=core.id,
                 core_position=core_position,
                 guard_ids=ordered_guard_ids,
-                radius=SYMMETRIC_CORE_RADIUS,
+                radius=coverage_radius,
                 assignments=assignments,
             )
             return assignments
@@ -6225,7 +6380,7 @@ class AggressiveStrategy:
         return patrol_position, "search outward for enemy units and Cores"
 
     def _patrol_ring_route(self, turn: Turn) -> tuple[Position, ...]:
-        """Return the traversable clockwise outer edge of the four blocks."""
+        """Return the traversable clockwise outer edge of the resource chunk."""
 
         home = self.memory.core_home_position
         if home is None:
@@ -6233,7 +6388,7 @@ class AggressiveStrategy:
         cached = self._patrol_ring_cache
         if cached is not None and cached[0] == turn.tick and cached[1] == home:
             return cached[2]
-        route = _four_block_outer_ring(home, self._rock_map(turn))
+        route = _single_chunk_outer_ring(home, self._rock_map(turn))
         self._patrol_ring_cache = (turn.tick, home, route)
         return route
 
@@ -6393,7 +6548,7 @@ class AggressiveStrategy:
         slots = self._reconcile_patrol_ring_slots(turn)
         slot = slots.get(unit.id)
         if not route or slot is None:
-            return unit.position, "hold while the four-block patrol ring is unavailable"
+            return unit.position, "hold while the chunk-edge patrol ring is unavailable"
         self._advance_patrol_ring_phase(turn, route, slots)
         route_index = (
             _ring_slot_index(slot, SYMMETRIC_PATROL_RING_UNITS, len(route))
@@ -6407,7 +6562,7 @@ class AggressiveStrategy:
             last_progress_position=unit.position,
         )
         self.memory.set_goal(str(unit.id), goal)
-        return patrol_position, "follow the clockwise four-block patrol ring"
+        return patrol_position, "follow the clockwise resource-chunk edge"
 
     def _enemy_score(
         self,
@@ -6475,15 +6630,15 @@ class AggressiveStrategy:
         return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
     def _resource_blocks(self) -> tuple[_ResourceBlock, ...]:
-        """Return the four fixed economy regions around the persisted junction."""
+        """Return the four quadrants of the persisted resource chunk."""
 
         if not self._symmetric_posture():
             return ()
         home = self.memory.core_home_position
-        return () if home is None else _four_resource_blocks(home)
+        return () if home is None else _single_chunk_resource_blocks(home)
 
     def _worker_resource_block(self, worker: Worker) -> _ResourceBlock | None:
-        """Return a Worker's durable block identity, if the live scheme is active."""
+        """Return a Worker's durable quadrant identity, if the scheme is active."""
 
         block_index = self.memory.worker_blocks.get(str(worker.id))
         return next(
@@ -6492,7 +6647,7 @@ class AggressiveStrategy:
         )
 
     def _reconcile_worker_blocks(self, turn: Turn) -> dict[UUID, _ResourceBlock]:
-        """Keep Worker/block identities stable and fill vacancies deterministically."""
+        """Keep Worker identities stable and fill quadrant vacancies."""
 
         blocks = self._resource_blocks()
         if not blocks:
@@ -6543,7 +6698,7 @@ class AggressiveStrategy:
         return assignments
 
     def _assign_block_resources(self, turn: Turn) -> dict[UUID, Position]:
-        """Pair each Worker only with resources inside its fixed 32x32 block."""
+        """Pair each Worker only with resources inside its fixed quadrant."""
 
         block_by_worker = self._reconcile_worker_blocks(turn)
         if not block_by_worker:
@@ -6577,7 +6732,7 @@ class AggressiveStrategy:
             - visible_resources
         )
 
-        # A resource claim made before the four-block policy went live may
+        # A resource claim made before the four-quadrant policy went live may
         # point outside this Worker's identity.  Drop it now; otherwise the
         # later resource-goal fallback would keep walking toward that stale
         # cross-block target even after the assignment pool excluded it.
@@ -6636,7 +6791,7 @@ class AggressiveStrategy:
                 block_workers.pop(worker_id)
                 known.remove(resource)
             self._uncross_claims(turn, local_assignments)
-            # A Worker can cross a block boundary while returning cargo or
+            # A Worker can cross a quadrant boundary while returning cargo or
             # converging after the migration.  The underfoot shortcut must not
             # turn that transit into a cross-block harvest: visible resources
             # are offered only to the Workers whose durable identity owns this
@@ -6674,7 +6829,7 @@ class AggressiveStrategy:
     def _assign_resources(self, turn: Turn) -> dict[UUID, Position]:
         """Assign known resource cells to empty Workers.
 
-        The live four-block posture dispatches to a per-identity block pool.
+        The live single-chunk posture dispatches to a per-identity quadrant pool.
         Legacy configurations retain the global nearest/round-trip pairing.
         Enemy and unreachable cells stay excluded in both paths so a Worker
         does not walk into a known threat or a walled-off route.
@@ -7815,7 +7970,7 @@ class AggressiveStrategy:
         worker: Worker,
         context: _TurnContext,
     ) -> Position:
-        """Sweep the Worker's own block by least-recently-arrived cell."""
+        """Sweep the Worker's own chunk quadrant by least-recently-arrived cell."""
 
         turn = context.turn
         block = self._worker_resource_block(worker)
@@ -8531,39 +8686,22 @@ def _resource_patrol_offsets(radius: int, spacing: int) -> tuple[Position, ...]:
     return tuple(route)
 
 
-def _four_resource_blocks(home: Position) -> tuple[_ResourceBlock, ...]:
-    """Return the four res-refresh blocks touching ``home`` at one corner."""
+def _single_chunk_resource_blocks(home: Position) -> tuple[_ResourceBlock, ...]:
+    """Return the four 16x16 quadrants of ``home``'s 32x32 chunk."""
 
     size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    half = size // 2
+    min_x = (home[0] // size) * size
+    min_y = (home[1] // size) * size
+    max_x = min_x + size - 1
+    max_y = min_y + size - 1
+    middle_x = min_x + half
+    middle_y = min_y + half
     return (
-        _ResourceBlock(
-            index=0,
-            min_x=home[0] - size,
-            max_x=home[0] - 1,
-            min_y=home[1] - size,
-            max_y=home[1] - 1,
-        ),
-        _ResourceBlock(
-            index=1,
-            min_x=home[0],
-            max_x=home[0] + size - 1,
-            min_y=home[1] - size,
-            max_y=home[1] - 1,
-        ),
-        _ResourceBlock(
-            index=2,
-            min_x=home[0] - size,
-            max_x=home[0] - 1,
-            min_y=home[1],
-            max_y=home[1] + size - 1,
-        ),
-        _ResourceBlock(
-            index=3,
-            min_x=home[0],
-            max_x=home[0] + size - 1,
-            min_y=home[1],
-            max_y=home[1] + size - 1,
-        ),
+        _ResourceBlock(0, min_x, middle_x - 1, min_y, middle_y - 1),
+        _ResourceBlock(1, middle_x, max_x, min_y, middle_y - 1),
+        _ResourceBlock(2, min_x, middle_x - 1, middle_y, max_y),
+        _ResourceBlock(3, middle_x, max_x, middle_y, max_y),
     )
 
 
@@ -8578,11 +8716,11 @@ def _resource_block_cells(block: _ResourceBlock) -> tuple[Position, ...]:
     )
 
 
-def _four_block_outer_ring(
+def _single_chunk_outer_ring(
     home: Position,
     obstacles: Container[Position],
 ) -> tuple[Position, ...]:
-    """Return the free cells on the clockwise edge of the 64x64 union.
+    """Return the free cells on the clockwise edge of the 32x32 chunk.
 
     Coordinates follow the game's integer grid with increasing y treated as
     north for direction naming.  The route is top-left to top-right, down the
@@ -8591,10 +8729,11 @@ def _four_block_outer_ring(
     pathfinder detours through the adjacent interior cell.
     """
 
-    min_x = home[0] - SYMMETRIC_RESOURCE_BLOCK_SIZE
-    max_x = home[0] + SYMMETRIC_RESOURCE_BLOCK_SIZE - 1
-    min_y = home[1] - SYMMETRIC_RESOURCE_BLOCK_SIZE
-    max_y = home[1] + SYMMETRIC_RESOURCE_BLOCK_SIZE - 1
+    size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    min_x = (home[0] // size) * size
+    max_x = min_x + size - 1
+    min_y = (home[1] // size) * size
+    max_y = min_y + size - 1
     edge = (
         ((x, max_y) for x in range(min_x, max_x + 1)),
         ((max_x, y) for y in range(max_y - 1, min_y - 1, -1)),
@@ -8972,47 +9111,258 @@ def _assign_fixed_defense_posts(
     return assigned
 
 
-def _place_defense_posts(
+@lru_cache(maxsize=32)
+def _manhattan_disk_offsets(radius: int) -> tuple[Position, ...]:
+    """Return one deterministic Manhattan disk in row-major order."""
+
+    return tuple(
+        (dx, dy)
+        for dx in range(-radius, radius + 1)
+        for dy in range(-radius, radius + 1)
+        if abs(dx) + abs(dy) <= radius
+    )
+
+
+def _symmetric_template_posts(center: Position) -> tuple[Position, ...]:
+    """Translate the clear-terrain 4V+16R template onto a Core center."""
+
+    return tuple(
+        (center[0] + dx, center[1] + dy)
+        for dx, dy in (*SYMMETRIC_VANGUARD_OFFSETS, *SYMMETRIC_RANGER_OFFSETS)
+    )
+
+
+def _visible_from_symmetric_posts(
     center: Position,
-    offsets: tuple[Position, ...],
+    posts: tuple[Position, ...],
     obstacles: set[Position],
+) -> set[Position]:
+    """Union Core and role-specific guard vision for one fixed post set."""
+
+    visible = set(visible_cells(center, RANGER_VISION_RADIUS, obstacles))
+    for index, post in enumerate(posts):
+        vision = (
+            VANGUARD_VISION_RADIUS
+            if index < SYMMETRIC_DEFENSE_VANGUARDS
+            else RANGER_VISION_RADIUS
+        )
+        visible.update(visible_cells(post, vision, obstacles))
+    return visible
+
+
+def _uncovered_symmetric_cells(
+    center: Position,
+    posts: tuple[Position, ...],
+    obstacles: set[Position],
+    radius: int,
+) -> set[Position]:
+    """Return traversable cells inside one defense disk that remain unseen."""
+
+    target = {
+        (center[0] + dx, center[1] + dy)
+        for dx, dy in _manhattan_disk_offsets(radius)
+        if (center[0] + dx, center[1] + dy) not in obstacles
+    }
+    return target - _visible_from_symmetric_posts(center, posts, obstacles)
+
+
+def _symmetric_posts_cover(
+    center: Position,
+    posts: tuple[Position, ...],
+    obstacles: set[Position],
+    radius: int,
+) -> bool:
+    """Return whether the complete guard ring is legal and gap-free."""
+
+    return (
+        len(posts) == SYMMETRIC_DEFENSE_VANGUARDS + SYMMETRIC_DEFENSE_RANGERS
+        and len(set(posts)) == len(posts)
+        and all(
+            post not in obstacles and manhattan(post, center) <= radius
+            for post in posts
+        )
+        and not _uncovered_symmetric_cells(center, posts, obstacles, radius)
+    )
+
+
+def _defense_score(union: int, target_mask: int) -> int:
+    """Prioritize the defended disk, then maximize vision beyond it."""
+
+    return (union & target_mask).bit_count() * 10_000 + union.bit_count()
+
+
+def _search_symmetric_defense_posts(
+    center: Position,
+    obstacles: set[Position],
+    radius: int,
 ) -> tuple[Position, ...]:
-    """Return the fixed posts, moving blocked slots to the nearest free cell."""
+    """Lay out 4V+16R inside one ring with bounded deterministic improvement.
 
+    All candidate posts are free cells no farther than the requested defense
+    radius.  A coverage bitset captures the server's Manhattan/supercover
+    visibility.  Greedy placement supplies the initial shape; a fixed-count,
+    fixed-seed walk then trades posts to complete the interior before widening
+    total outward vision.
+    """
+
+    horizon = max(24, radius + RANGER_VISION_RADIUS)
+    horizon_cells = tuple(
+        (center[0] + dx, center[1] + dy)
+        for dx, dy in _manhattan_disk_offsets(horizon)
+        if (center[0] + dx, center[1] + dy) not in obstacles
+    )
+    cell_index = {position: index for index, position in enumerate(horizon_cells)}
+    target_mask = sum(
+        1 << cell_index[(center[0] + dx, center[1] + dy)]
+        for dx, dy in _manhattan_disk_offsets(radius)
+        if (center[0] + dx, center[1] + dy) in cell_index
+    )
+    core_union = sum(
+        1 << cell_index[position]
+        for position in visible_cells(center, RANGER_VISION_RADIUS, obstacles)
+        if position in cell_index
+    )
+    vanguard_candidates: list[tuple[Position, int]] = []
+    ranger_candidates: list[tuple[Position, int]] = []
+    for dx, dy in _manhattan_disk_offsets(radius):
+        position = (center[0] + dx, center[1] + dy)
+        distance = abs(dx) + abs(dy)
+        if distance < 2 or position in obstacles:
+            continue
+        ranger_mask = sum(
+            1 << cell_index[cell]
+            for cell in visible_cells(position, RANGER_VISION_RADIUS, obstacles)
+            if cell in cell_index
+        )
+        ranger_candidates.append((position, ranger_mask))
+        if 3 <= distance <= 7:
+            vanguard_mask = sum(
+                1 << cell_index[cell]
+                for cell in visible_cells(position, VANGUARD_VISION_RADIUS, obstacles)
+                if cell in cell_index
+            )
+            vanguard_candidates.append((position, vanguard_mask))
+    if (
+        len(vanguard_candidates) < SYMMETRIC_DEFENSE_VANGUARDS
+        or len(ranger_candidates) < SYMMETRIC_DEFENSE_RANGERS
+    ):
+        return _symmetric_template_posts(center)
+
+    chosen: list[tuple[Position, int]] = []
     used: set[Position] = set()
-    posts: list[Position] = []
-    for dx, dy in offsets:
-        post = (center[0] + dx, center[1] + dy)
-        if post in obstacles or post in used:
-            post = _nearest_free_post(post, center, obstacles, used)
-        posts.append(post)
-        used.add(post)
-    return tuple(posts)
+    union = core_union
+    for slot in range(SYMMETRIC_DEFENSE_VANGUARDS + SYMMETRIC_DEFENSE_RANGERS):
+        candidates = (
+            vanguard_candidates
+            if slot < SYMMETRIC_DEFENSE_VANGUARDS
+            else ranger_candidates
+        )
+        best: tuple[int, int, int, Position, int] | None = None
+        for position, mask in candidates:
+            if position in used:
+                continue
+            trial = union | mask
+            key = (
+                _defense_score(trial, target_mask),
+                -manhattan(position, center),
+                -position[0],
+                position,
+                mask,
+            )
+            if best is None or key[:3] > best[:3]:
+                best = key
+        if best is None:
+            return _symmetric_template_posts(center)
+        chosen.append((best[3], best[4]))
+        used.add(best[3])
+        union |= best[4]
+
+    best_chosen = tuple(position for position, _mask in chosen)
+    best_score = _defense_score(union, target_mask)
+    state = (
+        0x9E3779B1
+        ^ (center[0] * 0x85EBCA6B)
+        ^ (center[1] * 0xC2B2AE35)
+        ^ (radius * 0x27D4EB2F)
+    ) & 0xFFFFFFFF
+    for step in range(SYMMETRIC_DEFENSE_SEARCH_ITERATIONS):
+        state = (state * 1_664_525 + 1_013_904_223) & 0xFFFFFFFF
+        slot = state % len(chosen)
+        state = (state * 1_664_525 + 1_013_904_223) & 0xFFFFFFFF
+        candidates = (
+            vanguard_candidates
+            if slot < SYMMETRIC_DEFENSE_VANGUARDS
+            else ranger_candidates
+        )
+        replacement: tuple[Position, int] | None = None
+        for _attempt in range(8):
+            position, mask = candidates[state % len(candidates)]
+            state = (state * 1_664_525 + 1_013_904_223) & 0xFFFFFFFF
+            if position not in used:
+                replacement = (position, mask)
+                break
+        if replacement is None:
+            continue
+
+        old_position, _old_mask = chosen[slot]
+        base_union = core_union
+        for other_slot, (_position, mask) in enumerate(chosen):
+            if other_slot != slot:
+                base_union |= mask
+        trial_union = base_union | replacement[1]
+        current_score = _defense_score(union, target_mask)
+        trial_score = _defense_score(trial_union, target_mask)
+        state = (state * 1_664_525 + 1_013_904_223) & 0xFFFFFFFF
+        progress = step / SYMMETRIC_DEFENSE_SEARCH_ITERATIONS
+        temperature = 18.0 * (1.0 - progress) + 0.1
+        accept = trial_score >= current_score
+        if not accept:
+            roll = (state & 0xFFFFFF) / 16_777_216
+            accept = roll < exp((trial_score - current_score) / temperature)
+        if not accept:
+            continue
+        chosen[slot] = replacement
+        used.remove(old_position)
+        used.add(replacement[0])
+        union = trial_union
+        if trial_score > best_score:
+            best_score = trial_score
+            best_chosen = tuple(position for position, _mask in chosen)
+    return best_chosen
 
 
-def _nearest_free_post(
-    post: Position,
+def _optimized_symmetric_defense_posts(
     center: Position,
     obstacles: set[Position],
-    used: set[Position],
-) -> Position:
-    """Pick a deterministic nearby cell for a post covered by a rock."""
+) -> tuple[tuple[Position, ...], int]:
+    """Find the largest gap-free guard disk and maximize its outward vision."""
 
-    radius = manhattan(post, center)
-    candidates = []
-    for dx in range(-3, 4):
-        for dy in range(-3, 4):
-            candidate = (post[0] + dx, post[1] + dy)
-            if candidate in obstacles or candidate in used or candidate == center:
-                continue
-            candidates.append(
-                (
-                    abs(dx) + abs(dy),
-                    abs(manhattan(candidate, center) - radius),
-                    candidate,
-                )
-            )
-    return min(candidates)[-1] if candidates else post
+    template = _symmetric_template_posts(center)
+    if _symmetric_posts_cover(
+        center,
+        template,
+        obstacles,
+        SYMMETRIC_DEFENSE_MAX_RADIUS,
+    ):
+        return template, SYMMETRIC_DEFENSE_MAX_RADIUS
+
+    best_failure: tuple[int, int, int, tuple[Position, ...]] | None = None
+    for radius in range(
+        SYMMETRIC_DEFENSE_MAX_RADIUS - 1,
+        SYMMETRIC_DEFENSE_MIN_RADIUS - 1,
+        -1,
+    ):
+        posts = _search_symmetric_defense_posts(center, obstacles, radius)
+        missing = _uncovered_symmetric_cells(center, posts, obstacles, radius)
+        if not missing:
+            return posts, radius
+        visible = _visible_from_symmetric_posts(center, posts, obstacles)
+        key = (len(missing), -len(visible), -radius, posts)
+        if best_failure is None or key[:3] < best_failure[:3]:
+            best_failure = key
+    if best_failure is not None:
+        return best_failure[3], -best_failure[2]
+    return template, 0
 
 
 def _ring_is_covered(

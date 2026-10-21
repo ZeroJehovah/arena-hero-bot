@@ -1,4 +1,4 @@
-"""Durable four-block Worker and shared clockwise patrol-ring coverage."""
+"""Durable single-chunk Worker quadrants and chunk-edge patrol coverage."""
 
 from __future__ import annotations
 
@@ -7,24 +7,28 @@ from uuid import UUID
 from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
+    CORE_LAYOUT_VERSION,
     PATROL_RING_PURPOSE,
     RESOURCE_CLAIM_PURPOSE,
     WORKER_BLOCK_PATROL_PURPOSE,
     AggressiveStrategy,
     StrategyConfig,
-    _four_block_outer_ring,
-    _four_resource_blocks,
     _ring_slot_index,
+    _single_chunk_outer_ring,
+    _single_chunk_resource_blocks,
 )
 
 from .factories import core, make_turn, unit
 
-HOME = (-416, 672)
+HOME = (-400, 655)
 
 
 def _strategy(memory: WorldMemory | None = None) -> AggressiveStrategy:
+    memory = memory or WorldMemory(core_home_position=HOME)
+    if memory.core_home_position is not None:
+        memory.core_layout_version = CORE_LAYOUT_VERSION
     return AggressiveStrategy(
-        memory or WorldMemory(core_home_position=HOME),
+        memory,
         StrategyConfig(
             target_workers=16,
             max_population=None,
@@ -44,32 +48,46 @@ def _workers() -> list[dict]:
     ]
 
 
-def test_four_resource_blocks_meet_at_the_home_junction() -> None:
-    blocks = _four_resource_blocks(HOME)
+def test_resource_quadrants_share_one_centered_chunk() -> None:
+    blocks = _single_chunk_resource_blocks(HOME)
 
     assert [block.index for block in blocks] == [0, 1, 2, 3]
     assert {
         (block.min_x, block.max_x, block.min_y, block.max_y) for block in blocks
     } == {
-        (-448, -417, 640, 671),
-        (-416, -385, 640, 671),
-        (-448, -417, 672, 703),
-        (-416, -385, 672, 703),
+        (-416, -401, 640, 655),
+        (-400, -385, 640, 655),
+        (-416, -401, 656, 671),
+        (-400, -385, 656, 671),
     }
     assert sum(block.contains(HOME) for block in blocks) == 1
 
 
-def test_outer_ring_is_a_single_252_cell_clockwise_edge() -> None:
-    route = _four_block_outer_ring(HOME, set())
+def test_home_selection_chooses_the_least_blocked_nearby_chunk_center() -> None:
+    strategy = _strategy(WorldMemory())
+    obstacles = {
+        (chunk_x * 32 + 8, chunk_y * 32 + 8)
+        for chunk_x in range(-1, 2)
+        for chunk_y in range(-1, 2)
+        if (chunk_x, chunk_y) != (-1, -1)
+    }
 
-    assert len(route) == 252
-    assert len(set(route)) == 252
-    assert route[0] == (-448, 703)
-    assert route[63] == (-385, 703)
-    assert route[64] == (-385, 702)
-    assert route[126] == (-385, 640)
-    assert route[127] == (-386, 640)
-    assert route[-1] == (-448, 702)
+    home = strategy._symmetric_home_candidate_from((0, 0), obstacles, set(), set())
+
+    assert home in {(-17, -17), (-16, -17), (-17, -16), (-16, -16)}
+
+
+def test_outer_ring_is_a_single_124_cell_clockwise_chunk_edge() -> None:
+    route = _single_chunk_outer_ring(HOME, set())
+
+    assert len(route) == 124
+    assert len(set(route)) == 124
+    assert route[0] == (-416, 671)
+    assert route[31] == (-385, 671)
+    assert route[32] == (-385, 670)
+    assert route[62] == (-385, 640)
+    assert route[63] == (-386, 640)
+    assert route[-1] == (-416, 670)
 
 
 def test_worker_assignments_are_four_per_block_and_survive_replacements() -> None:
@@ -119,7 +137,7 @@ def test_worker_assignments_are_four_per_block_and_survive_replacements() -> Non
 def test_workers_never_claim_resources_outside_their_assigned_block() -> None:
     strategy = _strategy()
     workers = _workers()
-    blocks = _four_resource_blocks(HOME)
+    blocks = _single_chunk_resource_blocks(HOME)
     resources = [(block.min_x + 5, block.min_y + 5) for block in blocks] + [(100, 100)]
     turn = make_turn(
         objects=[core(position=HOME), *workers],
@@ -166,7 +184,7 @@ def test_underfoot_resource_in_another_block_is_not_claimed() -> None:
     memory = WorldMemory(core_home_position=HOME)
     strategy = _strategy(memory)
     foreign_block = next(
-        block for block in _four_resource_blocks(HOME) if block.index == 1
+        block for block in _single_chunk_resource_blocks(HOME) if block.index == 1
     )
     worker = unit(
         301,
@@ -195,7 +213,7 @@ def test_worker_patrol_chooses_oldest_reachable_cell_and_persists_visits(
     strategy._assign_resources(turn)
     block = next(
         block
-        for block in _four_resource_blocks(HOME)
+        for block in _single_chunk_resource_blocks(HOME)
         if block.index == memory.worker_blocks[worker["id"]]
     )
     target = (block.min_x + 7, block.min_y + 9)
@@ -262,14 +280,14 @@ def test_ring_slots_are_eight_flagship_phases_and_move_clockwise_together() -> N
 
     assert len(slots) == 8
     assert sorted(slots.values()) == list(range(8))
-    route = _four_block_outer_ring(HOME, set())
+    route = _single_chunk_outer_ring(HOME, set())
     indices = sorted(_ring_slot_index(slot, 8, len(route)) for slot in slots.values())
     gaps = [
         (right - left) % len(route)
         for left, right in zip(indices, indices[1:] + indices[:1], strict=True)
     ]
-    assert min(gaps) == 31
-    assert max(gaps) == 32
+    assert min(gaps) == 15
+    assert max(gaps) == 16
 
     patrol_ids = strategy._patrol_ids(first)
     targets = {
@@ -312,7 +330,7 @@ def test_all_worker_patrol_targets_are_unique_and_inside_their_blocks() -> None:
 
     strategy.decide(turn)
 
-    blocks = _four_resource_blocks(HOME)
+    blocks = _single_chunk_resource_blocks(HOME)
     targets: dict[str, tuple[int, int]] = {}
     for worker in workers:
         goal = memory.goal_for(worker["id"])
@@ -343,7 +361,7 @@ def test_ring_contact_alert_uses_clockwise_path_distance() -> None:
     first = make_turn(objects=[core(position=HOME), *vanguards, *rangers])
     strategy._reconcile_unit_roles(first)
     patrol_ids = strategy._patrol_ids(first)
-    route = _four_block_outer_ring(HOME, set())
+    route = _single_chunk_outer_ring(HOME, set())
     patrol_ranger = next(item for item in rangers if UUID(item["id"]) in patrol_ids)
     patrol_ranger = dict(patrol_ranger)
     patrol_ranger["position"] = list(route[0])
@@ -374,7 +392,7 @@ def test_first_ring_assignment_preserves_circular_order_with_minimal_travel() ->
     first = make_turn(objects=[core(position=HOME), *vanguards, *rangers])
     strategy._reconcile_unit_roles(first)
     patrol_ids = sorted(strategy._patrol_ids(first), key=lambda value: value.bytes)
-    route = _four_block_outer_ring(HOME, set())
+    route = _single_chunk_outer_ring(HOME, set())
     positions = {
         member_id: route[_ring_slot_index(slot, 8, len(route))]
         for slot, member_id in enumerate(reversed(patrol_ids))
@@ -400,7 +418,7 @@ def test_first_ring_assignment_preserves_circular_order_with_minimal_travel() ->
         member = next(item for item in second.rangers if item.id == member_id)
         total_distance += manhattan(member.position, target)
     assert total_distance == 0
-    assert memory.patrol_ring_layout_version == 2
+    assert memory.patrol_ring_layout_version == 3
 
 
 def test_patrol_goal_identities_are_durable_across_restart(tmp_path) -> None:

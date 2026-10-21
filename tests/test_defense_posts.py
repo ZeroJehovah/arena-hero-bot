@@ -6,14 +6,22 @@ import pytest
 
 from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import WorldMemory
-from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig
+from arena_hero_bot.strategy import (
+    CORE_LAYOUT_VERSION,
+    AggressiveStrategy,
+    StrategyConfig,
+    _uncovered_symmetric_cells,
+)
 
 from .factories import core, make_turn, object_id, unit
 
 
 def _strategy(memory=None):
+    memory = memory or WorldMemory()
+    if memory.core_home_position is not None:
+        memory.core_layout_version = CORE_LAYOUT_VERSION
     return AggressiveStrategy(
-        memory or WorldMemory(),
+        memory,
         StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
     )
 
@@ -32,6 +40,20 @@ def _stationed_units(center=(0, 0)):
         )
         for index, (dx, dy) in enumerate(offsets)
     ]
+
+
+def test_clear_terrain_template_covers_a_complete_radius_20_disk() -> None:
+    center = (17, -23)
+    posts = tuple(
+        (center[0] + dx, center[1] + dy)
+        for dx, dy in (
+            *AggressiveStrategy._symmetric_defense_offsets()[0],
+            *AggressiveStrategy._symmetric_defense_offsets()[1],
+        )
+    )
+
+    assert len(posts) == 20
+    assert not _uncovered_symmetric_cells(center, posts, set(), 20)
 
 
 @pytest.mark.parametrize("center", [(0, 0), (17, -23)])
@@ -64,31 +86,18 @@ def test_initial_posts_restore_symmetry_without_moving_stationed_guards(center):
         assert offsets == {(-x, -y) for x, y in offsets}
 
 
-def test_blocked_post_falls_back_to_nearest_free_cell():
-    center = (-416, 672)
-    guards = _stationed_units(center)
-    blocked = (center[0], center[1] + 8)
-    blocked_guard = next(
-        guard for guard in guards if tuple(guard["position"]) == blocked
-    )
-    blocked_guard["position"] = [blocked[0] + 1, blocked[1]]
-    turn = make_turn(
-        objects=[core(position=center), *guards],
-        obstacles=[blocked],
-    )
-    strategy = _strategy(WorldMemory(core_home_position=center))
+def test_rocky_home_reflows_posts_without_creating_blind_cells():
+    center = (0, 0)
+    obstacles = {(0, 5), (4, -2)}
+    strategy = _strategy()
 
-    strategy.decide(turn)
+    posts, radius = strategy._symmetric_defense_posts(center, obstacles)
 
-    posts = {tuple(position) for position in strategy.memory.defense_posts.values()}
-    vanguards, rangers = AggressiveStrategy._symmetric_defense_offsets()
-    expected = {(center[0] + dx, center[1] + dy) for dx, dy in (*vanguards, *rangers)}
     assert len(posts) == 20
-    assert blocked not in posts
-    assert expected - {blocked} <= posts
-    displaced = posts - expected
-    assert len(displaced) == 1
-    assert manhattan(next(iter(displaced)), blocked) == 1
+    assert len(set(posts)) == len(posts)
+    assert not set(posts) & obstacles
+    assert radius >= 10
+    assert not _uncovered_symmetric_cells(center, posts, obstacles, radius)
 
 
 def test_defender_returns_to_original_post_after_combat_and_restart(tmp_path):
@@ -132,7 +141,10 @@ def test_defender_returns_to_original_post_after_combat_and_restart(tmp_path):
     assert restarted.memory.defense_posts == expected
     returning = peaceful.plan.unit_actions[UUID(ranger_id)]
     assert returning.type == "MOVE"
-    assert add((1, -8), returning.direction) == expected[ranger_id]
+    assert manhattan(
+        add((1, -8), returning.direction),
+        expected[ranger_id],
+    ) < manhattan((1, -8), expected[ranger_id])
     guards[4]["position"] = list(expected[ranger_id])
     arrived = make_turn(tick=103, objects=[core(), *guards])
     restarted.decide(arrived)
@@ -207,21 +219,32 @@ def test_healing_preserves_post_and_recovered_defender_returns_to_it():
     assert strategy.memory.defense_posts == expected
 
 
-def test_rock_does_not_move_individual_posts_or_allow_an_illegal_return():
-    strategy = _strategy()
+def test_new_rock_recomputes_a_gap_free_home_layout():
+    strategy = _strategy(WorldMemory(core_home_position=(0, 0)))
     guards = _stationed_units()
     strategy.decide(make_turn(objects=[core(), *guards]))
-    expected = dict(strategy.memory.defense_posts)
-    guards[4]["position"] = [1, -8]
-    blocked = make_turn(tick=101, objects=[core(), *guards], obstacles=[(0, -8)])
+    blocked_cell = strategy.memory.defense_posts[object_id(200)]
+    blocked = make_turn(
+        tick=101,
+        objects=[core(), *guards],
+        obstacles=[blocked_cell],
+    )
 
-    report = strategy.decide(blocked)
+    strategy.decide(blocked)
 
-    assert strategy.memory.defense_posts == expected
-    assert blocked.plan.unit_actions[UUID(object_id(200))].type == "WAIT"
-    assert any(
-        item.actor_id == object_id(200) and "post is obstructed" in item.reason
-        for item in report.decisions
+    posts = (
+        *(strategy.memory.defense_posts[guard["id"]] for guard in guards[:4]),
+        *(strategy.memory.defense_posts[guard["id"]] for guard in guards[4:]),
+    )
+    obstacles = set(blocked.obstacle_cells)
+    assert blocked_cell not in posts
+    assert not set(posts) & obstacles
+    assert strategy._defensive_layout is not None
+    assert not _uncovered_symmetric_cells(
+        (0, 0),
+        posts,
+        obstacles,
+        strategy._defensive_layout.radius,
     )
 
 
@@ -327,9 +350,6 @@ def test_reduced_formation_keeps_cardinal_owners_and_releases_eight_vanguards(
         unit(401, "RANGER", position=(center[0] + 12, center[1] + 1)),
     ]
     strategy = _strategy(memory)
-    expected_posts = {
-        uid: post for uid, post in posts.items() if uid not in released_ids
-    }
     expected_roles = {
         uid: "staged" if uid in released_ids else role
         for uid, role in original_roles.items()
@@ -338,9 +358,11 @@ def test_reduced_formation_keeps_cardinal_owners_and_releases_eight_vanguards(
     migrated = make_turn(resources=10000, objects=objects)
     strategy.decide(migrated)
 
-    assert strategy.memory.defense_posts == expected_posts
+    expected_posts = dict(strategy.memory.defense_posts)
     assert strategy.memory.unit_roles == expected_roles
     assert cardinal_ids <= set(strategy.memory.defense_posts)
+    assert not (released_ids & set(strategy.memory.defense_posts))
+    assert len(strategy.memory.defense_posts) == 20
     assert len(released_ids) == 8
     assert strategy._staged_ids == {
         UUID(uid) for uid in released_ids | {object_id(400), object_id(401)}
