@@ -624,7 +624,7 @@ class AggressiveStrategy:
             self._emergency_combat_mode(turn, recent_enemies)
             or threat.requires_coordination
         )
-        all_hands_defense = emergency and self._all_hands_defense(
+        all_hands_defense = self._all_hands_defense(
             turn,
             tactical_enemies,
         )
@@ -4052,6 +4052,12 @@ class AggressiveStrategy:
         cannot win that exchange alone.  Recent sightings provide a little
         hysteresis when enemy vision flickers, while the Core-relative radius
         keeps this a local defensive response rather than a distant chase.
+
+        This deliberately does not wait for emergency mode.  A formation of
+        three fighters inside the defensive leash needs several Ticks to
+        concentrate from the far side of the ring; waiting for the first Core
+        hit leaves only one or two firing opportunities before a five-point
+        Core can be destroyed.
         """
 
         core = turn.core
@@ -4067,7 +4073,7 @@ class AggressiveStrategy:
                 UnitType.RANGER.value,
             }
             and manhattan(core.position, enemy.position)
-            <= self.config.combat_alert_radius
+            <= self.config.combat_pursuit_radius
         }
         return len(nearby_ids) >= ALL_HANDS_DEFENSE_MIN_ENEMIES
 

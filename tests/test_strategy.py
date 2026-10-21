@@ -5423,6 +5423,43 @@ def test_massed_core_assault_pulls_the_far_side_into_the_fight() -> None:
     )
 
 
+def test_massed_approach_starts_local_defense_before_first_core_hit() -> None:
+    # The far side of the ring must start moving while the group is still at
+    # the edge of the defensive leash.  Waiting for emergency mode leaves too
+    # few Ticks before several Rangers can knock down a fresh Core shield.
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        resources=0,
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, -10)),
+            unit(30, "RANGER", controlled=False, position=(0, 17)),
+            unit(31, "RANGER", controlled=False, position=(1, 17)),
+            unit(32, "VANGUARD", controlled=False, position=(0, 18)),
+        ],
+    )
+
+    strategy = AggressiveStrategy(WorldMemory(), config)
+    report = strategy.decide(turn)
+
+    reasons = _reasons_by_number(report)
+    assert not strategy._emergency_combat_mode(
+        turn,
+        strategy.memory.recent_enemies(turn.tick, config.enemy_memory_ttl),
+    )
+    assert strategy._all_hands_defense(
+        turn,
+        strategy._tactical_enemies(
+            turn,
+            strategy.memory.recent_enemies(turn.tick, config.enemy_memory_ttl),
+        ),
+    )
+    assert reasons[2] != PERIMETER_REASON
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert action.type == "MOVE"
+    assert add((0, -10), action.direction)[1] > -10
+
+
 def test_two_contacts_do_not_empty_the_far_side_of_the_ring() -> None:
     config = StrategyConfig(target_workers=0, max_population=None)
     turn = make_turn(
