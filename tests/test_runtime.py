@@ -10,6 +10,7 @@ from arena_hero import APIError, ArenaHeroError, Turn
 
 from arena_hero_bot import cli, runtime
 from arena_hero_bot.memory import WorldMemory
+from arena_hero_bot.migration import write_migration_request
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.runtime import RuntimeConfig
 from arena_hero_bot.strategy import AggressiveStrategy
@@ -257,6 +258,36 @@ def test_run_bot_persists_memory_and_turn_telemetry(tmp_path, monkeypatch) -> No
     assert all(record["submission"]["status"] == "observed" for record in records)
     assert all(record["observed_at"].endswith("+00:00") for record in records)
     assert "test-key" not in _written_telemetry(tmp_path).read_text()
+
+
+def test_run_bot_applies_hot_core_migration_request(tmp_path, monkeypatch) -> None:
+    turn = make_turn(objects=[core(), unit(2, "WORKER", position=(1, 0))])
+    write_migration_request(tmp_path / "core-migration.json", (16, 16))
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+        def turns(self):
+            yield turn
+
+    monkeypatch.setattr(runtime, "ArenaHeroClient", FakeClient)
+    runtime.run_bot(
+        RuntimeConfig(
+            api_key="test-key",
+            data_dir=tmp_path,
+            observe_only=True,
+            max_turns=1,
+        )
+    )
+
+    assert WorldMemory.load(tmp_path / "memory.json").core_home_position == (16, 16)
 
 
 def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> None:

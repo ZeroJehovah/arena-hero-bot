@@ -2631,7 +2631,7 @@ def test_core_stays_receptive_while_worker_returns_cargo() -> None:
     assert turn.plan.core_action is None
 
 
-def test_worker_with_cargo_clears_migrating_core_destination() -> None:
+def test_loaded_worker_holds_outside_migrating_core_destination() -> None:
     turn = make_turn(
         objects=[
             core(
@@ -2648,13 +2648,9 @@ def test_worker_with_cargo_clears_migrating_core_destination() -> None:
 
     report = decide(turn)
 
-    action = turn.plan.unit_actions[turn.workers[0].id]
-    assert action.type == "MOVE"
-    next_position = add(turn.workers[0].position, action.direction)
-    assert manhattan(next_position, (0, 0)) > 2
-    assert next_position != (1, 0)
+    assert turn.workers[0].id not in turn.plan.unit_actions
     assert any(
-        item.reason == "clear the moving Core approach with economy unit"
+        item.reason == "hold loaded cargo at the moving Core approach"
         for item in report.decisions
     )
 
@@ -2675,19 +2671,14 @@ def test_worker_never_deposits_while_core_is_migrating() -> None:
 
     report = decide(turn)
 
-    action = turn.plan.unit_actions[turn.workers[0].id]
-    assert action.type == "MOVE"
-    assert action.type != "DEPOSIT"
-    next_position = add(turn.workers[0].position, action.direction)
-    assert next_position != (1, 0)
-    assert next_position != (0, 0)
+    assert turn.workers[0].id not in turn.plan.unit_actions
     assert any(
-        item.reason == "clear the moving Core approach with economy unit"
+        item.reason == "hold loaded cargo at the moving Core approach"
         for item in report.decisions
     )
 
 
-def test_worker_holds_far_cargo_while_core_is_migrating() -> None:
+def test_worker_follows_far_cargo_toward_a_migrating_core() -> None:
     turn = make_turn(
         objects=[
             core(
@@ -2703,14 +2694,16 @@ def test_worker_holds_far_cargo_while_core_is_migrating() -> None:
 
     report = decide(turn)
 
-    assert turn.workers[0].id not in turn.plan.unit_actions
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
     assert any(
-        item.reason == "hold cargo clear of the moving Core"
+        item.reason == "follow the moving Core to its next deposit halt"
         for item in report.decisions
     )
 
 
-def test_worker_clears_normal_core_waiting_between_migration_steps() -> None:
+def test_loaded_worker_holds_between_migration_steps() -> None:
     turn = make_turn(
         objects=[
             core(position=(0, 0)),
@@ -2728,11 +2721,9 @@ def test_worker_clears_normal_core_waiting_between_migration_steps() -> None:
         config=StrategyConfig(target_workers=16, expedition_mode=True),
     )
 
-    action = turn.plan.unit_actions[turn.workers[0].id]
-    assert action.type == "MOVE"
-    assert add(turn.workers[0].position, action.direction) != (1, 0)
+    assert turn.workers[0].id not in turn.plan.unit_actions
     assert any(
-        item.reason == "clear the moving Core approach with economy unit"
+        item.reason == "hold loaded cargo at the moving Core approach"
         for item in report.decisions
     )
 

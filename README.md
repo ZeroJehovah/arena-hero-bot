@@ -91,6 +91,31 @@ The supplied unit targets the canonical deployment path
 
 Runtime memory and JSONL telemetry are written under `var/` by default.
 
+## Long Core migration
+
+The bot can relocate the Core between resource chunks without stopping the
+local economy. A migration walks eight cells, pauses eight Ticks for Worker
+deposits, harvests through the Core's current chunk, translates the defensive
+posts, and keeps patrols on a ring around the moving Core. The target and pause
+schedule are durable across restarts.
+
+Plan the cleanest nearby block at the next natural-resource tier:
+
+```bash
+uv run arena-core-migration --data-dir var plan
+```
+
+Publish an atomic hot request to the running bot:
+
+```bash
+uv run arena-core-migration --data-dir var request-next-tier
+```
+
+An explicit chunk-center cell can be supplied with `request X Y`; `status`
+shows the persisted home and pending request. Requests are validated against
+chunk-center geometry and remembered obstacles before the running bot picks
+them up on its next Turn.
+
 ## Development
 
 ```bash

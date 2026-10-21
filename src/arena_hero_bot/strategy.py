@@ -291,11 +291,23 @@ SYMMETRIC_RANGER_OFFSETS: tuple[Position, ...] = (
     (10, -5),
 )
 CORE_QUEUE_RADIUS = 4
-# A moving Core must not have its next cell occupied when the four-Tick move
-# completes.  Economy traffic therefore stays outside this radius while a
-# migration is in progress.  Nearby economy units step outward until clear;
-# loaded Workers farther out wait rather than chasing the moving destination.
-CORE_MIGRATION_CLEAR_RADIUS = 2
+# A moving Core must not have its next completion cell occupied.  Keep the
+# four immediate neighbours available between steps, but do not push Workers
+# two cells away from a resource they are harvesting or deliver on a broad
+# exclusion disk.  The explicit destination check below remains authoritative
+# throughout the four-Tick move.
+CORE_MIGRATION_CLEAR_RADIUS = 1
+# A moving Core cannot receive deposits.  Break long walks into eight-cell
+# batches with eight-Tick stops: at one Core cell per four Ticks this costs at
+# most 20% travel speed while giving Workers recurring windows to close and
+# unload.  The schedule is persisted because a pause commonly spans snapshots
+# that contain a MOVING Core.
+CORE_MIGRATION_STEP_BATCH = 8
+CORE_MIGRATION_PAUSE_TICKS = 8
+# While the Core is between homes, keep the eight patrol Rangers on a compact
+# ring around its current cell instead of teleporting their duty to the final
+# chunk edge.
+CORE_MIGRATION_PATROL_RADIUS = 18
 
 
 class _MoveIntent(StrEnum):
@@ -592,6 +604,7 @@ class AggressiveStrategy:
             self._reconcile_unit_roles(turn)
             if self._symmetric_posture():
                 self._ensure_symmetric_layout(turn)
+            self._observe_core_migration(turn)
             self._update_expeditions(turn)
             self._refresh_expedition_pursuits(turn)
             self._refresh_expedition_navigation(turn)
@@ -1662,7 +1675,19 @@ class AggressiveStrategy:
             return
 
         if self._core_migration_in_progress(core.view):
-            if manhattan(worker.position, core.position) <= CORE_MIGRATION_CLEAR_RADIUS:
+            if (
+                self._core_approach_locked(context.turn)
+                and manhattan(worker.position, core.position)
+                <= CORE_MIGRATION_CLEAR_RADIUS
+            ):
+                if worker.cargo > 0:
+                    self.memory.clear_goal(str(worker.id))
+                    self._record_wait(
+                        worker,
+                        context,
+                        "hold loaded cargo at the moving Core approach",
+                    )
+                    return
                 if self._move_to_moving_core_hold(
                     worker,
                     context,
@@ -1675,12 +1700,30 @@ class AggressiveStrategy:
                     "hold outside the moving Core approach",
                 )
                 return
-            if worker.cargo > 0:
+            if worker.cargo > 0 and not self._core_accepts_deposits(context.turn):
                 self.memory.clear_goal(str(worker.id))
+                if manhattan(worker.position, core.position) <= (
+                    CORE_MIGRATION_CLEAR_RADIUS + 1
+                ):
+                    self._record_wait(
+                        worker,
+                        context,
+                        "hold loaded cargo at the moving Core approach",
+                    )
+                    return
+                if self._move(
+                    worker,
+                    core.position,
+                    context,
+                    reason="follow the moving Core to its next deposit halt",
+                    allow_goal=True,
+                    intent=_MoveIntent.INBOUND,
+                ):
+                    return
                 self._record_wait(
                     worker,
                     context,
-                    "hold cargo clear of the moving Core",
+                    "wait at the moving Core approach for the next deposit halt",
                 )
                 return
 
@@ -1909,7 +1952,7 @@ class AggressiveStrategy:
                 self.memory.clear_goal(str(worker.id))
 
         if self._preserves_resources():
-            chunk = self._resource_chunk()
+            chunk = self._resource_chunk(context.turn)
             if chunk is not None:
                 goal = self._worker_block_patrol_goal(worker, context)
                 reason = "patrol least-seen coverage in the resource chunk"
@@ -1974,6 +2017,75 @@ class AggressiveStrategy:
             return False
         home = self.memory.core_home_position
         return home is not None and core.position != home
+
+    def _observe_core_migration(self, turn: Turn) -> None:
+        """Advance the durable walk-pause schedule from authoritative cells."""
+
+        core = turn.core
+        home = self.memory.core_home_position
+        if not self._symmetric_posture() or core is None or home is None:
+            return
+        if core.position == home:
+            self._reset_core_migration_progress()
+            return
+
+        previous = self.memory.core_migration_last_position
+        if previous is None:
+            self.memory.core_migration_last_position = core.position
+            return
+        if previous == core.position:
+            return
+        if manhattan(previous, core.position) == 1:
+            self.memory.core_migration_steps_since_pause += 1
+        else:
+            # Respawning or any non-cardinal jump starts a fresh batch.  The
+            # next ordinary Core step will establish the new route baseline.
+            self.memory.core_migration_steps_since_pause = 0
+        self.memory.core_migration_last_position = core.position
+        if self.memory.core_migration_steps_since_pause >= CORE_MIGRATION_STEP_BATCH:
+            self.memory.core_migration_steps_since_pause = 0
+            self.memory.core_migration_pause_until_tick = max(
+                self.memory.core_migration_pause_until_tick,
+                turn.tick + CORE_MIGRATION_PAUSE_TICKS,
+            )
+
+    def _migration_pause_active(self, turn: Turn) -> bool:
+        """Return whether the current migration batch is stopped for deposits."""
+
+        core = turn.core
+        home = self.memory.core_home_position
+        return (
+            core is not None
+            and home is not None
+            and core.position != home
+            and turn.tick < self.memory.core_migration_pause_until_tick
+        )
+
+    def _core_accepts_deposits(self, turn: Turn) -> bool:
+        """Whether a stationary Core can receive cargo on this command Tick."""
+
+        core = turn.core
+        if core is None or core.view.state is not CoreState.NORMAL:
+            return False
+        home = self.memory.core_home_position
+        return (
+            home is None or core.position == home or self._migration_pause_active(turn)
+        )
+
+    def _core_approach_locked(self, turn: Turn) -> bool:
+        """Keep the moving Core's immediate approach clear outside pause Ticks."""
+
+        core = turn.core
+        return (
+            core is not None
+            and self._core_migration_in_progress(core.view)
+            and not self._migration_pause_active(turn)
+        )
+
+    def _reset_core_migration_progress(self) -> None:
+        self.memory.core_migration_last_position = None
+        self.memory.core_migration_steps_since_pause = 0
+        self.memory.core_migration_pause_until_tick = -1
 
     def _core_queue_positions(
         self,
@@ -2389,16 +2501,16 @@ class AggressiveStrategy:
             and core.position == home
             and home not in self._rock_map(context.turn)
         )
-        if (
-            self._symmetric_posture()
-            and not nearby_enemy
-            and context.turn.workers
-            and not at_home
-        ):
-            # Workers already know how to stage carried resources at the
-            # Core's current destination while it is moving.  Requiring the
-            # whole economy to be empty before starting the revised live
-            # relocation deadlocks as soon as a remote Worker is returning.
+        if self._symmetric_posture() and not nearby_enemy and not at_home:
+            if self._migration_pause_active(context.turn):
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="WAIT",
+                    reason="hold the migration batch for Worker deposits",
+                    target=core.position,
+                )
+                return
             direction = self._core_home_direction(context)
             if direction is not None:
                 core.start_move(direction)
@@ -3048,7 +3160,13 @@ class AggressiveStrategy:
         core = context.turn.core
         if (
             core is not None
-            and self._core_migration_in_progress(core.view)
+            and core.view.state is CoreState.MOVING
+            and destination == core.view.destination
+        ):
+            return False
+        if (
+            core is not None
+            and self._core_approach_locked(context.turn)
             and manhattan(destination, core.position) <= CORE_MIGRATION_CLEAR_RADIUS
             and manhattan(destination, core.position)
             <= manhattan(unit.position, core.position)
@@ -6005,6 +6123,7 @@ class AggressiveStrategy:
             return
         self.memory.core_home_position = target
         self.memory.core_layout_version = CORE_LAYOUT_VERSION
+        self._reset_core_migration_progress()
         self.memory.defense_posts.clear()
         self.memory.defense_anchor = None
         self.memory.worker_sectors.clear()
@@ -6020,6 +6139,18 @@ class AggressiveStrategy:
         self._symmetric_defense_cache = None
         self._patrol_ring_cache = None
         self._patrol_ring_phase_tick = -1
+
+    def request_core_migration(self, target: Position) -> bool:
+        """Persist a new chunk-center migration requested by the operator."""
+
+        if target == self.memory.core_home_position:
+            return False
+        if target not in _resource_block_center_cells(target):
+            raise ValueError("migration target must be one of a chunk's center cells")
+        if target in self.memory.obstacles:
+            raise ValueError("migration target is a remembered obstacle")
+        self._commit_symmetric_home(target)
+        return True
 
     def _symmetric_home_candidate(self, context: _TurnContext) -> Position | None:
         """Pick the best center of a nearby 32x32 resource chunk."""
@@ -6525,16 +6656,27 @@ class AggressiveStrategy:
         return patrol_position, "search outward for enemy units and Cores"
 
     def _patrol_ring_route(self, turn: Turn) -> tuple[Position, ...]:
-        """Return the traversable clockwise outer edge of the resource chunk."""
+        """Return the patrol ring around the Core's active economy area."""
 
         home = self.memory.core_home_position
         if home is None:
             return ()
+        core = turn.core
+        migrating = core is not None and core.position != home
+        center = core.position if migrating else home
         cached = self._patrol_ring_cache
-        if cached is not None and cached[0] == turn.tick and cached[1] == home:
+        if cached is not None and cached[0] == turn.tick and cached[1] == center:
             return cached[2]
-        route = _single_chunk_outer_ring(home, self._rock_map(turn))
-        self._patrol_ring_cache = (turn.tick, home, route)
+        obstacles = self._rock_map(turn)
+        if migrating:
+            route = tuple(
+                (center[0] + dx, center[1] + dy)
+                for dx, dy in _defensive_ring_offsets(CORE_MIGRATION_PATROL_RADIUS)
+                if (center[0] + dx, center[1] + dy) not in obstacles
+            )
+        else:
+            route = _single_chunk_outer_ring(home, obstacles)
+        self._patrol_ring_cache = (turn.tick, center, route)
         return route
 
     def _reconcile_patrol_ring_slots(self, turn: Turn) -> dict[UUID, int]:
@@ -6774,26 +6916,35 @@ class AggressiveStrategy:
     def _ranger_range(origin: Position, target: Position) -> int:
         return max(abs(target[0] - origin[0]), abs(target[1] - origin[1]))
 
-    def _resource_chunk(self) -> _ResourceBlock | None:
-        """Return the active 32x32 economy chunk, if the live posture is active."""
+    def _resource_chunk(self, turn: Turn | None = None) -> _ResourceBlock | None:
+        """Return the chunk the travelling economy should work right now."""
 
         if not self._symmetric_posture():
             return None
         home = self.memory.core_home_position
-        return None if home is None else _single_chunk_resource_block(home)
+        if home is None:
+            return None
+        core = turn.core if turn is not None else None
+        anchor = core.position if core is not None and core.position != home else home
+        return _single_chunk_resource_block(anchor)
 
-    def _resource_patrol_sectors(self) -> tuple[_ResourceBlock, ...]:
+    def _resource_patrol_sectors(
+        self, turn: Turn | None = None
+    ) -> tuple[_ResourceBlock, ...]:
         """Return the sixteen soft 8x8 Worker patrol sectors."""
 
         if not self._symmetric_posture():
             return ()
-        home = self.memory.core_home_position
-        return () if home is None else _single_chunk_patrol_sectors(home)
+        chunk = self._resource_chunk(turn)
+        if chunk is None:
+            return ()
+        anchor = (chunk.min_x + 16, chunk.min_y + 16)
+        return _single_chunk_patrol_sectors(anchor)
 
     def _reconcile_worker_sectors(self, turn: Turn) -> dict[UUID, _ResourceBlock]:
         """Keep one preferred patrol sector per Worker across replacements."""
 
-        sectors = self._resource_patrol_sectors()
+        sectors = self._resource_patrol_sectors(turn)
         if not sectors:
             return {}
         if self.memory.worker_sector_layout_version != WORKER_SECTOR_LAYOUT_VERSION:
@@ -6828,7 +6979,7 @@ class AggressiveStrategy:
         self.memory.worker_sectors = {
             str(worker_id): sector.index for worker_id, sector in assignments.items()
         }
-        chunk = self._resource_chunk()
+        chunk = self._resource_chunk(turn)
         if chunk is not None:
             allowed_cells = set(_resource_block_cells(chunk))
             self.memory.worker_seen_ticks = {
@@ -6841,7 +6992,7 @@ class AggressiveStrategy:
     def _assign_chunk_resources(self, turn: Turn) -> dict[UUID, Position]:
         """Pair every empty Worker with the nearest resource in the live chunk."""
 
-        chunk = self._resource_chunk()
+        chunk = self._resource_chunk(turn)
         if chunk is None:
             return {}
         self._reconcile_worker_sectors(turn)
@@ -6955,7 +7106,7 @@ class AggressiveStrategy:
         """
 
         self._resource_scout_id = None
-        if self._resource_chunk() is not None:
+        if self._resource_chunk(turn) is not None:
             return self._assign_chunk_resources(turn)
         workers = {worker.id: worker for worker in turn.workers if worker.cargo == 0}
         self._unreachable_claims = {
@@ -8106,7 +8257,7 @@ class AggressiveStrategy:
         """Cover the chunk by stale sightlines, with soft 8x8 sector balance."""
 
         turn = context.turn
-        chunk = self._resource_chunk()
+        chunk = self._resource_chunk(context.turn)
         if chunk is None:
             return self._resource_patrol_goal(worker, turn, context)
         obstacles = self._rock_map(turn)
@@ -8885,6 +9036,21 @@ def _single_chunk_resource_block(home: Position) -> _ResourceBlock:
         max_x=min_x + size - 1,
         min_y=min_y,
         max_y=min_y + size - 1,
+    )
+
+
+def _resource_block_center_cells(position: Position) -> tuple[Position, ...]:
+    """Return the four center cells of the 32x32 chunk containing ``position``."""
+
+    size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    half = size // 2
+    min_x = (position[0] // size) * size
+    min_y = (position[1] // size) * size
+    return (
+        (min_x + half - 1, min_y + half - 1),
+        (min_x + half, min_y + half - 1),
+        (min_x + half - 1, min_y + half),
+        (min_x + half, min_y + half),
     )
 
 

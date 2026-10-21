@@ -1,0 +1,280 @@
+"""Planning and control files for long-distance Core migrations."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from arena_hero import Position
+
+from .geometry import manhattan
+from .memory import WorldMemory
+from .strategy import (
+    SYMMETRIC_HOME_CLEAR_RADIUS,
+    SYMMETRIC_RANGER_OFFSETS,
+    SYMMETRIC_RESOURCE_BLOCK_SIZE,
+    SYMMETRIC_VANGUARD_OFFSETS,
+    _resource_block_center_cells,
+)
+
+MIGRATION_REQUEST_VERSION = 1
+_DEFENSE_OFFSETS = (*SYMMETRIC_VANGUARD_OFFSETS, *SYMMETRIC_RANGER_OFFSETS)
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationPlan:
+    """One deterministic next-resource-tier destination recommendation."""
+
+    current_block: Position
+    current_ring: int
+    current_quota: int
+    target_block: Position
+    target_ring: int
+    target_quota: int
+    target: Position
+    estimated_cells: int
+    block_rocks: int
+    clear_cells: int
+    blocked_defense_posts: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "current_block": list(self.current_block),
+            "current_ring": self.current_ring,
+            "current_quota": self.current_quota,
+            "target_block": list(self.target_block),
+            "target_ring": self.target_ring,
+            "target_quota": self.target_quota,
+            "target": list(self.target),
+            "estimated_cells": self.estimated_cells,
+            "block_rocks": self.block_rocks,
+            "clear_cells": self.clear_cells,
+            "blocked_defense_posts": self.blocked_defense_posts,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationRequest:
+    """A durable operator request consumed by the running bot."""
+
+    target: Position
+    requested_at: str
+    note: str = ""
+    version: int = MIGRATION_REQUEST_VERSION
+
+
+def _axis(coordinate: int) -> int:
+    return coordinate if coordinate >= 0 else -coordinate - 1
+
+
+def resource_block_index(position: Position) -> Position:
+    """Return the signed 32x32 block containing ``position``."""
+
+    size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    return position[0] // size, position[1] // size
+
+
+def resource_block_ring(block: Position) -> int:
+    """Return the symmetric block-ring distance from the world center."""
+
+    return _axis(block[0]) + _axis(block[1])
+
+
+def resource_block_quota(block: Position) -> int:
+    """Return the natural-resource quota for one 32x32 block."""
+
+    ring = resource_block_ring(block)
+    return max(2, (16 * 8) // (8 + ring))
+
+
+def next_resource_tier_ring(current_ring: int) -> int | None:
+    """Return the highest inner ring whose quota exceeds the current one."""
+
+    current_quota = max(2, (16 * 8) // (8 + current_ring))
+    higher = [
+        ring
+        for ring in range(current_ring)
+        if max(2, (16 * 8) // (8 + ring)) > current_quota
+    ]
+    return max(higher) if higher else None
+
+
+def _blocks_on_ring(ring: int) -> tuple[Position, ...]:
+    limit = ring + 1
+    return tuple(
+        (x, y)
+        for x in range(-limit, limit + 1)
+        for y in range(-limit, limit + 1)
+        if _axis(x) + _axis(y) == ring
+    )
+
+
+def _block_cells(block: Position) -> tuple[Position, ...]:
+    size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    min_x = block[0] * size
+    min_y = block[1] * size
+    return tuple(
+        (x, y) for x in range(min_x, min_x + size) for y in range(min_y, min_y + size)
+    )
+
+
+def plan_next_resource_tier(
+    memory: WorldMemory,
+    *,
+    current_position: Position | None = None,
+) -> MigrationPlan | None:
+    """Pick the cleanest nearby block-center that reaches the next quota tier."""
+
+    origin = (
+        current_position
+        or memory.core_migration_last_position
+        or memory.core_home_position
+    )
+    if origin is None:
+        return None
+    current_block = resource_block_index(origin)
+    current_ring = resource_block_ring(current_block)
+    target_ring = next_resource_tier_ring(current_ring)
+    if target_ring is None:
+        return None
+
+    blocked = memory.obstacles | set(memory.resource_cells)
+    candidates: list[tuple[int, int, int, int, Position, Position]] = []
+    for block in _blocks_on_ring(target_ring):
+        block_rocks = sum(cell in memory.obstacles for cell in _block_cells(block))
+        for target in _resource_block_center_cells(
+            (
+                block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+            )
+        ):
+            if target in blocked:
+                continue
+            clear_cells = sum(
+                (target[0] + dx, target[1] + dy) not in memory.obstacles
+                for dx in range(
+                    -SYMMETRIC_HOME_CLEAR_RADIUS, SYMMETRIC_HOME_CLEAR_RADIUS + 1
+                )
+                for dy in range(
+                    -SYMMETRIC_HOME_CLEAR_RADIUS, SYMMETRIC_HOME_CLEAR_RADIUS + 1
+                )
+                if abs(dx) + abs(dy) <= SYMMETRIC_HOME_CLEAR_RADIUS
+            )
+            blocked_posts = sum(
+                (target[0] + dx, target[1] + dy) in memory.obstacles
+                for dx, dy in _DEFENSE_OFFSETS
+            )
+            candidates.append(
+                (
+                    manhattan(origin, target),
+                    blocked_posts,
+                    block_rocks,
+                    -clear_cells,
+                    block,
+                    target,
+                )
+            )
+    if not candidates:
+        return None
+
+    nearest = min(candidate[0] for candidate in candidates)
+    nearby = [
+        candidate
+        for candidate in candidates
+        if candidate[0] <= nearest + 2 * SYMMETRIC_RESOURCE_BLOCK_SIZE
+    ]
+    distance, blocked_posts, block_rocks, negative_clear, block, target = min(
+        nearby,
+        key=lambda candidate: (
+            candidate[1],
+            candidate[2],
+            candidate[3],
+            candidate[0],
+            candidate[4],
+            candidate[5],
+        ),
+    )
+    return MigrationPlan(
+        current_block=current_block,
+        current_ring=current_ring,
+        current_quota=resource_block_quota(current_block),
+        target_block=block,
+        target_ring=target_ring,
+        target_quota=resource_block_quota(block),
+        target=target,
+        estimated_cells=distance,
+        block_rocks=block_rocks,
+        clear_cells=-negative_clear,
+        blocked_defense_posts=blocked_posts,
+    )
+
+
+def load_migration_request(path: Path) -> MigrationRequest | None:
+    """Load and validate an optional hot migration request."""
+
+    if not path.exists():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("migration request must be a JSON object")
+    version = int(raw.get("version", 0))
+    if version != MIGRATION_REQUEST_VERSION:
+        raise ValueError(f"unsupported migration request version: {version}")
+    target_raw = raw.get("target")
+    if not isinstance(target_raw, list) or len(target_raw) != 2:
+        raise ValueError("migration request target must contain [x, y]")
+    target = int(target_raw[0]), int(target_raw[1])
+    if target not in _resource_block_center_cells(target):
+        raise ValueError("migration target must be one of a chunk's center cells")
+    return MigrationRequest(
+        target=target,
+        requested_at=str(raw.get("requested_at", "")),
+        note=str(raw.get("note", "")),
+        version=version,
+    )
+
+
+def write_migration_request(
+    path: Path,
+    target: Position,
+    *,
+    note: str = "",
+) -> MigrationRequest:
+    """Atomically publish a validated migration request."""
+
+    if target not in _resource_block_center_cells(target):
+        raise ValueError("migration target must be one of a chunk's center cells")
+    request = MigrationRequest(
+        target=target,
+        requested_at=datetime.now(UTC).isoformat(),
+        note=note,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": request.version,
+        "target": list(request.target),
+        "requested_at": request.requested_at,
+        "note": request.note,
+    }
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=path.parent,
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    return request

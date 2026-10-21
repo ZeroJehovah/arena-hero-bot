@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from arena_hero import APIError, ArenaHeroClient, ArenaHeroError, Turn, __version__
 
 from .memory import WorldMemory
+from .migration import load_migration_request
 from .models import DecisionReport
 from .strategy import AggressiveStrategy, StrategyConfig
 from .telemetry import BEIJING_TZ, RETAIN_TELEMETRY_DAYS, JsonlTelemetry
@@ -49,6 +50,7 @@ def run_bot(
     """Observe Turns, submit aggressive plans, and return the Turn count."""
 
     memory_path = config.data_dir / "memory.json"
+    migration_request_path = config.data_dir / "core-migration.json"
     telemetry = JsonlTelemetry(config.data_dir / "turns.jsonl", rotate_daily=True)
     memory = WorldMemory.load(memory_path)
     strategy = AggressiveStrategy(memory, strategy_config)
@@ -66,6 +68,7 @@ def run_bot(
     _prune_telemetry()
     pruned_day = datetime.now(BEIJING_TZ).date()
     turns_seen = 0
+    migration_request_signature: tuple[int, int] | None = None
     mode = "observe-only" if config.observe_only else "aggressive-pvp"
     LOGGER.info(
         "starting mode=%s sdk=%s endpoint=%s",
@@ -96,6 +99,23 @@ def run_bot(
                     if config.max_turns is not None and turns_seen >= config.max_turns:
                         break
                     continue
+                request_signature = _file_signature(migration_request_path)
+                if request_signature != migration_request_signature:
+                    migration_request_signature = request_signature
+                    if request_signature is not None:
+                        try:
+                            request = load_migration_request(migration_request_path)
+                            if request is not None and strategy.request_core_migration(
+                                request.target
+                            ):
+                                LOGGER.info(
+                                    "accepted Core migration request target=%s",
+                                    request.target,
+                                )
+                        except (OSError, ValueError, TypeError) as exc:
+                            LOGGER.warning(
+                                "ignored invalid Core migration request: %s", exc
+                            )
                 observed_at = datetime.now(UTC).isoformat()
                 started = monotonic()
                 report, planning_error = _plan_turn(strategy, turn)
@@ -147,6 +167,16 @@ def run_bot(
                     break
 
     return turns_seen
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    """Return a cheap change marker for an optional control file."""
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 def _is_beijing_day_change(previous: date, at: datetime) -> bool:

@@ -136,6 +136,12 @@ class WorldMemory:
     # marker durable so a restart during migration does not choose a second
     # home or discard the current sector allocation.
     core_layout_version: int = 0
+    # Long Core walks execute in short batches followed by durable economy
+    # halts.  Workers can only deposit while the Core is stationary, so the
+    # stop scheduler must survive both MOVING Core snapshots and restarts.
+    core_migration_last_position: Position | None = None
+    core_migration_steps_since_pause: int = 0
+    core_migration_pause_until_tick: int = -1
     # Workers have one preferred 8x8 sector among the sixteen in the active
     # resource chunk.  This is a soft patrol identity, not a resource-claim
     # restriction; every Worker may harvest anywhere in the chunk.
@@ -616,6 +622,13 @@ class WorldMemory:
                 else None
             ),
             "core_layout_version": self.core_layout_version,
+            "core_migration_last_position": (
+                list(self.core_migration_last_position)
+                if self.core_migration_last_position is not None
+                else None
+            ),
+            "core_migration_steps_since_pause": self.core_migration_steps_since_pause,
+            "core_migration_pause_until_tick": self.core_migration_pause_until_tick,
             "worker_sectors": dict(sorted(self.worker_sectors.items())),
             "worker_sector_layout_version": self.worker_sector_layout_version,
             "worker_seen_ticks": [
@@ -767,6 +780,15 @@ class WorldMemory:
             ),
             core_home_position=_optional_position(raw.get("core_home_position")),
             core_layout_version=int(raw.get("core_layout_version", 0)),
+            core_migration_last_position=_optional_position(
+                raw.get("core_migration_last_position")
+            ),
+            core_migration_steps_since_pause=int(
+                raw.get("core_migration_steps_since_pause", 0)
+            ),
+            core_migration_pause_until_tick=int(
+                raw.get("core_migration_pause_until_tick", -1)
+            ),
             worker_sectors={
                 str(unit_id): int(block)
                 for unit_id, block in raw.get(
