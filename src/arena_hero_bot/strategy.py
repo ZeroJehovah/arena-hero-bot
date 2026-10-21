@@ -149,6 +149,11 @@ DEFENSIVE_PERIMETER_MIN_RADIUS = 2
 DEFENSIVE_RING_SPACING = 3
 VANGUARD_VISION_RADIUS = 4
 RANGER_VISION_RADIUS = 5
+# Defensive guards share a slightly wider local contact radius than their own
+# vision disc.  This keeps a second rank on the same fight without allowing a
+# fleet-wide chase: movement is still bounded by the Core leash and the
+# fireline gate below.
+DEFENSIVE_SUPPORT_RADIUS = 8
 RANGER_STANDOFF_RANGE = 3
 RANGER_RETURN_THREAT_RADIUS = 5
 COMBAT_SCREEN_RADIUS = 3
@@ -974,6 +979,28 @@ class AggressiveStrategy:
                     )
                 ):
                     return
+                lethal = context.damage_ledger.remaining(target) <= 1
+                attackers = self._visible_attackers_at(
+                    ranger.position,
+                    context.turn,
+                    obstacles,
+                )
+                surviving_attackers = tuple(
+                    enemy
+                    for enemy in attackers
+                    if not (lethal and enemy.id == target.id)
+                )
+                safe_killing_shot = lethal and len(surviving_attackers) < ranger.hp
+                if (
+                    not expedition_member
+                    and len(surviving_attackers) >= ranger.hp
+                    and self._move_ranger_toward_core(
+                        ranger,
+                        context,
+                        reason="leave a lethal multi-source firing line",
+                    )
+                ):
+                    return
                 if (
                     isinstance(target, UnitView)
                     and target.unit_type is not UnitType.WORKER
@@ -986,6 +1013,7 @@ class AggressiveStrategy:
                     )
                     if (
                         not context.combat_assault
+                        and not safe_killing_shot
                         and standoff is not None
                         and standoff != ranger.position
                         and self._ranger_range(ranger.position, target.position)
@@ -1043,14 +1071,21 @@ class AggressiveStrategy:
         if self._pickup_beacon(ranger, context):
             return
         if not expedition_member:
+            approach_enemies = tuple(
+                enemy
+                for enemy in visible_enemies
+                if not (
+                    isinstance(enemy, UnitView) and enemy.unit_type is UnitType.WORKER
+                )
+            )
             visible_target = self._preferred_target(
-                context.focus_target, visible_enemies
+                context.focus_target, approach_enemies
             )
             if visible_target is None:
                 visible_target = self._best_visible_target(
                     ranger.position,
                     context.turn,
-                    visible_enemies,
+                    approach_enemies,
                 )
             if visible_target is not None:
                 goal = self._ranger_approach_goal(
@@ -1065,6 +1100,7 @@ class AggressiveStrategy:
                     context,
                     offensive=offensive,
                     reason=f"close firing angle on {self._enemy_label(visible_target)}",
+                    avoid_new_threats=True,
                 ):
                     return
 
@@ -1086,6 +1122,7 @@ class AggressiveStrategy:
                 context,
                 offensive=offensive,
                 reason=f"hunt last seen {remembered.kind.lower()}",
+                avoid_new_threats=True,
             ):
                 return
 
@@ -1101,6 +1138,7 @@ class AggressiveStrategy:
             context,
             reason=reason,
             wait_at_goal=not offensive and self._preserves_resources(),
+            avoid_new_threats=not expedition_member,
         )
 
     def _decide_vanguard(
@@ -1532,6 +1570,11 @@ class AggressiveStrategy:
     ) -> bool:
         """Check the shot ray after movement resolves for this Tick."""
 
+        # ``line_of_fire`` checks the cells between a shooter and its target.
+        # A predictive shot can otherwise aim at an empty rock endpoint even
+        # though every intervening cell is clear.
+        if target in obstacles or (friendly_positions and target in friendly_positions):
+            return False
         if friendly_positions:
             obstacles = overlay_blockers(
                 obstacles,
@@ -2900,20 +2943,34 @@ class AggressiveStrategy:
         allow_goal: bool = False,
         wait_at_goal: bool = False,
         intent: _MoveIntent = _MoveIntent.STAND,
+        avoid_new_threats: bool = False,
     ) -> None:
         if unit.position == goal:
             self._record_wait(unit, context, reason)
             if wait_at_goal:
                 unit.wait()
-        elif not self._move(
-            unit,
-            goal,
-            context,
-            reason=reason,
-            allow_goal=allow_goal,
-            intent=intent,
-        ):
-            self._record_wait(unit, context, f"no safe path for: {reason}")
+        else:
+            moved = (
+                self._move_within_leash(
+                    unit,
+                    goal,
+                    context,
+                    offensive=False,
+                    reason=reason,
+                    avoid_new_threats=True,
+                )
+                if isinstance(unit, Ranger) and avoid_new_threats
+                else self._move(
+                    unit,
+                    goal,
+                    context,
+                    reason=reason,
+                    allow_goal=allow_goal,
+                    intent=intent,
+                )
+            )
+            if not moved:
+                self._record_wait(unit, context, f"no safe path for: {reason}")
 
     def _retreat_worker(
         self,
@@ -3125,6 +3182,7 @@ class AggressiveStrategy:
         require_path: bool = False,
         extra_blockers: Container[Position] | None = None,
         avoid_recent: bool = True,
+        avoid_new_threats: bool = False,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -3190,6 +3248,22 @@ class AggressiveStrategy:
         if direction is None:
             return False
         destination = add(unit.position, direction)
+        if avoid_new_threats:
+            threats = self._rock_map(context.turn)
+            current = {
+                str(enemy.id)
+                for enemy in self._visible_attackers_at(
+                    unit.position, context.turn, threats
+                )
+            }
+            entered = {
+                str(enemy.id)
+                for enemy in self._visible_attackers_at(
+                    destination, context.turn, threats
+                )
+            }
+            if entered - current:
+                return False
         if destination in blocked and not (allow_goal and destination == goal):
             return False
         return self._queue_move(
@@ -4038,6 +4112,27 @@ class AggressiveStrategy:
             obstacles,
         )
 
+    def _visible_attackers_at(
+        self,
+        position: Position,
+        turn: Turn,
+        obstacles: set[Position] | frozenset[Position],
+    ) -> tuple[UnitView, ...]:
+        """Return every visible hostile currently able to hit ``position``.
+
+        Two hostile Units may share one cell, so this deliberately counts
+        hostile identities rather than unique positions.  The caller can use it
+        to avoid committing a low-HP Ranger to a multi-source firing line.
+        """
+
+        return tuple(
+            enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and self._enemy_can_attack_position(enemy, position, obstacles)
+        )
+
     def _ranger_shot_cell(
         self,
         ranger: Ranger,
@@ -4060,6 +4155,10 @@ class AggressiveStrategy:
             and predicted != enemy.position
             and self._ranger_range(ranger.position, enemy.position) > 1
         )
+        role = self.memory.unit_roles.get(str(ranger.id))
+        defensive = role == DEFENSE_ROLE or (
+            role is not None and role.startswith(PATROL_ROLE_PREFIX)
+        )
         if leads:
             # A hostile that moved out of its cell makes the standing cell a
             # guaranteed miss once movement settles first.  When the lead cell
@@ -4067,13 +4166,35 @@ class AggressiveStrategy:
             # max range falls one cell beyond it), decline the shot so the
             # caller closes on a range where the lead is legal, instead of
             # spending the Tick on an arrow aimed at empty ground.
-            if predicted is not None and self._line_of_fire_clear(
-                ranger.position,
-                predicted,
-                obstacles,
-                friendly_positions,
-            ):
-                return predicted
+            cells = [predicted] if predicted is not None else []
+            if defensive and turn.core is not None:
+                # If the exact lead is not shootable, cover the target's
+                # plausible approach cells towards the Core.  This is a
+                # deliberate firing line, not a chase after empty ground.
+                approach = [
+                    cell
+                    for cell in adjacent_positions(enemy.position)
+                    if manhattan(cell, turn.core.position)
+                    < manhattan(enemy.position, turn.core.position)
+                    and cell not in obstacles
+                    and cell not in friendly_positions
+                ]
+                approach.sort(
+                    key=lambda cell: (
+                        manhattan(cell, predicted) if predicted is not None else 0,
+                        manhattan(ranger.position, cell),
+                        cell,
+                    )
+                )
+                cells.extend(approach)
+            for cell in dict.fromkeys(cells):
+                if self._line_of_fire_clear(
+                    ranger.position,
+                    cell,
+                    obstacles,
+                    friendly_positions,
+                ):
+                    return cell
             return None
         if self._line_of_fire_clear(
             ranger.position,
@@ -4091,6 +4212,16 @@ class AggressiveStrategy:
         turn: Turn | None = None,
     ) -> bool:
         if manhattan(unit.position, target) <= _combat_vision_radius(unit):
+            return True
+        if (
+            turn is not None
+            and self._symmetric_posture()
+            and self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
+            and manhattan(unit.position, target) <= DEFENSIVE_SUPPORT_RADIUS
+        ):
+            # The second defensive rank must be able to answer a contact that
+            # is already inside the local fight.  This is deliberately much
+            # smaller than the fleet-wide response used during an emergency.
             return True
         if (
             turn is None
@@ -6974,21 +7105,59 @@ class AggressiveStrategy:
         friendly_positions: Container[Position] = (),
     ) -> Position | None:
         obstacles = self._rock_map(context.turn)
+        defensive = not self._is_expedition_member(ranger, context.turn)
+        target_position = target.position
+        if defensive:
+            predicted = self.memory.predicted_enemy_position(
+                str(target.id), context.turn.tick
+            ) or self.memory.enemy_drift_position(str(target.id), context.turn.tick, 1)
+            if (
+                predicted is not None
+                and predicted != target.position
+                and predicted not in obstacles
+                and self._ranger_range(ranger.position, target.position) > 1
+            ):
+                # Defensive Rangers position for the enemy's next cell.  A
+                # same-speed follower that chases the standing cell is always
+                # one cell late and often turns a legal shot into a move.
+                target_position = predicted
+        current_attackers = (
+            {
+                str(enemy.id)
+                for enemy in self._visible_attackers_at(
+                    ranger.position, context.turn, obstacles
+                )
+            }
+            if defensive
+            else set()
+        )
         candidates = [
             position
-            for position in firing_positions(target.position)
+            for position in firing_positions(target_position)
             if position not in obstacles
             and position not in context.enemy_positions
             and self._line_of_fire_clear(
                 position,
-                target.position,
+                target_position,
                 obstacles,
                 friendly_positions,
             )
             # Range-three diagonals have Manhattan distance six, outside a
             # Ranger's local vision. Such a firing goal made it lose contact
             # on arrival and immediately chase back out of the firing cell.
-            and manhattan(position, target.position) <= RANGER_VISION_RADIUS
+            and manhattan(position, target_position) <= RANGER_VISION_RADIUS
+            and (
+                not defensive
+                or not (
+                    {
+                        str(enemy.id)
+                        for enemy in self._visible_attackers_at(
+                            position, context.turn, obstacles
+                        )
+                    }
+                    - current_attackers
+                )
+            )
         ]
         if not candidates:
             return None
@@ -6996,7 +7165,7 @@ class AggressiveStrategy:
             candidates,
             key=lambda position: (
                 position in friendly_positions,
-                -self._ranger_range(position, target.position),
+                -self._ranger_range(position, target_position),
                 manhattan(ranger.position, position),
                 position,
             ),
@@ -7729,6 +7898,7 @@ class AggressiveStrategy:
         offensive: bool,
         reason: str,
         extra_blockers: Container[Position] | None = None,
+        avoid_new_threats: bool = False,
     ) -> bool:
         """Move towards ``goal`` only while it stays inside the combat zone."""
 
@@ -7740,6 +7910,7 @@ class AggressiveStrategy:
             context,
             reason=reason,
             extra_blockers=extra_blockers,
+            avoid_new_threats=avoid_new_threats,
         )
 
     def _garrison_ids(
@@ -8060,13 +8231,10 @@ class AggressiveStrategy:
         }
         if self.config.expedition_mode:
             # Expedition members never return; the generic intercept recall
-            # must not pull them back into the defensive zone.  The patrol
-            # contingent is different: it is only a bounded scouting screen,
-            # so a local fighter contact should send it home before it gets
-            # trapped far outside the Core.  The old early return protected
-            # the expedition but accidentally left those patrol members in
-            # the normal chase branch, which cost two remote patrol deaths in
-            # one hostile contact.
+            # must not pull them back into the defensive zone.  Patrol members
+            # also remain on their local contact: the defensive fireline rules
+            # now keep them from entering a new enemy firing line, so an
+            # automatic pre-shot return only surrendered useful support.
             self._squad_return_until = {
                 unit_id: until
                 for unit_id, until in self._squad_return_until.items()
@@ -8075,31 +8243,6 @@ class AggressiveStrategy:
             if turn.core is None:
                 self._squad_return_until.clear()
                 return frozenset()
-
-            visible_combat = tuple(
-                enemy
-                for enemy in turn.visible_enemies
-                if isinstance(enemy, UnitView)
-                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-            )
-            patrol_ids = self._patrol_ids(turn)
-            expedition_members = self._expedition_member_ids(turn)
-            for unit in (*turn.vanguards, *turn.rangers):
-                if (
-                    unit.id not in patrol_ids
-                    or unit.id in expedition_members
-                    or unit.id in raid_ids
-                    or unit.id in perimeter_intercept_ids
-                ):
-                    continue
-                if any(
-                    manhattan(unit.position, enemy.position) <= 5
-                    for enemy in visible_combat
-                ):
-                    self._squad_return_until[unit.id] = max(
-                        self._squad_return_until.get(unit.id, 0),
-                        turn.tick + 8,
-                    )
 
             for unit_id in tuple(self._squad_return_until):
                 unit = next(

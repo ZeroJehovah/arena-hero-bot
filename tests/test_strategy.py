@@ -25,6 +25,7 @@ from arena_hero_bot.strategy import (
     EXPEDITION_LINK_RADIUS,
     EXPEDITION_STAGING_PATH_EXPANSIONS,
     EXPEDITION_STAGING_RADIUS,
+    RANGER_STANDOFF_RANGE,
     RANGER_VISION_RADIUS,
     RESOURCE_SCOUT_INTERVAL,
     STAGED_ROLE,
@@ -89,6 +90,114 @@ def test_ranger_does_not_shoot_through_remembered_obstacle() -> None:
     )
     decide(turn)
     assert turn.plan.unit_actions[turn.rangers[0].id].type == "MOVE"
+
+
+def test_ranger_never_shoots_at_a_predicted_obstacle_cell() -> None:
+    strategy = AggressiveStrategy(WorldMemory())
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "RANGER", position=(0, 0)),
+            unit(3, "WORKER", controlled=False, position=(0, 3)),
+        ],
+        obstacles=[(0, 4)],
+    )
+    enemy = turn.visible_enemies[0]
+    strategy.memory.enemy_position_history[str(enemy.id)] = [
+        (98, (0, 1)),
+        (99, (0, 2)),
+        (100, (0, 3)),
+    ]
+
+    report = strategy.decide(turn)
+
+    assert all(
+        not (item.action == "SHOOT" and item.target == (0, 4))
+        for item in report.decisions
+    )
+
+
+def test_defensive_ranger_does_not_step_into_enemy_range_to_chase() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "RANGER", position=(0, 0)),
+            unit(3, "RANGER", controlled=False, position=(0, 4)),
+        ],
+    )
+
+    strategy = AggressiveStrategy(WorldMemory())
+    strategy.memory.unit_roles[str(turn.rangers[0].id)] = DEFENSE_ROLE
+    report = strategy.decide(turn)
+
+    action = turn.plan.unit_actions.get(turn.rangers[0].id)
+    decision = next(
+        item for item in report.decisions if item.actor_id == str(turn.rangers[0].id)
+    )
+    assert action is not None or decision.action == "WAIT"
+    if action is not None and action.type == "MOVE":
+        destination = add(turn.rangers[0].position, action.direction)
+        assert manhattan(destination, (0, 4)) > RANGER_STANDOFF_RANGE
+
+
+def test_defensive_ranger_leaves_a_lethal_multi_source_firing_line() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "RANGER", position=(0, 0), hp=2),
+            unit(3, "RANGER", controlled=False, position=(0, 2)),
+            unit(4, "RANGER", controlled=False, position=(0, 3)),
+        ],
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    strategy.memory.unit_roles[str(turn.rangers[0].id)] = DEFENSE_ROLE
+
+    report = strategy.decide(turn)
+
+    assert turn.plan.unit_actions[turn.rangers[0].id].type != "SHOOT"
+    assert any(
+        item.actor_id == object_id(2)
+        and item.reason == "leave a lethal multi-source firing line"
+        for item in report.decisions
+    )
+
+
+def test_defensive_ranger_takes_a_safe_killing_shot_under_return_fire() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "RANGER", position=(0, 0), hp=2),
+            unit(3, "RANGER", controlled=False, position=(0, 2), hp=1),
+            unit(4, "RANGER", controlled=False, position=(0, 3)),
+        ],
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    strategy.memory.unit_roles[str(turn.rangers[0].id)] = DEFENSE_ROLE
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == "SHOOT"
+    assert str(action.target_id) == object_id(3)
+
+
+def test_defensive_second_rank_receives_local_contact() -> None:
+    strategy = AggressiveStrategy(
+        WorldMemory(),
+        StrategyConfig(expedition_mode=True, target_workers=16),
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, 0)),
+            unit(3, "RANGER", controlled=False, position=(7, 0)),
+        ],
+    )
+    strategy.memory.unit_roles[str(turn.rangers[0].id)] = DEFENSE_ROLE
+
+    assert strategy._combat_target_is_local(
+        turn.rangers[0], turn.visible_enemies[0].position, turn
+    )
 
 
 def test_ranger_moves_to_clear_a_friendly_firing_line() -> None:
@@ -6394,7 +6503,7 @@ def test_boxed_wounded_expedition_vanguard_fights_instead_of_waiting() -> None:
     assert all(item.action != "WAIT" for item in context.report.decisions)
 
 
-def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> None:
+def test_expedition_mode_keeps_patrol_on_local_contact() -> None:
     strategy = _expedition_strategy()
     vanguards = [
         unit(number, "VANGUARD", position=(number, 100)) for number in range(2, 19)
@@ -6410,7 +6519,7 @@ def test_expedition_mode_recalls_patrol_on_local_contact_but_not_member() -> Non
 
     patrol_id = UUID(int=17)
     returns = strategy._update_squad_returns(turn, ThreatAssessment())
-    assert patrol_id in returns
+    assert patrol_id not in returns
 
     strategy._expedition_squads = [(frozenset({patrol_id}), (1, 0))]
     returns = strategy._update_squad_returns(turn, ThreatAssessment())
