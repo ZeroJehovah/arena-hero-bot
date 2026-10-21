@@ -7086,6 +7086,29 @@ def test_symmetric_posture_migrates_while_worker_returns_cargo() -> None:
     assert any("symmetric-defense home" in item.reason for item in report.decisions)
 
 
+def test_core_at_symmetric_home_returns_to_normal_healing() -> None:
+    config = expedition_config(target_workers=16, max_population=16)
+    memory = WorldMemory(
+        core_home_position=(0, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+    )
+    strategy = AggressiveStrategy(memory, config)
+    workers = [
+        unit(100 + number, "WORKER", position=(10 + number, 10)) for number in range(16)
+    ]
+    turn = make_turn(resources=10, objects=[core(hp=4), *workers])
+
+    report = strategy.decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "HEAL"
+    assert any(
+        item.action == "HEAL" and item.reason == "restore Core HP between engagements"
+        for item in report.decisions
+    )
+    assert not any("Core migration" in item.reason for item in report.decisions)
+
+
 def test_symmetric_layout_migrates_a_legacy_junction_home() -> None:
     config = expedition_config(target_workers=16)
     home = (-416, 672)

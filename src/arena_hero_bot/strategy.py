@@ -2373,7 +2373,18 @@ class AggressiveStrategy:
                 )
                 return
 
-        if self._symmetric_posture() and not nearby_enemy and context.turn.workers:
+        home = self.memory.core_home_position
+        at_home = (
+            home is not None
+            and core.position == home
+            and home not in self._rock_map(context.turn)
+        )
+        if (
+            self._symmetric_posture()
+            and not nearby_enemy
+            and context.turn.workers
+            and not at_home
+        ):
             # Workers already know how to stage carried resources at the
             # Core's current destination while it is moving.  Requiring the
             # whole economy to be empty before starting the revised live
