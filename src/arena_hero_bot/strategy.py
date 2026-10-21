@@ -2556,16 +2556,27 @@ class AggressiveStrategy:
                     <= CORE_MIGRATION_CLEAR_RADIUS
                     for worker in context.turn.workers
                 )
-                if blocked_by_loaded_worker:
+                blocked_by_critical_unit = any(
+                    unit.hp <= 1
+                    and manhattan(unit.position, core.position)
+                    <= CORE_MIGRATION_CLEAR_RADIUS
+                    for unit in context.turn.units
+                )
+                if blocked_by_loaded_worker or blocked_by_critical_unit:
                     # A loaded Worker holds at the moving Core approach so it
-                    # cannot overtake the Core.  If that Worker occupies the
-                    # only legal next step, waiting for the eight-step batch
-                    # would deadlock both actors.  Open a deposit halt now.
+                    # cannot overtake the Core.  A critical unit also needs to
+                    # enter for healing.  If either occupies the only legal
+                    # next step, waiting for the eight-step batch would
+                    # deadlock both actors.  Open a service halt now.
                     self.memory.core_migration_pause_until_tick = max(
                         self.memory.core_migration_pause_until_tick,
                         context.turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
                     )
-                    reason = "hold for a loaded Worker blocking the Core approach"
+                    reason = (
+                        "hold for a loaded Worker blocking the Core approach"
+                        if blocked_by_loaded_worker
+                        else "hold for a critical unit blocking the Core approach"
+                    )
                 else:
                     reason = "wait for a clear Core migration step"
                 context.report.add(

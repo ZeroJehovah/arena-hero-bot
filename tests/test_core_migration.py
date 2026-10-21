@@ -226,6 +226,36 @@ def test_loaded_worker_blocking_core_step_opens_immediate_deposit_halt() -> None
     )
 
 
+def test_critical_unit_blocking_core_step_opens_immediate_service_halt() -> None:
+    core_object = core()
+    memory = WorldMemory(
+        core_home_position=(3, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-1, 0),
+        core_migration_steps_since_pause=4,
+        position_history={core_object["id"]: [(0, 1), (0, 0)]},
+    )
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core_object,
+            unit(2, "RANGER", position=(1, 0), hp=1),
+        ],
+        obstacles=[(0, 1), (0, -1), (-1, 0)],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is None
+    assert memory.core_migration_pause_until_tick == (
+        100 + CORE_MIGRATION_PAUSE_MAX_TICKS
+    )
+    assert any(
+        item.reason == "hold for a critical unit blocking the Core approach"
+        for item in report.decisions
+    )
+
+
 def test_migration_pause_clears_non_service_unit_from_core_cell() -> None:
     memory = WorldMemory(
         core_home_position=(3, 0),
