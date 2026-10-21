@@ -2045,8 +2045,18 @@ class AggressiveStrategy:
         if self._preserves_resources():
             chunk = self._resource_chunk(context.turn)
             if chunk is not None:
-                goal = self._worker_block_patrol_goal(worker, context)
-                reason = "patrol least-seen coverage in the resource chunk"
+                if (
+                    self._is_resource_scout(worker, context.turn)
+                    and context.threat.level is ThreatLevel.NORMAL
+                ):
+                    goal = self._exploration_goal(worker, context.turn.tick)
+                    reason = (
+                        "scout beyond the local resource chunk after the "
+                        "local resource pool is exhausted"
+                    )
+                else:
+                    goal = self._worker_block_patrol_goal(worker, context)
+                    reason = "patrol least-seen coverage in the resource chunk"
             elif (
                 self._is_resource_scout(worker, context.turn)
                 and context.threat.level is ThreatLevel.NORMAL
@@ -7856,6 +7866,21 @@ class AggressiveStrategy:
             assignments,
             clear_missing=False,
         )
+
+        if (
+            not known
+            and self.config.campaign_mode
+            and self._unbounded_growth()
+            and workers
+        ):
+            # A full local sightline map with no known harvestable cell can
+            # leave every Worker circling the same 32x32 block indefinitely.
+            # Keep the local patrol roster intact, but let one unclaimed
+            # Worker refresh the surrounding map until a local site appears.
+            scout = self._resource_scout(workers)
+            if scout is not None:
+                self._resource_scout_id = scout.id
+                workers.pop(scout.id)
 
         while workers and known:
             _, _, worker_id, resource = min(

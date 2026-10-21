@@ -23,7 +23,7 @@ from arena_hero_bot.strategy import (
     _worker_patrol_sector_index,
 )
 
-from .factories import core, make_turn, unit
+from .factories import core, make_turn, object_id, unit
 
 HOME = (-400, 655)
 
@@ -277,6 +277,49 @@ def test_visible_resource_interrupts_worker_block_patrol() -> None:
     assert claim is not None
     assert claim.purpose == RESOURCE_CLAIM_PURPOSE
     assert claim.position == resource
+
+
+def test_empty_campaign_chunk_leaves_one_worker_to_refresh_the_map() -> None:
+    core_object = core(1, position=HOME)
+    memory = WorldMemory(
+        core_home_position=HOME,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+        unit_roles_initialized=True,
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(
+            target_workers=16,
+            max_population=None,
+            expedition_mode=True,
+            campaign_mode=True,
+        ),
+    )
+    turn = make_turn(
+        objects=[
+            core_object,
+            unit(2, "WORKER", position=(HOME[0] - 8, HOME[1] - 8)),
+            unit(3, "WORKER", position=(HOME[0] - 7, HOME[1] - 8)),
+            unit(4, "WORKER", position=(HOME[0] - 6, HOME[1] - 8)),
+        ],
+    )
+
+    report = strategy.decide(turn)
+
+    scout = next(item for item in report.decisions if item.actor_id == object_id(2))
+    patrol = [item for item in report.decisions if item.actor_id != object_id(2)]
+    assert scout.action == "MOVE"
+    assert scout.reason == (
+        "scout beyond the local resource chunk after the local resource pool "
+        "is exhausted"
+    )
+    assert all(
+        item.reason == "patrol least-seen coverage in the resource chunk"
+        for item in patrol
+    )
 
 
 def test_ring_slots_are_eight_flagship_phases_and_move_clockwise_together() -> None:
