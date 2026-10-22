@@ -3942,6 +3942,26 @@ class AggressiveStrategy:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
+        core = context.turn.core
+        if (
+            core is not None
+            and self._core_approach_locked(context.turn)
+            and unit.position != core.position
+            and not (isinstance(unit, Worker) and unit.cargo > 0)
+        ):
+            # The queue check below rejects a step that enters or moves
+            # laterally inside the locked approach.  Include that transient
+            # rule in the route search as well, otherwise A* can repeatedly
+            # choose the forbidden first step and strand a unit one cell
+            # outside the approach.  Loaded Workers remain exempt because
+            # their migration branches explicitly route to the service or
+            # arrival cell.
+            approach_blockers = {
+                position
+                for position in adjacent_positions(core.position)
+                if manhattan(position, core.position) <= CORE_MIGRATION_CLEAR_RADIUS
+            }
+            blocked = overlay_blockers(blocked, approach_blockers)
         # Only the next step settles this Tick. Route around saturated
         # neighbours using departures and arrivals already planned, while
         # allowing single occupants, swaps and later transit through the cell.

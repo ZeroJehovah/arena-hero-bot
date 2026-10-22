@@ -9,7 +9,7 @@ import pytest
 
 from arena_hero_bot import migration_cli
 from arena_hero_bot.geometry import manhattan
-from arena_hero_bot.memory import WorldMemory
+from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.migration import (
     blocks_are_cardinally_adjacent,
     load_migration_request,
@@ -23,6 +23,7 @@ from arena_hero_bot.migration import (
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
     CORE_MIGRATION_PAUSE_MAX_TICKS,
+    WORKER_PATROL_PURPOSE,
     AggressiveStrategy,
     StrategyConfig,
     _resource_block_center_cells,
@@ -410,6 +411,63 @@ def test_loaded_worker_routes_around_the_locked_core_approach() -> None:
     assert action.direction.value == "UP"
     assert any(
         item.reason == "stage carried resources at the Core arrival cell"
+        for item in report.decisions
+    )
+
+
+def test_unloaded_worker_routes_out_of_the_locked_core_approach() -> None:
+    core_object = core(position=(0, 0))
+    worker_object = unit(2, "WORKER", position=(-1, -1))
+    memory = WorldMemory(
+        core_home_position=(1, 1),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+        unit_roles_initialized=True,
+        core_migration_last_position=(0, 0),
+        core_migration_pause_until_tick=-1,
+        campaign_resting=True,
+    )
+    memory.set_goal(
+        worker_object["id"],
+        UnitGoal(
+            position=(7, 0),
+            assigned_tick=90,
+            purpose=WORKER_PATROL_PURPOSE,
+            last_progress_position=(-1, -1),
+        ),
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(
+            target_workers=16,
+            max_population=None,
+            expedition_mode=True,
+            campaign_mode=True,
+        ),
+    )
+    turn = make_turn(
+        tick=100,
+        objects=[core_object, worker_object],
+    )
+
+    report = strategy.decide(turn)
+
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    core_view = turn.core
+    assert core_view is not None
+    destination = (
+        worker.position[0] + action.direction.delta[0],
+        worker.position[1] + action.direction.delta[1],
+    )
+    assert manhattan(destination, core_view.position) > manhattan(
+        worker.position, core_view.position
+    )
+    assert not any(
+        item.actor_id == worker_object["id"] and item.action == "WAIT"
         for item in report.decisions
     )
 
