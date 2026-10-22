@@ -356,6 +356,30 @@ def test_loaded_worker_stages_at_moving_core_destination() -> None:
     )
 
 
+def test_loaded_worker_can_cross_clear_space_to_a_stationary_core() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(1, 1), cargo=1),
+        ],
+        obstacles=[(0, 1), (1, 2)],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction.value == "UP"
+    assert any(
+        item.action == "MOVE" and item.reason == "return carried resources to Core"
+        for item in report.decisions
+    )
+
+
 def test_loaded_worker_routes_around_the_locked_core_approach() -> None:
     moving = make_turn(
         objects=[

@@ -139,7 +139,7 @@ def test_stage_one_spends_on_the_twelfth_worker_without_a_reserve() -> None:
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_stage_one_respawn_guard_precedes_the_second_worker() -> None:
+def test_stage_one_guardless_core_expands_capacity_for_an_unfittable_guard() -> None:
     core_object = core(position=(0, 0))
     memory = WorldMemory(
         core_home_position=(0, 0),
@@ -149,8 +149,34 @@ def test_stage_one_respawn_guard_precedes_the_second_worker() -> None:
         campaign_last_core_id=core_object["id"],
     )
     turn = make_turn(
-        resources=unit_cost(UnitType.RANGER, 1),
+        resources=10,
         objects=[core_object, unit(2, "WORKER", position=(1, 0))],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
+def test_stage_one_guardless_core_builds_ranger_once_capacity_allows() -> None:
+    core_object = core(position=(0, 0))
+    memory = WorldMemory(
+        core_home_position=(0, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+    )
+    turn = make_turn(
+        resources=unit_cost(UnitType.RANGER, 3),
+        objects=[
+            core_object,
+            unit(2, "WORKER", position=(1, 0)),
+            unit(3, "WORKER", position=(2, 0)),
+            unit(4, "WORKER", position=(3, 0)),
+        ],
     )
 
     _strategy(memory).decide(turn)

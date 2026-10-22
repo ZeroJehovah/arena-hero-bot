@@ -4070,7 +4070,6 @@ class AggressiveStrategy:
         stationary_core_service = (
             core is not None
             and core.view.state is CoreState.NORMAL
-            and destination == core.position
             and isinstance(unit, Worker)
             and unit.cargo > 0
         )
@@ -10201,6 +10200,14 @@ class AggressiveStrategy:
             # a fresh Core cannot safely spend its next five resources on a
             # second Worker with no combat answer.  Once this one Ranger
             # exists, the normal stage-1 Worker quota resumes.
+            if (
+                unit_cost(UnitType.RANGER, turn.state.population)
+                > turn.resource_capacity
+            ):
+                # A ten-capacity respawn Core cannot ever hold the first
+                # Ranger.  Expand capacity with one Worker instead of waiting
+                # for a unit that the current Core can never queue.
+                return (UnitType.WORKER,)
             return (UnitType.RANGER,)
         if (
             self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1
