@@ -9,7 +9,7 @@ import pytest
 from arena_hero import APIError, ArenaHeroError, Turn
 
 from arena_hero_bot import cli, runtime
-from arena_hero_bot.memory import WorldMemory
+from arena_hero_bot.memory import PatrolContact, WorldMemory
 from arena_hero_bot.migration import write_migration_request
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.runtime import RuntimeConfig
@@ -160,6 +160,7 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
         unit_roles={"u1": "defense"},
         defense_posts={"u1": (3, -8)},
         defense_anchor=(3, 0),
+        patrol_contacts={"patrol-1": PatrolContact((3, 6), 95, 100, "enemy")},
     )
     record = runtime._turn_record(
         turn=turn,
@@ -173,11 +174,14 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
     )
     memory.defense_posts["u1"] = (9, 9)
     memory.defense_anchor = (9, 17)
+    memory.patrol_contacts.clear()
     assert record["tick"] == turn.tick
     assert record["state"]["status"] == "ACTIVE"
     assert record["identity"]["unit_roles"]["u1"] == "defense"
     assert record["identity"]["defense_posts"]["u1"] == [3, -8]
     assert record["identity"]["defense_anchor"] == [3, 0]
+    assert record["identity"]["patrol_contacts"]["patrol-1"]["origin"] == [3, 6]
+    assert record["identity"]["patrol_contacts"]["patrol-1"]["started_tick"] == 95
     assert record["plan"]["tick"] == turn.tick
     assert "api_key" not in json.dumps(record).lower()
 

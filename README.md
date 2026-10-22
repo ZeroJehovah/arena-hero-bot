@@ -74,6 +74,21 @@ form one-way expeditions of 2 Vanguards and 2 Rangers. Upgrading an older format
 preserves the cardinal post owners and patrol Rangers while releasing diagonal
 and patrol Vanguards into expedition staging.
 
+In the expedition posture, fixed defenders do not pursue enemies. Rangers
+keep survivable shots, cover possible enemy approach cells, and rotate free
+cell shots along the outer firing edge while holding position. Repositioning
+requires a threatened ally or Core, stays within the defensive layers, and
+avoids new firing sources. A necessary withdrawal is planned before rear-rank
+shots and prefers an equally safe cell that preserves supporting fire.
+
+Patrol Rangers may pursue a visible fighter only with a healthy local force
+advantage and a supporting shooter that can actually cover the contact. Each
+engagement is limited to four cells from its original contact position and
+six Ticks; the budget survives restarts and continuous sightings do not renew
+it. A threatened Core takes priority. Expeditions retain their independent
+one-way offensive policy. Deliberate empty-cell coverage may produce misses;
+shot counts alone are not a measure of combat success.
+
 For a persistent systemd deployment, install the supplied service after creating
 the virtual environment and `.env` file:
 

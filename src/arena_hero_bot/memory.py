@@ -80,6 +80,16 @@ class UnitGoal:
 
 
 @dataclass(frozen=True, slots=True)
+class PatrolContact:
+    """A bounded patrol engagement that cannot restart on every sighting."""
+
+    origin: Position
+    started_tick: int
+    last_contact_tick: int
+    target_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExpeditionSquad:
     """A persisted expedition membership, current heading and shared route."""
 
@@ -112,6 +122,7 @@ class WorldMemory:
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
     # ``patrol-1`` .. ``patrol-4``, ``staged`` or ``expedition-N``.
     unit_roles: dict[str, str] = field(default_factory=dict)
+    patrol_contacts: dict[str, PatrolContact] = field(default_factory=dict)
     # Exact defensive posts, independent of temporary combat/healing goals.
     # The anchor lets the strategy translate every post together if the Core
     # moves, without reallocating surviving Units to different slots.
@@ -257,6 +268,12 @@ class WorldMemory:
             if unit_id in live_worker_ids
         }
         live_combat_ids = {str(unit.id) for unit in (*turn.vanguards, *turn.rangers)}
+        live_roles = {self.unit_roles.get(unit_id) for unit_id in live_combat_ids}
+        self.patrol_contacts = {
+            role: contact
+            for role, contact in self.patrol_contacts.items()
+            if role in live_roles
+        }
         self.patrol_ring_slots = {
             unit_id: slot
             for unit_id, slot in self.patrol_ring_slots.items()
@@ -595,6 +612,10 @@ class WorldMemory:
                 for position, seen_tick in sorted(self.resource_cells.items())
             ],
             "unit_roles": dict(sorted(self.unit_roles.items())),
+            "patrol_contacts": {
+                role: asdict(contact)
+                for role, contact in sorted(self.patrol_contacts.items())
+            },
             "defense_posts": {
                 unit_id: list(position)
                 for unit_id, position in sorted(self.defense_posts.items())
@@ -750,6 +771,15 @@ class WorldMemory:
             unit_roles={
                 str(unit_id): str(role)
                 for unit_id, role in raw.get("unit_roles", {}).items()
+            },
+            patrol_contacts={
+                str(role): PatrolContact(
+                    origin=_position(value["origin"]),
+                    started_tick=int(value["started_tick"]),
+                    last_contact_tick=int(value["last_contact_tick"]),
+                    target_id=str(value["target_id"]),
+                )
+                for role, value in raw.get("patrol_contacts", {}).items()
             },
             defense_posts={
                 str(unit_id): _position(position)

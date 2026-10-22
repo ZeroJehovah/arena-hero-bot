@@ -278,6 +278,15 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
     ]
     return {
         "unit_roles": dict(sorted(memory.unit_roles.items())),
+        "patrol_contacts": {
+            role: {
+                "origin": list(contact.origin),
+                "started_tick": contact.started_tick,
+                "last_contact_tick": contact.last_contact_tick,
+                "target_id": contact.target_id,
+            }
+            for role, contact in sorted(memory.patrol_contacts.items())
+        },
         "defense_posts": {
             unit_id: list(position)
             for unit_id, position in sorted(memory.defense_posts.items())
