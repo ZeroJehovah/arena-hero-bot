@@ -7437,9 +7437,32 @@ class AggressiveStrategy:
         defense_rangers = self._campaign_defense_rangers(turn)
         patrol_rangers = self._campaign_patrol_rangers(turn)
         if (
+            phase == CAMPAIGN_PHASE_STAGE2
+            and self.memory.campaign_resting
+            and workers >= CAMPAIGN_STAGE1_WORKERS
+            and defense_rangers >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
+            and all(worker.cargo == 0 for worker in turn.workers)
+        ):
+            # Releases a persisted pre-fix state that promoted to stage 2
+            # before the stage-1 32-cell rest had finished.  Such a rest is
+            # identifiable while its hop target is still in the Core's block;
+            # a normal stage-2 rest targets the next block.
+            from .migration import resource_block_index
+
+            core = turn.core
+            home = self.memory.core_home_position
+            if (
+                core is not None
+                and home is not None
+                and resource_block_index(core.position) == resource_block_index(home)
+            ):
+                self.memory.campaign_resting = False
+                self.memory.campaign_leg_steps = 0
+        if (
             phase == CAMPAIGN_PHASE_STAGE1
             and workers >= CAMPAIGN_STAGE1_WORKERS
             and defense_rangers >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
+            and not self.memory.campaign_resting
         ):
             self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE2
             self.memory.campaign_target_quota = 3

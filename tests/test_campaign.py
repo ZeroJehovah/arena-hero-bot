@@ -360,6 +360,52 @@ def test_stage_one_builds_ranger_after_twelve_workers() -> None:
     assert turn.plan.core_action.unit_type is UnitType.RANGER
 
 
+def test_stage_one_finishes_pending_rest_before_promoting() -> None:
+    core_object = core(position=(-1743, -1905))
+    memory = WorldMemory(
+        core_home_position=(-1744, -1904),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+        campaign_resting=True,
+    )
+    rangers = _rangers(8)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    turn = make_turn(objects=[core_object, *_workers(12), *rangers])
+
+    _strategy(memory).decide(turn)
+
+    assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE1
+    assert memory.campaign_resting is False
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+
+
+def test_stage_two_repairs_a_rest_promoted_before_the_stage_one_hop() -> None:
+    core_object = core(position=(-1743, -1905))
+    memory = WorldMemory(
+        core_home_position=(-1744, -1904),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE2,
+        campaign_target_quota=3,
+        campaign_last_core_id=core_object["id"],
+        campaign_resting=True,
+    )
+    rangers = _rangers(8)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    turn = make_turn(objects=[core_object, *_workers(12), *rangers])
+
+    _strategy(memory).decide(turn)
+
+    assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE2
+    assert memory.campaign_resting is False
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+
+
 def test_stage_two_finishes_workers_before_expanding_its_screen() -> None:
     core_object = core(position=(0, 0))
     memory = WorldMemory(
