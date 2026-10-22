@@ -7296,49 +7296,28 @@ class AggressiveStrategy:
         if core is None:
             return
         core_id = str(core.id)
-        if self.memory.campaign_last_core_id == core_id and self.memory.campaign_phase:
+        core_respawned = any(
+            event.event_type == "CORE_RESPAWNED" and str(event.target_id) == core_id
+            for event in turn.events
+        )
+        if (
+            self.memory.campaign_last_core_id == core_id
+            and self.memory.campaign_phase
+            and not core_respawned
+        ):
+            self._repair_campaign_home(turn, core)
             return
 
         self.memory.core_home_position = None
         obstacles = self._rock_map(turn)
         resources = set(turn.resource_cells) | set(self.memory.resource_cells)
         occupied = {unit.position for unit in turn.units}
-        centers = sorted(
-            _resource_block_center_cells(core.position),
-            key=lambda cell: (
-                cell in obstacles,
-                cell in resources,
-                cell in occupied,
-                manhattan(cell, core.position),
-                cell,
-            ),
+        target = self._current_block_home_candidate(
+            core.position,
+            obstacles,
+            resources,
+            occupied,
         )
-        target = next(
-            (
-                position
-                for position in centers
-                if position not in obstacles
-                and position not in resources
-                and position not in occupied
-            ),
-            None,
-        )
-        if target is None:
-            # Dynamic resources or the arriving Worker may temporarily cover
-            # every center.  They will clear; another chunk's old home never
-            # becomes a valid respawn target.
-            target = next(
-                (position for position in centers if position not in obstacles), None
-            )
-        if target is None:
-            target = self._symmetric_home_candidate_from(
-                core.position,
-                obstacles,
-                resources,
-                occupied,
-            )
-        if target is None:
-            target = centers[0]
 
         self.memory.unit_roles.clear()
         self.memory.patrol_contacts.clear()
@@ -7364,6 +7343,72 @@ class AggressiveStrategy:
         else:
             self.memory.campaign_target_quota = 2
 
+    def _current_block_home_candidate(
+        self,
+        position: Position,
+        obstacles: set[Position],
+        resources: set[Position],
+        occupied: set[Position],
+    ) -> Position:
+        """Return one center cell in ``position``'s block, never an old home."""
+
+        centers = sorted(
+            _resource_block_center_cells(position),
+            key=lambda cell: (
+                cell in obstacles,
+                cell in resources,
+                cell in occupied,
+                manhattan(cell, position),
+                cell,
+            ),
+        )
+        return next(
+            (
+                cell
+                for cell in centers
+                if cell not in obstacles
+                and cell not in resources
+                and cell not in occupied
+            ),
+            next((cell for cell in centers if cell not in obstacles), centers[0]),
+        )
+
+    def _repair_campaign_home(self, turn: Turn, core: Core) -> None:
+        """Discard a stale positional target after a restart or location jump."""
+
+        from .migration import blocks_are_cardinally_adjacent, resource_block_index
+
+        previous = self.memory.core_migration_last_position
+        jumped = previous is not None and manhattan(previous, core.position) > 1
+        if jumped:
+            self.memory.core_migration_steps_since_pause = 0
+        home = self.memory.core_home_position
+        if home is not None:
+            current_block = resource_block_index(core.position)
+            home_block = resource_block_index(home)
+            same_block = current_block == home_block
+            adjacent_block = blocks_are_cardinally_adjacent(current_block, home_block)
+            valid = (
+                same_block
+                if self.memory.campaign_phase <= 1
+                else (same_block or adjacent_block)
+            )
+            block_changed = (
+                jumped
+                and previous is not None
+                and resource_block_index(previous) != current_block
+            )
+            if valid and not block_changed:
+                return
+        obstacles = self._rock_map(turn)
+        target = self._current_block_home_candidate(
+            core.position,
+            obstacles,
+            set(turn.resource_cells) | set(self.memory.resource_cells),
+            {unit.position for unit in turn.units},
+        )
+        self._commit_symmetric_home(target)
+
     def _advance_campaign_phase(self, turn: Turn) -> None:
         """Advance only on completed composition; casualties never demote."""
 
@@ -7377,7 +7422,7 @@ class AggressiveStrategy:
             and defense_rangers >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
         ):
             self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE2
-            self._campaign_retarget(turn, 3)
+            self.memory.campaign_target_quota = 3
         if (
             self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE2
             and workers >= CAMPAIGN_STAGE2_WORKERS
@@ -7385,7 +7430,7 @@ class AggressiveStrategy:
             and patrol_rangers >= CAMPAIGN_STAGE2_PATROL_RANGERS
         ):
             self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE3
-            self._campaign_retarget(turn, 4)
+            self.memory.campaign_target_quota = 4
         if self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE3:
             from .migration import resource_block_index, resource_block_quota
 
@@ -7397,9 +7442,31 @@ class AggressiveStrategy:
             ):
                 self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE4
                 self.memory.campaign_target_quota = 4
+        self._continue_campaign_migration(turn)
+
+    def _continue_campaign_migration(self, turn: Turn) -> None:
+        """Publish the next adjacent hop only after the current one is reached."""
+
+        from .migration import resource_block_index, resource_block_quota
+
+        if self.memory.campaign_phase not in (
+            CAMPAIGN_PHASE_STAGE2,
+            CAMPAIGN_PHASE_STAGE3,
+        ):
+            return
+        core = turn.core
+        if core is None:
+            return
+        home = self.memory.core_home_position
+        if home is not None and core.position != home:
+            return
+        target_quota = self.memory.campaign_target_quota
+        if target_quota <= resource_block_quota(resource_block_index(core.position)):
+            return
+        self._campaign_retarget(turn, target_quota)
 
     def _campaign_retarget(self, turn: Turn, target_quota: int) -> None:
-        """Select the outermost block ring that guarantees the next quota."""
+        """Select one clean cardinal neighbor toward the requested quota."""
 
         from .migration import (
             plan_resource_quota,
@@ -7420,7 +7487,13 @@ class AggressiveStrategy:
         )
         if plan is not None:
             self.memory.campaign_target_quota = target_quota
-            self._commit_symmetric_home(plan.target)
+            self._set_campaign_hop_target(plan.target)
+
+    def _set_campaign_hop_target(self, target: Position) -> None:
+        """Retarget one hop without resetting economy or the 32-cell leg."""
+
+        self.memory.core_home_position = target
+        self.memory.core_layout_version = CORE_LAYOUT_VERSION
 
     def _campaign_defense_rangers(self, turn: Turn) -> int:
         return sum(
@@ -7563,12 +7636,27 @@ class AggressiveStrategy:
     def request_core_migration(self, target: Position) -> bool:
         """Persist a new chunk-center migration requested by the operator."""
 
+        from .migration import blocks_are_cardinally_adjacent, resource_block_index
+
         if target == self.memory.core_home_position:
             return False
         if target not in _resource_block_center_cells(target):
             raise ValueError("migration target must be one of a chunk's center cells")
         if target in self.memory.obstacles:
             raise ValueError("migration target is a remembered obstacle")
+        source = (
+            self.memory.core_migration_last_position or self.memory.core_home_position
+        )
+        if source is not None:
+            source_block = resource_block_index(source)
+            target_block = resource_block_index(target)
+            if source_block != target_block and not blocks_are_cardinally_adjacent(
+                source_block, target_block
+            ):
+                raise ValueError(
+                    "migration target must stay in the current or a cardinal "
+                    "neighboring resource block"
+                )
         self._commit_symmetric_home(target)
         return True
 
@@ -7594,8 +7682,13 @@ class AggressiveStrategy:
         target = self.memory.core_home_position
         obstacles = self._rock_map(context.turn)
         if target is None or target in obstacles:
-            target = self._symmetric_home_candidate(context)
-            self._commit_symmetric_home(target)
+            target = self._current_block_home_candidate(
+                target or core.position,
+                obstacles,
+                set(context.turn.resource_cells) | set(self.memory.resource_cells),
+                set(context.occupied),
+            )
+            self._set_campaign_hop_target(target)
         if target is None or core.position == target:
             return None
         occupied_to_capacity = {

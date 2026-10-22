@@ -16,7 +16,7 @@ from arena_hero_bot.runtime import RuntimeConfig
 from arena_hero_bot.strategy import AggressiveStrategy
 from arena_hero_bot.telemetry import BEIJING_TZ, JsonlTelemetry
 
-from .factories import core, make_turn, unit
+from .factories import core, make_turn, object_id, unit
 
 
 def _written_telemetry(path):
@@ -161,6 +161,11 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
         defense_posts={"u1": (3, -8)},
         defense_anchor=(3, 0),
         patrol_contacts={"patrol-1": PatrolContact((3, 6), 95, 100, "enemy")},
+        core_home_position=(16, 16),
+        campaign_last_core_id=object_id(1),
+        campaign_phase=2,
+        campaign_target_quota=3,
+        campaign_leg_steps=7,
     )
     record = runtime._turn_record(
         turn=turn,
@@ -182,6 +187,10 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
     assert record["identity"]["defense_anchor"] == [3, 0]
     assert record["identity"]["patrol_contacts"]["patrol-1"]["origin"] == [3, 6]
     assert record["identity"]["patrol_contacts"]["patrol-1"]["started_tick"] == 95
+    assert record["identity"]["campaign"]["home_position"] == [16, 16]
+    assert record["identity"]["campaign"]["phase"] == 2
+    assert record["identity"]["campaign"]["target_quota"] == 3
+    assert record["identity"]["campaign"]["leg_steps"] == 7
     assert record["plan"]["tick"] == turn.tick
     assert "api_key" not in json.dumps(record).lower()
 

@@ -11,6 +11,7 @@ from arena_hero_bot import migration_cli
 from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.migration import (
+    blocks_are_cardinally_adjacent,
     load_migration_request,
     next_resource_tier_ring,
     plan_next_resource_tier,
@@ -63,10 +64,15 @@ def test_next_tier_planner_selects_a_clean_center_block() -> None:
 
     assert plan is not None
     assert (plan.current_ring, plan.current_quota) == (32, 3)
-    assert (plan.target_ring, plan.target_quota) == (24, 4)
+    assert (plan.target_ring, plan.target_quota) == (31, 3)
+    assert (plan.goal_ring, plan.goal_quota) == (24, 4)
     assert plan.target in _resource_block_center_cells(plan.target)
     assert resource_block_index(plan.target) == plan.target_block
-    assert 254 <= plan.estimated_cells <= 320
+    assert blocks_are_cardinally_adjacent(
+        plan.current_block,
+        plan.target_block,
+    )
+    assert 30 <= plan.estimated_cells <= 34
     assert plan.blocked_defense_posts == 0
 
 
@@ -135,13 +141,15 @@ def test_committed_migration_resets_identity_and_tuning_state() -> None:
     )
     strategy = _strategy(memory)
 
-    assert strategy.request_core_migration((-368, 432)) is True
-    assert memory.core_home_position == (-368, 432)
+    assert strategy.request_core_migration((-368, 655)) is True
+    assert memory.core_home_position == (-368, 655)
     assert memory.core_migration_last_position is None
     assert memory.core_migration_steps_since_pause == 0
     assert memory.core_migration_pause_until_tick == -1
     assert memory.defense_posts == {}
-    assert strategy.request_core_migration((-368, 432)) is False
+    assert strategy.request_core_migration((-368, 655)) is False
+    with pytest.raises(ValueError, match="cardinal"):
+        strategy.request_core_migration((-368, 432))
     with pytest.raises(ValueError, match="center cells"):
         strategy.request_core_migration((0, 0))
 
@@ -444,8 +452,10 @@ def test_migration_cli_plans_requests_and_reports(tmp_path: Path, capsys) -> Non
 
     migration_cli.main(["--data-dir", str(tmp_path), "plan"])
     plan = json.loads(capsys.readouterr().out)
-    assert plan["target_ring"] == 24
-    assert plan["target_quota"] == 4
+    assert plan["target_ring"] == 31
+    assert plan["target_quota"] == 3
+    assert plan["goal_ring"] == 24
+    assert plan["goal_quota"] == 4
 
     migration_cli.main(["--data-dir", str(tmp_path), "request-next-tier"])
     request = json.loads(capsys.readouterr().out)

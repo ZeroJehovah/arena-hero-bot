@@ -10,6 +10,7 @@ from pathlib import Path
 from .geometry import manhattan
 from .memory import WorldMemory
 from .migration import (
+    blocks_are_cardinally_adjacent,
     load_migration_request,
     plan_next_resource_tier,
     resource_block_index,
@@ -69,6 +70,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         note = args.note
         if target in memory.obstacles or target in memory.resource_cells:
             raise SystemExit("requested target is a remembered obstacle or resource")
+        source = memory.core_migration_last_position or memory.core_home_position
+        if source is not None:
+            source_block = resource_block_index(source)
+            target_block = resource_block_index(target)
+            if source_block != target_block and not blocks_are_cardinally_adjacent(
+                source_block, target_block
+            ):
+                raise SystemExit(
+                    "requested target must stay in the current or a cardinal "
+                    "neighboring resource block"
+                )
         plan = None
     else:
         request = load_migration_request(request_path)

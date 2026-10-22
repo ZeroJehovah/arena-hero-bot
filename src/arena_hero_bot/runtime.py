@@ -295,6 +295,27 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             list(memory.defense_anchor) if memory.defense_anchor is not None else None
         ),
         "expedition_squads": squads,
+        "campaign": {
+            "core_id": memory.campaign_last_core_id,
+            "phase": memory.campaign_phase,
+            "target_quota": memory.campaign_target_quota,
+            "home_position": (
+                list(memory.core_home_position)
+                if memory.core_home_position is not None
+                else None
+            ),
+            "leg_steps": memory.campaign_leg_steps,
+            "resting": memory.campaign_resting,
+        },
+        "core_migration": {
+            "last_position": (
+                list(memory.core_migration_last_position)
+                if memory.core_migration_last_position is not None
+                else None
+            ),
+            "steps_since_pause": memory.core_migration_steps_since_pause,
+            "pause_until_tick": memory.core_migration_pause_until_tick,
+        },
         "exploration": {
             "new_cells": memory.exploration.new_cells,
             "tracked_tiles": len(memory.exploration.tiles),

@@ -8,9 +8,9 @@ from arena_hero import UnitType, unit_cost
 
 from arena_hero_bot.memory import ExpeditionSquad, WorldMemory
 from arena_hero_bot.migration import (
+    blocks_are_cardinally_adjacent,
     plan_resource_quota,
     resource_block_index,
-    resource_block_quota,
 )
 from arena_hero_bot.strategy import (
     CAMPAIGN_LEG_CELLS,
@@ -52,16 +52,18 @@ def _rangers(count: int, *, offset: int = 1000) -> list[dict[str, object]]:
     ]
 
 
-def test_explicit_quota_plan_stops_at_outer_guaranteed_tier() -> None:
+def test_explicit_quota_plan_publishes_one_adjacent_hop() -> None:
     memory = WorldMemory(core_home_position=(-2033, -2929))
 
     tier3 = plan_resource_quota(memory, 3, current_position=(-2033, -2929))
     tier4 = plan_resource_quota(memory, 4, current_position=(-2033, -2929))
 
     assert tier3 is not None
-    assert (tier3.target_ring, tier3.target_quota) == (34, 3)
+    assert (tier3.goal_ring, tier3.goal_quota) == (34, 3)
+    assert blocks_are_cardinally_adjacent(tier3.current_block, tier3.target_block)
     assert tier4 is not None
-    assert (tier4.target_ring, tier4.target_quota) == (24, 4)
+    assert (tier4.goal_ring, tier4.goal_quota) == (24, 4)
+    assert blocks_are_cardinally_adjacent(tier4.current_block, tier4.target_block)
 
 
 def test_new_core_resets_old_campaign_to_its_spawn_chunk() -> None:
@@ -121,6 +123,104 @@ def test_new_core_keeps_its_own_chunk_when_every_center_is_temporarily_busy() ->
     assert resource_block_index(memory.core_home_position) == resource_block_index(
         current_core["position"]
     )
+
+
+def test_core_respawn_event_resets_even_with_replayed_uuid() -> None:
+    current_core = core(9, position=(-1740, -1900))
+    memory = WorldMemory(
+        core_home_position=(-2033, -2929),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=current_core["id"],
+    )
+    turn = make_turn(
+        tick=101,
+        objects=[current_core, unit(2, "WORKER", position=(-1739, -1900))],
+        events=[
+            {
+                "event_id": object_id(900),
+                "tick": 101,
+                "event_type": "CORE_RESPAWNED",
+                "target_id": current_core["id"],
+                "position": [-1740, -1900],
+            }
+        ],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE1
+    assert memory.campaign_target_quota == 2
+    assert memory.core_home_position is not None
+    assert resource_block_index(memory.core_home_position) == resource_block_index(
+        current_core["position"]
+    )
+
+
+def test_same_core_discards_a_distant_persisted_target() -> None:
+    current_core = core(9, position=(-1740, -1900))
+    memory = WorldMemory(
+        core_home_position=(-2033, -2929),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE1,
+        campaign_target_quota=2,
+        campaign_last_core_id=current_core["id"],
+        core_migration_last_position=(-1740, -1900),
+    )
+    turn = make_turn(objects=[current_core])
+
+    _strategy(memory).decide(turn)
+
+    assert memory.core_home_position is not None
+    assert resource_block_index(memory.core_home_position) == resource_block_index(
+        current_core["position"]
+    )
+
+
+def test_non_cardinal_core_jump_discards_a_cross_block_target() -> None:
+    current_core = core(9, position=(-2033, -2929))
+    memory = WorldMemory(
+        core_home_position=(-2001, -2929),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE2,
+        campaign_target_quota=2,
+        campaign_last_core_id=current_core["id"],
+        core_migration_last_position=(0, 0),
+        core_migration_steps_since_pause=12,
+    )
+    turn = make_turn(objects=[current_core])
+
+    _strategy(memory).decide(turn)
+
+    assert memory.core_home_position is not None
+    assert resource_block_index(memory.core_home_position) == resource_block_index(
+        current_core["position"]
+    )
+    assert memory.core_migration_steps_since_pause == 0
+
+
+def test_campaign_retargets_only_after_reaching_the_previous_hop() -> None:
+    current_core = core(9, position=(-2033, -2929))
+    current_center = (-2033, -2929)
+    memory = WorldMemory(
+        core_home_position=current_center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=current_core["id"],
+        core_migration_last_position=current_center,
+        campaign_leg_steps=17,
+    )
+    turn = make_turn(objects=[current_core])
+
+    _strategy(memory).decide(turn)
+
+    assert memory.core_home_position is not None
+    previous_block = resource_block_index(current_center)
+    target_block = resource_block_index(memory.core_home_position)
+    assert blocks_are_cardinally_adjacent(previous_block, target_block)
+    assert memory.campaign_leg_steps == 17
 
 
 def test_campaign_memory_round_trip_preserves_stage_and_leg(tmp_path: Path) -> None:
@@ -301,7 +401,10 @@ def test_completed_stage_one_retargets_quota_three_immediately() -> None:
     assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE2
     assert memory.campaign_target_quota == 3
     assert memory.core_home_position is not None
-    assert resource_block_quota(resource_block_index(memory.core_home_position)) == 3
+    assert blocks_are_cardinally_adjacent(
+        resource_block_index(core_object["position"]),
+        resource_block_index(memory.core_home_position),
+    )
 
 
 def test_completed_stage_two_switches_to_ranger_only_expedition_and_quota_four() -> (
@@ -385,11 +488,11 @@ def test_campaign_arrival_reserves_exactly_one_service_tick() -> None:
 def test_campaign_enters_a_roster_rest_after_thirty_two_cells() -> None:
     core_object = core(position=(1, 0))
     memory = WorldMemory(
-        core_home_position=(100, 0),
+        core_home_position=(33, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
         core_migration_last_position=(0, 0),
-        campaign_phase=CAMPAIGN_PHASE_STAGE1,
-        campaign_target_quota=2,
+        campaign_phase=CAMPAIGN_PHASE_STAGE2,
+        campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
         campaign_leg_steps=CAMPAIGN_LEG_CELLS - 1,
     )

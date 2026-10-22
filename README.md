@@ -109,10 +109,11 @@ Runtime memory and JSONL telemetry are written under `var/` by default.
 ## Long Core migration
 
 The bot can relocate the Core between resource chunks without stopping the
-local economy. A migration walks eight cells, pauses eight Ticks for Worker
-deposits, harvests through the Core's current chunk, translates the defensive
-posts, and keeps patrols on a ring around the moving Core. The target and pause
-schedule are durable across restarts.
+local economy. Long campaigns publish one current-or-cardinal-neighbor chunk
+center at a time; after reaching that roughly 32-cell hop they publish the next
+one. The Core moves for four Ticks, reserves one Tick for a deposit or heal, and
+harvests through its current chunk while defensive posts and patrols follow it.
+The quota goal, current hop, and pause schedule are durable across restarts.
 
 Plan the cleanest nearby block at the next natural-resource tier:
 
@@ -126,10 +127,12 @@ Publish an atomic hot request to the running bot:
 uv run arena-core-migration --data-dir var request-next-tier
 ```
 
-An explicit chunk-center cell can be supplied with `request X Y`; `status`
-shows the persisted home and pending request. Requests are validated against
-chunk-center geometry and remembered obstacles before the running bot picks
-them up on its next Turn.
+An explicit chunk-center cell can be supplied with `request X Y`; it must stay
+in the current chunk or a cardinal-neighbor chunk. `status` shows the persisted
+home and pending request. Requests are validated against chunk-center geometry
+and remembered obstacles before the running bot picks them up on its next Turn.
+`CORE_RESPAWNED`, Core UUID changes, non-cardinal position jumps, and per-Turn
+block adjacency checks prevent a new Core from inheriting an old destination.
 
 ## Development
 

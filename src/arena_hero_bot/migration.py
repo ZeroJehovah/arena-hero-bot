@@ -28,7 +28,7 @@ _DEFENSE_OFFSETS = (*SYMMETRIC_VANGUARD_OFFSETS, *SYMMETRIC_RANGER_OFFSETS)
 
 @dataclass(frozen=True, slots=True)
 class MigrationPlan:
-    """One deterministic next-resource-tier destination recommendation."""
+    """One deterministic next-block recommendation toward a quota goal."""
 
     current_block: Position
     current_ring: int
@@ -36,6 +36,8 @@ class MigrationPlan:
     target_block: Position
     target_ring: int
     target_quota: int
+    goal_ring: int
+    goal_quota: int
     target: Position
     estimated_cells: int
     block_rocks: int
@@ -50,6 +52,8 @@ class MigrationPlan:
             "target_block": list(self.target_block),
             "target_ring": self.target_ring,
             "target_quota": self.target_quota,
+            "goal_ring": self.goal_ring,
+            "goal_quota": self.goal_quota,
             "target": list(self.target),
             "estimated_cells": self.estimated_cells,
             "block_rocks": self.block_rocks,
@@ -124,14 +128,17 @@ def resource_quota_outer_ring(target_quota: int) -> int | None:
     return max(rings) if rings else None
 
 
-def _blocks_on_ring(ring: int) -> tuple[Position, ...]:
-    limit = ring + 1
-    return tuple(
-        (x, y)
-        for x in range(-limit, limit + 1)
-        for y in range(-limit, limit + 1)
-        if _axis(x) + _axis(y) == ring
-    )
+def cardinal_block_neighbors(block: Position) -> tuple[Position, ...]:
+    """Return the four blocks sharing an edge with ``block``."""
+
+    x, y = block
+    return (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)
+
+
+def blocks_are_cardinally_adjacent(left: Position, right: Position) -> bool:
+    """Return whether two block indices differ by one cardinal step."""
+
+    return abs(left[0] - right[0]) + abs(left[1] - right[1]) == 1
 
 
 def _block_cells(block: Position) -> tuple[Position, ...]:
@@ -148,7 +155,7 @@ def plan_next_resource_tier(
     *,
     current_position: Position | None = None,
 ) -> MigrationPlan | None:
-    """Pick the cleanest nearby block-center that reaches the next quota tier."""
+    """Pick one clean adjacent block center toward the next quota tier."""
 
     origin = (
         current_position
@@ -163,13 +170,13 @@ def plan_next_resource_tier(
     if target_ring is None:
         return None
     target_quota = _resource_quota_at_ring(target_ring)
-    return _plan_quota_tier(
+    return _plan_adjacent_block(
         memory,
         origin=origin,
         current_block=current_block,
         current_ring=current_ring,
-        target_ring=target_ring,
-        target_quota=target_quota,
+        goal_ring=target_ring,
+        goal_quota=target_quota,
     )
 
 
@@ -179,12 +186,12 @@ def plan_resource_quota(
     *,
     current_position: Position | None = None,
 ) -> MigrationPlan | None:
-    """Pick the outermost center ring that guarantees ``target_quota``.
+    """Pick one clean adjacent block center toward ``target_quota``.
 
-    Unlike :func:`plan_next_resource_tier`, this accepts an explicit campaign
-    stage target.  A Core still outside quota 2 territory can therefore aim
-    directly at the quota-3 boundary, and a later stage can switch to quota 4
-    without first pretending it had already reached the intermediate ring.
+    The quota boundary remains the durable campaign goal, while each published
+    ``core_home_position`` is only the next 32-cell block hop.  Repeating these
+    hops prevents a respawned or restarted Core from inheriting a distant final
+    coordinate as if it were the next local waypoint.
     """
 
     origin = (
@@ -202,30 +209,32 @@ def plan_resource_quota(
     target_ring = resource_quota_outer_ring(target_quota)
     if target_ring is None or target_ring >= current_ring:
         return None
-    return _plan_quota_tier(
+    return _plan_adjacent_block(
         memory,
         origin=origin,
         current_block=current_block,
         current_ring=current_ring,
-        target_ring=target_ring,
-        target_quota=target_quota,
+        goal_ring=target_ring,
+        goal_quota=target_quota,
     )
 
 
-def _plan_quota_tier(
+def _plan_adjacent_block(
     memory: WorldMemory,
     *,
     origin: Position,
     current_block: Position,
     current_ring: int,
-    target_ring: int,
-    target_quota: int,
+    goal_ring: int,
+    goal_quota: int,
 ) -> MigrationPlan | None:
-    """Search the center cells of one quota-boundary block ring."""
+    """Search the center cells of the inward cardinal neighboring blocks."""
 
-    blocked = memory.obstacles | set(memory.resource_cells)
-    candidates: list[tuple[int, int, int, int, Position, Position]] = []
-    for block in _blocks_on_ring(target_ring):
+    candidates: list[tuple[int, int, int, int, int, int, Position, Position]] = []
+    for block in cardinal_block_neighbors(current_block):
+        ring = resource_block_ring(block)
+        if ring >= current_ring:
+            continue
         block_rocks = sum(cell in memory.obstacles for cell in _block_cells(block))
         for target in _resource_block_center_cells(
             (
@@ -233,7 +242,7 @@ def _plan_quota_tier(
                 block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
             )
         ):
-            if target in blocked:
+            if target in memory.obstacles:
                 continue
             clear_cells = sum(
                 (target[0] + dx, target[1] + dy) not in memory.obstacles
@@ -251,10 +260,12 @@ def _plan_quota_tier(
             )
             candidates.append(
                 (
-                    manhattan(origin, target),
+                    ring,
+                    int(target in memory.resource_cells),
                     blocked_posts,
                     block_rocks,
                     -clear_cells,
+                    manhattan(origin, target),
                     block,
                     target,
                 )
@@ -262,30 +273,25 @@ def _plan_quota_tier(
     if not candidates:
         return None
 
-    nearest = min(candidate[0] for candidate in candidates)
-    nearby = [
-        candidate
-        for candidate in candidates
-        if candidate[0] <= nearest + 2 * SYMMETRIC_RESOURCE_BLOCK_SIZE
-    ]
-    distance, blocked_posts, block_rocks, negative_clear, block, target = min(
-        nearby,
-        key=lambda candidate: (
-            candidate[1],
-            candidate[2],
-            candidate[3],
-            candidate[0],
-            candidate[4],
-            candidate[5],
-        ),
-    )
+    (
+        _ring,
+        _known_resource,
+        blocked_posts,
+        block_rocks,
+        negative_clear,
+        distance,
+        block,
+        target,
+    ) = min(candidates)
     return MigrationPlan(
         current_block=current_block,
         current_ring=current_ring,
         current_quota=resource_block_quota(current_block),
         target_block=block,
-        target_ring=target_ring,
-        target_quota=target_quota,
+        target_ring=resource_block_ring(block),
+        target_quota=resource_block_quota(block),
+        goal_ring=goal_ring,
+        goal_quota=goal_quota,
         target=target,
         estimated_cells=distance,
         block_rocks=block_rocks,
