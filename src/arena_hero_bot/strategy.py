@@ -2024,10 +2024,17 @@ class AggressiveStrategy:
                     self._is_resource_scout(worker, context.turn)
                     and context.threat.level is ThreatLevel.NORMAL
                 ):
-                    goal = self._exploration_goal(worker, context.turn.tick)
+                    # The campaign economy is deliberately anchored to this
+                    # 32x32 chunk.  An outside resource cannot be claimed by
+                    # ``_assign_chunk_resources``, and following the old
+                    # inward exploration goal moved the refresh Worker farther
+                    # from home every time its route completed.  Keep the
+                    # refresh role visible in telemetry while sweeping the
+                    # cells that can actually replenish this economy.
+                    goal = self._worker_block_patrol_goal(worker, context)
                     reason = (
-                        "scout beyond the local resource chunk after the "
-                        "local resource pool is exhausted"
+                        "refresh least-seen coverage in the resource chunk "
+                        "after the local resource pool is exhausted"
                     )
                 else:
                     goal = self._worker_block_patrol_goal(worker, context)
@@ -3224,16 +3231,25 @@ class AggressiveStrategy:
             return False
         if unit.position == goal:
             return True
-        return (
-            next_step(
-                unit.position,
-                goal,
-                blocked=self._static_blockers(unit, context),
-                allow_goal=allow_goal,
-                require_path=True,
-            )
-            is not None
+        blocked = self._static_blockers(unit, context)
+        direction = next_step(
+            unit.position,
+            goal,
+            blocked=blocked,
+            allow_goal=allow_goal,
+            require_path=True,
         )
+        if direction is None and isinstance(unit, Worker):
+            escape_blockers = self._worker_core_escape_blockers(unit, context, blocked)
+            if escape_blockers is not None:
+                direction = next_step(
+                    unit.position,
+                    goal,
+                    blocked=escape_blockers,
+                    allow_goal=allow_goal,
+                    require_path=True,
+                )
+        return direction is not None
 
     def _move(
         self,
@@ -3336,10 +3352,31 @@ class AggressiveStrategy:
             allow_goal=allow_goal,
             require_path=require_path,
         )
+        effective_blockers = blocked
+        if direction is None and isinstance(unit, Worker):
+            escape_blockers = self._worker_core_escape_blockers(unit, context, blocked)
+            if escape_blockers is not None:
+                effective_blockers = escape_blockers
+                direction = next_step(
+                    unit.position,
+                    goal,
+                    blocked=effective_blockers,
+                    recent=(
+                        self.memory.recent_positions(str(unit.id))
+                        if avoid_recent
+                        else ()
+                    ),
+                    direction_offset=self._direction_offset(unit.id),
+                    max_expansions=max_expansions,
+                    allow_goal=allow_goal,
+                    require_path=require_path,
+                )
         if direction is None:
             return False
         destination = add(unit.position, direction)
-        if destination in blocked and not (allow_goal and destination == goal):
+        if destination in effective_blockers and not (
+            allow_goal and destination == goal
+        ):
             return False
         return self._queue_move(
             unit,
@@ -9265,14 +9302,90 @@ class AggressiveStrategy:
         )
 
     def _worker_threat_exclusion_cells(self, turn: Turn) -> set[Position]:
+        return self._worker_core_threat_exclusion_cells(
+            turn
+        ) | self._worker_combat_threat_exclusion_cells(turn)
+
+    def _worker_core_threat_positions(self, turn: Turn) -> tuple[Position, ...]:
+        """Return recently remembered hostile Core positions."""
+
+        return tuple(
+            enemy.position
+            for enemy in self.memory.recent_enemies(
+                turn.tick,
+                self.config.enemy_core_memory_ttl,
+            )
+            if enemy.kind == "CORE"
+            and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
+        )
+
+    def _worker_core_threat_exclusion_cells(self, turn: Turn) -> set[Position]:
+        """Return only the conservative danger disks around remembered Cores."""
+
+        return self._worker_threat_disks(self._worker_core_threat_positions(turn))
+
+    def _worker_combat_threat_positions(self, turn: Turn) -> tuple[Position, ...]:
+        """Return recently remembered hostile combat Units."""
+
+        return tuple(
+            enemy.position
+            for enemy in self.memory.recent_enemies(
+                turn.tick,
+                self.config.worker_threat_memory_ttl,
+            )
+            if enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            and turn.tick - enemy.tick <= self.config.worker_threat_memory_ttl
+        )
+
+    def _worker_combat_threat_exclusion_cells(self, turn: Turn) -> set[Position]:
+        """Return danger disks around recently seen hostile combat Units."""
+
+        return self._worker_threat_disks(self._worker_combat_threat_positions(turn))
+
+    def _worker_threat_disks(self, centers: tuple[Position, ...]) -> set[Position]:
         radius = self.config.worker_threat_radius
         return {
             (center[0] + dx, center[1] + dy)
-            for center in self._remembered_worker_danger_positions(turn)
+            for center in centers
             for dx in range(-radius, radius + 1)
             for dy in range(-radius, radius + 1)
             if abs(dx) + abs(dy) <= radius
         }
+
+    def _worker_core_escape_blockers(
+        self,
+        unit: Worker,
+        context: _TurnContext,
+        blockers: Container[Position],
+    ) -> set[Position] | None:
+        """Open a stale Core disk only when it is the sole physical exit.
+
+        A Worker can settle at the rim of a remembered Core exclusion and then
+        find every free neighbor one step closer to that Core.  Treating the
+        heuristic disk as solid terrain stranded the Worker indefinitely.  If
+        no hostile is visible, permit a route that crosses only remembered Core
+        disks; remembered combat Units, rocks, the Core itself and all other
+        blockers remain in force.
+        """
+
+        if context.turn.visible_enemies:
+            return None
+        core_threat = self._worker_core_threat_exclusion_cells(context.turn)
+        if not core_threat:
+            return None
+        neighbors = adjacent_positions(unit.position)
+        if any(position not in blockers for position in neighbors):
+            return None
+        escaped = self._worker_combat_threat_exclusion_cells(context.turn)
+        escaped.update(self.memory.obstacles)
+        escaped.update(context.turn.obstacle_cells)
+        escaped.update(context.enemy_positions)
+        escaped.update(self.memory.contested_positions)
+        escaped.update(self._worker_core_threat_positions(context.turn))
+        if any(position not in escaped for position in neighbors):
+            return escaped
+        return None
 
     def _core_can_spawn(self, context: _TurnContext) -> bool:
         core = context.turn.core

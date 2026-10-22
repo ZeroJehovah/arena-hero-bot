@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from uuid import UUID
 
+from arena_hero import Direction
+
 from arena_hero_bot.exploration import visible_cells
 from arena_hero_bot.geometry import manhattan
 from arena_hero_bot.memory import UnitGoal, WorldMemory
@@ -279,7 +281,7 @@ def test_visible_resource_interrupts_worker_block_patrol() -> None:
     assert claim.position == resource
 
 
-def test_empty_campaign_chunk_leaves_one_worker_to_refresh_the_map() -> None:
+def test_empty_campaign_chunk_keeps_all_workers_refreshing_the_chunk() -> None:
     core_object = core(1, position=HOME)
     memory = WorldMemory(
         core_home_position=HOME,
@@ -313,12 +315,119 @@ def test_empty_campaign_chunk_leaves_one_worker_to_refresh_the_map() -> None:
     patrol = [item for item in report.decisions if item.actor_id != object_id(2)]
     assert scout.action == "MOVE"
     assert scout.reason == (
-        "scout beyond the local resource chunk after the local resource pool "
-        "is exhausted"
+        "refresh least-seen coverage in the resource chunk after the local "
+        "resource pool is exhausted"
     )
+    assert scout.target is not None
+    assert _single_chunk_resource_block(HOME).contains(tuple(scout.target))
     assert all(
         item.reason == "patrol least-seen coverage in the resource chunk"
         for item in patrol
+    )
+
+
+def test_campaign_chunk_refresh_brings_a_remote_scout_back_home() -> None:
+    core_object = core(1, position=HOME)
+    memory = WorldMemory(
+        core_home_position=HOME,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+        unit_roles_initialized=True,
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(
+            target_workers=16,
+            max_population=None,
+            expedition_mode=True,
+            campaign_mode=True,
+        ),
+    )
+    worker = unit(2, "WORKER", position=(HOME[0] + 700, HOME[1]))
+    memory.set_goal(
+        worker["id"],
+        UnitGoal(
+            position=(HOME[0] + 724, HOME[1]),
+            assigned_tick=50,
+            purpose="explore-center-v3",
+            last_progress_position=(HOME[0] + 701, HOME[1]),
+        ),
+    )
+    turn = make_turn(tick=100, objects=[core_object, worker])
+
+    report = strategy.decide(turn)
+
+    decision = next(item for item in report.decisions if item.actor_id == worker["id"])
+    goal = memory.goal_for(worker["id"])
+    assert decision.reason == (
+        "refresh least-seen coverage in the resource chunk after the local "
+        "resource pool is exhausted"
+    )
+    assert goal is not None
+    assert _single_chunk_resource_block(HOME).contains(goal.position)
+
+
+def test_worker_routes_out_of_a_remembered_core_exclusion_pocket() -> None:
+    core_object = core(1, position=HOME)
+    memory = WorldMemory(
+        core_home_position=HOME,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+        unit_roles_initialized=True,
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(
+            target_workers=16,
+            max_population=None,
+            expedition_mode=True,
+            campaign_mode=True,
+            worker_threat_radius=6,
+        ),
+    )
+    worker_position = (HOME[0] - 8, HOME[1])
+    enemy_core = core(
+        3,
+        controlled=False,
+        owner_username="rival",
+        position=(HOME[0] - 15, HOME[1]),
+    )
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core_object,
+            unit(2, "WORKER", position=worker_position),
+            enemy_core,
+        ],
+    )
+    strategy.decide(observed)
+
+    pocket = make_turn(
+        tick=101,
+        objects=[
+            core_object,
+            unit(2, "WORKER", position=worker_position),
+        ],
+        obstacles=[
+            (worker_position[0], worker_position[1] - 1),
+            (worker_position[0], worker_position[1] + 1),
+            (worker_position[0] + 1, worker_position[1]),
+        ],
+    )
+    report = strategy.decide(pocket)
+
+    action = pocket.plan.unit_actions[UUID(object_id(2))]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.LEFT
+    assert next(
+        item for item in report.decisions if item.actor_id == object_id(2)
+    ).reason == (
+        "refresh least-seen coverage in the resource chunk after the local "
+        "resource pool is exhausted"
     )
 
 
