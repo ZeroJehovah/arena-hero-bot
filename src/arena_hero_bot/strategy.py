@@ -1766,6 +1766,10 @@ class AggressiveStrategy:
                     reason="stage carried resources at the Core arrival cell",
                     allow_goal=True,
                     intent=_MoveIntent.INBOUND,
+                    extra_blockers=(
+                        {core.position, *adjacent_positions(core.position)}
+                        - {arrival}
+                    ),
                 ):
                     return
                 self._record_wait(

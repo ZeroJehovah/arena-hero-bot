@@ -356,6 +356,32 @@ def test_loaded_worker_stages_at_moving_core_destination() -> None:
     )
 
 
+def test_loaded_worker_routes_around_the_locked_core_approach() -> None:
+    moving = make_turn(
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="UP",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[0, -1],
+            ),
+            unit(2, "WORKER", position=(1, 0), cargo=1),
+        ],
+        obstacles=[(1, 1)],
+    )
+
+    report = _strategy(WorldMemory()).decide(moving)
+
+    action = moving.plan.unit_actions[moving.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction.value == "UP"
+    assert any(
+        item.reason == "stage carried resources at the Core arrival cell"
+        for item in report.decisions
+    )
+
+
 def test_economy_and_patrol_follow_the_current_core_chunk() -> None:
     memory = WorldMemory(
         core_home_position=(64, 0),
