@@ -169,7 +169,6 @@ def test_defensive_ranger_takes_a_safe_killing_shot_under_return_fire() -> None:
             core(position=(10, 10)),
             unit(2, "RANGER", position=(0, 0), hp=2),
             unit(3, "RANGER", controlled=False, position=(0, 2), hp=1),
-            unit(4, "RANGER", controlled=False, position=(0, 3)),
         ],
     )
     strategy = AggressiveStrategy(WorldMemory())

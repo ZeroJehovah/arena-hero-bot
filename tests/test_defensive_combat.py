@@ -2,7 +2,8 @@
 
 from uuid import UUID
 
-from arena_hero import UnitView
+import pytest
+from arena_hero import MoveAction, UnitView
 
 from arena_hero_bot.combat_policy import ThreatAssessment, ThreatLevel
 from arena_hero_bot.geometry import add, line_of_fire, manhattan
@@ -326,3 +327,248 @@ def test_massed_assault_fallback_is_inert_without_the_shared_picture() -> None:
         tuple(turn.visible_enemies),
         context,
     )
+
+
+def test_killing_one_of_two_shooters_does_not_cancel_its_return_fire() -> None:
+    # Both attacks resolve even when the one-HP target dies in this volley.
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(0, 2), hp=1),
+            unit(31, "RANGER", controlled=False, position=(0, 3)),
+        ],
+    )
+    strategy = _strategy()
+
+    report = strategy.decide(turn)
+
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert action.type == "MOVE"
+    destination = add((0, 0), action.direction)
+    assert len(strategy._visible_attackers_at(destination, turn, set())) < 2
+    assert "lethal multi-source" in _decisions_by_number(report)[2]
+
+
+def test_straight_moving_shooters_are_counted_before_they_enter_range() -> None:
+    memory = WorldMemory()
+    for number in (30, 31):
+        memory.enemy_position_history[object_id(number)] = [
+            (98, (0, 6)),
+            (99, (0, 5)),
+            (100, (0, 4)),
+        ]
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(0, 4)),
+            unit(31, "RANGER", controlled=False, position=(0, 4)),
+        ],
+    )
+    strategy = _strategy(memory)
+
+    attackers = strategy._visible_attackers_at((0, 0), turn, set())
+
+    assert len(attackers) == 2
+    assert {str(enemy.id) for enemy in attackers} == {
+        object_id(30),
+        object_id(31),
+    }
+    assert not strategy._visible_attackers_at((0, 0), turn, {(0, 3)})
+
+
+def test_defender_routes_around_an_unsafe_first_step() -> None:
+    # Going right is the shortest path but exposes a fresh enemy ray. Going
+    # down reaches the same overwatch goal safely instead of returning WAIT.
+    turn = make_turn(
+        objects=[
+            core(position=(0, 10)),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(1, 2)),
+        ],
+    )
+    strategy = _strategy()
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={enemy.position for enemy in turn.visible_enemies},
+    )
+
+    assert strategy._move(
+        turn.rangers[0],
+        (3, 0),
+        context,
+        reason="join the defensive firing line",
+        avoid_new_threats=True,
+    )
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert isinstance(action, MoveAction)
+    destination = add((0, 0), action.direction)
+    assert destination == (0, -1)
+    assert not strategy._visible_attackers_at(destination, turn, set())
+
+
+def test_retreat_prefers_a_safe_ray_over_distance_to_core() -> None:
+    # The old non-closing distance rule selected (1, 0), still exposed to
+    # both stacked shooters. (0, -1) leaves their range in one step.
+    turn = make_turn(
+        objects=[
+            core(position=(10, 0)),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(0, 3)),
+            unit(31, "RANGER", controlled=False, position=(0, 3)),
+        ],
+    )
+    strategy = _strategy()
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={enemy.position for enemy in turn.visible_enemies},
+    )
+
+    assert strategy._move_ranger_toward_core(
+        turn.rangers[0], context, reason="leave lethal fire"
+    )
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert isinstance(action, MoveAction)
+    destination = add((0, 0), action.direction)
+    assert not strategy._visible_attackers_at(destination, turn, set())
+
+
+def test_defender_fires_when_every_escape_is_equally_lethal() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(10, 10)),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(1, 1), hp=1),
+            unit(31, "RANGER", controlled=False, position=(2, 2)),
+        ],
+        obstacles=[(-1, 0), (1, 0), (0, -1), (0, 1)],
+    )
+    strategy = _strategy()
+
+    strategy.decide(turn)
+
+    assert turn.plan.unit_actions[UUID(int=2)].type == "SHOOT"
+
+
+@pytest.mark.parametrize("end", [(2, 4), (1, 4), (2, 3), (2, 5)])
+def test_defensive_aim_covers_stops_reversals_and_turns(end) -> None:
+    memory = WorldMemory()
+    memory.unit_roles[object_id(2)] = DEFENSE_ROLE
+    memory.enemy_position_history[object_id(30)] = [
+        (98, (0, 4)),
+        (99, (1, 4)),
+        (100, (2, 4)),
+    ]
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(end[0] - 2, end[1] - 2)),
+            unit(30, "RANGER", controlled=False, position=(2, 4)),
+        ],
+    )
+    strategy = _strategy(memory)
+
+    cells = strategy._ranger_shot_cells(
+        turn.rangers[0], turn.visible_enemies[0], turn, set()
+    )
+
+    assert end in cells
+    assert all(manhattan(cell, (2, 4)) <= 1 for cell in cells)
+    assert end not in strategy._ranger_shot_cells(
+        turn.rangers[0], turn.visible_enemies[0], turn, {end}
+    )
+    assert end not in strategy._ranger_shot_cells(
+        turn.rangers[0], turn.visible_enemies[0], turn, set(), {end}
+    )
+
+
+def test_flickering_diagonal_drift_cannot_aim_two_steps_ahead() -> None:
+    memory = WorldMemory()
+    memory.unit_roles[object_id(2)] = DEFENSE_ROLE
+    memory.enemy_position_history[object_id(30)] = [
+        (98, (0, 2)),
+        (100, (2, 4)),
+    ]
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, 2)),
+            unit(30, "RANGER", controlled=False, position=(2, 4)),
+        ],
+    )
+    strategy = _strategy(memory)
+
+    cells = strategy._ranger_shot_cells(
+        turn.rangers[0], turn.visible_enemies[0], turn, set()
+    )
+
+    assert cells
+    assert (3, 5) not in cells
+    assert all(manhattan(cell, (2, 4)) <= 1 for cell in cells)
+
+
+def test_massed_defense_keeps_a_survivable_shot_instead_of_waiting_for_a_volley():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, 6)),
+            unit(30, "RANGER", controlled=False, position=(0, 9)),
+            unit(31, "RANGER", controlled=False, position=(8, 0)),
+            unit(32, "RANGER", controlled=False, position=(9, 0)),
+        ],
+    )
+    strategy = _strategy()
+
+    strategy.decide(turn)
+
+    assert turn.plan.unit_actions[UUID(int=2)].type == "SHOOT"
+
+
+def test_single_cell_shooter_counts_toward_the_next_shooters_aim_quota():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(2, 0), hp=1),
+        ],
+    )
+    strategy = _strategy()
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={enemy.position for enemy in turn.visible_enemies},
+    )
+    target = turn.visible_enemies[0]
+
+    assert strategy._volley_aim_cell(context, target, ((2, 0),)) == (2, 0)
+    assert strategy._volley_aim_cell(context, target, ((2, 0), (1, 0))) == (1, 0)
+
+
+def test_alternate_aim_receives_enough_arrows_to_kill_a_full_health_target():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(2, 0)),
+        ],
+    )
+    strategy = _strategy()
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={item.position for item in turn.units},
+        enemy_positions={enemy.position for enemy in turn.visible_enemies},
+    )
+    target = turn.visible_enemies[0]
+
+    aims = [
+        strategy._volley_aim_cell(context, target, ((2, 0), (1, 0))) for _ in range(4)
+    ]
+
+    assert aims == [(2, 0), (2, 0), (1, 0), (1, 0)]
