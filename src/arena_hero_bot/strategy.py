@@ -7299,30 +7299,37 @@ class AggressiveStrategy:
         if self.memory.campaign_last_core_id == core_id and self.memory.campaign_phase:
             return
 
-        previous_home = self.memory.core_home_position
         self.memory.core_home_position = None
         obstacles = self._rock_map(turn)
         resources = set(turn.resource_cells) | set(self.memory.resource_cells)
         occupied = {unit.position for unit in turn.units}
+        centers = sorted(
+            _resource_block_center_cells(core.position),
+            key=lambda cell: (
+                cell in obstacles,
+                cell in resources,
+                cell in occupied,
+                manhattan(cell, core.position),
+                cell,
+            ),
+        )
         target = next(
             (
                 position
-                for position in sorted(
-                    _resource_block_center_cells(core.position),
-                    key=lambda cell: (
-                        cell in obstacles,
-                        cell in resources,
-                        cell in occupied,
-                        manhattan(cell, core.position),
-                        cell,
-                    ),
-                )
+                for position in centers
                 if position not in obstacles
                 and position not in resources
                 and position not in occupied
             ),
             None,
         )
+        if target is None:
+            # Dynamic resources or the arriving Worker may temporarily cover
+            # every center.  They will clear; another chunk's old home never
+            # becomes a valid respawn target.
+            target = next(
+                (position for position in centers if position not in obstacles), None
+            )
         if target is None:
             target = self._symmetric_home_candidate_from(
                 core.position,
@@ -7331,7 +7338,7 @@ class AggressiveStrategy:
                 occupied,
             )
         if target is None:
-            target = previous_home
+            target = centers[0]
 
         self.memory.unit_roles.clear()
         self.memory.patrol_contacts.clear()

@@ -95,6 +95,34 @@ def test_new_core_resets_old_campaign_to_its_spawn_chunk() -> None:
     assert memory.expedition_squads == []
 
 
+def test_new_core_keeps_its_own_chunk_when_every_center_is_temporarily_busy() -> None:
+    current_core = core(9, position=(-1740, -1900))
+    centers = ((-1745, -1905), (-1744, -1905), (-1745, -1904), (-1744, -1904))
+    memory = WorldMemory(
+        core_home_position=(-2033, -2929),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=object_id(1),
+    )
+    turn = make_turn(
+        objects=[
+            current_core,
+            *(
+                unit(20 + index, "WORKER", position=cell)
+                for index, cell in enumerate(centers)
+            ),
+        ]
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.core_home_position in centers
+    assert resource_block_index(memory.core_home_position) == resource_block_index(
+        current_core["position"]
+    )
+
+
 def test_campaign_memory_round_trip_preserves_stage_and_leg(tmp_path: Path) -> None:
     path = tmp_path / "memory.json"
     memory = WorldMemory(
