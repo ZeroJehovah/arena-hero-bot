@@ -167,7 +167,7 @@ def test_stage_one_spends_on_the_twelfth_worker_without_a_reserve() -> None:
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_stage_one_guardless_core_expands_capacity_for_an_unfittable_guard() -> None:
+def test_stage_one_spends_low_capacity_resources_on_a_worker() -> None:
     core_object = core(position=(0, 0))
     memory = WorldMemory(
         core_home_position=(0, 0),
@@ -188,7 +188,7 @@ def test_stage_one_guardless_core_expands_capacity_for_an_unfittable_guard() -> 
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_stage_one_guardless_core_builds_ranger_once_capacity_allows() -> None:
+def test_stage_one_keeps_workers_first_until_twelve() -> None:
     core_object = core(position=(0, 0))
     memory = WorldMemory(
         core_home_position=(0, 0),
@@ -211,7 +211,32 @@ def test_stage_one_guardless_core_builds_ranger_once_capacity_allows() -> None:
 
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "SPAWN"
-    assert turn.plan.core_action.unit_type is UnitType.RANGER
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
+def test_stage_one_keeps_workers_first_under_core_threat() -> None:
+    core_object = core(position=(0, 0), hp=4, shield=5)
+    memory = WorldMemory(
+        core_home_position=(0, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+    )
+    turn = make_turn(
+        resources=unit_cost(UnitType.RANGER, 5),
+        objects=[
+            core_object,
+            *_workers(4),
+            unit(900, "RANGER", controlled=False, position=(2, 0)),
+        ],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
 def test_stage_one_builds_ranger_after_twelve_workers() -> None:

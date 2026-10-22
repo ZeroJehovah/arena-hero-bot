@@ -10150,9 +10150,9 @@ class AggressiveStrategy:
         decided by the existing threat logic still spends this Tick -- with
         ``strict_preference=False`` so a cheaper candidate is accepted -- but
         takes its type from the same formation and staging gaps as routine
-        growth, and the early resource-guard sequence is preserved so a freshly
-        respawned Core always establishes its first combat unit before widening
-        the economy.
+        growth.  Campaign mode is deliberately exempt from that emergency
+        substitution: its configured production order is a hard sequence, so
+        no guard or threat may postpone an unfinished Worker batch.
         """
 
         if self.config.campaign_mode:
@@ -10192,39 +10192,17 @@ class AggressiveStrategy:
         )
 
     def _campaign_spawn_candidates(self, turn: Turn) -> tuple[UnitType, ...] | None:
-        """Return the exact next stage slot, or ``None`` when fully staffed."""
+        """Return the exact next stage slot, or ``None`` when fully staffed.
+
+        Campaign production follows the configured order without emergency
+        substitutions.  In particular, a respawned or threatened Core still
+        completes its first twelve Workers before producing a defensive
+        Ranger; the stage-one economy must not be interrupted by a guard.
+        """
 
         workers = len(turn.workers)
         defense = self._campaign_defense_rangers(turn)
         patrol = self._campaign_patrol_rangers(turn)
-        if (
-            self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1
-            and defense == 0
-            and self._needs_resource_guard(turn)
-        ):
-            # Campaign mode keeps the twelve-Worker opening, but it must
-            # retain the low-capacity respawn guard: after the first Worker,
-            # a fresh Core cannot safely spend its next five resources on a
-            # second Worker with no combat answer.  Once this one Ranger
-            # exists, the normal stage-1 Worker quota resumes.
-            if (
-                unit_cost(UnitType.RANGER, turn.state.population)
-                > turn.resource_capacity
-            ):
-                # A ten-capacity respawn Core cannot ever hold the first
-                # Ranger.  Expand capacity with one Worker instead of waiting
-                # for a unit that the current Core can never queue.
-                return (UnitType.WORKER,)
-            return (UnitType.RANGER,)
-        if (
-            self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1
-            and defense == 0
-            and self._emergency_combat_mode(turn)
-        ):
-            # The requested opening is twelve Workers, but a Core already
-            # taking fire with no ranged answer is not a viable economy.
-            # This exception disappears after the first defensive Ranger.
-            return (UnitType.RANGER,)
         if self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1:
             if workers < CAMPAIGN_STAGE1_WORKERS:
                 return (UnitType.WORKER,)
