@@ -1767,8 +1767,7 @@ class AggressiveStrategy:
                     allow_goal=True,
                     intent=_MoveIntent.INBOUND,
                     extra_blockers=(
-                        {core.position, *adjacent_positions(core.position)}
-                        - {arrival}
+                        {core.position, *adjacent_positions(core.position)} - {arrival}
                     ),
                 ):
                     return
