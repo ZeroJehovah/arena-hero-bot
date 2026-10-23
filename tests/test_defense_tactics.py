@@ -20,15 +20,18 @@ from arena_hero_bot.strategy import (
 from .factories import core, make_turn, object_id, unit
 
 
-def _scenario(rangers, enemies=(), *, tick=100, obstacles=(), roles=None):
+def _scenario(rangers, enemies=(), *, tick=100, obstacles=(), roles=None, posts=None):
     roles = roles or {number: "defense" for number, _, _ in rangers}
+    posts = posts or {
+        number: position
+        for number, position, _ in rangers
+        if roles[number] == "defense"
+    }
     memory = WorldMemory(
         unit_roles={object_id(number): role for number, role in roles.items()},
         unit_roles_initialized=True,
         defense_posts={
-            object_id(number): position
-            for number, position, _ in rangers
-            if roles[number] == "defense"
+            object_id(number): position for number, position in posts.items()
         },
         defense_anchor=(0, 0),
     )
@@ -57,7 +60,7 @@ def _scenario(rangers, enemies=(), *, tick=100, obstacles=(), roles=None):
         occupied={item.position for item in turn.units},
         enemy_positions={item.position for item in turn.visible_enemies},
         defensive_assignments={
-            ranger.id: ranger.position
+            ranger.id: posts.get(ranger.id.int, ranger.position)
             for ranger in turn.rangers
             if roles[ranger.id.int] == "defense"
         },
@@ -98,6 +101,30 @@ def test_defender_does_not_follow_a_contact_outside_its_fire():
     assert action.target_id is None
     assert strategy.memory.defense_posts == before
     assert not any("hunt" in decision.reason for decision in context.report.decisions)
+
+
+def test_trailing_defender_regroups_before_shooting_a_worker():
+    strategy, turn, context = _scenario(
+        [(2, (0, 15), 2)],
+        [(30, "WORKER", (1, 14), 2)],
+        posts={2: (0, 5)},
+    )
+
+    action = _decide(strategy, turn.rangers[0], context)
+
+    assert isinstance(action, MoveAction)
+    assert manhattan(add((0, 15), action.direction), (0, 5)) < 10
+    assert "regroup" in context.report.decisions[-1].reason
+
+
+def test_trailing_defender_still_fires_at_a_combat_target():
+    strategy, turn, context = _scenario(
+        [(2, (0, 15), 2)],
+        [(30, "RANGER", (1, 14), 2)],
+        posts={2: (0, 5)},
+    )
+
+    assert isinstance(_decide(strategy, turn.rangers[0], context), ShootAction)
 
 
 def test_front_rank_withdrawal_opens_a_covering_shot_for_the_next_rank():

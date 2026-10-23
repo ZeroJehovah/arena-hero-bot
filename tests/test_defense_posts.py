@@ -269,6 +269,38 @@ def test_core_movement_translates_posts_without_reassigning_units():
     }
 
 
+def test_core_movement_reflows_template_posts_that_hit_rocks():
+    strategy = _strategy()
+    guards = _stationed_units()
+    strategy.decide(make_turn(objects=[core(), *guards]))
+    expected = dict(strategy.memory.defense_posts)
+    center = (5, -2)
+    translated = {
+        unit_id: (post[0] + center[0], post[1] + center[1])
+        for unit_id, post in expected.items()
+    }
+    blocked = {
+        (center[0] + 15, center[1]),
+        (center[0] + 10, center[1] + 5),
+        (center[0] + 5, center[1] - 10),
+    }
+
+    strategy.decide(
+        make_turn(
+            tick=101,
+            objects=[core(position=center), *guards],
+            obstacles=blocked,
+        )
+    )
+
+    posts = tuple(strategy.memory.defense_posts.values())
+    assert len(posts) == 20
+    assert len(set(posts)) == 20
+    assert not set(posts) & blocked
+    assert len(set(posts) - set(translated.values())) == len(blocked)
+    assert len(set(translated.values()) - set(posts)) == len(blocked)
+
+
 def test_posts_are_assigned_even_when_all_defenders_are_recovering():
     strategy = _strategy()
     guards = _stationed_units()

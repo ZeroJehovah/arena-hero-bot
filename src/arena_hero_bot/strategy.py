@@ -1064,6 +1064,45 @@ class AggressiveStrategy:
         ):
             return
         if shootable:
+            # A defender that has fallen behind the moving formation must not
+            # let an opportunistic Worker or Core target pin it in place.  The
+            # old Core-relative firing branch always won over movement, so a
+            # Ranger could keep missing the same target while the Core walked
+            # many screens away.  Fighters still retain first priority; only a
+            # non-combat firing opportunity yields to regrouping.
+            core = context.turn.core
+            if (
+                role == DEFENSE_ROLE
+                and core is not None
+                and not any(
+                    isinstance(enemy, UnitView)
+                    and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                    for enemy, _cells in shootable
+                )
+            ):
+                post = (context.defensive_assignments or {}).get(
+                    ranger.id,
+                    self.memory.defense_posts.get(str(ranger.id), core.position),
+                )
+                beyond_leash = manhattan(ranger.position, core.position) > (
+                    self._combat_leash_radius(ranger, context, offensive=offensive)
+                )
+                beyond_support = (
+                    post is not None
+                    and manhattan(ranger.position, post) > DEFENSIVE_SUPPORT_RADIUS
+                )
+                if (beyond_leash or beyond_support) and self._move_within_leash(
+                    ranger,
+                    post or core.position,
+                    context,
+                    offensive=False,
+                    reason=(
+                        "regroup with the defensive formation before firing "
+                        "at a non-combat target"
+                    ),
+                    avoid_new_threats=True,
+                ):
+                    return
             focused = self._preferred_target(context.focus_target, firing_pool)
             if local_formation:
                 # Arrows on different possible cells are not a combined kill.
@@ -7916,9 +7955,10 @@ class AggressiveStrategy:
                 vanguard_offsets, ranger_offsets = (
                     self._symmetric_defense_layout_offsets()
                 )
-                posts = tuple(
-                    (core_position[0] + dx, core_position[1] + dy)
-                    for dx, dy in (*vanguard_offsets, *ranger_offsets)
+                posts = _clear_translated_defense_posts(
+                    core_position,
+                    (*vanguard_offsets, *ranger_offsets),
+                    obstacles,
                 )
                 coverage_radius = SYMMETRIC_DEFENSE_MAX_RADIUS
             if self.config.campaign_mode:
@@ -11375,6 +11415,67 @@ def _assign_fixed_defense_posts(
         assigned[unit.id] = post
         available.remove(post)
     return assigned
+
+
+def _clear_translated_defense_posts(
+    center: Position,
+    offsets: tuple[Position, ...],
+    obstacles: set[Position] | frozenset[Position],
+) -> tuple[Position, ...]:
+    """Translate the defensive template onto clear cells during migration."""
+
+    used: set[Position] = set()
+    posts: list[Position] = []
+    for offset_x, offset_y in offsets:
+        desired = (center[0] + offset_x, center[1] + offset_y)
+        required_radius = abs(offset_x) + abs(offset_y)
+        post = (
+            desired
+            if desired not in obstacles and desired != center and desired not in used
+            else None
+        )
+        if post is not None:
+            posts.append(post)
+            used.add(post)
+            continue
+
+        # Prefer another clear seat on the same Manhattan ring, then look
+        # progressively farther in or out.  Keeping every unblocked template
+        # cell still preserves the formation while one or two seats reflow.
+        radii = sorted(
+            range(1, SYMMETRIC_DEFENSE_MAX_RADIUS + 1),
+            key=lambda radius: (
+                abs(radius - required_radius),
+                radius < required_radius,
+                radius,
+            ),
+        )
+        for radius in radii:
+            candidates = [
+                (center[0] + dx, center[1] + dy)
+                for dx, dy in _manhattan_disk_offsets(radius)
+                if abs(dx) + abs(dy) == radius
+                and (center[0] + dx, center[1] + dy) not in obstacles
+                and (center[0] + dx, center[1] + dy) != center
+                and (center[0] + dx, center[1] + dy) not in used
+            ]
+            if candidates:
+                post = min(
+                    candidates,
+                    key=lambda position: (
+                        (position[0] - desired[0]) ** 2
+                        + (position[1] - desired[1]) ** 2,
+                        position,
+                    ),
+                )
+                break
+        if post is None:
+            # Keep the suffix total even on an implausible, fully walled map;
+            # the assignment pass then leaves that guard on its current cell.
+            break
+        posts.append(post)
+        used.add(post)
+    return tuple(posts)
 
 
 @lru_cache(maxsize=32)
