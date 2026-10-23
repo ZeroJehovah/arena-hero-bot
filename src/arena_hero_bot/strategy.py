@@ -3127,6 +3127,12 @@ class AggressiveStrategy:
             manhattan(core.position, enemy.position) <= 4
             for enemy in context.turn.visible_enemies
         )
+        nearby_combat_enemy = any(
+            isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(core.position, enemy.position) <= 4
+            for enemy in context.turn.visible_enemies
+        )
         if core.hp <= 2 and context.remaining_resources > 0:
             core.heal()
             context.report.add(
@@ -3197,7 +3203,7 @@ class AggressiveStrategy:
             and core.position == home
             and home not in self._rock_map(context.turn)
         )
-        if self._symmetric_posture() and not nearby_enemy and not at_home:
+        if self._symmetric_posture() and not nearby_combat_enemy and not at_home:
             if self.config.campaign_mode and self.memory.campaign_resting:
                 if self._campaign_rest_complete(context.turn):
                     self.memory.campaign_resting = False

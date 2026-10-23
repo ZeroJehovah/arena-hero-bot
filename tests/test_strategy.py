@@ -7368,6 +7368,27 @@ def test_symmetric_posture_selects_and_starts_migration_to_clear_home() -> None:
     )
 
 
+def test_symmetric_posture_migrates_past_a_nearby_enemy_core() -> None:
+    config = expedition_config(target_workers=16)
+    memory = WorldMemory(core_home_position=(8, 0))
+    strategy = AggressiveStrategy(memory, config)
+    workers = [
+        unit(100 + number, "WORKER", position=(20 + number, 20)) for number in range(16)
+    ]
+    enemy_core = core(
+        200,
+        controlled=False,
+        owner_username="rival",
+        position=(3, 0),
+    )
+    turn = make_turn(resources=0, objects=[core(), *workers, enemy_core])
+
+    strategy.decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+
+
 def test_symmetric_posture_waits_briefly_for_nearby_cargo() -> None:
     config = expedition_config(target_workers=16)
     memory = WorldMemory(core_home_position=(0, 4))
