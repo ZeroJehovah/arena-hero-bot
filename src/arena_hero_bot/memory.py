@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -541,6 +542,32 @@ class WorldMemory:
             if 1 <= tick - older_tick <= ENEMY_DRIFT_MAX_GAP:
                 return older != current
         return False
+
+    def enemy_is_stationary(
+        self,
+        enemy_id: str,
+        tick: int,
+        observations: int = 3,
+    ) -> bool:
+        """Whether the latest consecutive sightings all share one cell.
+
+        One repeated snapshot can be a blocked move or a path crossing, so
+        require several contiguous observations before treating an aim cell
+        as the target's standing position rather than a lead candidate.
+        """
+
+        history = self.enemy_position_history.get(enemy_id, [])
+        if observations < 2 or len(history) < observations:
+            return False
+        recent = history[-observations:]
+        if recent[-1][0] != tick:
+            return False
+        if any(
+            current_tick - previous_tick != 1
+            for (previous_tick, _), (current_tick, _) in pairwise(recent)
+        ):
+            return False
+        return all(position == recent[-1][1] for _, position in recent)
 
     def goal_for(self, unit_id: str) -> UnitGoal | None:
         """Return a Unit's current durable exploration goal."""

@@ -516,6 +516,50 @@ def test_enemy_recently_moved_ignores_a_stale_prior_cell() -> None:
     assert memory.enemy_recently_moved(object_id(6), 24) is False
 
 
+def test_enemy_is_stationary_requires_consecutive_observations() -> None:
+    memory = WorldMemory()
+    for tick, position in (
+        (20, (3, 0)),
+        (21, (3, 0)),
+        (22, (3, 0)),
+    ):
+        memory.observe(
+            make_turn(
+                tick=tick,
+                objects=[unit(6, "WORKER", controlled=False, position=position)],
+            )
+        )
+
+    assert memory.enemy_is_stationary(object_id(6), 22)
+    assert not memory.enemy_is_stationary(object_id(6), 21)
+
+
+def test_enemy_is_stationary_rejects_a_gap_in_observations() -> None:
+    memory = WorldMemory()
+    for tick, position in (
+        (20, (2, 0)),
+        (21, (3, 0)),
+        (22, (3, 0)),
+        (23, (3, 0)),
+    ):
+        memory.observe(
+            make_turn(
+                tick=tick,
+                objects=[unit(6, "WORKER", controlled=False, position=position)],
+            )
+        )
+
+    assert memory.enemy_is_stationary(object_id(6), 23)
+
+    memory.observe(
+        make_turn(
+            tick=25,
+            objects=[unit(6, "WORKER", controlled=False, position=(3, 0))],
+        )
+    )
+    assert not memory.enemy_is_stationary(object_id(6), 25)
+
+
 def test_worker_coverage_records_actual_vision_not_just_arrival(tmp_path) -> None:
     memory = WorldMemory(core_home_position=(16, 16))
     memory.observe(

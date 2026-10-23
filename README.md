@@ -75,11 +75,14 @@ preserves the cardinal post owners and patrol Rangers while releasing diagonal
 and patrol Vanguards into expedition staging.
 
 In the expedition posture, fixed defenders do not pursue enemies. Rangers
-keep survivable shots, cover possible enemy approach cells, and rotate free
-cell shots along the outer firing edge while holding position. Repositioning
-requires a threatened ally or Core, stays within the defensive layers, and
-avoids new firing sources. A necessary withdrawal is planned before rear-rank
-shots and prefers an equally safe cell that preserves supporting fire.
+keep survivable shots and cover only cells that still have an unseen or
+hostile-occupied approach. A target confirmed stationary is aimed at on its
+current cell rather than an adjacent predicted cell. If an aim cell and all of
+its neighbours are visible and contain no enemy, the Ranger holds fire instead
+of rotating shots through known-empty ground. Repositioning requires a
+threatened ally or Core, stays within the defensive layers, and avoids new
+firing sources. A necessary withdrawal is planned before rear-rank shots and
+prefers an equally safe cell that preserves supporting fire.
 
 Patrol Rangers may pursue a visible fighter only with a healthy local force
 advantage and a supporting shooter that can actually cover the contact. Each

@@ -564,6 +564,10 @@ class AggressiveStrategy:
         # Rebuilding ``memory.obstacles | turn.obstacle_cells`` per Unit made
         # planning time grow with the explored map, so cache it per Tick.
         self._rock_map_cache: tuple[int, set[Position]] | None = None
+        # The current fleet vision disc is shared by every firing decision.
+        # Cache its union for the Tick so checking whether an empty cell can
+        # actually receive an unseen enemy does not rebuild every Unit's view.
+        self._fleet_view_cache: tuple[int, frozenset[Position]] | None = None
         # Raid state deliberately lives on the strategy instead of
         # ``WorldMemory``: a restart then aborts the raid and walks the
         # detachment home, which is the safe direction to fail in.
@@ -928,6 +932,55 @@ class AggressiveStrategy:
         obstacles = self.memory.obstacles | set(turn.obstacle_cells)
         self._rock_map_cache = (turn.tick, obstacles)
         return obstacles
+
+    def _fleet_visible_cells(self, turn: Turn) -> frozenset[Position]:
+        """Return the union of every friendly observer's current vision disc."""
+
+        cached = self._fleet_view_cache
+        if cached is not None and cached[0] == turn.tick:
+            return cached[1]
+        obstacles = self._rock_map(turn)
+        visible: set[Position] = set()
+        for unit in turn.units:
+            if unit.unit_type is UnitType.RANGER:
+                radius = RANGER_VISION_RADIUS
+            elif unit.unit_type is UnitType.VANGUARD:
+                radius = VANGUARD_VISION_RADIUS
+            else:
+                radius = 3
+            visible.update(visible_cells(unit.position, radius, obstacles))
+        if turn.core is not None:
+            visible.update(
+                visible_cells(turn.core.position, RANGER_VISION_RADIUS, obstacles)
+            )
+        result = frozenset(visible)
+        self._fleet_view_cache = (turn.tick, result)
+        return result
+
+    def _aim_cell_has_enemy_opportunity(
+        self,
+        position: Position,
+        turn: Turn,
+    ) -> bool:
+        """Whether an enemy can occupy the aim cell when the shot resolves.
+
+        Units move at most one cardinal cell per Tick.  When the aim cell and
+        all four of its neighbours are currently visible and no hostile stands
+        in that neighbourhood, no enemy can arrive there before the shot
+        resolves.  An enemy already on the cell, or an unseen neighbour, keeps
+        the target valid.
+        """
+
+        visible = self._fleet_visible_cells(turn)
+        enemy_positions = {enemy.position for enemy in turn.visible_enemies}
+        if position in enemy_positions:
+            return True
+        if position not in visible:
+            return True
+        return any(
+            neighbour not in visible or neighbour in enemy_positions
+            for neighbour in adjacent_positions(position)
+        )
 
     def _decide_ranger(
         self,
@@ -1648,7 +1701,7 @@ class AggressiveStrategy:
         *,
         frontier: bool = False,
     ) -> bool:
-        """Cover plausible enemy cells or rotate free shots along the frontier."""
+        """Cover cells that can still receive an enemy without pursuing."""
 
         obstacles = self._rock_map(context.turn)
         positions = self._predicted_friendly_positions(context)
@@ -1665,17 +1718,18 @@ class AggressiveStrategy:
             # reachable region bounded, rather than chasing the last sighting.
             age = max(0, context.turn.tick - enemy.tick)
             cells = {enemy.position}
-            for _ in range(age + 1):
-                cells |= {
-                    adjacent
-                    for cell in tuple(cells)
-                    for adjacent in adjacent_positions(cell)
-                    if adjacent not in obstacles
-                }
+            if not self.memory.enemy_is_stationary(enemy.object_id, context.turn.tick):
+                for _ in range(age + 1):
+                    cells |= {
+                        adjacent
+                        for cell in tuple(cells)
+                        for adjacent in adjacent_positions(cell)
+                        if adjacent not in obstacles
+                    }
             for cell in cells:
                 if self._line_of_fire_clear(
                     ranger.position, cell, obstacles, positions
-                ):
+                ) and self._aim_cell_has_enemy_opportunity(cell, context.turn):
                     candidates[cell] = max(candidates.get(cell, 0), 10 - age)
         if not candidates and frontier:
             core = context.turn.core
@@ -1684,6 +1738,8 @@ class AggressiveStrategy:
                 if not self._line_of_fire_clear(
                     ranger.position, cell, obstacles, positions
                 ):
+                    continue
+                if not self._aim_cell_has_enemy_opportunity(cell, context.turn):
                     continue
                 if core is not None and manhattan(cell, core.position) <= manhattan(
                     ranger.position, core.position
@@ -5107,16 +5163,22 @@ class AggressiveStrategy:
         Movement resolves before the shot. Prefer a repeated straight or
         two-cell patrol track over extrapolating just the last direction.
         The looser ``drift`` estimate also works across flickering vision.
-        At range 1 the target is close enough
-        to stall or collide, so the standing cell is still the better guess
-        there; from range 2 outwards the lead is preferred.
+        A target confirmed stationary for several consecutive observations is
+        aimed at on its standing cell only; one clean observation is not enough
+        evidence to stop using approach cells.  At range 1 a moving target is
+        close enough to stall or collide, so the standing cell is the better
+        guess; from range 2 outwards the lead is preferred.
 
         The ordered tail keeps the cells the target can plausibly step into
         next, so a volley can hedge instead of stacking every arrow on the
         same prediction (``_volley_aim_cell``).
         """
-        strict = self.memory.predicted_enemy_position(str(enemy.id), turn.tick)
-        drift = self.memory.enemy_drift_position(str(enemy.id), turn.tick, 1)
+        enemy_id = str(enemy.id)
+        stationary = isinstance(enemy, UnitView) and self.memory.enemy_is_stationary(
+            enemy_id, turn.tick
+        )
+        strict = self.memory.predicted_enemy_position(enemy_id, turn.tick)
+        drift = self.memory.enemy_drift_position(enemy_id, turn.tick, 1)
         predicted = strict or drift
         if predicted is not None and manhattan(enemy.position, predicted) > 1:
             # Flickering diagonal drift can extrapolate two cardinal steps;
@@ -5132,7 +5194,7 @@ class AggressiveStrategy:
             role is not None and role.startswith(PATROL_ROLE_PREFIX)
         )
         cells = [predicted] if leads and predicted is not None else [enemy.position]
-        if defensive and isinstance(enemy, UnitView):
+        if defensive and isinstance(enemy, UnitView) and not stationary:
             # A lead is a guess: the target can stop, reverse or turn. Keep
             # the lead first, then cover Core approaches, staying and other
             # one-step exits. All cells still require a legal, clear ray.
@@ -5166,6 +5228,7 @@ class AggressiveStrategy:
                 obstacles,
                 friendly_positions,
             )
+            and self._aim_cell_has_enemy_opportunity(cell, turn)
         )
 
     @staticmethod

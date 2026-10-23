@@ -166,6 +166,7 @@ def test_idle_defender_rotates_free_cell_shots_without_leaving_its_post():
         assert action.target_id is None
         assert line_of_fire((0, 6), action.expected_cell, set())
         assert manhattan((0, 0), action.expected_cell) > 6
+        assert strategy._aim_cell_has_enemy_opportunity(action.expected_cell, turn)
         aims.add(action.expected_cell)
     assert len(aims) > 1
 
@@ -180,7 +181,23 @@ def test_defender_waits_when_every_firing_ray_is_a_rock():
     assert context.report.decisions[-1].action == "WAIT"
 
 
-def test_recent_hidden_contact_is_shot_as_a_cell_without_starting_a_hunt():
+def test_fully_observed_empty_cell_is_not_a_valid_aim_cell():
+    strategy, turn, _context = _scenario([(2, (0, 6), 2)])
+
+    assert not strategy._aim_cell_has_enemy_opportunity((0, 9), turn)
+    assert not strategy._aim_cell_has_enemy_opportunity((1, 9), turn)
+    assert strategy._aim_cell_has_enemy_opportunity((3, 9), turn)
+
+
+def test_visible_neighbour_keeps_an_empty_approach_cell_valid():
+    strategy, turn, _context = _scenario(
+        [(2, (0, 6), 2)], [(30, "VANGUARD", (0, 10), 4)]
+    )
+
+    assert strategy._aim_cell_has_enemy_opportunity((0, 9), turn)
+
+
+def test_recent_hidden_contact_is_not_shot_when_its_neighbourhood_is_visible():
     strategy, _turn, context = _scenario([(2, (0, 6), 2)], [(30, "RANGER", (0, 9), 2)])
     dark = make_turn(tick=101, objects=[core(), unit(2, "RANGER", position=(0, 6))])
     strategy.memory.observe(dark)
@@ -192,12 +209,114 @@ def test_recent_hidden_contact_is_shot_as_a_cell_without_starting_a_hunt():
         defensive_assignments={UUID(int=2): (0, 6)},
     )
 
-    shot = _decide(strategy, dark.rangers[0], context)
+    assert not strategy._defensive_cover_fire(
+        dark.rangers[0],
+        context,
+        strategy.memory.recent_enemies(dark.tick, 32),
+    )
+
+
+def test_recent_hidden_contact_is_covered_when_a_neighbour_remains_unseen():
+    strategy, _turn, context = _scenario(
+        [(2, (0, 6), 2)],
+        [(30, "RANGER", (0, 9), 2)],
+        obstacles=[(1, 8)],
+    )
+    dark = make_turn(tick=101, objects=[core(), unit(2, "RANGER", position=(0, 6))])
+    strategy.memory.observe(dark)
+    context = _TurnContext(
+        turn=dark,
+        report=DecisionReport(tick=101),
+        occupied={(0, 6)},
+        enemy_positions=set(),
+        defensive_assignments={UUID(int=2): (0, 6)},
+    )
+
+    assert strategy._defensive_cover_fire(
+        dark.rangers[0],
+        context,
+        strategy.memory.recent_enemies(dark.tick, 32),
+    )
+    shot = dark.plan.unit_actions[dark.rangers[0].id]
 
     assert isinstance(shot, ShootAction)
     assert shot.target_id is None
     assert manhattan(shot.expected_cell, (0, 9)) <= 2
     assert "without pursuit" in context.report.decisions[-1].reason
+
+
+def test_stationary_target_does_not_get_an_adjacent_prediction_shot():
+    memory = WorldMemory(
+        unit_roles={object_id(2): "defense"},
+        unit_roles_initialized=True,
+        defense_posts={object_id(2): (0, 6)},
+        defense_anchor=(0, 0),
+    )
+    strategy = AggressiveStrategy(
+        memory, StrategyConfig(target_workers=0, max_population=None)
+    )
+    for tick in (98, 99, 100):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(),
+                unit(2, "RANGER", position=(0, 6)),
+                unit(30, "WORKER", controlled=False, position=(1, 8)),
+            ],
+        )
+        memory.observe(turn)
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=100),
+        occupied={item.position for item in turn.units},
+        enemy_positions={item.position for item in turn.visible_enemies},
+        defensive_assignments={UUID(int=2): (0, 6)},
+    )
+
+    target = turn.visible_enemies[0]
+    assert (
+        strategy._ranger_shot_cells(
+            turn.rangers[0], target, turn, set(), {item.position for item in turn.units}
+        )
+        == ()
+    )
+    assert not strategy._defensive_cover_fire(
+        turn.rangers[0],
+        context,
+        memory.recent_enemies(turn.tick, 32),
+    )
+
+
+def test_moving_target_still_uses_its_observed_lead_cell():
+    memory = WorldMemory(
+        unit_roles={object_id(2): "defense"},
+        unit_roles_initialized=True,
+        defense_posts={object_id(2): (0, 6)},
+        defense_anchor=(0, 0),
+    )
+    strategy = AggressiveStrategy(
+        memory, StrategyConfig(target_workers=0, max_population=None)
+    )
+    for tick, position in ((98, (1, 10)), (99, (1, 9)), (100, (1, 8))):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(),
+                unit(2, "RANGER", position=(0, 6)),
+                unit(30, "WORKER", controlled=False, position=position),
+            ],
+        )
+        memory.observe(turn)
+
+    cells = strategy._ranger_shot_cells(
+        turn.rangers[0],
+        turn.visible_enemies[0],
+        turn,
+        set(),
+        {item.position for item in turn.units},
+    )
+
+    assert cells[0] == (1, 7)
 
 
 def _patrol_case(*, enemy_count=1, supporter=(0, 11), supporter_hp=2, tick=100):
@@ -280,24 +399,21 @@ def test_pursuit_never_enters_a_lethal_cell_even_with_a_local_advantage():
 
 def test_real_volley_count_excludes_blocked_and_doomed_rangers():
     strategy, turn, context = _scenario(
-        [(2, (0, 6), 2), (3, (0, 7), 1), (4, (2, 8), 2)],
+        [(2, (0, 6), 2), (3, (0, 7), 1), (5, (3, 6), 2)],
         [(30, "RANGER", (0, 9), 2)],
-        obstacles=[(1, 8)],
     )
 
     assert strategy._ranger_volley_count(turn.visible_enemies[0], context) == 1
 
 
-def test_front_and_rear_shots_do_not_target_a_friendly_reserved_endpoint():
+def test_front_and_rear_wait_instead_of_targeting_a_friendly_reserved_endpoint():
     strategy, turn, context = _scenario(
         [(2, (0, 6), 2), (3, (0, 9), 2)], [(30, "RANGER", (0, 10), 2)]
     )
 
     action = _decide(strategy, turn.rangers[0], context)
 
-    assert isinstance(action, ShootAction)
-    assert action.expected_cell != (0, 9)
-    assert line_of_fire((0, 6), action.expected_cell, {(0, 9)})
+    assert action.type == "WAIT"
 
 
 def test_new_core_clears_persisted_patrol_contact():

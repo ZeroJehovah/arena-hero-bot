@@ -76,8 +76,8 @@ def test_initial_posts_restore_symmetry_without_moving_stationed_guards(center):
     for ranger in turn.rangers:
         if tuple(ranger.position) == expected[str(ranger.id)]:
             shot = turn.plan.unit_actions[ranger.id]
-            assert shot.type == "SHOOT"
-            assert shot.target_id is None
+            assert shot.type in {"SHOOT", "WAIT"}
+            assert getattr(shot, "target_id", None) is None
     for kind, count in (("VANGUARD", 4), ("RANGER", 16)):
         offsets = {
             (post[0] - center[0], post[1] - center[1])
@@ -153,7 +153,7 @@ def test_defender_returns_to_original_post_after_combat_and_restart(tmp_path):
     guards[4]["position"] = list(expected[ranger_id])
     arrived = make_turn(tick=103, objects=[core(), *guards])
     restarted.decide(arrived)
-    assert arrived.plan.unit_actions[UUID(ranger_id)].type == "SHOOT"
+    assert arrived.plan.unit_actions[UUID(ranger_id)].type in {"SHOOT", "WAIT"}
     assert restarted.memory.defense_posts == expected
 
 
