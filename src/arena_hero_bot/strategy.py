@@ -7937,9 +7937,12 @@ class AggressiveStrategy:
             self._set_campaign_hop_target(target)
         if target is None or core.position == target:
             return None
+        capacity_cells = (
+            context.friendly_occupancy.keys() | context.arrival_counts.keys()
+        )
         occupied_to_capacity = {
             position
-            for position in context.occupied
+            for position in capacity_cells
             if self._predicted_friendly_occupancy(position, context) >= 2
         }
         blocked = (
@@ -7947,7 +7950,6 @@ class AggressiveStrategy:
             | set(context.turn.resource_cells)
             | context.enemy_positions
             | occupied_to_capacity
-            | context.reserved
         ) - {core.position}
         recent = self.memory.recent_positions(str(core.id))
         direction = next_step(

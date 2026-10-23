@@ -20,6 +20,7 @@ from arena_hero_bot.migration import (
     resource_block_ring,
     write_migration_request,
 )
+from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
     CORE_MIGRATION_PAUSE_MAX_TICKS,
@@ -27,6 +28,7 @@ from arena_hero_bot.strategy import (
     AggressiveStrategy,
     StrategyConfig,
     _resource_block_center_cells,
+    _TurnContext,
 )
 
 from .factories import core, make_turn, unit
@@ -323,6 +325,34 @@ def test_loaded_worker_deposits_during_the_arrival_tick() -> None:
     assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
     assert turn.plan.core_action is None
     assert memory.core_migration_pause_until_tick == turn.tick + 1
+
+
+def test_core_migration_can_use_reserved_cell_with_one_inbound_unit() -> None:
+    core_position = (0, 0)
+    target = (-1, 0)
+    turn = make_turn(objects=[core(position=core_position)])
+    strategy = _strategy(
+        WorldMemory(
+            core_home_position=target,
+            core_layout_version=CORE_LAYOUT_VERSION,
+        )
+    )
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={core_position},
+        enemy_positions=set(),
+        reserved={target},
+        friendly_occupancy={core_position: 1},
+        arrival_counts={target: 1},
+    )
+
+    direction = strategy._core_home_direction(context)
+    assert direction is not None
+    assert direction.value == "LEFT"
+
+    context.arrival_counts[target] = 2
+    assert strategy._core_home_direction(context) is None
 
 
 def test_loaded_worker_stages_at_moving_core_destination() -> None:
