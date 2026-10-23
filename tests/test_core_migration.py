@@ -427,7 +427,7 @@ def test_unloaded_worker_routes_out_of_the_locked_core_approach() -> None:
         unit_roles_initialized=True,
         core_migration_last_position=(0, 0),
         core_migration_pause_until_tick=-1,
-        campaign_resting=True,
+        campaign_resting=False,
     )
     memory.set_goal(
         worker_object["id"],
@@ -470,6 +470,41 @@ def test_unloaded_worker_routes_out_of_the_locked_core_approach() -> None:
         item.actor_id == worker_object["id"] and item.action == "WAIT"
         for item in report.decisions
     )
+
+
+def test_campaign_rest_allows_an_adjacent_resource_harvest() -> None:
+    core_object = core(position=(0, 0))
+    worker_object = unit(2, "WORKER", position=(0, 1))
+    memory = WorldMemory(
+        core_home_position=(1, 1),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=1,
+        campaign_target_quota=2,
+        campaign_last_core_id=core_object["id"],
+        unit_roles_initialized=True,
+        core_migration_last_position=(0, 0),
+        core_migration_pause_until_tick=-1,
+        campaign_resting=True,
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(
+            target_workers=16,
+            max_population=None,
+            expedition_mode=True,
+            campaign_mode=True,
+        ),
+    )
+    turn = make_turn(
+        tick=100,
+        objects=[core_object, worker_object],
+        resource_cells=[(0, 1)],
+    )
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "HARVEST"
 
 
 def test_economy_and_patrol_follow_the_current_core_chunk() -> None:

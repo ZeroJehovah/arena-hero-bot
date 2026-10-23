@@ -2856,14 +2856,23 @@ class AggressiveStrategy:
         return core is not None and core.view.state is CoreState.NORMAL
 
     def _core_approach_locked(self, turn: Turn) -> bool:
-        """Keep the moving Core's immediate approach clear outside pause Ticks."""
+        """Keep the moving Core's immediate approach clear outside pause Ticks.
+
+        A campaign rest can leave the Core NORMAL and short of its persisted
+        home while it drains cargo and refills the stage roster. That is a
+        stationary service window, not a movement phase: locking its four
+        neighbours makes an adjacent resource unclaimable and pushes a Worker
+        standing on it away before the harvest branch runs.
+        """
 
         core = turn.core
-        return (
-            core is not None
-            and self._core_migration_in_progress(core.view)
-            and not self._migration_pause_active(turn)
-        )
+        if core is None or self._migration_pause_active(turn):
+            return False
+        if core.view.state is CoreState.MOVING:
+            return True
+        if self.memory.campaign_resting:
+            return False
+        return self._core_migration_in_progress(core.view)
 
     def _reset_core_migration_progress(self) -> None:
         self.memory.core_migration_last_position = None
