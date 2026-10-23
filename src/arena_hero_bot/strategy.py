@@ -3372,6 +3372,12 @@ class AggressiveStrategy:
             and manhattan(core.position, enemy.position) <= 4
             for enemy in context.turn.visible_enemies
         )
+        home = self.memory.core_home_position
+        at_home = (
+            home is not None
+            and core.position == home
+            and home not in self._rock_map(context.turn)
+        )
         if core.hp <= 2 and context.remaining_resources > 0:
             core.heal()
             context.report.add(
@@ -3396,53 +3402,17 @@ class AggressiveStrategy:
                 target=core.position,
             )
             return
-        if (
-            not context.beacon_claimed
-            and core.position == context.turn.beacon.position
-            and context.turn.beacon.status is BeaconStatus.GROUND
-        ):
-            core.pickup_beacon()
-            context.beacon_claimed = True
-            context.report.add(
-                actor_id=str(core.id),
-                actor_kind="CORE",
-                action="PICKUP_BEACON",
-                reason="secure Champion Beacon with Core",
-                target=core.position,
-            )
-            return
 
-        if self._core_can_spawn(context):
-            unit_type = (
-                None
-                if self._normal_growth_on_cooldown(context)
-                else self._choose_spawn(context.turn, context.remaining_resources)
-            )
-            if unit_type is not None:
-                core.spawn(unit_type)
-                context.core_service_action = "SPAWN"
-                if self._growth_slowdown_active(context.turn) and not context.emergency:
-                    self.memory.last_normal_growth_tick = context.turn.tick
-                    self.memory.last_normal_growth_resources = (
-                        context.remaining_resources
-                        - unit_cost(unit_type, context.turn.state.population)
-                    )
-                context.report.add(
-                    actor_id=str(core.id),
-                    actor_kind="CORE",
-                    action="SPAWN",
-                    reason=self._spawn_reason(unit_type),
-                    target=core.position,
-                )
-                return
-
-        home = self.memory.core_home_position
-        at_home = (
-            home is not None
-            and core.position == home
-            and home not in self._rock_map(context.turn)
+        migration_preempts_nonurgent_actions = (
+            not self.config.campaign_mode
+            or self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
         )
-        if self._symmetric_posture() and not nearby_combat_enemy and not at_home:
+        if (
+            self._symmetric_posture()
+            and migration_preempts_nonurgent_actions
+            and not nearby_combat_enemy
+            and not at_home
+        ):
             if self._migration_pause_active(context.turn):
                 context.report.add(
                     actor_id=str(core.id),
@@ -3492,6 +3462,46 @@ class AggressiveStrategy:
                     target=core.position,
                 )
             return
+
+        if (
+            not context.beacon_claimed
+            and core.position == context.turn.beacon.position
+            and context.turn.beacon.status is BeaconStatus.GROUND
+        ):
+            core.pickup_beacon()
+            context.beacon_claimed = True
+            context.report.add(
+                actor_id=str(core.id),
+                actor_kind="CORE",
+                action="PICKUP_BEACON",
+                reason="secure Champion Beacon with Core",
+                target=core.position,
+            )
+            return
+
+        if self._core_can_spawn(context):
+            unit_type = (
+                None
+                if self._normal_growth_on_cooldown(context)
+                else self._choose_spawn(context.turn, context.remaining_resources)
+            )
+            if unit_type is not None:
+                core.spawn(unit_type)
+                context.core_service_action = "SPAWN"
+                if self._growth_slowdown_active(context.turn) and not context.emergency:
+                    self.memory.last_normal_growth_tick = context.turn.tick
+                    self.memory.last_normal_growth_resources = (
+                        context.remaining_resources
+                        - unit_cost(unit_type, context.turn.state.population)
+                    )
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="SPAWN",
+                    reason=self._spawn_reason(unit_type),
+                    target=core.position,
+                )
+                return
 
         preserving_resources = self._preserves_resources()
         if not preserving_resources and core.hp < 5 and context.remaining_resources > 0:

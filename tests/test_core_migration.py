@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from arena_hero import UnitType
 
 from arena_hero_bot import migration_cli
 from arena_hero_bot.geometry import manhattan
@@ -345,6 +346,28 @@ def test_core_starts_next_step_on_arrival_when_no_unit_service_is_needed() -> No
     assert turn.plan.core_action.type == "START_MOVE"
     assert turn.plan.core_action.direction.value == "RIGHT"
     assert memory.core_migration_pause_until_tick == -1
+
+
+def test_core_migration_moves_before_nonurgent_production(monkeypatch) -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(1, 0),
+    )
+    turn = make_turn(resources=100, objects=[core()])
+    strategy = _strategy(memory)
+    monkeypatch.setattr(strategy, "_core_can_spawn", lambda context: True)
+    monkeypatch.setattr(
+        strategy,
+        "_choose_spawn",
+        lambda current_turn, resources: UnitType.RANGER,
+    )
+
+    strategy.decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
 
 
 def test_unit_heal_on_arrival_consumes_the_service_tick_before_core_moves() -> None:

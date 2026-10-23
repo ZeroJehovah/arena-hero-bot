@@ -391,9 +391,9 @@ def test_persisted_rest_off_the_published_center_resumes_the_hop() -> None:
 
 
 def test_stage_two_finishes_workers_before_expanding_its_screen() -> None:
-    core_object = core(position=(0, 0))
+    core_object = core(position=(-400, 655))
     memory = WorldMemory(
-        core_home_position=(0, 0),
+        core_home_position=(-400, 655),
         core_layout_version=CORE_LAYOUT_VERSION,
         campaign_phase=CAMPAIGN_PHASE_STAGE2,
         campaign_target_quota=3,
