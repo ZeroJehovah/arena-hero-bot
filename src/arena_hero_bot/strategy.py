@@ -327,10 +327,11 @@ CAMPAIGN_REST_RADIUS = CORE_QUEUE_RADIUS
 # exclusion disk.  The explicit destination check below remains authoritative
 # throughout the four-Tick move.
 CORE_MIGRATION_CLEAR_RADIUS = 1
-# A moving Core cannot receive deposits.  Keep one arrival Tick for a staged
-# Worker to unload, then resume immediately on the following Tick.  A four-Tick
-# fallback halt remains available for exceptional traffic or healing blocks;
-# normal migration no longer waits after a fixed number of steps.
+# Keep a four-cell lookahead clear so friendlies do not yield one step forward
+# into the Core's next planned cell while it completes the current move.
+CORE_MIGRATION_LANE_LENGTH = 4
+# Legacy exceptional service halts are retained in persisted memory; ordinary
+# movement now pauses only when a delivery or heal actually occurs on arrival.
 CORE_MIGRATION_PAUSE_MIN_TICKS = 1
 CORE_MIGRATION_PAUSE_MAX_TICKS = 4
 # While the Core is between homes, keep the eight patrol Rangers on a compact
@@ -416,6 +417,9 @@ class _TurnContext:
     planned_ids: set[UUID] = field(default_factory=set)
     core_inbound_id: UUID | None = None
     core_service_action: str | None = None
+    core_migration_direction: Direction | None = None
+    core_migration_destination: Position | None = None
+    core_migration_lane: tuple[Position, ...] = ()
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
     defensive_assignments: dict[UUID, Position] | None = None
     remaining_resources: int = 0
@@ -652,10 +656,11 @@ class AggressiveStrategy:
                 self._advance_campaign_phase(turn)
             if self._symmetric_posture():
                 self._ensure_symmetric_layout(turn)
-            self._observe_core_migration(turn)
             self._update_expeditions(turn)
             self._refresh_expedition_pursuits(turn)
             self._refresh_expedition_navigation(turn)
+        if self._symmetric_posture():
+            self._observe_core_migration(turn)
         obstacles = self._rock_map(turn)
         threat = self._combat_policy.assess(turn, obstacles)
         recent_enemies = self.memory.recent_enemies(
@@ -815,16 +820,19 @@ class AggressiveStrategy:
             return True
 
         deadlined = False
+        if turn.core is not None:
+            self._prepare_core_migration_step(context)
         if turn.core is not None and (
             self._core_migration_in_progress(turn.core.view)
             or self.memory.campaign_resting
         ):
             # Preserve the arrival-cell service slot before combat planning.
-            # On a NORMAL arrival Tick the loaded Worker deposits while the
-            # Core waits; the next plan starts the following four-Tick move.
+            # On a NORMAL arrival Tick, a loaded Worker can deposit before
+            # the Core decides whether to begin its next four-Tick move.
             # A campaign rest opens the same window on a block center, so the
             # queue that defines the rest can actually reach the Core.
             self._prepare_core_departure(context)
+            self._yield_core_migration_step(context)
         combat_units = [
             unit
             for unit in (*turn.rangers, *turn.vanguards)
@@ -2799,13 +2807,12 @@ class AggressiveStrategy:
         return home is not None and core.position != home
 
     def _observe_core_migration(self, turn: Turn) -> None:
-        """Track migration progress and release fallback service halts.
+        """Track completed steps and release legacy fallback service halts.
 
         A campaign hop runs from one block center to the next, so progress is
-        counted per completed Core cell and never decides a rest: the only
-        place the Core may hold a roster rest is standing on its published
-        ``core_home_position``, which is always a center.  Anywhere else the
-        published hop is still owed and the Core keeps walking.
+        counted per completed Core cell.  Whether to spend the arrival Tick
+        servicing a unit is decided from the actual deposit/heal action later
+        in this plan; movement does not reserve an unconditional pause.
         """
 
         core = turn.core
@@ -2833,16 +2840,9 @@ class AggressiveStrategy:
             return
         if previous == core.position:
             return
-        if manhattan(previous, core.position) == 1:
+        arrived = manhattan(previous, core.position) == 1
+        if arrived:
             self.memory.core_migration_steps_since_pause += 1
-            if self.config.campaign_mode:
-                # One completed Core step consumes four move Ticks.  Reserve
-                # the following Tick for one deposit/heal service action so a
-                # normal campaign cycle is exactly five Ticks per cell.
-                self.memory.core_migration_pause_until_tick = max(
-                    self.memory.core_migration_pause_until_tick,
-                    turn.tick + 1,
-                )
         else:
             # Respawning or any non-cardinal jump resets the progress baseline.
             self.memory.core_migration_steps_since_pause = 0
@@ -2888,6 +2888,129 @@ class AggressiveStrategy:
         self.memory.core_migration_last_position = None
         self.memory.core_migration_steps_since_pause = 0
         self.memory.core_migration_pause_until_tick = -1
+
+    def _prepare_core_migration_step(self, context: _TurnContext) -> None:
+        """Reserve the Core's next homeward cell before units plan this Tick."""
+
+        core = context.turn.core
+        if (
+            core is None
+            or core.view.state is not CoreState.NORMAL
+            or not self._core_migration_in_progress(core.view)
+            or self._migration_pause_active(context.turn)
+            or any(
+                isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and manhattan(core.position, enemy.position) <= 4
+                for enemy in context.turn.visible_enemies
+            )
+        ):
+            return
+        direction = self._core_home_direction(context)
+        if direction is None:
+            return
+        context.core_migration_direction = direction
+        context.core_migration_destination = add(core.position, direction)
+        target = self.memory.core_home_position
+        if target is None:
+            return
+        blocked = (
+            self._rock_map(context.turn)
+            | set(context.turn.resource_cells)
+            | context.enemy_positions
+        ) - {core.position}
+        position = core.position
+        recent = list(self.memory.recent_positions(str(core.id)))
+        lane: list[Position] = []
+        for index in range(CORE_MIGRATION_LANE_LENGTH):
+            if index == 0:
+                step = direction
+            else:
+                step = next_step(
+                    position,
+                    target,
+                    blocked=blocked,
+                    recent=tuple(recent),
+                    direction_offset=self._direction_offset(core.id),
+                )
+            if step is None:
+                break
+            position = add(position, step)
+            lane.append(position)
+            recent.insert(0, position)
+            if position == target:
+                break
+        context.core_migration_lane = tuple(lane)
+
+    def _yield_core_migration_step(self, context: _TurnContext) -> None:
+        """Clear the reserved Core lane before normal unit planning."""
+
+        core = context.turn.core
+        destination = context.core_migration_destination
+        if core is None or destination is None or not context.core_migration_lane:
+            return
+        for lane_position in context.core_migration_lane:
+            blockers = [
+                unit
+                for unit in context.turn.units
+                if unit.position == lane_position
+                and not self._has_unit_action(unit, context)
+            ]
+            for unit in sorted(blockers, key=lambda candidate: candidate.id.bytes):
+                static_blockers = self._static_blockers(unit, context)
+                current_distance = manhattan(unit.position, core.position)
+                candidates: list[tuple[int, int, Position]] = []
+                for position in adjacent_positions(unit.position):
+                    if (
+                        position in context.core_migration_lane
+                        or position in static_blockers
+                        or position in context.enemy_positions
+                        or position in context.standing_reserved
+                        or self._predicted_friendly_occupancy(position, context) != 0
+                        or manhattan(position, core.position) <= current_distance
+                    ):
+                        continue
+                    incoming_attackers = len(
+                        self._visible_attackers_at(
+                            position,
+                            context.turn,
+                            self._rock_map(context.turn),
+                        )
+                    )
+                    current_attackers = len(
+                        self._visible_attackers_at(
+                            unit.position,
+                            context.turn,
+                            self._rock_map(context.turn),
+                        )
+                    )
+                    if (
+                        incoming_attackers > current_attackers
+                        or incoming_attackers >= unit.hp
+                    ):
+                        continue
+                    candidates.append(
+                        (
+                            incoming_attackers,
+                            -manhattan(position, core.position),
+                            position,
+                        )
+                    )
+                for _, _, position in sorted(candidates):
+                    escape_direction = direction_between(unit.position, position)
+                    if escape_direction is None:
+                        continue
+                    context.standing_reserved.add(position)
+                    if self._queue_move(
+                        unit,
+                        escape_direction,
+                        context,
+                        reason="yield the Core migration lane",
+                        target=position,
+                        intent=_MoveIntent.STAND,
+                    ):
+                        break
+                    context.standing_reserved.discard(position)
 
     def _core_queue_positions(
         self,
@@ -3329,97 +3452,43 @@ class AggressiveStrategy:
                     target=core.position,
                 )
                 return
-            loaded_workers = [
-                worker for worker in context.turn.workers if worker.cargo > 0
-            ]
-            service_ready = any(
-                worker.position == core.position for worker in loaded_workers
+            if context.core_service_action in {"DEPOSIT", "HEAL"}:
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="WAIT",
+                    reason="hold one arrival Tick for a completed delivery or heal",
+                    target=core.position,
+                )
+                return
+            direction = context.core_migration_direction or self._core_home_direction(
+                context
             )
-            # Only cargo already inside the service neighbourhood is worth a
-            # short halt.  A Worker further out cannot reach the service cell
-            # within the halt anyway, so it keeps walking with the Core
-            # instead of stalling the whole operation behind distant cargo.
-            approaching_workers = [
-                worker
-                for worker in loaded_workers
-                if manhattan(worker.position, core.position) <= CAMPAIGN_REST_RADIUS
-            ]
-            if service_ready:
-                self.memory.core_migration_pause_until_tick = context.turn.tick + 1
-                context.report.add(
-                    actor_id=str(core.id),
-                    actor_kind="CORE",
-                    action="WAIT",
-                    reason="hold one Tick for the arrival-cell deposit",
-                    target=core.position,
-                )
-                return
-            elif (
-                approaching_workers
-                and self.memory.core_migration_pause_until_tick == -1
-            ):
-                nearest = min(
-                    manhattan(worker.position, core.position)
-                    for worker in approaching_workers
-                )
-                wait_ticks = min(
-                    CORE_MIGRATION_PAUSE_MAX_TICKS,
-                    max(1, nearest),
-                )
-                self.memory.core_migration_pause_until_tick = (
-                    context.turn.tick + wait_ticks
-                )
-                context.report.add(
-                    actor_id=str(core.id),
-                    actor_kind="CORE",
-                    action="WAIT",
-                    reason="wait briefly for a loaded Worker to enter the service cell",
-                    target=core.position,
-                )
-                return
-            direction = self._core_home_direction(context)
             if direction is not None:
-                core.start_move(direction)
-                context.report.add(
-                    actor_id=str(core.id),
-                    actor_kind="CORE",
-                    action="START_MOVE",
-                    reason="relocate Core to the selected symmetric-defense home",
-                    target=add(core.position, direction),
-                )
-            else:
-                blocked_by_loaded_worker = any(
-                    worker.cargo > 0
-                    and manhattan(worker.position, core.position)
-                    <= CORE_MIGRATION_CLEAR_RADIUS
-                    for worker in context.turn.workers
-                )
-                blocked_by_critical_unit = any(
-                    unit.hp <= 1
-                    and manhattan(unit.position, core.position)
-                    <= CORE_MIGRATION_CLEAR_RADIUS
-                    for unit in context.turn.units
-                )
-                if blocked_by_loaded_worker or blocked_by_critical_unit:
-                    # A loaded Worker or critical unit can occupy the only
-                    # legal next step.  Open a short fallback halt so it can
-                    # service or clear the approach without stalling migration.
-                    self.memory.core_migration_pause_until_tick = max(
-                        self.memory.core_migration_pause_until_tick,
-                        context.turn.tick + CORE_MIGRATION_PAUSE_MAX_TICKS,
-                    )
-                    reason = (
-                        "hold for a loaded Worker blocking the Core approach"
-                        if blocked_by_loaded_worker
-                        else "hold for a critical unit blocking the Core approach"
+                destination = add(core.position, direction)
+                if self._predicted_friendly_occupancy(destination, context) > 0:
+                    context.report.add(
+                        actor_id=str(core.id),
+                        actor_kind="CORE",
+                        action="WAIT",
+                        reason="wait for friendlies to clear Core's next cell",
+                        target=destination,
                     )
                 else:
-                    reason = "wait for a clear Core migration step"
+                    core.start_move(direction)
+                    context.report.add(
+                        actor_id=str(core.id),
+                        actor_kind="CORE",
+                        action="START_MOVE",
+                        reason="relocate Core to the selected symmetric-defense home",
+                        target=destination,
+                    )
+            else:
                 context.report.add(
                     actor_id=str(core.id),
                     actor_kind="CORE",
                     action="WAIT",
-                    reason=reason,
+                    reason="wait for a clear Core migration step",
                     target=core.position,
                 )
             return
@@ -4077,6 +4146,8 @@ class AggressiveStrategy:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
+        if context.core_migration_lane:
+            blocked = overlay_blockers(blocked, set(context.core_migration_lane))
         core = context.turn.core
         if (
             core is not None
@@ -4215,6 +4286,8 @@ class AggressiveStrategy:
             destination in self.memory.obstacles
             or destination in context.turn.obstacle_cells
         ):
+            return False
+        if destination in context.core_migration_lane:
             return False
         core = context.turn.core
         moving_core_destination = (
@@ -7937,19 +8010,8 @@ class AggressiveStrategy:
             self._set_campaign_hop_target(target)
         if target is None or core.position == target:
             return None
-        capacity_cells = (
-            context.friendly_occupancy.keys() | context.arrival_counts.keys()
-        )
-        occupied_to_capacity = {
-            position
-            for position in capacity_cells
-            if self._predicted_friendly_occupancy(position, context) >= 2
-        }
         blocked = (
-            obstacles
-            | set(context.turn.resource_cells)
-            | context.enemy_positions
-            | occupied_to_capacity
+            obstacles | set(context.turn.resource_cells) | context.enemy_positions
         ) - {core.position}
         recent = self.memory.recent_positions(str(core.id))
         direction = next_step(
@@ -7964,9 +8026,8 @@ class AggressiveStrategy:
             and recent
             and add(core.position, direction) == recent[0]
         ):
-            # Patrol and defense units can pause on the one cell the Core needs
-            # next.  Wait or take a non-reversing detour, but never begin an
-            # A-B-A loop while the destination is crowded.
+            # Keep a non-reversing route when one exists.  Friendly occupancy
+            # is handled separately by clearing the Core's planned lane.
             detour = next_step(
                 core.position,
                 target,

@@ -23,7 +23,6 @@ from arena_hero_bot.migration import (
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
-    CORE_MIGRATION_PAUSE_MAX_TICKS,
     WORKER_PATROL_PURPOSE,
     AggressiveStrategy,
     StrategyConfig,
@@ -157,7 +156,7 @@ def test_committed_migration_resets_identity_and_tuning_state() -> None:
         strategy.request_core_migration((0, 0))
 
 
-def test_arrival_deposit_uses_one_tick_before_next_core_move() -> None:
+def test_arrival_deposit_uses_service_tick_then_resumes_next_tick() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -173,7 +172,7 @@ def test_arrival_deposit_uses_one_tick_before_next_core_move() -> None:
 
     assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
     assert turn.plan.core_action is None
-    assert memory.core_migration_pause_until_tick == 101
+    assert memory.core_migration_pause_until_tick == -1
 
     workers[0]["cargo"] = 0
     resumed = make_turn(tick=101, objects=[core(), *workers])
@@ -220,7 +219,7 @@ def test_core_steps_into_a_cell_with_one_friendly_unit() -> None:
     assert turn.plan.core_action.direction.value == "RIGHT"
 
 
-def test_unstaged_loaded_worker_opens_a_short_arrival_wait() -> None:
+def test_unstaged_loaded_worker_does_not_make_core_wait_off_its_route() -> None:
     core_object = core()
     memory = WorldMemory(
         core_home_position=(3, 0),
@@ -242,14 +241,15 @@ def test_unstaged_loaded_worker_opens_a_short_arrival_wait() -> None:
     report = _strategy(memory).decide(turn)
 
     assert turn.plan.core_action is None
-    assert memory.core_migration_pause_until_tick == 101
+    assert memory.core_migration_pause_until_tick == -1
     assert any(
-        item.reason == "wait briefly for a loaded Worker to enter the service cell"
+        item.reason == "wait for friendlies to clear Core's next cell"
+        and item.target == (1, 0)
         for item in report.decisions
     )
 
 
-def test_critical_unit_blocking_core_step_opens_immediate_service_halt() -> None:
+def test_critical_units_blocking_core_step_do_not_trigger_an_extra_pause() -> None:
     core_object = core()
     memory = WorldMemory(
         core_home_position=(3, 0),
@@ -271,11 +271,10 @@ def test_critical_unit_blocking_core_step_opens_immediate_service_halt() -> None
     report = _strategy(memory).decide(turn)
 
     assert turn.plan.core_action is None
-    assert memory.core_migration_pause_until_tick == (
-        100 + CORE_MIGRATION_PAUSE_MAX_TICKS
-    )
+    assert memory.core_migration_pause_until_tick == -1
     assert any(
-        item.reason == "hold for a critical unit blocking the Core approach"
+        item.reason == "wait for friendlies to clear Core's next cell"
+        and item.target == (1, 0)
         for item in report.decisions
     )
 
@@ -311,7 +310,7 @@ def test_migration_pause_clears_non_service_unit_from_core_cell() -> None:
     )
 
 
-def test_loaded_worker_deposits_during_the_arrival_tick() -> None:
+def test_loaded_worker_deposits_during_the_arrival_tick_and_core_holds_once() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -320,14 +319,57 @@ def test_loaded_worker_deposits_during_the_arrival_tick() -> None:
     )
     turn = make_turn(objects=[core(), unit(2, "WORKER", position=(0, 0), cargo=1)])
 
-    _strategy(memory).decide(turn)
+    report = _strategy(memory).decide(turn)
 
     assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
     assert turn.plan.core_action is None
-    assert memory.core_migration_pause_until_tick == turn.tick + 1
+    assert memory.core_migration_pause_until_tick == -1
+    assert any(
+        item.reason == "hold one arrival Tick for a completed delivery or heal"
+        for item in report.decisions
+    )
 
 
-def test_core_migration_can_use_reserved_cell_with_one_inbound_unit() -> None:
+def test_core_starts_next_step_on_arrival_when_no_unit_service_is_needed() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(1, 0),
+        core_migration_steps_since_pause=7,
+    )
+    turn = make_turn(objects=[core()])
+
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
+    assert memory.core_migration_pause_until_tick == -1
+
+
+def test_unit_heal_on_arrival_consumes_the_service_tick_before_core_moves() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(1, 0),
+    )
+    turn = make_turn(
+        resources=1,
+        objects=[core(), unit(2, "RANGER", position=(0, 0), hp=1)],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    ranger = turn.rangers[0]
+    assert turn.plan.unit_actions[ranger.id].type == "HEAL"
+    assert turn.plan.core_action is None
+    assert any(
+        item.reason == "hold one arrival Tick for a completed delivery or heal"
+        for item in report.decisions
+    )
+
+
+def test_core_migration_route_ignores_friendly_arrival_reservations() -> None:
     core_position = (0, 0)
     target = (-1, 0)
     turn = make_turn(objects=[core(position=core_position)])
@@ -352,7 +394,64 @@ def test_core_migration_can_use_reserved_cell_with_one_inbound_unit() -> None:
     assert direction.value == "LEFT"
 
     context.arrival_counts[target] = 2
-    assert strategy._core_home_direction(context) is None
+    assert strategy._core_home_direction(context) is direction
+
+
+def test_core_migration_makes_friendly_yield_its_next_cell() -> None:
+    core_position = (0, 0)
+    destination = (1, 0)
+    worker_object = unit(2, "WORKER", position=destination)
+    turn = make_turn(
+        objects=[core(position=core_position), worker_object],
+    )
+    strategy = _strategy(
+        WorldMemory(
+            core_home_position=(3, 0),
+            core_layout_version=CORE_LAYOUT_VERSION,
+        )
+    )
+
+    report = strategy.decide(turn)
+
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions[worker.id]
+    assert action.type == "MOVE"
+    assert action.direction.value in {"UP", "DOWN"}
+    assert any(
+        item.actor_id == worker_object["id"]
+        and item.reason == "yield the Core migration lane"
+        for item in report.decisions
+    )
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
+
+
+def test_core_waits_on_route_when_friendly_cannot_yield_instead_of_detouring() -> None:
+    core_position = (0, 0)
+    destination = (1, 0)
+    core_object = core(position=core_position)
+    turn = make_turn(
+        objects=[core_object, unit(2, "WORKER", position=destination)],
+        obstacles=[(1, -1), (1, 1)],
+    )
+    strategy = _strategy(
+        WorldMemory(
+            core_home_position=(3, 0),
+            core_layout_version=CORE_LAYOUT_VERSION,
+        )
+    )
+
+    report = strategy.decide(turn)
+
+    assert turn.plan.core_action is None
+    assert any(
+        item.actor_id == core_object["id"]
+        and item.action == "WAIT"
+        and item.target == destination
+        and item.reason == "wait for friendlies to clear Core's next cell"
+        for item in report.decisions
+    )
 
 
 def test_loaded_worker_stages_at_moving_core_destination() -> None:
@@ -412,7 +511,7 @@ def test_loaded_worker_can_cross_clear_space_to_a_stationary_core() -> None:
 
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction.value == "UP"
+    assert action.direction.value == "RIGHT"
     assert any(
         item.action == "MOVE" and item.reason == "return carried resources to Core"
         for item in report.decisions

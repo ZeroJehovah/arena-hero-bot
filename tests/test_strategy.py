@@ -2849,7 +2849,7 @@ def test_loaded_worker_approaches_stationary_core_service_cell() -> None:
         core_layout_version=CORE_LAYOUT_VERSION,
     )
 
-    decide(
+    report = decide(
         turn,
         memory=memory,
         config=StrategyConfig(target_workers=16, expedition_mode=True),
@@ -2857,7 +2857,13 @@ def test_loaded_worker_approaches_stationary_core_service_cell() -> None:
 
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction is Direction.LEFT
+    assert any(
+        item.actor_id == str(turn.workers[0].id)
+        and item.reason == "yield the Core migration lane"
+        for item in report.decisions
+    )
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
 
 
 def test_one_loaded_worker_can_reserve_moving_core_destination() -> None:
@@ -2942,7 +2948,7 @@ def test_core_takes_a_non_reversing_detour_when_homeward_cells_are_full() -> Non
     assert direction is not Direction.LEFT
 
 
-def test_core_waits_rather_than_immediately_backtracking() -> None:
+def test_core_route_ignores_friendly_occupancy_when_avoiding_backtracking() -> None:
     turn = make_turn(objects=[core(position=(0, 0))])
     memory = WorldMemory(
         core_home_position=(1, 1),
@@ -2958,7 +2964,7 @@ def test_core_waits_rather_than_immediately_backtracking() -> None:
         enemy_positions=set(),
     )
 
-    assert strategy._core_home_direction(context) is None
+    assert strategy._core_home_direction(context) is Direction.RIGHT
 
 
 def test_population_cap_stops_production() -> None:
@@ -7389,7 +7395,7 @@ def test_symmetric_posture_migrates_past_a_nearby_enemy_core() -> None:
     assert turn.plan.core_action.type == "START_MOVE"
 
 
-def test_symmetric_posture_waits_briefly_for_nearby_cargo() -> None:
+def test_symmetric_posture_does_not_wait_for_cargo_away_from_core_cell() -> None:
     config = expedition_config(target_workers=16)
     memory = WorldMemory(core_home_position=(0, 4))
     strategy = AggressiveStrategy(memory, config)
@@ -7401,8 +7407,10 @@ def test_symmetric_posture_waits_briefly_for_nearby_cargo() -> None:
 
     report = strategy.decide(turn)
 
-    assert turn.plan.core_action is None
-    assert any(
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction is Direction.LEFT
+    assert not any(
         "wait briefly for a loaded Worker" in item.reason for item in report.decisions
     )
 

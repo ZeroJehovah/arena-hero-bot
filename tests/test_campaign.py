@@ -492,7 +492,7 @@ def test_campaign_defense_optimizer_uses_twenty_ranger_posts() -> None:
     )
 
 
-def test_campaign_arrival_reserves_exactly_one_service_tick() -> None:
+def test_campaign_arrival_without_unit_service_starts_next_move_immediately() -> None:
     core_object = core(position=(14, 15))
     memory = WorldMemory(
         core_home_position=(15, 15),
@@ -506,13 +506,10 @@ def test_campaign_arrival_reserves_exactly_one_service_tick() -> None:
 
     arrival = make_turn(tick=100, objects=[core_object])
     strategy.decide(arrival)
-    assert arrival.plan.core_action is None
-    assert memory.core_migration_pause_until_tick == 101
-
-    resumed = make_turn(tick=101, objects=[core_object])
-    strategy.decide(resumed)
-    assert resumed.plan.core_action is not None
-    assert resumed.plan.core_action.type == "START_MOVE"
+    assert arrival.plan.core_action is not None
+    assert arrival.plan.core_action.type == "START_MOVE"
+    assert arrival.plan.core_action.direction.value == "RIGHT"
+    assert memory.core_migration_pause_until_tick == -1
 
 
 def test_campaign_never_rests_away_from_a_block_center() -> None:
@@ -544,8 +541,8 @@ def test_campaign_never_rests_away_from_a_block_center() -> None:
     assert not any("hold the block center" in item.reason for item in report.decisions)
 
 
-def test_campaign_mid_leg_cargo_only_earns_a_short_service_halt() -> None:
-    """Cargo near a travelling Core waits one service Tick, not a roster rest."""
+def test_campaign_mid_leg_cargo_yields_without_delaying_core() -> None:
+    """Cargo near a travelling Core clears its path without a service wait."""
 
     core_object = core(position=(-1686, -1904))
     memory = WorldMemory(
@@ -566,10 +563,14 @@ def test_campaign_mid_leg_cargo_only_earns_a_short_service_halt() -> None:
     report = _strategy(memory).decide(turn)
 
     assert memory.campaign_resting is False
-    assert memory.core_migration_pause_until_tick == 101
-    assert turn.plan.core_action is None
+    assert memory.core_migration_pause_until_tick == -1
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
     assert any(
-        item.reason == "wait briefly for a loaded Worker to enter the service cell"
+        item.actor_id == str(loaded["id"])
+        and item.action == "MOVE"
+        and item.reason == "yield the Core migration lane"
         for item in report.decisions
     )
 
