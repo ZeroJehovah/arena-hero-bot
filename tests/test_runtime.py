@@ -165,7 +165,7 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
         campaign_last_core_id=object_id(1),
         campaign_phase=2,
         campaign_target_quota=3,
-        campaign_leg_steps=7,
+        campaign_resting=True,
     )
     record = runtime._turn_record(
         turn=turn,
@@ -190,7 +190,7 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
     assert record["identity"]["campaign"]["home_position"] == [16, 16]
     assert record["identity"]["campaign"]["phase"] == 2
     assert record["identity"]["campaign"]["target_quota"] == 3
-    assert record["identity"]["campaign"]["leg_steps"] == 7
+    assert record["identity"]["campaign"]["resting"] is True
     assert record["plan"]["tick"] == turn.tick
     assert "api_key" not in json.dumps(record).lower()
 

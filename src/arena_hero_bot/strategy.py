@@ -281,7 +281,6 @@ CAMPAIGN_STAGE1_DEFENSE_RANGERS = 8
 CAMPAIGN_STAGE2_WORKERS = 16
 CAMPAIGN_STAGE2_DEFENSE_RANGERS = 20
 CAMPAIGN_STAGE2_PATROL_RANGERS = 8
-CAMPAIGN_LEG_CELLS = 32
 # The clear-terrain template covers a radius-20 Manhattan disk.  On a remembered
 # rock map the same roster is reflowed inside successively smaller rings until
 # every traversable cell inside the ring is visible.  Ten is the floor at which
@@ -318,6 +317,10 @@ SYMMETRIC_RANGER_OFFSETS: tuple[Position, ...] = (
     (10, -5),
 )
 CORE_QUEUE_RADIUS = 4
+# A campaign rest ends as soon as every Worker that was close enough to hand
+# cargo in has unloaded.  Cargo deeper in the block keeps walking with the Core
+# instead of parking the whole operation on the next hop.
+CAMPAIGN_REST_RADIUS = CORE_QUEUE_RADIUS
 # A moving Core must not have its next completion cell occupied.  Keep the
 # four immediate neighbours available between steps, but do not push Workers
 # two cells away from a resource they are harvesting or deliver on a broad
@@ -812,10 +815,15 @@ class AggressiveStrategy:
             return True
 
         deadlined = False
-        if turn.core is not None and self._core_migration_in_progress(turn.core.view):
+        if turn.core is not None and (
+            self._core_migration_in_progress(turn.core.view)
+            or self.memory.campaign_resting
+        ):
             # Preserve the arrival-cell service slot before combat planning.
             # On a NORMAL arrival Tick the loaded Worker deposits while the
             # Core waits; the next plan starts the following four-Tick move.
+            # A campaign rest opens the same window on a block center, so the
+            # queue that defines the rest can actually reach the Core.
             self._prepare_core_departure(context)
         combat_units = [
             unit
@@ -2791,7 +2799,14 @@ class AggressiveStrategy:
         return home is not None and core.position != home
 
     def _observe_core_migration(self, turn: Turn) -> None:
-        """Track migration progress and release fallback service halts."""
+        """Track migration progress and release fallback service halts.
+
+        A campaign hop runs from one block center to the next, so progress is
+        counted per completed Core cell and never decides a rest: the only
+        place the Core may hold a roster rest is standing on its published
+        ``core_home_position``, which is always a center.  Anywhere else the
+        published hop is still owed and the Core keeps walking.
+        """
 
         core = turn.core
         home = self.memory.core_home_position
@@ -2821,7 +2836,6 @@ class AggressiveStrategy:
         if manhattan(previous, core.position) == 1:
             self.memory.core_migration_steps_since_pause += 1
             if self.config.campaign_mode:
-                self.memory.campaign_leg_steps += 1
                 # One completed Core step consumes four move Ticks.  Reserve
                 # the following Tick for one deposit/heal service action so a
                 # normal campaign cycle is exactly five Ticks per cell.
@@ -2829,9 +2843,6 @@ class AggressiveStrategy:
                     self.memory.core_migration_pause_until_tick,
                     turn.tick + 1,
                 )
-                if self.memory.campaign_leg_steps >= CAMPAIGN_LEG_CELLS:
-                    self.memory.campaign_leg_steps = 0
-                    self.memory.campaign_resting = True
         else:
             # Respawning or any non-cardinal jump resets the progress baseline.
             self.memory.core_migration_steps_since_pause = 0
@@ -2858,10 +2869,11 @@ class AggressiveStrategy:
     def _core_approach_locked(self, turn: Turn) -> bool:
         """Keep the moving Core's immediate approach clear outside pause Ticks.
 
-        A campaign rest can leave the Core NORMAL and short of its persisted
-        home while it drains cargo and refills the stage roster. That is a
-        stationary service window, not a movement phase: locking its four
-        neighbours makes an adjacent resource unclaimable and pushes a Worker
+        Clearance belongs to a Core that is genuinely walking.  A campaign
+        Core standing on its published home is parked for service -- that is
+        the rest stance, which spans several Ticks and still has to accept
+        deliveries and let neighbours harvest.  Locking its four neighbours
+        there makes an adjacent resource unclaimable and pushes a Worker
         standing on it away before the harvest branch runs.
         """
 
@@ -2870,16 +2882,12 @@ class AggressiveStrategy:
             return False
         if core.view.state is CoreState.MOVING:
             return True
-        if self.memory.campaign_resting:
-            return False
         return self._core_migration_in_progress(core.view)
 
     def _reset_core_migration_progress(self) -> None:
         self.memory.core_migration_last_position = None
         self.memory.core_migration_steps_since_pause = 0
         self.memory.core_migration_pause_until_tick = -1
-        self.memory.campaign_leg_steps = 0
-        self.memory.campaign_resting = False
 
     def _core_queue_positions(
         self,
@@ -3144,9 +3152,15 @@ class AggressiveStrategy:
                 ),
                 None,
             )
-        migration_service_window = self._core_migration_in_progress(core.view) and any(
-            worker.cargo > 0 for worker in context.turn.workers
-        )
+        if self._core_migration_in_progress(core.view):
+            service_window = any(worker.cargo > 0 for worker in context.turn.workers)
+        elif self.memory.campaign_resting:
+            # A resting Core only has to free its cell for cargo that is
+            # already inside the service neighbourhood; the rest ends on that
+            # same queue, so distant cargo never justifies the churn.
+            service_window = self._campaign_pending_deliveries(context.turn) > 0
+        else:
+            service_window = False
         for unit in sorted(core_units, key=lambda candidate: candidate.id.bytes):
             if unit is service_candidate:
                 continue
@@ -3157,9 +3171,7 @@ class AggressiveStrategy:
             full_loaded_worker = isinstance(unit, Worker) and (
                 unit.cargo > 0 and context.remaining_resource_space <= 0
             )
-            extra_service_unit = (
-                service_candidate is not None or migration_service_window
-            )
+            extra_service_unit = service_candidate is not None or service_window
             if not (
                 critical_without_service or full_loaded_worker or extra_service_unit
             ):
@@ -3308,22 +3320,6 @@ class AggressiveStrategy:
             and home not in self._rock_map(context.turn)
         )
         if self._symmetric_posture() and not nearby_combat_enemy and not at_home:
-            if self.config.campaign_mode and self.memory.campaign_resting:
-                if self._campaign_rest_complete(context.turn):
-                    self.memory.campaign_resting = False
-                    self.memory.campaign_leg_steps = 0
-                else:
-                    context.report.add(
-                        actor_id=str(core.id),
-                        actor_kind="CORE",
-                        action="WAIT",
-                        reason=(
-                            "finish the 32-cell campaign rest: drain cargo and "
-                            "refill the current stage roster"
-                        ),
-                        target=core.position,
-                    )
-                    return
             if self._migration_pause_active(context.turn):
                 context.report.add(
                     actor_id=str(core.id),
@@ -3339,6 +3335,15 @@ class AggressiveStrategy:
             service_ready = any(
                 worker.position == core.position for worker in loaded_workers
             )
+            # Only cargo already inside the service neighbourhood is worth a
+            # short halt.  A Worker further out cannot reach the service cell
+            # within the halt anyway, so it keeps walking with the Core
+            # instead of stalling the whole operation behind distant cargo.
+            approaching_workers = [
+                worker
+                for worker in loaded_workers
+                if manhattan(worker.position, core.position) <= CAMPAIGN_REST_RADIUS
+            ]
             if service_ready:
                 self.memory.core_migration_pause_until_tick = context.turn.tick + 1
                 context.report.add(
@@ -3349,10 +3354,13 @@ class AggressiveStrategy:
                     target=core.position,
                 )
                 return
-            elif loaded_workers and self.memory.core_migration_pause_until_tick == -1:
+            elif (
+                approaching_workers
+                and self.memory.core_migration_pause_until_tick == -1
+            ):
                 nearest = min(
                     manhattan(worker.position, core.position)
-                    for worker in loaded_workers
+                    for worker in approaching_workers
                 )
                 wait_ticks = min(
                     CORE_MIGRATION_PAUSE_MAX_TICKS,
@@ -3438,6 +3446,23 @@ class AggressiveStrategy:
                 actor_kind="CORE",
                 action="REPAIR_SHIELD",
                 reason="restore shield between engagements",
+                target=core.position,
+            )
+            return
+
+        if self._symmetric_posture() and at_home and self.memory.campaign_resting:
+            # A campaign rest is a hold on a block center, never a step count:
+            # the Core stays put until the queue around it has delivered and
+            # this block's quota gate has its roster.  Production, healing and
+            # deposits above stay available for the whole hold.
+            context.report.add(
+                actor_id=str(core.id),
+                actor_kind="CORE",
+                action="WAIT",
+                reason=(
+                    "hold the block center until the delivery queue drains and "
+                    "the quota gate roster is full"
+                ),
                 target=core.position,
             )
             return
@@ -7468,7 +7493,6 @@ class AggressiveStrategy:
         self._staged_ids = frozenset()
         self.memory.campaign_last_core_id = core_id
         self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE1
-        self.memory.campaign_leg_steps = 0
         self.memory.campaign_resting = False
         self._commit_symmetric_home(target)
         if target is not None:
@@ -7525,11 +7549,15 @@ class AggressiveStrategy:
             home_block = resource_block_index(home)
             same_block = current_block == home_block
             adjacent_block = blocks_are_cardinally_adjacent(current_block, home_block)
+            # A campaign rest only exists on a block center.  Older snapshots
+            # could persist any clear cell as the destination, so a target
+            # that is not one of its block's four center cells is rebuilt
+            # instead of being treated as a legal stopping point.
             valid = (
                 same_block
                 if self.memory.campaign_phase <= 1
                 else (same_block or adjacent_block)
-            )
+            ) and home in _resource_block_center_cells(home)
             block_changed = (
                 jumped
                 and previous is not None
@@ -7549,37 +7577,13 @@ class AggressiveStrategy:
     def _advance_campaign_phase(self, turn: Turn) -> None:
         """Advance only on completed composition; casualties never demote."""
 
-        phase = self.memory.campaign_phase
         workers = len(turn.workers)
         defense_rangers = self._campaign_defense_rangers(turn)
         patrol_rangers = self._campaign_patrol_rangers(turn)
         if (
-            phase == CAMPAIGN_PHASE_STAGE2
-            and self.memory.campaign_resting
+            self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE1
             and workers >= CAMPAIGN_STAGE1_WORKERS
             and defense_rangers >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
-            and all(worker.cargo == 0 for worker in turn.workers)
-        ):
-            # Releases a persisted pre-fix state that promoted to stage 2
-            # before the stage-1 32-cell rest had finished.  Such a rest is
-            # identifiable while its hop target is still in the Core's block;
-            # a normal stage-2 rest targets the next block.
-            from .migration import resource_block_index
-
-            core = turn.core
-            home = self.memory.core_home_position
-            if (
-                core is not None
-                and home is not None
-                and resource_block_index(core.position) == resource_block_index(home)
-            ):
-                self.memory.campaign_resting = False
-                self.memory.campaign_leg_steps = 0
-        if (
-            phase == CAMPAIGN_PHASE_STAGE1
-            and workers >= CAMPAIGN_STAGE1_WORKERS
-            and defense_rangers >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
-            and not self.memory.campaign_resting
         ):
             self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE2
             self.memory.campaign_target_quota = 3
@@ -7602,17 +7606,19 @@ class AggressiveStrategy:
             ):
                 self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE4
                 self.memory.campaign_target_quota = 4
+        self._observe_campaign_rest(turn)
         self._continue_campaign_migration(turn)
 
     def _continue_campaign_migration(self, turn: Turn) -> None:
-        """Publish the next adjacent hop only after the current one is reached."""
+        """Publish the next hop after the reached block center has been served.
 
-        from .migration import resource_block_index, resource_block_quota
+        The rest gate is the only hold between hops.  While the Core still owes
+        a nearby delivery or this block's quota gate still owes roster, the
+        published home stays where the Core is standing, so the operation
+        never leaves a center early and never parks off one either.
+        """
 
-        if self.memory.campaign_phase not in (
-            CAMPAIGN_PHASE_STAGE2,
-            CAMPAIGN_PHASE_STAGE3,
-        ):
+        if self.memory.campaign_resting:
             return
         core = turn.core
         if core is None:
@@ -7620,10 +7626,9 @@ class AggressiveStrategy:
         home = self.memory.core_home_position
         if home is not None and core.position != home:
             return
-        target_quota = self.memory.campaign_target_quota
-        if target_quota <= resource_block_quota(resource_block_index(core.position)):
+        if not self._campaign_hop_pending(turn):
             return
-        self._campaign_retarget(turn, target_quota)
+        self._campaign_retarget(turn, self.memory.campaign_target_quota)
 
     def _campaign_retarget(self, turn: Turn, target_quota: int) -> None:
         """Select one clean cardinal neighbor toward the requested quota."""
@@ -7650,7 +7655,7 @@ class AggressiveStrategy:
             self._set_campaign_hop_target(plan.target)
 
     def _set_campaign_hop_target(self, target: Position) -> None:
-        """Retarget one hop without resetting economy or the 32-cell leg."""
+        """Retarget one hop without resetting the running economy."""
 
         self.memory.core_home_position = target
         self.memory.core_layout_version = CORE_LAYOUT_VERSION
@@ -7668,21 +7673,102 @@ class AggressiveStrategy:
             for unit in turn.rangers
         )
 
-    def _campaign_rest_complete(self, turn: Turn) -> bool:
-        """Return whether a 32-cell halt has neither cargo nor roster debt."""
+    def _campaign_hop_pending(self, turn: Turn) -> bool:
+        """Return whether the campaign still owes a hop out of this block."""
 
-        if any(worker.cargo > 0 for worker in turn.workers):
+        from .migration import resource_block_index, resource_block_quota
+
+        if self.memory.campaign_phase not in (
+            CAMPAIGN_PHASE_STAGE2,
+            CAMPAIGN_PHASE_STAGE3,
+        ):
             return False
-        if self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE1:
+        core = turn.core
+        if core is None:
+            return False
+        block = resource_block_index(core.position)
+        return self.memory.campaign_target_quota > resource_block_quota(block)
+
+    def _campaign_quota_gate_complete(self, turn: Turn) -> bool:
+        """Return whether the roster matches the quota of the current block.
+
+        The gate follows the block the Core is standing in, not the campaign
+        phase.  A quota-2 block only owes the stage-1 economy, so the operation
+        keeps hopping; a quota-3 (or better) block has to finish the full
+        stage-2 screen and patrol ring before heading for quota 4.
+        """
+
+        from .migration import resource_block_index, resource_block_quota
+
+        core = turn.core
+        quota = (
+            resource_block_quota(resource_block_index(core.position))
+            if core is not None
+            else 0
+        )
+        if quota >= 3:
             return (
-                len(turn.workers) >= CAMPAIGN_STAGE1_WORKERS
+                len(turn.workers) >= CAMPAIGN_STAGE2_WORKERS
                 and self._campaign_defense_rangers(turn)
-                >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
+                >= CAMPAIGN_STAGE2_DEFENSE_RANGERS
+                and self._campaign_patrol_rangers(turn)
+                >= CAMPAIGN_STAGE2_PATROL_RANGERS
             )
         return (
-            len(turn.workers) >= CAMPAIGN_STAGE2_WORKERS
-            and self._campaign_defense_rangers(turn) >= CAMPAIGN_STAGE2_DEFENSE_RANGERS
-            and self._campaign_patrol_rangers(turn) >= CAMPAIGN_STAGE2_PATROL_RANGERS
+            len(turn.workers) >= CAMPAIGN_STAGE1_WORKERS
+            and self._campaign_defense_rangers(turn) >= CAMPAIGN_STAGE1_DEFENSE_RANGERS
+        )
+
+    def _campaign_pending_deliveries(self, turn: Turn) -> int:
+        """Count Workers that are close enough to hand cargo in right now."""
+
+        core = turn.core
+        if core is None:
+            return 0
+        return sum(
+            1
+            for worker in turn.workers
+            if worker.cargo > 0
+            and manhattan(worker.position, core.position) <= CAMPAIGN_REST_RADIUS
+        )
+
+    def _campaign_rest_complete(self, turn: Turn) -> bool:
+        """Return whether the Core may leave the block center it stands on.
+
+        Draining every Worker in the block is not the goal: cargo deeper in the
+        chunk keeps walking with the Core.  A rest ends as soon as the service
+        neighbourhood has no delivery left and this block's quota gate holds
+        its roster.
+        """
+
+        if self._campaign_pending_deliveries(turn):
+            return False
+        return self._campaign_quota_gate_complete(turn)
+
+    def _campaign_rest_pending(self, turn: Turn) -> bool:
+        """Return whether the Core holds a block center instead of walking.
+
+        Only a Core standing on its published ``core_home_position`` can rest,
+        and only while a hop is still owed.  Anywhere else the published hop is
+        owed regardless, so a persisted flag can never park the Core away from
+        its target: the stance is recomputed every Turn from the live board.
+        """
+
+        core = turn.core
+        home = self.memory.core_home_position
+        if core is None or home is None or core.position != home:
+            return False
+        if not self._campaign_hop_pending(turn):
+            return False
+        return not self._campaign_rest_complete(turn)
+
+    def _observe_campaign_rest(self, turn: Turn) -> None:
+        """Recompute the rest stance before any hop is published this Turn."""
+
+        self.memory.campaign_resting = (
+            self.config.campaign_mode
+            and self._symmetric_posture()
+            and self._campaign_rest_pending(turn)
         )
 
     def _symmetric_home_candidate_from(

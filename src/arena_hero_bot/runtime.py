@@ -304,7 +304,6 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
                 if memory.core_home_position is not None
                 else None
             ),
-            "leg_steps": memory.campaign_leg_steps,
             "resting": memory.campaign_resting,
         },
         "core_migration": {

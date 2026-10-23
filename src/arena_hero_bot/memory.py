@@ -161,7 +161,9 @@ class WorldMemory:
     campaign_phase: int = 0
     campaign_target_quota: int = 0
     campaign_last_core_id: str | None = None
-    campaign_leg_steps: int = 0
+    # A rest exists only while the Core stands on its published block center.
+    # The flag is recomputed every Turn from the live stance, so it can never
+    # act as durable progress that parks the Core short of its target.
     campaign_resting: bool = False
     # Workers have one preferred 8x8 sector among the sixteen in the active
     # resource chunk.  This is a soft patrol identity, not a resource-claim
@@ -696,7 +698,6 @@ class WorldMemory:
             "campaign_phase": self.campaign_phase,
             "campaign_target_quota": self.campaign_target_quota,
             "campaign_last_core_id": self.campaign_last_core_id,
-            "campaign_leg_steps": self.campaign_leg_steps,
             "campaign_resting": self.campaign_resting,
             "worker_sectors": dict(sorted(self.worker_sectors.items())),
             "worker_sector_layout_version": self.worker_sector_layout_version,
@@ -874,7 +875,6 @@ class WorldMemory:
                 if raw.get("campaign_last_core_id") is not None
                 else None
             ),
-            campaign_leg_steps=int(raw.get("campaign_leg_steps", 0)),
             campaign_resting=bool(raw.get("campaign_resting", False)),
             worker_sectors={
                 str(unit_id): int(block)

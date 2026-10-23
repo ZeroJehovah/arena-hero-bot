@@ -473,18 +473,20 @@ def test_unloaded_worker_routes_out_of_the_locked_core_approach() -> None:
 
 
 def test_campaign_rest_allows_an_adjacent_resource_harvest() -> None:
-    core_object = core(position=(0, 0))
-    worker_object = unit(2, "WORKER", position=(0, 1))
+    """A Core holding its block center must not lock its four neighbours."""
+
+    center = (-945, -945)
+    core_object = core(position=center)
+    worker_object = unit(2, "WORKER", position=(-944, -945))
     memory = WorldMemory(
-        core_home_position=(1, 1),
+        core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
-        campaign_phase=1,
-        campaign_target_quota=2,
+        campaign_phase=2,
+        campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
         unit_roles_initialized=True,
-        core_migration_last_position=(0, 0),
+        core_migration_last_position=center,
         core_migration_pause_until_tick=-1,
-        campaign_resting=True,
     )
     strategy = AggressiveStrategy(
         memory,
@@ -498,11 +500,14 @@ def test_campaign_rest_allows_an_adjacent_resource_harvest() -> None:
     turn = make_turn(
         tick=100,
         objects=[core_object, worker_object],
-        resource_cells=[(0, 1)],
+        resource_cells=[(-944, -945)],
     )
 
     strategy.decide(turn)
 
+    # The quota gate still owes the stage-1 economy, so this is a real rest
+    # stance on the center -- and its neighbours must stay claimable.
+    assert memory.campaign_resting is True
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "HARVEST"
 

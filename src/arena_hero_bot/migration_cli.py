@@ -116,7 +116,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "pause_until_tick": memory.core_migration_pause_until_tick,
                     "campaign_phase": memory.campaign_phase,
                     "campaign_target_quota": memory.campaign_target_quota,
-                    "campaign_leg_steps": memory.campaign_leg_steps,
                     "campaign_resting": memory.campaign_resting,
                 },
                 ensure_ascii=False,
