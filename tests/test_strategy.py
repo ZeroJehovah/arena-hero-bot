@@ -2748,6 +2748,36 @@ def test_core_migration_avoids_immediate_backtrack() -> None:
     assert turn.plan.core_action.direction is Direction.RIGHT
 
 
+def test_core_backtracks_out_of_a_dead_end_when_no_detour_exists() -> None:
+    core_id = str(object_id(1))
+    memory = WorldMemory(
+        core_home_position=(-1457, -1136),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        position_history={
+            core_id: [
+                (-1455, -1168),
+                (-1455, -1167),
+                (-1456, -1167),
+                (-1457, -1167),
+                (-1457, -1168),
+            ]
+        },
+    )
+    turn = make_turn(
+        objects=[core(position=(-1457, -1168))],
+        obstacles=[(-1457, -1169), (-1458, -1168), (-1456, -1168)],
+    )
+    strategy = AggressiveStrategy(memory, StrategyConfig(target_workers=2))
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied={(-1457, -1168)},
+        enemy_positions=set(),
+    )
+
+    assert strategy._core_home_direction(context) is Direction.DOWN
+
+
 def test_core_stays_receptive_while_worker_returns_cargo() -> None:
     turn = make_turn(
         objects=[

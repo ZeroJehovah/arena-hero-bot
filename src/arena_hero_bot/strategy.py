@@ -8101,7 +8101,10 @@ class AggressiveStrategy:
                 direction_offset=self._direction_offset(core.id),
             )
             if detour is None or add(core.position, detour) == recent[0]:
-                return None
+                # A non-reversing route is preferred, but it must not become a
+                # hard constraint: a Core that steps into a rock cul-de-sac
+                # would otherwise have no legal escape and wait forever.
+                return direction
             return detour
         return direction
 
