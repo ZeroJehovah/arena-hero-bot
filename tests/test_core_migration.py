@@ -211,6 +211,7 @@ def test_core_steps_into_a_cell_with_one_friendly_unit() -> None:
             core(),
             unit(2, "WORKER", position=(1, 0)),
         ],
+        obstacles=[(1, -1), (1, 1)],
     )
 
     _strategy(memory).decide(turn)
@@ -220,7 +221,7 @@ def test_core_steps_into_a_cell_with_one_friendly_unit() -> None:
     assert turn.plan.core_action.direction.value == "RIGHT"
 
 
-def test_unstaged_loaded_worker_does_not_make_core_wait_off_its_route() -> None:
+def test_loaded_worker_does_not_block_a_shared_core_step() -> None:
     core_object = core()
     memory = WorldMemory(
         core_home_position=(3, 0),
@@ -241,11 +242,12 @@ def test_unstaged_loaded_worker_does_not_make_core_wait_off_its_route() -> None:
 
     report = _strategy(memory).decide(turn)
 
-    assert turn.plan.core_action is None
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
     assert memory.core_migration_pause_until_tick == -1
-    assert any(
+    assert not any(
         item.reason == "wait for friendlies to clear Core's next cell"
-        and item.target == (1, 0)
         for item in report.decisions
     )
 
@@ -455,7 +457,11 @@ def test_core_waits_on_route_when_friendly_cannot_yield_instead_of_detouring() -
     destination = (1, 0)
     core_object = core(position=core_position)
     turn = make_turn(
-        objects=[core_object, unit(2, "WORKER", position=destination)],
+        objects=[
+            core_object,
+            unit(2, "WORKER", position=destination),
+            unit(3, "WORKER", position=destination),
+        ],
         obstacles=[(1, -1), (1, 1)],
     )
     strategy = _strategy(

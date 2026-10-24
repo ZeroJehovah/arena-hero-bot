@@ -3436,7 +3436,11 @@ class AggressiveStrategy:
             )
             if direction is not None:
                 destination = add(core.position, direction)
-                if self._predicted_friendly_occupancy(destination, context) > 0:
+                # A Core occupies one slot but may share the second slot with
+                # one friendly unit.  Only a genuinely full destination must
+                # hold the Core on its route; treating any friendly occupant
+                # as terrain deadlocks migration behind a queued Worker.
+                if self._predicted_friendly_occupancy(destination, context) >= 2:
                     context.report.add(
                         actor_id=str(core.id),
                         actor_kind="CORE",
