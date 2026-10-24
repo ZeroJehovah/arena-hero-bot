@@ -3431,6 +3431,37 @@ class AggressiveStrategy:
                     target=core.position,
                 )
                 return
+            if self._full_bank_center_service_pending(context):
+                unit_type = None
+                if not self._normal_growth_on_cooldown(context):
+                    unit_type = self._choose_spawn(
+                        context.turn,
+                        context.remaining_resources,
+                    )
+                if unit_type is not None:
+                    if self._core_can_spawn(context):
+                        core.spawn(unit_type)
+                        context.core_service_action = "SPAWN"
+                        context.report.add(
+                            actor_id=str(core.id),
+                            actor_kind="CORE",
+                            action="SPAWN",
+                            reason=(
+                                "produce at the block center to reopen deposit capacity"
+                            ),
+                            target=core.position,
+                        )
+                        return
+                    context.report.add(
+                        actor_id=str(core.id),
+                        actor_kind="CORE",
+                        action="WAIT",
+                        reason=(
+                            "hold the block center to reopen full-Core deposit capacity"
+                        ),
+                        target=core.position,
+                    )
+                    return
             direction = context.core_migration_direction or self._core_home_direction(
                 context
             )
@@ -7817,6 +7848,26 @@ class AggressiveStrategy:
             for worker in turn.workers
             if worker.cargo > 0
             and manhattan(worker.position, core.position) <= CAMPAIGN_REST_RADIUS
+        )
+
+    def _full_bank_center_service_pending(self, context: _TurnContext) -> bool:
+        """Whether a full campaign Core must spend a center Tick on production.
+
+        A moving Core cannot accept deposits, and normal production yields to
+        migration everywhere except a block center.  If the bank is full while
+        Workers already carry cargo, continuing the hop only piles more cargo
+        around a Core that cannot accept it.  Use the center's service window
+        to fund the next Unit and reopen deposit capacity before moving on.
+        """
+
+        core = context.turn.core
+        return (
+            core is not None
+            and self.config.campaign_mode
+            and self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
+            and context.remaining_resources >= context.turn.resource_capacity
+            and core.position in _resource_block_center_cells(core.position)
+            and any(worker.cargo > 0 for worker in context.turn.workers)
         )
 
     def _campaign_rest_complete(self, turn: Turn) -> bool:

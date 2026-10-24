@@ -687,6 +687,59 @@ def test_campaign_rest_clears_the_service_cell_for_the_next_delivery() -> None:
     )
 
 
+def test_full_bank_center_spawns_before_the_next_campaign_hop() -> None:
+    """A full bank must not carry loaded Workers past its center service tick."""
+
+    center = (15, 15)
+    core_object = core(position=center)
+    memory = WorldMemory(
+        core_home_position=(47, 15),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    loaded = unit(500, "WORKER", position=(16, 15), cargo=1)
+    turn = make_turn(
+        tick=100,
+        resources=65,
+        objects=[core_object, *_workers(12), loaded],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert turn.resource_capacity == 65
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
+def test_full_bank_center_keeps_migrating_without_loaded_workers() -> None:
+    """Production only interrupts migration when cargo is waiting behind it."""
+
+    center = (15, 15)
+    core_object = core(position=center)
+    memory = WorldMemory(
+        core_home_position=(47, 15),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    turn = make_turn(
+        tick=100,
+        resources=65,
+        objects=[core_object, *_workers(12)],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+
+
 def test_quota_three_block_waits_for_the_stage_two_roster() -> None:
     """Quota 3 is reached here, so the Core holds until the screen is full."""
 
