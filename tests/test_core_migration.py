@@ -670,6 +670,34 @@ def test_campaign_rest_allows_an_adjacent_resource_harvest() -> None:
     assert action.type == "HARVEST"
 
 
+def test_worker_harvests_resource_blocking_the_core_next_migration_step() -> None:
+    """A migration approach cannot evict the Worker clearing its next cell."""
+
+    core_object = core(position=(0, 0))
+    worker_object = unit(2, "WORKER", position=(1, 0))
+    memory = WorldMemory(
+        core_home_position=(1, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+    )
+    turn = make_turn(
+        objects=[core_object, worker_object],
+        obstacles=[(0, 1), (0, -1), (1, 1), (1, -1)],
+        resource_cells=[(1, 0)],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "HARVEST"
+    assert turn.plan.core_action is None
+    assert any(
+        item.actor_id == worker_object["id"]
+        and item.action == "HARVEST"
+        and item.reason == "harvest current visible resource"
+        for item in report.decisions
+    )
+
+
 def test_economy_and_patrol_follow_the_current_core_chunk() -> None:
     memory = WorldMemory(
         core_home_position=(64, 0),

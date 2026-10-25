@@ -420,6 +420,7 @@ class _TurnContext:
     core_migration_direction: Direction | None = None
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
+    core_resource_clearance_target: Position | None = None
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
     defensive_assignments: dict[UUID, Position] | None = None
     remaining_resources: int = 0
@@ -2449,6 +2450,7 @@ class AggressiveStrategy:
             )
             return
 
+        assigned_resource = context.resource_assignments.get(worker.id)
         if self._core_migration_in_progress(core.view):
             if worker.cargo > 0 and not self._core_accepts_deposits(context.turn):
                 self.memory.clear_goal(str(worker.id))
@@ -2480,6 +2482,7 @@ class AggressiveStrategy:
                 return
             if (
                 self._core_approach_locked(context.turn)
+                and assigned_resource != context.core_resource_clearance_target
                 and not (worker.cargo > 0 and self._core_accepts_deposits(context.turn))
                 and manhattan(worker.position, core.position)
                 <= CORE_MIGRATION_CLEAR_RADIUS
@@ -2590,7 +2593,6 @@ class AggressiveStrategy:
                 )
             return
 
-        assigned_resource = context.resource_assignments.get(worker.id)
         if worker.position == assigned_resource:
             worker.harvest()
             self.memory.clear_goal(str(worker.id))
@@ -2884,6 +2886,41 @@ class AggressiveStrategy:
             return True
         return self._core_migration_in_progress(core.view)
 
+    def _core_resource_clearance_target(
+        self,
+        context: _TurnContext,
+    ) -> Position | None:
+        """Return a visible resource blocking the Core's only next step.
+
+        A resource can respawn on the next migration cell.  The Core must not
+        enter that cell, but the Worker assigned to it must still be allowed
+        through the temporary approach clearance bubble to harvest it.
+        """
+
+        core = context.turn.core
+        if (
+            core is None
+            or core.view.state is not CoreState.NORMAL
+            or not self._core_migration_in_progress(core.view)
+        ):
+            return None
+        if self._core_home_direction(context) is not None:
+            return None
+        home = self.memory.core_home_position
+        if home is None:
+            return None
+        direction = next_step(
+            core.position,
+            home,
+            blocked=self._rock_map(context.turn) | context.enemy_positions,
+            recent=self.memory.recent_positions(str(core.id)),
+            direction_offset=self._direction_offset(core.id),
+        )
+        if direction is None:
+            return None
+        candidate = add(core.position, direction)
+        return candidate if candidate in context.turn.resource_cells else None
+
     def _reset_core_migration_progress(self) -> None:
         self.memory.core_migration_last_position = None
         self.memory.core_migration_steps_since_pause = 0
@@ -2908,6 +2945,9 @@ class AggressiveStrategy:
             return
         direction = self._core_home_direction(context)
         if direction is None:
+            context.core_resource_clearance_target = (
+                self._core_resource_clearance_target(context)
+            )
             return
         context.core_migration_direction = direction
         context.core_migration_destination = add(core.position, direction)
@@ -4191,6 +4231,11 @@ class AggressiveStrategy:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
+        core_resource_clearance = (
+            isinstance(unit, Worker)
+            and unit.cargo == 0
+            and goal == context.core_resource_clearance_target
+        )
         if context.core_migration_lane:
             blocked = overlay_blockers(blocked, set(context.core_migration_lane))
         core = context.turn.core
@@ -4199,6 +4244,7 @@ class AggressiveStrategy:
             and self._core_approach_locked(context.turn)
             and unit.position != core.position
             and not (isinstance(unit, Worker) and unit.cargo > 0)
+            and not core_resource_clearance
         ):
             # The queue check below rejects a step that enters or moves
             # laterally inside the locked approach.  Include that transient
@@ -4346,6 +4392,11 @@ class AggressiveStrategy:
             and isinstance(unit, Worker)
             and unit.cargo > 0
         )
+        core_resource_clearance = (
+            isinstance(unit, Worker)
+            and unit.cargo == 0
+            and target == context.core_resource_clearance_target
+        )
         predicted = self._predicted_friendly_occupancy(destination, context)
         if moving_core_destination:
             # The Core occupies one of the destination cell's two slots.  Only
@@ -4358,6 +4409,7 @@ class AggressiveStrategy:
             core is not None
             and self._core_approach_locked(context.turn)
             and not stationary_core_service
+            and not core_resource_clearance
             and manhattan(destination, core.position) <= CORE_MIGRATION_CLEAR_RADIUS
             and manhattan(destination, core.position)
             <= manhattan(unit.position, core.position)
