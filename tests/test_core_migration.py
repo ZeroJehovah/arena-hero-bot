@@ -483,6 +483,41 @@ def test_core_waits_on_route_when_friendly_cannot_yield_instead_of_detouring() -
     )
 
 
+def test_full_loaded_core_destination_uses_the_vacated_core_cell() -> None:
+    core_object = core()
+    destination = (1, 0)
+    memory = WorldMemory(
+        core_home_position=(3, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-1, 0),
+    )
+    turn = make_turn(
+        objects=[
+            core_object,
+            unit(2, "WORKER", position=destination, cargo=1),
+            unit(3, "WORKER", position=destination, cargo=1),
+        ],
+        obstacles=[(1, -1), (1, 1)],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    moving_workers = [
+        item
+        for item in report.decisions
+        if item.actor_kind == "WORKER" and item.action == "MOVE"
+    ]
+    assert len(moving_workers) == 1
+    assert moving_workers[0].reason == (
+        "clear the full Core migration destination through the vacated Core cell"
+    )
+    assert moving_workers[0].target == (0, 0)
+    assert turn.plan.unit_actions[turn.workers[0].id].type == "MOVE"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
+
+
 def test_loaded_worker_stages_at_moving_core_destination() -> None:
     moving = make_turn(
         objects=[

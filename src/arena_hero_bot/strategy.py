@@ -2997,6 +2997,30 @@ class AggressiveStrategy:
                 and not self._has_unit_action(unit, context)
             ]
             for unit in sorted(blockers, key=lambda candidate: candidate.id.bytes):
+                if (
+                    lane_position == destination
+                    and self._predicted_friendly_occupancy(lane_position, context) >= 2
+                    and self._predicted_friendly_occupancy(core.position, context) < 2
+                ):
+                    # When rocks seal every outward escape from a full next
+                    # cell, one friendly may enter the Core cell on the same
+                    # Tick that the Core leaves it.  This is a legal
+                    # Core/Unit exchange and reduces the destination to the
+                    # Core plus one Unit, so migration can continue without
+                    # treating friendly occupancy as terrain.
+                    direction = direction_between(unit.position, core.position)
+                    if direction is not None and self._queue_move(
+                        unit,
+                        direction,
+                        context,
+                        reason=(
+                            "clear the full Core migration destination through the "
+                            "vacated Core cell"
+                        ),
+                        target=core.position,
+                        intent=_MoveIntent.INBOUND,
+                    ):
+                        continue
                 static_blockers = self._static_blockers(unit, context)
                 current_distance = manhattan(unit.position, core.position)
                 candidates: list[tuple[int, int, Position]] = []
