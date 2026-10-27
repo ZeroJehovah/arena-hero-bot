@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Container
+from collections.abc import Container, Iterable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
@@ -165,6 +165,7 @@ RANGER_STANDOFF_RANGE = 3
 RANGER_RETURN_THREAT_RADIUS = 5
 COMBAT_SCREEN_RADIUS = 3
 CORE_ESCAPE_MIN_ENEMIES = 3
+WORKER_EMERGENCY_STANDOFF_RADIUS = 12
 MAX_VANGUARD_ATTACKERS = 4
 CORE_WORKER_INTERCEPT_RADIUS = 4
 CORE_INTRUDER_INTERCEPTORS = 4
@@ -188,6 +189,7 @@ EARLY_COMBAT_GUARD_WORKERS = 4
 GARRISON_MIN_GUARDS = 3
 GARRISON_ROSTER_SHARE = 4
 ALL_HANDS_DEFENSE_MIN_ENEMIES = 3
+DEFENSIVE_LANE_ROTATIONS_PER_TICK = 2
 RAID_ABORT_SCAN_RADIUS = 6
 # Active-offense ("expedition") posture: a fixed formation saturates the Core
 # neighbourhood while everything built beyond it is sent out on independent,
@@ -452,6 +454,7 @@ class _TurnContext:
     all_hands_defense: bool = False
     volley_aims: dict[str, list[Position]] = field(default_factory=dict)
     defensive_fire_cells: dict[Position, int] = field(default_factory=dict)
+    defensive_lane_moves: int = 0
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
     campaign_patrol_recall_ids: frozenset[UUID] = field(default_factory=frozenset)
@@ -1117,6 +1120,38 @@ class AggressiveStrategy:
                 )
             )
         ]
+        direct_shootable = [
+            (enemy, (enemy.position,))
+            for enemy, shot_cells in shootable
+            if enemy.position in shot_cells
+        ]
+        if context.combat_assault and local_formation:
+            lane_goal = self._defensive_firing_lane_goal(
+                ranger,
+                visible_enemies,
+                context,
+                friendly_positions,
+            )
+            if lane_goal is not None and self._move_within_leash(
+                ranger,
+                lane_goal,
+                context,
+                offensive=False,
+                reason=(
+                    "spread overlapping defenders onto a clear firing lane"
+                    if self._predicted_friendly_occupancy(ranger.position, context) > 1
+                    else "move to a clear firing lane on current enemy positions"
+                ),
+                avoid_new_threats=False,
+                intent=_MoveIntent.STAND,
+            ):
+                context.defensive_lane_moves += 1
+                return
+            if direct_shootable:
+                # A current enemy cell is a materially better target than any
+                # one-cell lead.  Keep the shot on that cell instead of letting
+                # the prediction hedge consume the whole local volley.
+                shootable = direct_shootable
         # A wounded defender keeps a safe shot before recovery. Incoming
         # damage is checked below against the post-movement firing picture;
         # killing an enemy does not cancel its simultaneous return shot.
@@ -3474,11 +3509,14 @@ class AggressiveStrategy:
         if core is None:
             return worker.position
         obstacles = self._rock_map(context.turn)
-        enemy_positions = {enemy.position for enemy in context.assault_enemies}
+        enemy_positions = {enemy.position for enemy in context.turn.visible_enemies}
         candidates = [
             (core.position[0] + dx, core.position[1] + dy)
             for dx, dy in _defensive_ring_offsets(
-                max(5, self.config.core_assault_radius)
+                max(
+                    WORKER_EMERGENCY_STANDOFF_RADIUS,
+                    self.config.core_assault_radius + 4,
+                )
             )
         ]
         legal = [
@@ -3543,13 +3581,29 @@ class AggressiveStrategy:
             and core.position == home
             and home not in self._rock_map(context.turn)
         )
-        if core.hp <= 2 and context.remaining_resources > 0:
+        projected_damage = context.threat.projected_core_damage
+        hp_after_hit = max(0, core.hp + core.shield - projected_damage)
+        preemptive_heal = (
+            projected_damage > 0
+            # Damage resolves before the Core action.  Repair is cheaper when
+            # its one shield already buys another survivable Tick; HEAL is the
+            # emergency choice only when the post-hit Core plus one repaired
+            # shield would still die before the next heal could resolve.
+            and hp_after_hit + 1 <= projected_damage
+            and min(5, hp_after_hit + 4) > projected_damage
+            and context.remaining_resources > 0
+        )
+        if (core.hp <= 2 or preemptive_heal) and context.remaining_resources > 0:
             core.heal()
             context.report.add(
                 actor_id=str(core.id),
                 actor_kind="CORE",
                 action="HEAL",
-                reason="prevent imminent Core destruction",
+                reason=(
+                    "heal before the projected strike becomes lethal"
+                    if preemptive_heal
+                    else "prevent imminent Core destruction"
+                ),
                 target=core.position,
             )
             return
@@ -3698,7 +3752,10 @@ class AggressiveStrategy:
                     actor_id=str(core.id),
                     actor_kind="CORE",
                     action="SPAWN",
-                    reason=self._spawn_reason(unit_type),
+                    reason=self._spawn_reason(
+                        unit_type,
+                        emergency=self._local_core_attackers(context.turn) != (),
+                    ),
                     target=core.position,
                 )
                 return
@@ -5407,6 +5464,114 @@ class AggressiveStrategy:
             reason="close on the massed assault",
             avoid_new_threats=True,
         )
+
+    def _defensive_firing_lane_goal(
+        self,
+        ranger: Ranger,
+        enemies: tuple[CoreView | UnitView, ...],
+        context: _TurnContext,
+        friendly_positions: Iterable[Position],
+    ) -> Position | None:
+        """Find a safe adjacent firing cell against enemies' current cells.
+
+        A defensive volley must not spend an entire assault firing at lead
+        cells while a rock or the Core blocks every ray to an enemy that is
+        already firing.  When the current cell has no direct shot, or another
+        defender shares it, rotate at most a small part of the formation onto
+        an empty neighbour that can see a current hostile.  A candidate is
+        allowed at most a survivable number of current attackers; the first
+        ranking term favours better Core-threat coverage over a safer but
+        tactically empty cell.
+        """
+
+        if (
+            not context.combat_assault
+            or context.defensive_lane_moves >= DEFENSIVE_LANE_ROTATIONS_PER_TICK
+        ):
+            return None
+        core = context.turn.core
+        if core is None or ranger.position == core.position:
+            return None
+        combat_targets = tuple(
+            enemy
+            for enemy in enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+            and manhattan(core.position, enemy.position) <= DEFENSIVE_SUPPORT_RADIUS
+        )
+        if not combat_targets:
+            return None
+
+        obstacles = self._rock_map(context.turn)
+        positions_after_departure = set(friendly_positions)
+        if self._predicted_friendly_occupancy(ranger.position, context) == 1:
+            positions_after_departure.discard(ranger.position)
+
+        def directly_targeted(position: Position) -> tuple[UnitView, ...]:
+            return tuple(
+                enemy
+                for enemy in combat_targets
+                if self._line_of_fire_clear(
+                    position,
+                    enemy.position,
+                    obstacles,
+                    positions_after_departure,
+                )
+            )
+
+        current_targets = directly_targeted(ranger.position)
+        stacked = self._predicted_friendly_occupancy(ranger.position, context) > 1
+        if current_targets and not stacked:
+            return None
+        current_core_targets = sum(
+            self._enemy_can_attack_position(enemy, core.position, obstacles)
+            for enemy in current_targets
+        )
+        post = (context.defensive_assignments or {}).get(
+            ranger.id,
+            self.memory.defense_posts.get(str(ranger.id), ranger.position),
+        )
+        radius = 1 + max(
+            manhattan(core.position, post),
+            manhattan(core.position, ranger.position),
+        )
+        candidates: list[tuple[int, int, int, int, Position]] = []
+        for position in adjacent_positions(ranger.position):
+            if (
+                position in obstacles
+                or position in context.enemy_positions
+                or position == core.position
+                or self._predicted_friendly_occupancy(position, context) != 0
+                or manhattan(post, position) > DEFENSIVE_POST_SUPPORT_DISTANCE
+                or manhattan(core.position, position) > radius
+            ):
+                continue
+            attackers = self._visible_attackers_at(position, context.turn, obstacles)
+            if len(attackers) >= ranger.hp:
+                continue
+            targets = directly_targeted(position)
+            if not targets:
+                continue
+            core_targets = sum(
+                self._enemy_can_attack_position(enemy, core.position, obstacles)
+                for enemy in targets
+            )
+            if current_core_targets > core_targets:
+                continue
+            if current_targets and len(targets) < len(current_targets):
+                continue
+            candidates.append(
+                (
+                    core_targets,
+                    len(targets),
+                    -len(attackers),
+                    -manhattan(ranger.position, position),
+                    position,
+                )
+            )
+        if not candidates:
+            return None
+        return max(candidates)[-1]
 
     def _decline_ranger_duel(
         self,
@@ -11346,6 +11511,17 @@ class AggressiveStrategy:
         growth_target = self._growth_population_target()
         if growth_target is not None and turn.state.population >= growth_target:
             return None
+        if self._local_core_attackers(turn) and self._emergency_combat_mode(turn):
+            # A staged Worker must never consume the Core action while the
+            # Core is already in a local firefight.  Ranger fire is the only
+            # immediate answer; a cheaper Vanguard remains a viable fallback
+            # when the next Ranger does not fit.
+            return self._affordable_spawn(
+                turn,
+                resources,
+                (UnitType.RANGER, UnitType.VANGUARD),
+                strict_preference=False,
+            )
         if self.config.expedition_mode:
             return self._expedition_spawn(turn, resources)
         emergency = self._emergency_combat_mode(turn)
@@ -11388,6 +11564,21 @@ class AggressiveStrategy:
             strict_preference=not emergency,
         )
 
+    def _local_core_attackers(self, turn: Turn) -> tuple[UnitView, ...]:
+        """Return visible combat Units currently inside the Core assault ring."""
+
+        core = turn.core
+        if core is None:
+            return ()
+        return tuple(
+            enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+            and manhattan(core.position, enemy.position)
+            <= self.config.core_assault_radius
+        )
+
     def _expedition_spawn(self, turn: Turn, resources: int) -> UnitType | None:
         """Choose the next Unit for the active-offense formation.
 
@@ -11397,9 +11588,10 @@ class AggressiveStrategy:
         decided by the existing threat logic still spends this Tick -- with
         ``strict_preference=False`` so a cheaper candidate is accepted -- but
         takes its type from the same formation and staging gaps as routine
-        growth.  Campaign mode is deliberately exempt from that emergency
-        substitution: its configured production order is a hard sequence, so
-        no guard or threat may postpone an unfinished Worker batch.
+        growth.  Campaign production follows its configured sequence only
+        while the Core is not in a visible local firefight; a hostile inside
+        the Core assault ring temporarily substitutes the next defender, so a
+        routine Worker slot cannot consume the only immediate defense action.
         """
 
         if self.config.campaign_mode:
@@ -11860,7 +12052,12 @@ class AggressiveStrategy:
 
         return self.config.max_population is None and self.config.resource_target <= 0
 
-    def _spawn_reason(self, unit_type: UnitType) -> str:
+    def _spawn_reason(self, unit_type: UnitType, *, emergency: bool = False) -> str:
+        if emergency:
+            return (
+                "produce an emergency Core defender instead of a staged economy unit "
+                f"({unit_type.value.lower()})"
+            )
         if self.config.campaign_mode:
             phase = self.memory.campaign_phase
             return f"fill campaign stage {phase} slot with {unit_type.value.lower()}"

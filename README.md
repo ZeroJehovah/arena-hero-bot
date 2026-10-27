@@ -69,17 +69,20 @@ The supervisor uses the live defaults `--target-workers 16 --no-max-population
 --expedition-mode --campaign-mode` when no arguments are supplied. Pass normal CLI
 arguments to override them. Campaign mode follows one cumulative Ranger-only
 sequence: `8W -> 16W -> 8R(defense) -> 20R(defense) -> 8R(patrol) -> *R(patrol)`.
+While a visible hostile combat unit is inside the Core assault ring, the next
+production slot temporarily becomes a Ranger; the normal sequence resumes as
+soon as that local threat is gone.
 It spends every affordable resource below the max formation and keeps a stockpile
 only after that formation is complete. Every later Ranger remains a patrol unit.
 Legacy expedition squads are recalled, fight normally while returning, and join
 the patrol roster within eight cells of the Core; campaign mode creates no new
 expeditions and no Vanguards.
 
-In the expedition posture, fixed defenders do not pursue enemies. Rangers
-keep survivable shots and cover only cells that still have an unseen or
-hostile-occupied approach. A target confirmed stationary is aimed at on its
-current cell rather than an adjacent predicted cell. If an aim cell and all of
-its neighbours are visible and contain no enemy, the Ranger holds fire instead
+Fixed defenders do not pursue enemies. During a Core assault they shoot at an
+enemy's current cell when a real ray exists; without one, up to two defenders
+may rotate onto a safe adjacent firing lane before speculative cover fire is
+used. Overlapping defenders prefer distinct firing cells. If an aim cell and all
+of its neighbours are visible and contain no enemy, the Ranger holds fire instead
 of rotating shots through known-empty ground. Repositioning requires a
 threatened ally or Core, stays within the defensive layers, and avoids new
 firing sources. A necessary withdrawal is planned before rear-rank shots and

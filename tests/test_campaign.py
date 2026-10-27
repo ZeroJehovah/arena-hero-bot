@@ -333,7 +333,7 @@ def test_stage_one_keeps_workers_first_until_twelve() -> None:
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_stage_one_keeps_workers_first_under_core_threat() -> None:
+def test_stage_one_builds_a_defender_before_a_worker_under_core_threat() -> None:
     core_object = core(position=(0, 0), hp=4, shield=5)
     memory = WorldMemory(
         core_home_position=(0, 0),
@@ -355,7 +355,7 @@ def test_stage_one_keeps_workers_first_under_core_threat() -> None:
 
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "SPAWN"
-    assert turn.plan.core_action.unit_type is UnitType.WORKER
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
 
 
 def test_stage_two_keeps_workers_ahead_of_rangers_until_sixteen() -> None:
