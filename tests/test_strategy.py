@@ -487,6 +487,43 @@ def test_core_holds_position_during_assault_without_escape_lane() -> None:
     assert turn.core is not None
 
 
+def test_massed_direct_assault_uses_a_non_worsening_core_escape_lane() -> None:
+    turn = make_turn(
+        resources=90,
+        objects=[
+            core(),
+            *[
+                unit(number, "RANGER", controlled=False, position=position)
+                for number, position in enumerate(
+                    (
+                        (0, 3),
+                        (0, 2),
+                        (0, -3),
+                        (0, -2),
+                        (3, 0),
+                        (2, 0),
+                        (-3, 0),
+                        (-2, 0),
+                    ),
+                    start=20,
+                )
+            ],
+        ],
+    )
+
+    report = decide(
+        turn,
+        config=StrategyConfig(target_workers=0, max_population=None),
+    )
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert any(
+        item.reason == "evacuate Core from overwhelming direct assault"
+        for item in report.decisions
+    )
+
+
 def test_assault_limits_vanguard_strike_team_and_assigns_unique_screen_slots() -> None:
     turn = make_turn(
         resources=20,

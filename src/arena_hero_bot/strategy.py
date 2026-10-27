@@ -429,6 +429,8 @@ class _TurnContext:
     core_migration_direction: Direction | None = None
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
+    core_escape_direction: Direction | None = None
+    core_escape_destination: Position | None = None
     core_resource_clearance_target: Position | None = None
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
     defensive_assignments: dict[UUID, Position] | None = None
@@ -816,6 +818,25 @@ class AggressiveStrategy:
             assault_enemies,
             threat,
         )
+        if context.combat_assault and self._should_evacuate_core(
+            turn,
+            assault_enemies,
+            threat,
+        ):
+            context.core_escape_direction = self._core_escape_direction(
+                context,
+                assault_enemies,
+            )
+            if context.core_escape_direction is not None and turn.core is not None:
+                context.core_escape_destination = add(
+                    turn.core.position,
+                    context.core_escape_direction,
+                )
+                # Reserve the lane before the ring and economy units choose
+                # their goals.  A Core occupies one of the two cell slots;
+                # the queue check below permits at most one existing or
+                # inbound friendly in this destination.
+                context.reserved.add(context.core_escape_destination)
         if self._symmetric_posture():
             # Establish home posts even when every defender is fighting or
             # healing and none will reach the idle movement branch this Tick.
@@ -3491,6 +3512,21 @@ class AggressiveStrategy:
             )
             return
 
+        if (
+            context.core_escape_direction is not None
+            and context.core_service_action is None
+            and core.hp > 2
+        ):
+            core.start_move(context.core_escape_direction)
+            context.report.add(
+                actor_id=str(core.id),
+                actor_kind="CORE",
+                action="START_MOVE",
+                reason="evacuate Core from overwhelming direct assault",
+                target=add(core.position, context.core_escape_direction),
+            )
+            return
+
         nearby_enemy = any(
             manhattan(core.position, enemy.position) <= 4
             for enemy in context.turn.visible_enemies
@@ -4528,6 +4564,16 @@ class AggressiveStrategy:
             and target == context.core_resource_clearance_target
         )
         predicted = self._predicted_friendly_occupancy(destination, context)
+        if (
+            context.core_escape_destination == destination
+            and destination != unit.position
+            and predicted >= 1
+        ):
+            # The emergency Core move will consume one slot in this cell.
+            # Leave room for it instead of allowing a second friendly arrival
+            # that would turn a legal Core/unit overlap into a three-entity
+            # destination at server resolution.
+            return False
         if moving_core_destination:
             # The Core occupies one of the destination cell's two slots.  Only
             # a loaded Worker may reserve the other slot for the arrival Tick.
@@ -5046,50 +5092,54 @@ class AggressiveStrategy:
         enemies: tuple[CoreView | UnitView, ...],
         threat: ThreatAssessment | None = None,
     ) -> bool:
+        """Return whether a massed direct assault merits an escape attempt.
+
+        Ordinary pre-evade and small engaged groups deliberately keep the
+        existing hold/repair posture.  A Core only reaches this branch when a
+        large local formation is already landing at least two legal shots and
+        the Core still has enough HP to spend the four-Tick move.
+        """
+
         core = turn.core
-        if core is None or core.view.state is CoreState.MOVING or not enemies:
-            return False
-        if not self._can_break_away(turn, enemies):
-            return False
-        if self._guardless_low_capacity_assault(turn, enemies):
-            # A freshly respawned Core can spend several minutes below the
-            # first Vanguard threshold.  Once a combat enemy enters the local
-            # assault ring, moving immediately is safer than waiting for the
-            # first shot while the economy is still undefended.
-            return True
-        if self._needs_preemptive_ranger_evasion(turn, enemies, threat):
-            # A distant combat unit cannot protect the Core during its
-            # four-Tick migration. Evacuate an outer-ring Ranger approach
-            # instead of waiting for pursuit memory or the first hit.
-            return True
-        if threat is not None and threat.should_evacuate_core:
-            # ``should_evacuate_core`` also fires on a lone fighter merely
-            # entering the preemptive horizon.  When the local combat guard
-            # already outmatches the approaching enemy, moving the Core
-            # trades four Ticks of production and healing for a fight the
-            # guards should win in place.  Only stand down while the enemy
-            # has not yet reached attack range or landed a hit.
-            outmatched = (
-                not threat.recent_core_attack
-                and not threat.threatening_core_enemy_ids
-                and self._local_combat_guard_count(turn) >= 2 * len(enemies)
-            )
-            return not outmatched
-        # A group already inside the pre-evade ring is dangerous even when it
-        # has not crossed attack range yet. Waiting for the first hit leaves a
-        # four-Tick Core migration too late against a melee group.
-        if (
-            threat is not None
-            and threat.level is ThreatLevel.PRE_EVADE
-            and len(enemies) >= 2
-            and min(manhattan(core.position, enemy.position) for enemy in enemies) <= 3
-        ):
-            return True
-        if len(enemies) >= self.config.core_escape_enemy_count:
-            return True
-        if core.shield <= 3 and len(enemies) >= 2:
-            return True
-        return core.hp <= 3
+        return bool(
+            core is not None
+            and core.view.state is not CoreState.MOVING
+            and enemies
+            and threat is not None
+            and threat.level is ThreatLevel.ENGAGED
+            and threat.projected_core_damage >= 2
+            and core.hp > 2
+            and len(enemies) >= max(8, self.config.core_escape_enemy_count * 2)
+        )
+
+    def _core_escape_direction(
+        self,
+        context: _TurnContext,
+        enemies: tuple[CoreView | UnitView, ...],
+    ) -> Direction | None:
+        """Choose a safe one-cell emergency lane for a massed assault."""
+
+        core = context.turn.core
+        if core is None:
+            return None
+        obstacles = self._rock_map(context.turn)
+        blocked = set(obstacles)
+        blocked.update(context.turn.resource_cells)
+        blocked.update(context.enemy_positions)
+        # Do not plan a third entity into the cell the moving Core will occupy.
+        # A single current occupant is legal under the server's two-entity
+        # capacity and may remain or leave on this Tick.
+        for position in adjacent_positions(core.position):
+            if self._predicted_friendly_occupancy(position, context) >= 2:
+                blocked.add(position)
+        blocked.update(context.reserved)
+        return self._combat_policy.escape_direction(
+            core.position,
+            enemies,
+            obstacles,
+            blocked,
+            beacon_position=context.turn.beacon.position,
+        )
 
     def _combat_defense_required(
         self,
