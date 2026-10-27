@@ -88,8 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--campaign-mode",
         action="store_true",
         help=(
-            "stage-gated campaign: mine the spawn chunk, build the 12W+8R and "
-            "16W+20R+8R formations, then migrate through quota-3/quota-4 chunks"
+            "stage-gated campaign: build 8W, 16W+8R and 16W+20R, add the "
+            "8R patrol screen, then migrate toward the quota-8 block"
         ),
     )
     parser.add_argument(

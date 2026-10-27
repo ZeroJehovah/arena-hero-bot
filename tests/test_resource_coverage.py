@@ -135,6 +135,31 @@ def test_worker_sectors_are_one_each_and_survive_replacements() -> None:
     assert sorted(updated.values()) == list(range(16))
 
 
+def test_migration_rebalances_sixteen_workers_across_the_two_chunk_area() -> None:
+    target = (HOME[0] + 32, HOME[1])
+    workers = _workers()
+    memory = WorldMemory(
+        core_home_position=target,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_start_position=HOME,
+        worker_sector_layout_version=1,
+        worker_sector_count=16,
+        worker_sectors={worker["id"]: index for index, worker in enumerate(workers)},
+    )
+    strategy = _strategy(memory)
+    turn = make_turn(objects=[core(position=HOME), *workers])
+
+    sectors = strategy._resource_patrol_sectors(turn)
+    assignments = strategy._reconcile_worker_sectors(turn)
+
+    assert len(sectors) == 32
+    assert len(set(assignments.values())) == 16
+    assert sorted(sector.index for sector in assignments.values()) == list(
+        range(0, 32, 2)
+    )
+    assert memory.worker_sector_count == 32
+
+
 def test_legacy_worker_blocks_migrate_to_fresh_patrol_sectors(tmp_path) -> None:
     workers = _workers()
     memory = WorldMemory(core_home_position=HOME)

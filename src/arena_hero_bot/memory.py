@@ -20,7 +20,7 @@ CONTESTED_CELL_TTL = 80
 RESOURCE_MEMORY_TTL = 65536
 RESOURCE_MEMORY_LIMIT = 2048
 WORKER_COVERAGE_SIZE = 32
-WORKER_COVERAGE_LIMIT = WORKER_COVERAGE_SIZE**2
+WORKER_COVERAGE_LIMIT = 2 * WORKER_COVERAGE_SIZE**2
 WORKER_SECTOR_LAYOUT_VERSION = 1
 RESOURCE_ABSENCE_RADIUS = 1
 RESOURCE_CLAIM_PURPOSE = "resource-claim-v1"
@@ -103,6 +103,7 @@ class ExpeditionSquad:
     pursuit_distance: int = 0
     exploration_route: ExplorationRoute = field(default_factory=ExplorationRoute)
     regroup_order: tuple[str, ...] = ()
+    recalled: bool = False
 
 
 @dataclass(slots=True)
@@ -154,6 +155,9 @@ class WorldMemory:
     core_migration_last_position: Position | None = None
     core_migration_steps_since_pause: int = 0
     core_migration_pause_until_tick: int = -1
+    # The centre a running hop started from.  Keep the source and destination
+    # chunks economically active even after the Core crosses the boundary.
+    core_migration_start_position: Position | None = None
     # Campaign state survives restarts.  ``campaign_phase`` is the highest
     # stage reached, not a live roster count: losing Units must not move the
     # whole operation back to an earlier resource tier.  The phase is reset
@@ -165,12 +169,25 @@ class WorldMemory:
     # The flag is recomputed every Turn from the live stance, so it can never
     # act as durable progress that parks the Core short of its target.
     campaign_resting: bool = False
-    # Workers have one preferred 8x8 sector among the sixteen in the active
-    # resource chunk.  This is a soft patrol identity, not a resource-claim
-    # restriction; every Worker may harvest anywhere in the chunk.
+    # A quota-4+ hop is held while patrol Rangers sweep the destination block.
+    # The exact per-cell ages are separate from the Worker economy map, which
+    # follows only the active one- or two-block harvest area.
+    campaign_scout_target: Position | None = None
+    campaign_scout_started_tick: int = 0
+    campaign_scout_last_enemy_tick: int = 0
+    campaign_scout_seen_ticks: dict[Position, int] = field(default_factory=dict)
+    campaign_scout_rejections: dict[Position, int] = field(default_factory=dict)
+    # The twenty defensive Rangers normally cover radius eight and fold into
+    # a radius-four inner screen under sustained pressure.
+    defense_compressed: bool = False
+    defense_calm_since_tick: int | None = None
+    # Workers have one preferred 8x8 sector among the one- or two-chunk active
+    # work area.  This is a soft patrol identity, not a resource-claim
+    # restriction; every Worker may harvest anywhere in the area.
     worker_sectors: dict[str, int] = field(default_factory=dict)
     worker_sector_layout_version: int = 0
-    # Exact per-cell vision ages for the active 32x32 resource chunk.  Unlike
+    worker_sector_count: int = 0
+    # Exact per-cell vision ages for the one- or two-chunk active area.  Unlike
     # the bounded exploration atlas, this map is small enough to retain the
     # last authoritative sighting of every cell and drive Worker coverage.
     worker_seen_ticks: dict[Position, int] = field(default_factory=dict)
@@ -200,6 +217,7 @@ class WorldMemory:
                 self._obstacle_rows.extend([x, y] for x, y in new_obstacles)
         self.observe_exploration(turn)
         self._observe_worker_coverage(turn)
+        self._observe_campaign_scout_coverage(turn)
         self._observe_resource_cells(turn)
         destroyed_enemy_ids = {
             str(event.target_id)
@@ -325,17 +343,29 @@ class WorldMemory:
         # destination made the table empty for the whole walk: the current
         # chunk filter then discarded those destination observations every
         # Tick.  Keep coverage in lockstep with the live economy anchor.
-        anchor = (
-            turn.core.position if turn.core is not None else self.core_home_position
-        )
-        if anchor is None:
+        anchors = {
+            anchor
+            for anchor in (
+                turn.core.position if turn.core is not None else None,
+                self.core_home_position,
+                self.core_migration_start_position,
+            )
+            if anchor is not None
+        }
+        if not anchors:
             return
-        min_x = (anchor[0] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
-        min_y = (anchor[1] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
+        blocks = {
+            (
+                (anchor[0] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE,
+                (anchor[1] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE,
+            )
+            for anchor in anchors
+        }
         block = {
-            (x, y)
-            for x in range(min_x, min_x + WORKER_COVERAGE_SIZE)
-            for y in range(min_y, min_y + WORKER_COVERAGE_SIZE)
+            (min_x + dx, min_y + dy)
+            for min_x, min_y in blocks
+            for dx in range(WORKER_COVERAGE_SIZE)
+            for dy in range(WORKER_COVERAGE_SIZE)
         }
         obstacles = self.obstacles
         seen: set[Position] = set()
@@ -354,6 +384,37 @@ class WorldMemory:
                 key=lambda item: (-item[1], item[0]),
             )[:WORKER_COVERAGE_LIMIT]
             self.worker_seen_ticks = dict(retained)
+
+    def _observe_campaign_scout_coverage(self, turn: Turn) -> None:
+        """Record fresh target-block vision for a pending migration hop."""
+
+        target = self.campaign_scout_target
+        if target is None:
+            self.campaign_scout_seen_ticks.clear()
+            return
+        min_x = (target[0] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
+        min_y = (target[1] // WORKER_COVERAGE_SIZE) * WORKER_COVERAGE_SIZE
+        block = {
+            (x, y)
+            for x in range(min_x, min_x + WORKER_COVERAGE_SIZE)
+            for y in range(min_y, min_y + WORKER_COVERAGE_SIZE)
+        }
+        seen: set[Position] = set()
+        for position, radius in self._vision_observers(turn):
+            seen.update(visible_cells(position, radius, self.obstacles) & block)
+        for position in seen:
+            self.campaign_scout_seen_ticks[position] = turn.tick
+        self.campaign_scout_seen_ticks = {
+            position: tick
+            for position, tick in self.campaign_scout_seen_ticks.items()
+            if position in block
+        }
+        if any(
+            min_x <= enemy.position[0] < min_x + WORKER_COVERAGE_SIZE
+            and min_y <= enemy.position[1] < min_y + WORKER_COVERAGE_SIZE
+            for enemy in turn.visible_enemies
+        ):
+            self.campaign_scout_last_enemy_tick = turn.tick
 
     def _closely_observed_cells(self, turn: Turn) -> set[Position]:
         """Return the cells close enough this Tick to trust an absence."""
@@ -668,6 +729,7 @@ class WorldMemory:
                     "pursuit_distance": squad.pursuit_distance,
                     "exploration_route": asdict(squad.exploration_route),
                     "regroup_order": list(squad.regroup_order),
+                    "recalled": squad.recalled,
                 }
                 for squad in self.expedition_squads
             ],
@@ -695,12 +757,35 @@ class WorldMemory:
             ),
             "core_migration_steps_since_pause": self.core_migration_steps_since_pause,
             "core_migration_pause_until_tick": self.core_migration_pause_until_tick,
+            "core_migration_start_position": (
+                list(self.core_migration_start_position)
+                if self.core_migration_start_position is not None
+                else None
+            ),
             "campaign_phase": self.campaign_phase,
             "campaign_target_quota": self.campaign_target_quota,
             "campaign_last_core_id": self.campaign_last_core_id,
             "campaign_resting": self.campaign_resting,
+            "campaign_scout_target": (
+                list(self.campaign_scout_target)
+                if self.campaign_scout_target is not None
+                else None
+            ),
+            "campaign_scout_started_tick": self.campaign_scout_started_tick,
+            "campaign_scout_last_enemy_tick": self.campaign_scout_last_enemy_tick,
+            "campaign_scout_seen_ticks": [
+                {"position": list(position), "tick": tick}
+                for position, tick in sorted(self.campaign_scout_seen_ticks.items())
+            ],
+            "campaign_scout_rejections": [
+                {"block": list(block), "tick": tick}
+                for block, tick in sorted(self.campaign_scout_rejections.items())
+            ],
+            "defense_compressed": self.defense_compressed,
+            "defense_calm_since_tick": self.defense_calm_since_tick,
             "worker_sectors": dict(sorted(self.worker_sectors.items())),
             "worker_sector_layout_version": self.worker_sector_layout_version,
+            "worker_sector_count": self.worker_sector_count,
             "worker_seen_ticks": [
                 {"position": list(position), "tick": tick}
                 for position, tick in sorted(self.worker_seen_ticks.items())
@@ -836,6 +921,7 @@ class WorldMemory:
                     regroup_order=tuple(
                         str(member) for member in value.get("regroup_order", [])
                     ),
+                    recalled=bool(value.get("recalled", False)),
                 )
                 for index, value in enumerate(raw.get("expedition_squads", []))
             ],
@@ -868,6 +954,9 @@ class WorldMemory:
             core_migration_pause_until_tick=int(
                 raw.get("core_migration_pause_until_tick", -1)
             ),
+            core_migration_start_position=_optional_position(
+                raw.get("core_migration_start_position")
+            ),
             campaign_phase=int(raw.get("campaign_phase", 0)),
             campaign_target_quota=int(raw.get("campaign_target_quota", 0)),
             campaign_last_core_id=(
@@ -876,6 +965,23 @@ class WorldMemory:
                 else None
             ),
             campaign_resting=bool(raw.get("campaign_resting", False)),
+            campaign_scout_target=_optional_position(raw.get("campaign_scout_target")),
+            campaign_scout_started_tick=int(raw.get("campaign_scout_started_tick", 0)),
+            campaign_scout_last_enemy_tick=int(
+                raw.get("campaign_scout_last_enemy_tick", 0)
+            ),
+            campaign_scout_seen_ticks={
+                _position(value["position"]): int(value["tick"])
+                for value in raw.get("campaign_scout_seen_ticks", [])
+            },
+            campaign_scout_rejections={
+                _position(value["block"]): int(value["tick"])
+                for value in raw.get("campaign_scout_rejections", [])
+            },
+            defense_compressed=bool(raw.get("defense_compressed", False)),
+            defense_calm_since_tick=_optional_integer(
+                raw.get("defense_calm_since_tick")
+            ),
             worker_sectors={
                 str(unit_id): int(block)
                 for unit_id, block in raw.get(
@@ -885,6 +991,7 @@ class WorldMemory:
             worker_sector_layout_version=int(
                 raw.get("worker_sector_layout_version", 0)
             ),
+            worker_sector_count=int(raw.get("worker_sector_count", 0)),
             worker_seen_ticks={
                 _position(value["position"]): int(value["tick"])
                 for value in raw.get("worker_seen_ticks", [])

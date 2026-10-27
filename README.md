@@ -66,13 +66,14 @@ For a long-running local instance that restarts after an unexpected process exit
 ```
 
 The supervisor uses the live defaults `--target-workers 16 --no-max-population
---expedition-mode` when no arguments are supplied. Pass normal CLI arguments to
-override them. The live expedition posture reserves 4 Vanguards on the cardinal
-posts and 16 Rangers around the perimeter, assigns four quadrant patrol teams
-of 2 Rangers each, and grows the Worker economy to 16 units. Surplus combat units
-form one-way expeditions of 2 Vanguards and 2 Rangers. Upgrading an older formation
-preserves the cardinal post owners and patrol Rangers while releasing diagonal
-and patrol Vanguards into expedition staging.
+--expedition-mode --campaign-mode` when no arguments are supplied. Pass normal CLI
+arguments to override them. Campaign mode follows one cumulative Ranger-only
+sequence: `8W -> 16W -> 8R(defense) -> 20R(defense) -> 8R(patrol) -> *R(patrol)`.
+It spends every affordable resource below the max formation and keeps a stockpile
+only after that formation is complete. Every later Ranger remains a patrol unit.
+Legacy expedition squads are recalled, fight normally while returning, and join
+the patrol roster within eight cells of the Core; campaign mode creates no new
+expeditions and no Vanguards.
 
 In the expedition posture, fixed defenders do not pursue enemies. Rangers
 keep survivable shots and cover only cells that still have an unseen or
@@ -88,9 +89,9 @@ Patrol Rangers may pursue a visible fighter only with a healthy local force
 advantage and a supporting shooter that can actually cover the contact. Each
 engagement is limited to four cells from its original contact position and
 six Ticks; the budget survives restarts and continuous sightings do not renew
-it. A threatened Core takes priority. Expeditions retain their independent
-one-way offensive policy. Deliberate empty-cell coverage may produce misses;
-shot counts alone are not a measure of combat success.
+it. A threatened Core takes priority and recalls forward patrols. Deliberate
+empty-cell coverage may produce misses; shot counts alone are not a measure of
+combat success.
 
 For a persistent systemd deployment, install the supplied service after creating
 the virtual environment and `.env` file:
@@ -115,8 +116,12 @@ The bot can relocate the Core between resource chunks without stopping the
 local economy. Long campaigns publish one current-or-cardinal-neighbor chunk
 center at a time; after reaching that roughly 32-cell hop they publish the next
 one. The Core moves for four Ticks, reserves one Tick for a deposit or heal, and
-harvests through its current chunk while defensive posts and patrols follow it.
-The quota goal, current hop, and pause schedule are durable across restarts.
+harvests across the source and destination chunks while defensive posts and
+patrols follow it. Formation tiers cap movement at quota 2, quota 3, and then
+the max formation's quota-8 goal. Before every hop into or within quota 4+,
+patrols must observe the destination block, confirm it is clear, and allow an
+eight-Tick enemy-clear settling window. The quota goal, current hop, scout
+coverage, and pause schedule are durable across restarts.
 
 Plan the cleanest nearby block at the next natural-resource tier:
 

@@ -119,6 +119,7 @@ def test_migration_schedule_survives_memory_round_trip(tmp_path: Path) -> None:
         core_home_position=(-368, 432),
         core_layout_version=CORE_LAYOUT_VERSION,
         core_migration_last_position=(-369, 432),
+        core_migration_start_position=(-400, 432),
         core_migration_steps_since_pause=5,
         core_migration_pause_until_tick=900,
     )
@@ -128,6 +129,7 @@ def test_migration_schedule_survives_memory_round_trip(tmp_path: Path) -> None:
     restored = WorldMemory.load(path)
 
     assert restored.core_migration_last_position == (-369, 432)
+    assert restored.core_migration_start_position == (-400, 432)
     assert restored.core_migration_steps_since_pause == 5
     assert restored.core_migration_pause_until_tick == 900
 
@@ -671,6 +673,8 @@ def test_campaign_rest_allows_an_adjacent_resource_harvest() -> None:
     center = (-945, -945)
     core_object = core(position=center)
     worker_object = unit(2, "WORKER", position=(-944, -945))
+    loaded_worker = unit(500, "WORKER", position=(-943, -945), cargo=1)
+    rangers = [unit(200 + index, "RANGER") for index in range(8)]
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -681,6 +685,8 @@ def test_campaign_rest_allows_an_adjacent_resource_harvest() -> None:
         core_migration_last_position=center,
         core_migration_pause_until_tick=-1,
     )
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
     strategy = AggressiveStrategy(
         memory,
         StrategyConfig(
@@ -692,16 +698,23 @@ def test_campaign_rest_allows_an_adjacent_resource_harvest() -> None:
     )
     turn = make_turn(
         tick=100,
-        objects=[core_object, worker_object],
+        objects=[
+            core_object,
+            worker_object,
+            loaded_worker,
+            *_workers(),
+            *rangers,
+        ],
         resource_cells=[(-944, -945)],
     )
 
     strategy.decide(turn)
 
-    # The quota gate still owes the stage-1 economy, so this is a real rest
-    # stance on the center -- and its neighbours must stay claimable.
+    # A nearby delivery keeps the completed stage-two center in its service
+    # stance.  The adjacent resource cell remains claimable for another Worker.
     assert memory.campaign_resting is True
-    action = turn.plan.unit_actions[turn.workers[0].id]
+    worker = next(unit for unit in turn.workers if str(unit.id) == worker_object["id"])
+    action = turn.plan.unit_actions[worker.id]
     assert action.type == "HARVEST"
 
 
@@ -733,7 +746,7 @@ def test_worker_harvests_resource_blocking_the_core_next_migration_step() -> Non
     )
 
 
-def test_economy_and_patrol_follow_the_current_core_chunk() -> None:
+def test_economy_expands_to_current_and_target_chunks_during_migration() -> None:
     memory = WorldMemory(
         core_home_position=(64, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -743,12 +756,50 @@ def test_economy_and_patrol_follow_the_current_core_chunk() -> None:
 
     chunk = strategy._resource_chunk(moving)
     route = strategy._patrol_ring_route(moving)
+    sectors = strategy._resource_patrol_sectors(moving)
 
     assert chunk is not None
     assert chunk.contains((40, 5))
-    assert not chunk.contains((64, 0))
+    assert chunk.contains((64, 0))
+    assert len(sectors) == 32
     assert route
     assert all(manhattan(cell, (40, 5)) == 18 for cell in route)
+
+
+def test_economy_keeps_the_source_chunk_after_crossing_into_the_target() -> None:
+    memory = WorldMemory(
+        core_home_position=(64, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_start_position=(32, 0),
+    )
+    strategy = _strategy(memory)
+    crossing = make_turn(objects=[core(position=(70, 0))])
+
+    chunk = strategy._resource_chunk(crossing)
+    sectors = strategy._resource_patrol_sectors(crossing)
+
+    assert chunk is not None
+    assert chunk.contains((32, 0))
+    assert chunk.contains((64, 0))
+    assert len(sectors) == 32
+
+
+def test_stale_far_migration_start_does_not_expand_the_economy_area() -> None:
+    memory = WorldMemory(
+        core_home_position=(64, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_start_position=(4096, 4096),
+    )
+    strategy = _strategy(memory)
+    turn = make_turn(objects=[core(position=(70, 0))])
+
+    chunk = strategy._resource_chunk(turn)
+    sectors = strategy._resource_patrol_sectors(turn)
+
+    assert chunk is not None
+    assert chunk.contains((64, 0))
+    assert not chunk.contains((4096, 4096))
+    assert len(sectors) == 16
 
 
 def test_worker_harvests_in_current_chunk_during_long_migration() -> None:

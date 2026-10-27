@@ -128,6 +128,24 @@ def resource_quota_outer_ring(target_quota: int) -> int | None:
     return max(rings) if rings else None
 
 
+def campaign_stop_ring(target_quota: int) -> int | None:
+    """Return the outermost campaign ring allowed at one formation tier.
+
+    Tiers 2 and 3 approach the next quota boundary without crossing it:
+    quota 2 stops at ring 35 beside quota 3, and quota 3 stops at ring 25
+    beside quota 4.  The max formation may enter quota 4 and travels all the
+    way to the outer quota 8 ring.
+    """
+
+    if target_quota <= 2:
+        boundary = resource_quota_outer_ring(3)
+        return None if boundary is None else boundary + 1
+    if target_quota < 8:
+        boundary = resource_quota_outer_ring(target_quota + 1)
+        return None if boundary is None else boundary + 1
+    return resource_quota_outer_ring(target_quota)
+
+
 def cardinal_block_neighbors(block: Position) -> tuple[Position, ...]:
     """Return the four blocks sharing an edge with ``block``."""
 
@@ -216,6 +234,120 @@ def plan_resource_quota(
         current_ring=current_ring,
         goal_ring=target_ring,
         goal_quota=target_quota,
+    )
+
+
+def plan_resource_cap(
+    memory: WorldMemory,
+    *,
+    target_quota: int,
+    stop_ring: int,
+    current_position: Position | None = None,
+    excluded_blocks: frozenset[Position] = frozenset(),
+    allow_lateral: bool = False,
+) -> MigrationPlan | None:
+    """Plan one hop without crossing a formation tier's quota ceiling.
+
+    The planner first uses an inward cardinal neighbor.  Lateral same-ring
+    neighbors are considered only when explicitly allowed and no inward
+    candidate remains, which gives blocked scouting targets a bounded detour
+    without ever increasing the block ring.
+    """
+
+    origin = (
+        current_position
+        or memory.core_migration_last_position
+        or memory.core_home_position
+    )
+    if origin is None:
+        return None
+    current_block = resource_block_index(origin)
+    current_ring = resource_block_ring(current_block)
+    current_quota = resource_block_quota(current_block)
+    if current_quota > target_quota or current_ring <= stop_ring:
+        return None
+
+    def candidates(
+        *, inward: bool
+    ) -> list[tuple[int, int, int, int, int, int, Position, Position]]:
+        found: list[tuple[int, int, int, int, int, int, Position, Position]] = []
+        for block in cardinal_block_neighbors(current_block):
+            ring = resource_block_ring(block)
+            if block in excluded_blocks or resource_block_quota(block) > target_quota:
+                continue
+            if inward and ring >= current_ring:
+                continue
+            if not inward and ring != current_ring:
+                continue
+            block_rocks = sum(cell in memory.obstacles for cell in _block_cells(block))
+            for target in _resource_block_center_cells(
+                (
+                    block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                    block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                )
+            ):
+                if target in memory.obstacles:
+                    continue
+                clear_cells = sum(
+                    (target[0] + dx, target[1] + dy) not in memory.obstacles
+                    for dx in range(
+                        -SYMMETRIC_HOME_CLEAR_RADIUS,
+                        SYMMETRIC_HOME_CLEAR_RADIUS + 1,
+                    )
+                    for dy in range(
+                        -SYMMETRIC_HOME_CLEAR_RADIUS,
+                        SYMMETRIC_HOME_CLEAR_RADIUS + 1,
+                    )
+                    if abs(dx) + abs(dy) <= SYMMETRIC_HOME_CLEAR_RADIUS
+                )
+                blocked_posts = sum(
+                    (target[0] + dx, target[1] + dy) in memory.obstacles
+                    for dx, dy in _DEFENSE_OFFSETS
+                )
+                found.append(
+                    (
+                        ring,
+                        int(target in memory.resource_cells),
+                        blocked_posts,
+                        block_rocks,
+                        -clear_cells,
+                        manhattan(origin, target),
+                        block,
+                        target,
+                    )
+                )
+        return found
+
+    pool = candidates(inward=True)
+    if not pool and allow_lateral:
+        pool = candidates(inward=False)
+    if not pool:
+        return None
+
+    (
+        _ring,
+        _known_resource,
+        blocked_posts,
+        block_rocks,
+        negative_clear,
+        distance,
+        block,
+        target,
+    ) = min(pool)
+    return MigrationPlan(
+        current_block=current_block,
+        current_ring=current_ring,
+        current_quota=current_quota,
+        target_block=block,
+        target_ring=resource_block_ring(block),
+        target_quota=resource_block_quota(block),
+        goal_ring=stop_ring,
+        goal_quota=target_quota,
+        target=target,
+        estimated_cells=distance,
+        block_rocks=block_rocks,
+        clear_cells=-negative_clear,
+        blocked_defense_posts=blocked_posts,
     )
 
 
