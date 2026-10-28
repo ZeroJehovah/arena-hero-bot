@@ -3441,7 +3441,7 @@ class AggressiveStrategy:
         if not core_units:
             return
         service_candidate: Unit | None = None
-        if context.remaining_resource_space > 0:
+        if not context.core_build_priority and context.remaining_resource_space > 0:
             service_candidate = next(
                 (
                     unit
@@ -3450,7 +3450,7 @@ class AggressiveStrategy:
                 ),
                 None,
             )
-        if service_candidate is None:
+        if not context.core_build_priority and service_candidate is None:
             service_candidate = next(
                 (
                     unit
@@ -3464,7 +3464,11 @@ class AggressiveStrategy:
                 ),
                 None,
             )
-        if self._core_migration_in_progress(core.view):
+        if context.core_build_priority:
+            # A spawn lands on the Core cell, so every friendly occupant must
+            # clear before the build-priority service Tick can produce.
+            service_window = True
+        elif self._core_migration_in_progress(core.view):
             service_window = any(worker.cargo > 0 for worker in context.turn.workers)
         elif self.memory.campaign_resting:
             # A resting Core only has to free its cell for cargo that is

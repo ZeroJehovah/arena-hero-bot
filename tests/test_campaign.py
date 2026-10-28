@@ -788,6 +788,37 @@ def test_campaign_migration_build_priority_blocks_unit_heal_that_tick() -> None:
     )
 
 
+def test_campaign_migration_build_priority_clears_a_parked_worker() -> None:
+    """The next spawn needs the Core cell even when the occupant has no cargo."""
+
+    core_object = core(position=(-945, -945))
+    memory = WorldMemory(
+        core_home_position=(-913, -945),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-945, -945),
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(12)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    workers = _workers(16)
+    parked = workers[0]
+    parked["position"] = [-945, -945]
+    population = 16 + len(rangers)
+    turn = make_turn(
+        tick=100,
+        resources=unit_cost(UnitType.RANGER, population),
+        objects=[core_object, *workers, *rangers],
+    )
+
+    _strategy(memory).decide(turn)
+
+    worker = next(unit for unit in turn.workers if str(unit.id) == parked["id"])
+    assert turn.plan.unit_actions[worker.id].type == "MOVE"
+
+
 def test_quota_two_block_departs_after_the_full_stage_two_formation() -> None:
     """Stage two grants quota-2 movement only after 16W+8R is intact."""
 
