@@ -680,6 +680,114 @@ def test_campaign_mid_leg_cargo_yields_without_delaying_core() -> None:
     )
 
 
+def test_campaign_migration_builds_on_the_arrival_tick_then_resumes() -> None:
+    """A formation gap spends the one service Tick before migration resumes."""
+
+    core_object = core(position=(-945, -945))
+    memory = WorldMemory(
+        core_home_position=(-913, -945),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-945, -945),
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(12)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    population = 16 + len(rangers)
+    turn = make_turn(
+        tick=100,
+        resources=unit_cost(UnitType.RANGER, population),
+        objects=[core_object, *_workers(16), *rangers],
+    )
+    strategy = _strategy(memory)
+
+    strategy.decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+    assert memory.core_home_position == (-913, -945)
+
+    resumed = make_turn(
+        tick=101,
+        objects=[core_object, *_workers(16), *rangers],
+    )
+    strategy.decide(resumed)
+
+    assert resumed.plan.core_action is not None
+    assert resumed.plan.core_action.type == "START_MOVE"
+
+
+def test_campaign_migration_build_priority_blocks_deposit_that_tick() -> None:
+    """A build-due service Tick does not let cargo take the Core action first."""
+
+    core_object = core(position=(-945, -945))
+    memory = WorldMemory(
+        core_home_position=(-913, -945),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-945, -945),
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(12)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    workers = _workers(16)
+    loaded = workers[0]
+    loaded["position"] = [-945, -945]
+    loaded["cargo"] = 1
+    population = 16 + len(rangers)
+    turn = make_turn(
+        tick=100,
+        resources=unit_cost(UnitType.RANGER, population),
+        objects=[core_object, *workers, *rangers],
+    )
+
+    _strategy(memory).decide(turn)
+
+    worker = next(unit for unit in turn.workers if str(unit.id) == loaded["id"])
+    assert turn.plan.unit_actions[worker.id].type != "DEPOSIT"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type != "SPAWN"
+
+
+def test_campaign_migration_build_priority_blocks_unit_heal_that_tick() -> None:
+    """A build-due service Tick does not let an ordinary heal take priority."""
+
+    core_object = core(position=(-945, -945))
+    memory = WorldMemory(
+        core_home_position=(-913, -945),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-945, -945),
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(12)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    workers = _workers(16)
+    critical = workers[0]
+    critical["position"] = [-945, -945]
+    critical["hp"] = 1
+    population = 16 + len(rangers)
+    turn = make_turn(
+        tick=100,
+        resources=unit_cost(UnitType.RANGER, population),
+        objects=[core_object, *workers, *rangers],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert not any(
+        decision.actor_id == str(critical["id"]) and decision.action == "HEAL"
+        for decision in report.decisions
+    )
+
+
 def test_quota_two_block_departs_after_the_full_stage_two_formation() -> None:
     """Stage two grants quota-2 movement only after 16W+8R is intact."""
 
@@ -821,8 +929,8 @@ def test_full_bank_center_spawns_before_the_next_campaign_hop() -> None:
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_full_bank_center_keeps_migrating_without_loaded_workers() -> None:
-    """Production only interrupts migration when cargo is waiting behind it."""
+def test_pre_max_migration_spends_an_affordable_formation_gap() -> None:
+    """A pre-max formation gap interrupts migration even without waiting cargo."""
 
     center = (-945, -945)
     core_object = core(position=center)
@@ -846,7 +954,79 @@ def test_full_bank_center_keeps_migrating_without_loaded_workers() -> None:
     _strategy(memory).decide(turn)
 
     assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
+def test_max_formation_migration_does_not_spawn_below_a_full_bank() -> None:
+    """The max formation keeps its full-bank-only reserve while travelling."""
+
+    center = (-945, -945)
+    core_object = core(position=center)
+    workers, rangers, roles = _max_roster()
+    memory = WorldMemory(
+        core_home_position=(-913, -945),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(
+        tick=100,
+        resources=core_resource_capacity(16 + len(rangers)) - 1,
+        objects=[core_object, *workers, *rangers],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "START_MOVE"
+
+
+def test_campaign_center_holds_for_an_affordable_build_before_the_next_hop() -> None:
+    """A center cannot publish a hop while an affordable formation slot is owed."""
+
+    center = (-945, -945)
+    core_object = core(position=center)
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(18)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    turn = make_turn(
+        tick=100,
+        resources=unit_cost(UnitType.RANGER, 16 + len(rangers)),
+        objects=[core_object, *_workers(16), *rangers],
+    )
+    strategy = _strategy(memory)
+
+    strategy.decide(turn)
+
+    assert memory.campaign_resting is True
+    assert memory.core_home_position == center
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+    depleted = make_turn(
+        tick=101,
+        objects=[core_object, *_workers(16), *rangers],
+    )
+    strategy.decide(depleted)
+
+    assert memory.campaign_resting is False
+    assert memory.core_home_position != center
+    assert depleted.plan.core_action is not None
+    assert depleted.plan.core_action.type == "START_MOVE"
 
 
 def test_quota_three_block_waits_for_the_stage_two_roster() -> None:

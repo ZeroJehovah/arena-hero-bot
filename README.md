@@ -118,10 +118,12 @@ Runtime memory and JSONL telemetry are written under `var/` by default.
 The bot can relocate the Core between resource chunks without stopping the
 local economy. Long campaigns publish one current-or-cardinal-neighbor chunk
 center at a time; after reaching that roughly 32-cell hop they publish the next
-one. The Core moves for four Ticks, reserves one Tick for a deposit or heal, and
-harvests across the source and destination chunks while defensive posts and
-patrols follow it. Formation tiers cap movement at quota 2, quota 3, and then
-the max formation's quota-8 goal. Before every hop into or within quota 4+,
+one. The Core moves for four Ticks; an arrival service Tick may spawn a unit,
+heal before depositing, or accept a delivery, keeping the hop to five Ticks. A
+new hop waits until affordable formation slots are built. The economy harvests
+across the source and destination chunks while defensive posts and patrols
+follow it. Formation tiers cap movement at quota 2, quota 3, and then the max
+formation's quota-8 goal. Before every hop into or within quota 4+,
 patrols must observe the destination block, confirm it is clear, and allow an
 eight-Tick enemy-clear settling window. The quota goal, current hop, scout
 coverage, and pause schedule are durable across restarts.

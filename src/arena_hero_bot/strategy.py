@@ -428,6 +428,7 @@ class _TurnContext:
     planned_ids: set[UUID] = field(default_factory=set)
     core_inbound_id: UUID | None = None
     core_service_action: str | None = None
+    core_build_priority: bool = False
     core_migration_direction: Direction | None = None
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
@@ -781,6 +782,7 @@ class AggressiveStrategy:
             raid_ids=raid_ids,
             campaign_patrol_recall_ids=campaign_patrol_recall_ids,
         )
+        context.core_build_priority = self._campaign_build_priority(context)
         static_blockers = context.static_blockers
         if static_blockers is None:
             static_blockers = obstacles
@@ -2626,6 +2628,7 @@ class AggressiveStrategy:
                 if (
                     context.remaining_resource_space > 0
                     and context.core_service_action is None
+                    and not context.core_build_priority
                 ):
                     deposited = min(worker.cargo, context.remaining_resource_space)
                     worker.deposit()
@@ -2657,6 +2660,7 @@ class AggressiveStrategy:
                 context.remaining_resource_space <= 0
                 or context.core_service_action is not None
                 or context.core_inbound_id is not None
+                or context.core_build_priority
             ):
                 if not self._move_to_core_queue(
                     worker,
@@ -3632,6 +3636,8 @@ class AggressiveStrategy:
             and not nearby_combat_enemy
             and not at_home
         ):
+            if self._campaign_migration_spawn(context):
+                return
             if self._migration_pause_active(context.turn):
                 context.report.add(
                     actor_id=str(core.id),
@@ -3650,37 +3656,6 @@ class AggressiveStrategy:
                     target=core.position,
                 )
                 return
-            if self._full_bank_center_service_pending(context):
-                unit_type = None
-                if not self._normal_growth_on_cooldown(context):
-                    unit_type = self._choose_spawn(
-                        context.turn,
-                        context.remaining_resources,
-                    )
-                if unit_type is not None:
-                    if self._core_can_spawn(context):
-                        core.spawn(unit_type)
-                        context.core_service_action = "SPAWN"
-                        context.report.add(
-                            actor_id=str(core.id),
-                            actor_kind="CORE",
-                            action="SPAWN",
-                            reason=(
-                                "produce at the block center to reopen deposit capacity"
-                            ),
-                            target=core.position,
-                        )
-                        return
-                    context.report.add(
-                        actor_id=str(core.id),
-                        actor_kind="CORE",
-                        action="WAIT",
-                        reason=(
-                            "hold the block center to reopen full-Core deposit capacity"
-                        ),
-                        target=core.position,
-                    )
-                    return
             direction = context.core_migration_direction or self._core_home_direction(
                 context
             )
@@ -3831,8 +3806,8 @@ class AggressiveStrategy:
                 actor_kind="CORE",
                 action="WAIT",
                 reason=(
-                    "hold the block center until the delivery queue drains and "
-                    "the quota gate roster is full"
+                    "hold the block center until deliveries, affordable builds, "
+                    "and the quota gate roster are complete"
                 ),
                 target=core.position,
             )
@@ -3925,7 +3900,7 @@ class AggressiveStrategy:
             context=context,
         ):
             return False
-        if context.core_service_action is not None:
+        if context.core_service_action is not None or context.core_build_priority:
             return False
         unit.heal()
         context.remaining_resources -= missing_hp
@@ -8296,9 +8271,10 @@ class AggressiveStrategy:
         """Publish the next hop after the reached block center has been served.
 
         The rest gate is the only hold between hops.  While the Core still owes
-        a nearby delivery or this block's quota gate still owes roster, the
-        published home stays where the Core is standing, so the operation
-        never leaves a center early and never parks off one either.
+        a nearby delivery, an affordable formation build, or this block's
+        quota gate still owes roster, the published home stays where the Core
+        is standing, so the operation never leaves a center early and never
+        parks off one either.
         """
 
         if self.memory.campaign_resting:
@@ -8630,46 +8606,98 @@ class AggressiveStrategy:
             and manhattan(worker.position, core.position) <= CAMPAIGN_REST_RADIUS
         )
 
-    def _full_bank_center_service_pending(self, context: _TurnContext) -> bool:
-        """Whether a full campaign Core must spend a center Tick on production.
-
-        A moving Core cannot accept deposits, and normal production yields to
-        migration everywhere except a block center.  If the bank is full while
-        Workers already carry cargo, continuing the hop only piles more cargo
-        around a Core that cannot accept it.  Use the center's service window
-        to fund the next Unit and reopen deposit capacity before moving on.
-        """
-
-        core = context.turn.core
-        return (
-            core is not None
-            and self.config.campaign_mode
-            and self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
-            and context.remaining_resources >= context.turn.resource_capacity
-            and core.position in _resource_block_center_cells(core.position)
-            and any(worker.cargo > 0 for worker in context.turn.workers)
-        )
-
     def _campaign_rest_complete(self, turn: Turn) -> bool:
         """Return whether the Core may leave the block center it stands on.
 
         Draining every Worker in the block is not the goal: cargo deeper in the
-        chunk keeps walking with the Core.  A rest ends as soon as the service
-        neighbourhood has no delivery left and this block's quota gate holds
-        its roster.
+        chunk keeps walking with the Core.  A rest ends only when the service
+        neighbourhood has no delivery left, every currently affordable campaign
+        formation slot has been produced, and this block's quota gate holds its
+        roster.  Starting a new hop with an owed build would strand the spend
+        for the whole leg.
         """
 
         if self._campaign_pending_deliveries(turn):
             return False
+        if self._campaign_spawn_ready(turn, turn.resources):
+            return False
         return self._campaign_quota_gate_complete(turn)
+
+    def _campaign_spawn_ready(self, turn: Turn, resources: int) -> bool:
+        """Return whether the campaign owes and can fund its next formation slot."""
+
+        if not self.config.campaign_mode:
+            return False
+        candidates = self._campaign_spawn_candidates(turn)
+        if candidates is None:
+            return False
+        if (
+            self._campaign_max_formation_complete(turn)
+            and resources < turn.resource_capacity
+        ):
+            return False
+        return (
+            self._affordable_spawn(
+                turn,
+                resources,
+                candidates,
+                strict_preference=True,
+            )
+            is not None
+        )
+
+    def _campaign_build_priority(self, context: _TurnContext) -> bool:
+        """Reserve the current service Tick for campaign production first."""
+
+        core = context.turn.core
+        if (
+            not self.config.campaign_mode
+            or core is None
+            or core.view.state is not CoreState.NORMAL
+        ):
+            return False
+        if not (
+            self._core_migration_in_progress(core.view) or self.memory.campaign_resting
+        ):
+            return False
+        if self._normal_growth_on_cooldown(context):
+            return False
+        return self._campaign_spawn_ready(
+            context.turn,
+            context.remaining_resources,
+        )
+
+    def _campaign_migration_spawn(self, context: _TurnContext) -> bool:
+        """Spend a migration service Tick on the next campaign Unit."""
+
+        core = context.turn.core
+        if not context.core_build_priority or core is None:
+            return False
+        unit_type = self._choose_spawn(
+            context.turn,
+            context.remaining_resources,
+        )
+        if unit_type is None or not self._core_can_spawn(context):
+            return False
+        core.spawn(unit_type)
+        context.core_service_action = "SPAWN"
+        context.report.add(
+            actor_id=str(core.id),
+            actor_kind="CORE",
+            action="SPAWN",
+            reason="produce the next campaign Unit during migration",
+            target=core.position,
+        )
+        return True
 
     def _campaign_rest_pending(self, turn: Turn) -> bool:
         """Return whether the Core holds a block center instead of walking.
 
         Only a Core standing on its published ``core_home_position`` can rest,
-        and only while a hop is still owed.  Anywhere else the published hop is
-        owed regardless, so a persisted flag can never park the Core away from
-        its target: the stance is recomputed every Turn from the live board.
+        and only while a hop is still owed or an affordable formation build is
+        due.  Anywhere else the published hop is owed regardless, so a
+        persisted flag can never park the Core away from its target: the stance
+        is recomputed every Turn from the live board.
         """
 
         core = turn.core
