@@ -1060,6 +1060,35 @@ def test_campaign_center_holds_for_an_affordable_build_before_the_next_hop() -> 
     assert depleted.plan.core_action.type == "START_MOVE"
 
 
+def test_campaign_build_priority_preempts_beacon_at_the_center() -> None:
+    """A build-due rest spends the Core action before picking up a Beacon."""
+
+    center = (-945, -945)
+    core_object = core(position=center)
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(18)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    turn = make_turn(
+        tick=100,
+        resources=unit_cost(UnitType.RANGER, 16 + len(rangers)),
+        objects=[core_object, *_workers(16), *rangers],
+        beacon={"position": list(center)},
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+
+
 def test_quota_three_block_waits_for_the_stage_two_roster() -> None:
     """Quota 3 is reached here, so the Core holds until the screen is full."""
 

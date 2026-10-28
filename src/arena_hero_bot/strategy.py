@@ -3696,6 +3696,9 @@ class AggressiveStrategy:
                 )
             return
 
+        if context.core_build_priority and self._campaign_migration_spawn(context):
+            return
+
         if (
             not context.beacon_claimed
             and core.position == context.turn.beacon.position
