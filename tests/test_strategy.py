@@ -5032,7 +5032,7 @@ def test_resource_patrol_goal_is_renewed_while_the_worker_closes_in() -> None:
     assert renewed.assigned_tick == progressed.tick
 
 
-def test_loaded_worker_returns_directly_to_shared_core() -> None:
+def test_loaded_worker_closes_a_gap_in_the_shared_core_queue() -> None:
     turn = make_turn(
         objects=[
             core(position=(0, 0)),
@@ -5044,9 +5044,14 @@ def test_loaded_worker_returns_directly_to_shared_core() -> None:
     report = decide(turn, config=StrategyConfig(target_workers=12, max_population=None))
 
     far = next(worker for worker in turn.workers if worker.position == (0, 4))
-    assert far.id not in turn.plan.unit_actions
+    action = turn.plan.unit_actions[far.id]
+    assert action.type == "MOVE"
+    assert manhattan(add(far.position, action.direction), (0, 0)) < manhattan(
+        far.position, (0, 0)
+    )
     assert any(
-        item.actor_id == str(far.id) and item.reason == "hold a unique Core queue slot"
+        item.actor_id == str(far.id)
+        and item.reason == "queue carried resources outside the Core service cell"
         for item in report.decisions
     )
 

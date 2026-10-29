@@ -721,7 +721,7 @@ def test_campaign_migration_builds_on_the_arrival_tick_then_resumes() -> None:
 
 
 def test_campaign_migration_build_priority_blocks_deposit_that_tick() -> None:
-    """A build-due service Tick does not let cargo take the Core action first."""
+    """A build-due service Tick clears the cell and holds for the spawn."""
 
     core_object = core(position=(-945, -945))
     memory = WorldMemory(
@@ -746,12 +746,110 @@ def test_campaign_migration_build_priority_blocks_deposit_that_tick() -> None:
         objects=[core_object, *workers, *rangers],
     )
 
-    _strategy(memory).decide(turn)
+    report = _strategy(memory).decide(turn)
 
     worker = next(unit for unit in turn.workers if str(unit.id) == loaded["id"])
-    assert turn.plan.unit_actions[worker.id].type != "DEPOSIT"
-    assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type != "SPAWN"
+    assert turn.plan.unit_actions[worker.id].type == "MOVE"
+    assert turn.plan.core_action is None
+    assert any(
+        item.actor_kind == "CORE"
+        and item.action == "WAIT"
+        and item.reason
+        == "hold one service Tick for the Core cell to clear before production"
+        for item in report.decisions
+    )
+
+
+def test_campaign_migration_spawns_after_the_cleared_service_tick() -> None:
+    """The one-Tick hold after clearing the Core cell actually produces."""
+
+    core_object = core(position=(-945, -945))
+    memory = WorldMemory(
+        core_home_position=(-913, -945),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-945, -945),
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(12)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    workers = _workers(16)
+    loaded = workers[0]
+    loaded["position"] = [-945, -945]
+    loaded["cargo"] = 1
+    population = 16 + len(rangers)
+    resources = unit_cost(UnitType.RANGER, population)
+    strategy = _strategy(memory)
+
+    first = make_turn(
+        tick=100,
+        resources=resources,
+        objects=[core_object, *workers, *rangers],
+    )
+    strategy.decide(first)
+
+    loaded["position"] = [-944, -945]
+    second = make_turn(
+        tick=101,
+        resources=resources,
+        objects=[core_object, *workers, *rangers],
+    )
+    strategy.decide(second)
+
+    assert second.plan.core_action is not None
+    assert second.plan.core_action.type == "SPAWN"
+
+
+def test_full_bank_mid_migration_does_not_skip_the_cleared_spawn_tick() -> None:
+    """A full bank clears the staged Worker, holds, then spends on the Ranger."""
+
+    core_object = core(position=(-945, -945))
+    memory = WorldMemory(
+        core_home_position=(-913, -945),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(-945, -945),
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+    )
+    workers, rangers, roles = _max_roster()
+    memory.unit_roles = roles
+    memory.unit_roles_initialized = True
+    loaded = workers[0]
+    loaded["position"] = [-945, -945]
+    loaded["cargo"] = 1
+    resources = core_resource_capacity(len(workers) + len(rangers))
+    strategy = _strategy(memory)
+
+    first = make_turn(
+        tick=100,
+        resources=resources,
+        objects=[core_object, *workers, *rangers],
+    )
+    report = strategy.decide(first)
+
+    assert first.plan.core_action is None
+    assert any(
+        item.actor_kind == "CORE"
+        and item.action == "WAIT"
+        and item.reason
+        == "hold one service Tick for the Core cell to clear before production"
+        for item in report.decisions
+    )
+
+    loaded["position"] = [-944, -945]
+    second = make_turn(
+        tick=101,
+        resources=resources,
+        objects=[core_object, *workers, *rangers],
+    )
+    strategy.decide(second)
+
+    assert second.plan.core_action is not None
+    assert second.plan.core_action.type == "SPAWN"
+    assert second.plan.core_action.unit_type is UnitType.RANGER
 
 
 def test_campaign_migration_build_priority_blocks_unit_heal_that_tick() -> None:

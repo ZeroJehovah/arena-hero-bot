@@ -3255,11 +3255,22 @@ class AggressiveStrategy:
         *,
         reason: str,
     ) -> bool:
-        """Move a unit toward a unique temporary Core queue slot."""
+        """Move a unit toward a unique temporary Core queue slot.
+
+        Loaded Workers must keep closing empty cells between them and the
+        Core.  Treating every unique cell inside the queue radius as a final
+        parking spot left the service doorstep empty whenever the Worker on
+        the Core finished depositing: the nearest loaded Worker could be two
+        or more cells away and no one could enter on the departure Tick.  A
+        loaded Worker now waits only on the adjacent front rank, or when every
+        closer queue cell is already occupied or reserved.  Other Units keep
+        the old stable-slot behavior.
+        """
 
         if self._has_unit_action(unit, context):
             return False
         core = context.turn.core
+        goals: tuple[Position, ...] | None = None
         if core is not None:
             distance = manhattan(unit.position, core.position)
             if (
@@ -3268,9 +3279,30 @@ class AggressiveStrategy:
                 and unit.position not in self.memory.obstacles
                 and unit.position not in context.enemy_positions
             ):
-                self._record_wait(unit, context, "hold a unique Core queue slot")
-                return True
-        for goal in self._core_queue_positions(unit, context):
+                loaded_worker = isinstance(unit, Worker) and unit.cargo > 0
+                closer_slot = (
+                    loaded_worker
+                    and distance > 1
+                    and self._has_open_core_queue_cell_closer_than(
+                        unit,
+                        core.position,
+                        context,
+                        distance,
+                    )
+                )
+                if not closer_slot:
+                    self._record_wait(unit, context, "hold a unique Core queue slot")
+                    return True
+                goals = self._core_queue_positions(unit, context)
+                goals = tuple(
+                    goal for goal in goals if manhattan(goal, core.position) < distance
+                )
+                if not goals:
+                    self._record_wait(unit, context, "hold a unique Core queue slot")
+                    return True
+        if goals is None:
+            goals = self._core_queue_positions(unit, context)
+        for goal in goals:
             context.standing_reserved.add(goal)
             if self._move(
                 unit,
@@ -3283,6 +3315,40 @@ class AggressiveStrategy:
             ):
                 return True
             context.standing_reserved.discard(goal)
+        return False
+
+    def _has_open_core_queue_cell_closer_than(
+        self,
+        unit: Unit,
+        core_position: Position,
+        context: _TurnContext,
+        distance: int,
+    ) -> bool:
+        """Return whether a cheaper queue cell exists before pathfinding.
+
+        The geometric check keeps the queue-compaction change off the hot
+        path: Workers already behind a full front rank hold without paying for
+        a route search across every candidate cell.
+        """
+
+        blockers = self._static_blockers(unit, context)
+        for radius in range(1, distance):
+            for dx in range(-radius, radius + 1):
+                dy = radius - abs(dx)
+                offsets = ((dx, dy),) if dy == 0 else ((dx, dy), (dx, -dy))
+                for offset_x, offset_y in offsets:
+                    position = (
+                        core_position[0] + offset_x,
+                        core_position[1] + offset_y,
+                    )
+                    if (
+                        position in blockers
+                        or position in context.enemy_positions
+                        or position in context.standing_reserved
+                        or self._predicted_friendly_occupancy(position, context) != 0
+                    ):
+                        continue
+                    return True
         return False
 
     def _move_to_moving_core_hold(
@@ -8675,7 +8741,16 @@ class AggressiveStrategy:
         )
 
     def _campaign_migration_spawn(self, context: _TurnContext) -> bool:
-        """Spend a migration service Tick on the next campaign Unit."""
+        """Spend a migration service Tick on the next campaign Unit.
+
+        A service Tick that first has to clear a friendly from the Core cell
+        cannot also spawn: the server resolves that departure before a new
+        Unit may occupy the same two-entity cell.  Previously the Core started
+        its next four-Tick move immediately, so a stream of loaded Workers
+        staging on each arrival cell could suppress production for many steps.
+        Hold this one Tick instead; the cleared cell is ready for the spawn on
+        the next Turn.
+        """
 
         core = context.turn.core
         if not context.core_build_priority or core is None:
@@ -8684,7 +8759,27 @@ class AggressiveStrategy:
             context.turn,
             context.remaining_resources,
         )
-        if unit_type is None or not self._core_can_spawn(context):
+        if unit_type is None:
+            return False
+        if not self._core_can_spawn(context):
+            core_position = core.position
+            if (
+                context.core_service_action is None
+                and context.departure_counts.get(core_position, 0) > 0
+                and context.arrival_counts.get(core_position, 0) == 0
+                and self._predicted_friendly_occupancy(core_position, context) <= 1
+            ):
+                context.report.add(
+                    actor_id=str(core.id),
+                    actor_kind="CORE",
+                    action="WAIT",
+                    reason=(
+                        "hold one service Tick for the Core cell to clear before "
+                        "production"
+                    ),
+                    target=core.position,
+                )
+                return True
             return False
         core.spawn(unit_type)
         context.core_service_action = "SPAWN"

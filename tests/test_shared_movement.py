@@ -190,6 +190,53 @@ def test_core_service_accepts_one_deposit_and_queues_the_next_unit():
     ]
 
 
+def test_core_service_pipeline_keeps_the_next_loaded_worker_at_the_door():
+    """A deposit frees the Core cell and the next Worker compacts toward it."""
+
+    turn = make_turn(
+        resources=2,
+        objects=[
+            core(),
+            unit(2, "WORKER", cargo=1),
+            unit(3, "WORKER", position=(2, 0), cargo=1),
+        ],
+    )
+    report = AggressiveStrategy(WorldMemory()).decide(turn)
+
+    depositing, waiting = turn.workers
+    assert turn.plan.unit_actions[depositing.id].type == "DEPOSIT"
+    waiting_action = turn.plan.unit_actions[waiting.id]
+    assert waiting_action.type == "MOVE"
+    assert add(waiting.position, waiting_action.direction) == (1, 0)
+    assert any(
+        decision.actor_id == str(waiting.id)
+        and decision.reason == "queue carried resources outside the Core service cell"
+        for decision in report.decisions
+    )
+
+
+def test_core_service_pipeline_admits_the_front_worker_on_departure():
+    """The next loaded Worker enters on the Tick the depositor leaves."""
+
+    turn = make_turn(
+        resources=2,
+        objects=[
+            core(),
+            unit(2, "WORKER"),
+            unit(3, "WORKER", position=(1, 0), cargo=1),
+        ],
+    )
+    AggressiveStrategy(WorldMemory()).decide(turn)
+
+    leaving, entering = turn.workers
+    leaving_action = turn.plan.unit_actions[leaving.id]
+    entering_action = turn.plan.unit_actions[entering.id]
+    assert leaving_action.type == "MOVE"
+    assert add(leaving.position, leaving_action.direction) != (0, 0)
+    assert entering_action.type == "MOVE"
+    assert add(entering.position, entering_action.direction) == (0, 0)
+
+
 def test_shared_core_deposits_respect_remaining_capacity():
     turn = make_turn(
         resources=9,
