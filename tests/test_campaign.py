@@ -6,7 +6,7 @@ from pathlib import Path
 
 from arena_hero import UnitType, core_resource_capacity, unit_cost
 
-from arena_hero_bot.geometry import manhattan
+from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import ExpeditionSquad, WorldMemory
 from arena_hero_bot.migration import (
     blocks_are_cardinally_adjacent,
@@ -1028,6 +1028,53 @@ def test_campaign_rest_clears_the_service_cell_for_the_next_delivery() -> None:
         and item.reason == "leave Core service cell for unique traffic"
         for item in report.decisions
     )
+
+
+def test_campaign_rest_pipeline_admits_the_next_worker_on_departure() -> None:
+    """A resting Core swaps one service Worker for the next in one Tick."""
+
+    center = (-945, -945)
+    core_object = core(position=center)
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE2,
+        campaign_target_quota=3,
+        campaign_last_core_id=core_object["id"],
+        campaign_resting=True,
+    )
+    rangers = _rangers(8)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    leaving = unit(600, "WORKER", position=center)
+    entering = unit(601, "WORKER", position=(-944, -945), cargo=1)
+    turn = make_turn(
+        tick=100,
+        resources=2,
+        objects=[core_object, leaving, entering, *rangers],
+    )
+
+    AggressiveStrategy(
+        memory,
+        StrategyConfig(
+            target_workers=16,
+            max_population=None,
+            expedition_mode=True,
+            campaign_mode=True,
+        ),
+    ).decide(turn)
+
+    leaving_unit = next(unit for unit in turn.workers if str(unit.id) == leaving["id"])
+    entering_unit = next(
+        unit for unit in turn.workers if str(unit.id) == entering["id"]
+    )
+    leaving_action = turn.plan.unit_actions[leaving_unit.id]
+    entering_action = turn.plan.unit_actions[entering_unit.id]
+    assert leaving_action.type == "MOVE"
+    assert add(leaving_unit.position, leaving_action.direction) != center
+    assert entering_action.type == "MOVE"
+    assert add(entering_unit.position, entering_action.direction) == center
 
 
 def test_full_bank_center_spawns_before_the_next_campaign_hop() -> None:
