@@ -2849,7 +2849,7 @@ def test_loaded_worker_reserves_migrating_core_destination() -> None:
     assert action.type == "MOVE"
     assert action.direction is Direction.LEFT
     assert any(
-        item.reason == "stage the next carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources on the Core forward route"
         for item in report.decisions
     )
 
@@ -2874,7 +2874,7 @@ def test_worker_does_not_deposit_while_core_is_moving() -> None:
     assert action.type == "MOVE"
     assert action.direction is Direction.RIGHT
     assert any(
-        item.reason == "stage the next carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources on the Core forward route"
         for item in report.decisions
     )
 
@@ -2899,7 +2899,7 @@ def test_worker_follows_far_cargo_toward_a_migrating_core() -> None:
     assert action.type == "MOVE"
     assert action.direction is Direction.LEFT
     assert any(
-        item.reason == "stage the next carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources on the Core forward route"
         for item in report.decisions
     )
 

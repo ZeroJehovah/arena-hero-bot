@@ -31,6 +31,8 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
     memory = WorldMemory()
     memory.core_home_position = (-400, 655)
     memory.core_layout_version = 3
+    memory.core_arrival_worker_id = object_id(2)
+    memory.core_arrival_destination = (1, 0)
     memory.observe(turn)
     memory.set_goal("worker", UnitGoal((9, 9), 50, "explore"))
     memory.last_normal_growth_tick = 40
@@ -50,6 +52,8 @@ def test_observations_round_trip_without_hidden_data(tmp_path) -> None:
     assert loaded.last_normal_growth_resources == 17
     assert loaded.core_home_position == (-400, 655)
     assert loaded.core_layout_version == 3
+    assert loaded.core_arrival_worker_id == object_id(2)
+    assert loaded.core_arrival_destination == (1, 0)
     assert loaded.recent_positions(str(turn.workers[0].id)) == ()
     assert turn.core is not None
     assert loaded.recent_positions(str(turn.core.id)) == ()

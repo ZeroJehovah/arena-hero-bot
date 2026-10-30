@@ -591,7 +591,7 @@ def test_loaded_worker_stages_at_moving_core_destination() -> None:
     assert action.type == "MOVE"
     assert action.direction.value == "LEFT"
     assert any(
-        item.reason == "stage the next carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources on the Core forward route"
         for item in report.decisions
     )
 
@@ -618,15 +618,157 @@ def test_only_one_loaded_worker_stages_at_moving_core_destination() -> None:
     staging_action = turn.plan.unit_actions[staging.id]
     assert staging_action.type == "MOVE"
     assert staging_action.direction.value == "LEFT"
-    assert waiting.id not in turn.plan.unit_actions or (
-        turn.plan.unit_actions[waiting.id].type == "WAIT"
-    )
+    waiting_action = turn.plan.unit_actions.get(waiting.id)
+    assert waiting_action is None or waiting_action.type in {"MOVE", "WAIT"}
     assert any(
         item.actor_id == str(waiting.id)
-        and item.action == "WAIT"
-        and item.reason == "hold a unique Core queue slot"
+        and item.action == "MOVE"
+        and item.reason == "queue carried resources on the Core forward route"
+        and item.target != (1, 0)
         for item in report.decisions
     )
+
+
+def test_loaded_workers_queue_on_the_core_forward_route() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    turn = make_turn(
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+            unit(3, "WORKER", position=(0, 1), cargo=1),
+            unit(4, "WORKER", position=(-1, 0), cargo=1),
+            unit(5, "WORKER", position=(0, -1), cargo=1),
+        ]
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    decisions = {
+        item.actor_id: item for item in report.decisions if item.actor_kind == "WORKER"
+    }
+    staging = next(worker for worker in turn.workers if worker.position == (2, 0))
+    assert decisions[str(staging.id)].target == (1, 0)
+    assert decisions[str(staging.id)].reason == (
+        "stage the next carried resources on the Core forward route"
+    )
+    queued = [
+        decisions[str(worker.id)]
+        for worker in turn.workers
+        if worker.position != (2, 0)
+    ]
+    assert sorted(target for item in queued if (target := item.target) is not None) == [
+        (2, 0),
+        (3, 0),
+        (4, 0),
+    ]
+    assert all(
+        item.reason == "queue carried resources on the Core forward route"
+        for item in queued
+    )
+
+
+def test_migrating_core_service_tick_queues_cargo_on_the_forward_route() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 0), cargo=1),
+            unit(3, "WORKER", position=(0, 1), cargo=1),
+            unit(4, "WORKER", position=(-1, 0), cargo=1),
+        ]
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    depositor = next(worker for worker in turn.workers if worker.position == (0, 0))
+    assert turn.plan.unit_actions[depositor.id].type == "DEPOSIT"
+    decisions = {
+        item.actor_id: item for item in report.decisions if item.actor_kind == "WORKER"
+    }
+    off_core = [
+        decisions[str(worker.id)]
+        for worker in turn.workers
+        if worker.position != (0, 0)
+    ]
+    assert all(item.target != (0, 0) for item in off_core)
+    assert all(item.target in {(1, 0), (2, 0), (3, 0), (4, 0)} for item in off_core)
+    assert any(
+        item.reason == "stage the next carried resources on the Core forward route"
+        for item in off_core
+    )
+
+
+def test_core_arrival_worker_stays_committed_to_the_same_forward_cell() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+            unit(3, "WORKER", position=(0, 1), cargo=1),
+        ],
+    )
+    first_report = _strategy(memory).decide(first)
+    selected = next(worker for worker in first.workers if worker.position == (2, 0))
+    assert memory.core_arrival_worker_id == str(selected.id)
+    assert any(
+        item.actor_id == str(selected.id)
+        and item.reason == "stage the next carried resources on the Core forward route"
+        for item in first_report.decisions
+    )
+
+    second = make_turn(
+        tick=101,
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=3,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(3, 0), cargo=1),
+            unit(3, "WORKER", position=(1, 1), cargo=1),
+        ],
+    )
+    second_report = _strategy(memory).decide(second)
+
+    assert memory.core_arrival_worker_id == str(selected.id)
+    decisions = {
+        item.actor_id: item
+        for item in second_report.decisions
+        if item.actor_kind == "WORKER"
+    }
+    assert decisions[str(selected.id)].target == (1, 0)
+    assert decisions[str(selected.id)].reason == (
+        "stage the next carried resources on the Core forward route"
+    )
+    closer = next(worker for worker in second.workers if worker.position == (1, 1))
+    assert decisions[str(closer.id)].target != (1, 0)
 
 
 def test_loaded_worker_in_the_next_core_cell_holds_for_the_arrival_tick() -> None:
@@ -690,7 +832,7 @@ def test_loaded_worker_already_on_the_next_core_cell_is_not_yielded() -> None:
 
 def test_loaded_worker_can_cross_clear_space_to_a_stationary_core() -> None:
     memory = WorldMemory(
-        core_home_position=(8, 0),
+        core_home_position=(0, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
     )
     turn = make_turn(
@@ -705,9 +847,10 @@ def test_loaded_worker_can_cross_clear_space_to_a_stationary_core() -> None:
 
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction.value == "RIGHT"
     assert any(
-        item.action == "MOVE" and item.reason == "return carried resources to Core"
+        item.action == "MOVE"
+        and item.reason == "return carried resources to Core"
+        and item.target == (0, 0)
         for item in report.decisions
     )
 
@@ -733,7 +876,7 @@ def test_loaded_worker_routes_around_the_locked_core_approach() -> None:
     assert action.type == "MOVE"
     assert action.direction.value == "UP"
     assert any(
-        item.reason == "stage the next carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources on the Core forward route"
         for item in report.decisions
     )
 
