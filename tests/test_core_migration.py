@@ -771,6 +771,48 @@ def test_core_arrival_worker_stays_committed_to_the_same_forward_cell() -> None:
     assert decisions[str(closer.id)].target != (1, 0)
 
 
+def test_stacked_loaded_workers_separate_when_the_forward_queue_is_full() -> None:
+    memory = WorldMemory(
+        core_home_position=(8, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    turn = make_turn(
+        objects=[
+            core(
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[1, 0],
+            ),
+            unit(2, "WORKER", position=(1, 0), cargo=1),
+            unit(3, "WORKER", position=(2, 0), cargo=1),
+            unit(4, "WORKER", position=(3, 0), cargo=1),
+            unit(5, "WORKER", position=(4, 0), cargo=1),
+            unit(6, "WORKER", position=(-1, -1), cargo=1),
+            unit(7, "WORKER", position=(-1, -1), cargo=1),
+        ]
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    decisions = {
+        item.actor_id: item for item in report.decisions if item.actor_kind == "WORKER"
+    }
+    stacked = [worker for worker in turn.workers if worker.position == (-1, -1)]
+    moved = [
+        decisions[str(worker.id)]
+        for worker in stacked
+        if worker.id in turn.plan.unit_actions
+    ]
+    assert len(moved) == 1
+    assert moved[0].reason == "separate from a shared Core queue waiting cell"
+    assert moved[0].target not in {(1, 0), (2, 0), (3, 0), (4, 0), (0, 0)}
+    assert moved[0].target is not None
+    assert manhattan(moved[0].target, (0, 0)) >= 2
+
+
 def test_loaded_worker_in_the_next_core_cell_holds_for_the_arrival_tick() -> None:
     turn = make_turn(
         objects=[

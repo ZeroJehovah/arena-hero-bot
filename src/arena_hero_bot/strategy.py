@@ -3459,6 +3459,10 @@ class AggressiveStrategy:
                         return True
                     context.standing_reserved.discard(goal)
                 return False
+            if self._predicted_friendly_occupancy(
+                unit.position, context
+            ) >= 2 and self._separate_core_queue_waiter(unit, context):
+                return True
             self._record_wait(
                 unit,
                 context,
@@ -3533,6 +3537,43 @@ class AggressiveStrategy:
                 continue
             candidates.append((index, manhattan(unit.position, position), position))
         return tuple(position for _, _, position in sorted(candidates))
+
+    def _separate_core_queue_waiter(
+        self,
+        unit: Unit,
+        context: _TurnContext,
+    ) -> bool:
+        """Move one of two stacked loaded Workers to a unique holding cell."""
+
+        core = context.turn.core
+        if core is None:
+            return False
+        current_distance = manhattan(unit.position, core.position)
+        blockers = self._static_blockers(unit, context)
+        for position in adjacent_positions(unit.position):
+            if (
+                position == core.position
+                or position in context.core_migration_lane
+                or position in blockers
+                or position in context.enemy_positions
+                or position in context.standing_reserved
+                or self._predicted_friendly_occupancy(position, context) != 0
+                or manhattan(position, core.position) < current_distance
+            ):
+                continue
+            context.standing_reserved.add(position)
+            if self._move(
+                unit,
+                position,
+                context,
+                reason="separate from a shared Core queue waiting cell",
+                allow_goal=True,
+                intent=_MoveIntent.STAND,
+                extra_blockers=set(context.core_migration_lane),
+            ):
+                return True
+            context.standing_reserved.discard(position)
+        return False
 
     def _has_open_core_queue_cell_closer_than(
         self,
