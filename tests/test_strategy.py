@@ -2849,7 +2849,7 @@ def test_loaded_worker_reserves_migrating_core_destination() -> None:
     assert action.type == "MOVE"
     assert action.direction is Direction.LEFT
     assert any(
-        item.reason == "stage carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources at the Core arrival cell"
         for item in report.decisions
     )
 
@@ -2874,7 +2874,7 @@ def test_worker_does_not_deposit_while_core_is_moving() -> None:
     assert action.type == "MOVE"
     assert action.direction is Direction.RIGHT
     assert any(
-        item.reason == "stage carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources at the Core arrival cell"
         for item in report.decisions
     )
 
@@ -2899,12 +2899,12 @@ def test_worker_follows_far_cargo_toward_a_migrating_core() -> None:
     assert action.type == "MOVE"
     assert action.direction is Direction.LEFT
     assert any(
-        item.reason == "stage carried resources at the Core arrival cell"
+        item.reason == "stage the next carried resources at the Core arrival cell"
         for item in report.decisions
     )
 
 
-def test_loaded_worker_approaches_stationary_core_service_cell() -> None:
+def test_loaded_worker_holds_the_next_stationary_core_service_cell() -> None:
     turn = make_turn(
         objects=[
             core(position=(0, 0)),
@@ -2922,11 +2922,14 @@ def test_loaded_worker_approaches_stationary_core_service_cell() -> None:
         config=StrategyConfig(target_workers=16, expedition_mode=True),
     )
 
-    action = turn.plan.unit_actions[turn.workers[0].id]
-    assert action.type == "MOVE"
+    worker = turn.workers[0]
+    assert worker.id not in turn.plan.unit_actions or (
+        turn.plan.unit_actions[worker.id].type == "WAIT"
+    )
     assert any(
-        item.actor_id == str(turn.workers[0].id)
-        and item.reason == "yield the Core migration lane"
+        item.actor_id == str(worker.id)
+        and item.action == "WAIT"
+        and item.reason == "hold the next Core arrival slot for in-transit delivery"
         for item in report.decisions
     )
     assert turn.plan.core_action is not None

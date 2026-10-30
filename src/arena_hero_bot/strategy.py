@@ -432,6 +432,7 @@ class _TurnContext:
     core_migration_direction: Direction | None = None
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
+    core_arrival_worker_id: UUID | None = None
     core_escape_direction: Direction | None = None
     core_escape_destination: Position | None = None
     core_resource_clearance_target: Position | None = None
@@ -888,6 +889,7 @@ class AggressiveStrategy:
             # queue that defines the rest can actually reach the Core.
             self._prepare_core_departure(context)
             self._yield_core_migration_step(context)
+            context.core_arrival_worker_id = self._select_core_arrival_worker(context)
         combat_units = [
             unit
             for unit in (*turn.rangers, *turn.vanguards)
@@ -2574,32 +2576,46 @@ class AggressiveStrategy:
 
         assigned_resource = context.resource_assignments.get(worker.id)
         if self._core_migration_in_progress(core.view):
+            arrival = context.core_migration_destination or core.view.destination
+            if worker.cargo > 0 and arrival is not None and worker.position == arrival:
+                self.memory.clear_goal(str(worker.id))
+                self._record_wait(
+                    worker,
+                    context,
+                    "hold the next Core arrival slot for in-transit delivery",
+                )
+                return
             if worker.cargo > 0 and not self._core_accepts_deposits(context.turn):
                 self.memory.clear_goal(str(worker.id))
-                arrival = core.view.destination or core.position
-                if worker.position == arrival:
-                    self._record_wait(
+                if (
+                    arrival is not None
+                    and worker.id == context.core_arrival_worker_id
+                    and self._move(
                         worker,
+                        arrival,
                         context,
-                        "wait at the Core arrival cell for in-transit delivery",
+                        reason=(
+                            "stage the next carried resources at the Core arrival cell"
+                        ),
+                        allow_goal=True,
+                        intent=_MoveIntent.INBOUND,
+                        extra_blockers=(
+                            {core.position, *adjacent_positions(core.position)}
+                            - {arrival}
+                        ),
                     )
+                ):
                     return
-                if self._move(
+                if self._move_to_core_queue(
                     worker,
-                    arrival,
                     context,
-                    reason="stage carried resources at the Core arrival cell",
-                    allow_goal=True,
-                    intent=_MoveIntent.INBOUND,
-                    extra_blockers=(
-                        {core.position, *adjacent_positions(core.position)} - {arrival}
-                    ),
+                    reason="hold carried resources near the moving Core",
                 ):
                     return
                 self._record_wait(
                     worker,
                     context,
-                    "wait for a path to the Core arrival cell",
+                    "hold carried resources near the moving Core",
                 )
                 return
             if (
@@ -3124,6 +3140,17 @@ class AggressiveStrategy:
             for unit in sorted(blockers, key=lambda candidate: candidate.id.bytes):
                 if (
                     lane_position == destination
+                    and isinstance(unit, Worker)
+                    and unit.cargo > 0
+                    and self._predicted_friendly_occupancy(lane_position, context) == 1
+                ):
+                    # The Core may share its next cell with one loaded Worker.
+                    # Keeping that Worker in place preserves the arrival-Tick
+                    # delivery instead of chasing it out and immediately
+                    # asking the same Worker to stage there again.
+                    continue
+                if (
+                    lane_position == destination
                     and self._predicted_friendly_occupancy(lane_position, context) >= 2
                     and self._predicted_friendly_occupancy(core.position, context) < 2
                 ):
@@ -3225,9 +3252,15 @@ class AggressiveStrategy:
                     if (
                         position in blockers
                         or position in context.enemy_positions
+                        or position in context.core_migration_lane
                         or position == core.position
                         or position in context.standing_reserved
                         or self._predicted_friendly_occupancy(position, context) != 0
+                        or (
+                            core.view.state is CoreState.MOVING
+                            and position == core.view.destination
+                            and unit.id != context.core_arrival_worker_id
+                        )
                         or not self._has_static_route(
                             unit,
                             position,
@@ -3247,6 +3280,42 @@ class AggressiveStrategy:
                 ),
             )
         )
+
+    def _select_core_arrival_worker(
+        self,
+        context: _TurnContext,
+    ) -> UUID | None:
+        """Choose one loaded Worker to occupy the moving Core's next cell."""
+
+        core = context.turn.core
+        if (
+            core is None
+            or core.view.state is not CoreState.MOVING
+            or core.view.destination is None
+        ):
+            return None
+        arrival = core.view.destination
+        candidates = sorted(
+            (
+                worker
+                for worker in context.turn.workers
+                if worker.cargo > 0 and worker.id not in context.planned_ids
+            ),
+            key=lambda worker: (
+                worker.position != arrival,
+                manhattan(worker.position, arrival),
+                worker.id.bytes,
+            ),
+        )
+        for worker in candidates:
+            if worker.position == arrival or self._has_static_route(
+                worker,
+                arrival,
+                context,
+                allow_goal=True,
+            ):
+                return worker.id
+        return None
 
     def _move_to_core_queue(
         self,
@@ -3332,6 +3401,7 @@ class AggressiveStrategy:
         """
 
         blockers = self._static_blockers(unit, context)
+        core = context.turn.core
         for radius in range(1, distance):
             for dx in range(-radius, radius + 1):
                 dy = radius - abs(dx)
@@ -3344,8 +3414,15 @@ class AggressiveStrategy:
                     if (
                         position in blockers
                         or position in context.enemy_positions
+                        or position in context.core_migration_lane
                         or position in context.standing_reserved
                         or self._predicted_friendly_occupancy(position, context) != 0
+                        or (
+                            core is not None
+                            and core.view.state is CoreState.MOVING
+                            and position == core.view.destination
+                            and unit.id != context.core_arrival_worker_id
+                        )
                     ):
                         continue
                     return True
@@ -4690,6 +4767,7 @@ class AggressiveStrategy:
             core is not None
             and self._core_approach_locked(context.turn)
             and not stationary_core_service
+            and not (isinstance(unit, Worker) and unit.cargo > 0)
             and not core_resource_clearance
             and manhattan(destination, core.position) <= CORE_MIGRATION_CLEAR_RADIUS
             and manhattan(destination, core.position)
@@ -8280,12 +8358,18 @@ class AggressiveStrategy:
         self,
         turn: Turn,
         origin: Position,
+        *,
+        preferred_target: Position | None = None,
     ) -> Position | None:
         """Choose a nearby center that permanent terrain does not seal off.
 
         Resource cells are excluded from the route check because Workers can
         clear them, while rocks cannot be crossed.  A center inside a rock cave
         can never become reachable and must not remain a published target.
+        When an adjacent hop becomes blocked after its center was published,
+        first try the other center cells in that same target block.  Falling
+        back to the current block before exhausting the intended block would
+        turn a fresh discovery into a visible Core reversal.
         """
 
         from .migration import (
@@ -8301,6 +8385,11 @@ class AggressiveStrategy:
         current_block = resource_block_index(origin)
         current_ring = resource_block_ring(current_block)
         movement_cap = self._campaign_movement_cap(turn)
+        preferred_block = (
+            resource_block_index(preferred_target)
+            if preferred_target is not None
+            else None
+        )
         blocks = (current_block, *cardinal_block_neighbors(current_block))
         candidates: list[tuple[int, int, int, int, int, Position]] = []
         for block in blocks:
@@ -8311,10 +8400,23 @@ class AggressiveStrategy:
                 and (movement_cap is None or resource_block_quota(block) > movement_cap)
             ):
                 continue
+            ring_delta = resource_block_ring(block) - current_ring
+            if preferred_block is not None and preferred_block != current_block:
+                block_priority = (
+                    0
+                    if block == preferred_block
+                    else 1
+                    if ring_delta < 0
+                    else 2
+                    if block == current_block
+                    else 3
+                )
+            else:
+                block_priority = 0 if block == current_block else 1
             candidates.extend(
                 (
-                    int(adjacent),
-                    resource_block_ring(block) - current_ring,
+                    block_priority,
+                    ring_delta,
                     int(cell in resources),
                     int(cell in occupied),
                     manhattan(origin, cell),
@@ -8347,7 +8449,11 @@ class AggressiveStrategy:
     ) -> Position | None:
         """Replace an unreachable home or release the Core from the wait."""
 
-        target = self._reachable_home_target(turn, origin)
+        target = self._reachable_home_target(
+            turn,
+            origin,
+            preferred_target=self.memory.core_home_position,
+        )
         if target is None:
             self.memory.core_home_position = None
             self.memory.core_migration_start_position = None
@@ -8396,7 +8502,11 @@ class AggressiveStrategy:
             )
             if valid and not block_changed:
                 return
-        target = self._reachable_home_target(turn, core.position)
+        target = self._reachable_home_target(
+            turn,
+            core.position,
+            preferred_target=home,
+        )
         self.memory.core_migration_start_position = None
         if target is None:
             self.memory.core_home_position = None

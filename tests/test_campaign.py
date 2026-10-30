@@ -119,6 +119,41 @@ def test_campaign_replaces_a_rock_sealed_block_center() -> None:
     assert turn.plan.core_action.type == "START_MOVE"
 
 
+def test_campaign_repairs_a_blocked_adjacent_center_in_the_same_block() -> None:
+    """A newly seen rock must not send an advancing Core back to its old block."""
+
+    origin = (-1033, -15)
+    blocked_center = (-1008, -16)
+    core_object = core(9, position=origin)
+    workers, rangers, roles = _max_roster()
+    memory = WorldMemory(
+        core_home_position=blocked_center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=origin,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(
+        objects=[core_object, *workers, *rangers],
+        obstacles=[blocked_center],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.core_home_position is not None
+    assert memory.core_home_position != blocked_center
+    assert resource_block_index(memory.core_home_position) == resource_block_index(
+        blocked_center
+    )
+    assert memory.core_home_position not in turn.obstacle_cells
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert turn.plan.core_action.direction.value == "RIGHT"
+
+
 def test_explicit_quota_plan_publishes_one_adjacent_hop() -> None:
     memory = WorldMemory(core_home_position=(-2033, -2929))
 
@@ -695,8 +730,8 @@ def test_campaign_continues_to_a_valid_adjacent_center() -> None:
     assert not any("hold the block center" in item.reason for item in report.decisions)
 
 
-def test_campaign_mid_leg_cargo_yields_without_delaying_core() -> None:
-    """Cargo near a travelling Core clears its path without a service wait."""
+def test_campaign_mid_leg_cargo_holds_without_delaying_core() -> None:
+    """Cargo in the shared next cell waits there instead of being evicted."""
 
     core_object = core(position=(-1686, -1904))
     memory = WorldMemory(
@@ -723,7 +758,12 @@ def test_campaign_mid_leg_cargo_yields_without_delaying_core() -> None:
     assert turn.plan.core_action.direction.value == "RIGHT"
     assert any(
         item.actor_id == str(loaded["id"])
-        and item.action == "MOVE"
+        and item.action == "WAIT"
+        and item.reason == "hold the next Core arrival slot for in-transit delivery"
+        for item in report.decisions
+    )
+    assert not any(
+        item.actor_id == str(loaded["id"])
         and item.reason == "yield the Core migration lane"
         for item in report.decisions
     )
