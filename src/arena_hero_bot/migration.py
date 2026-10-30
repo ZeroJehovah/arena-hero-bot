@@ -12,7 +12,7 @@ from typing import Any
 
 from arena_hero import Position
 
-from .geometry import manhattan
+from .geometry import manhattan, next_step
 from .memory import WorldMemory
 from .strategy import (
     SYMMETRIC_HOME_CLEAR_RADIUS,
@@ -318,12 +318,26 @@ def plan_resource_cap(
                 )
         return found
 
-    pool = candidates(inward=True)
-    if not pool and allow_lateral:
-        pool = candidates(inward=False)
-    if not pool:
+    pools = [sorted(candidates(inward=True))]
+    if allow_lateral:
+        pools.append(sorted(candidates(inward=False)))
+    chosen = next(
+        (
+            candidate
+            for pool in pools
+            for candidate in pool
+            if next_step(
+                origin,
+                candidate[-1],
+                blocked=memory.obstacles,
+                require_path=True,
+            )
+            is not None
+        ),
+        None,
+    )
+    if chosen is None:
         return None
-
     (
         _ring,
         _known_resource,
@@ -333,7 +347,7 @@ def plan_resource_cap(
         distance,
         block,
         target,
-    ) = min(pool)
+    ) = chosen
     return MigrationPlan(
         current_block=current_block,
         current_ring=current_ring,
@@ -402,9 +416,22 @@ def _plan_adjacent_block(
                     target,
                 )
             )
-    if not candidates:
+    chosen = next(
+        (
+            candidate
+            for candidate in sorted(candidates)
+            if next_step(
+                origin,
+                candidate[-1],
+                blocked=memory.obstacles,
+                require_path=True,
+            )
+            is not None
+        ),
+        None,
+    )
+    if chosen is None:
         return None
-
     (
         _ring,
         _known_resource,
@@ -414,7 +441,7 @@ def _plan_adjacent_block(
         distance,
         block,
         target,
-    ) = min(candidates)
+    ) = chosen
     return MigrationPlan(
         current_block=current_block,
         current_ring=current_ring,

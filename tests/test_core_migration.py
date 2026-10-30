@@ -9,13 +9,14 @@ import pytest
 from arena_hero import UnitType
 
 from arena_hero_bot import migration_cli
-from arena_hero_bot.geometry import manhattan
+from arena_hero_bot.geometry import manhattan, next_step
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.migration import (
     blocks_are_cardinally_adjacent,
     load_migration_request,
     next_resource_tier_ring,
     plan_next_resource_tier,
+    plan_resource_cap,
     resource_block_index,
     resource_block_quota,
     resource_block_ring,
@@ -77,6 +78,41 @@ def test_next_tier_planner_selects_a_clean_center_block() -> None:
     )
     assert 30 <= plan.estimated_cells <= 34
     assert plan.blocked_defense_posts == 0
+
+
+def test_quota_planner_skips_a_center_sealed_by_rocks() -> None:
+    """A free center inside a rock cave is not a publishable migration hop."""
+
+    origin = (-2033, -2929)
+    memory = WorldMemory(core_home_position=origin)
+    first = plan_resource_cap(
+        memory,
+        target_quota=8,
+        stop_ring=8,
+        current_position=origin,
+    )
+    assert first is not None
+    x, y = first.target
+    memory.obstacles.update({(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)})
+
+    second = plan_resource_cap(
+        memory,
+        target_quota=8,
+        stop_ring=8,
+        current_position=origin,
+    )
+
+    assert second is not None
+    assert second.target != first.target
+    assert (
+        next_step(
+            origin,
+            second.target,
+            blocked=memory.obstacles,
+            require_path=True,
+        )
+        is not None
+    )
 
 
 def test_migration_request_round_trip_is_atomic_and_private(tmp_path: Path) -> None:
@@ -239,7 +275,7 @@ def test_loaded_worker_does_not_block_a_shared_core_step() -> None:
             unit(2, "WORKER", position=(1, 0), cargo=1),
             unit(3, "WORKER", position=(1, 0)),
         ],
-        obstacles=[(0, 1), (0, -1), (-1, 0), (1, 1), (1, -1), (2, 0)],
+        obstacles=[(0, 1), (0, -1), (-1, 0), (1, 1), (1, -1)],
     )
 
     report = _strategy(memory).decide(turn)
@@ -270,7 +306,7 @@ def test_critical_units_blocking_core_step_do_not_trigger_an_extra_pause() -> No
             unit(2, "RANGER", position=(1, 0), hp=1),
             unit(3, "WORKER", position=(1, 0)),
         ],
-        obstacles=[(0, 1), (0, -1), (-1, 0), (1, 1), (1, -1), (2, 0)],
+        obstacles=[(0, 1), (0, -1), (-1, 0), (1, 1), (1, -1)],
     )
 
     report = _strategy(memory).decide(turn)

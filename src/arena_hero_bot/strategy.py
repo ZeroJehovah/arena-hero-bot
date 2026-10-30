@@ -8254,6 +8254,108 @@ class AggressiveStrategy:
             next((cell for cell in centers if cell not in obstacles), centers[0]),
         )
 
+    @staticmethod
+    def _has_core_static_route(
+        origin: Position,
+        target: Position,
+        obstacles: Container[Position],
+    ) -> bool:
+        """Return whether a Core can reach a target without clearing resources."""
+
+        if target in obstacles:
+            return False
+        if origin == target:
+            return True
+        return (
+            next_step(
+                origin,
+                target,
+                blocked=obstacles,
+                require_path=True,
+            )
+            is not None
+        )
+
+    def _reachable_home_target(
+        self,
+        turn: Turn,
+        origin: Position,
+    ) -> Position | None:
+        """Choose a nearby center that permanent terrain does not seal off.
+
+        Resource cells are excluded from the route check because Workers can
+        clear them, while rocks cannot be crossed.  A center inside a rock cave
+        can never become reachable and must not remain a published target.
+        """
+
+        from .migration import (
+            cardinal_block_neighbors,
+            resource_block_index,
+            resource_block_quota,
+            resource_block_ring,
+        )
+
+        obstacles = self._rock_map(turn)
+        resources = set(turn.resource_cells) | set(self.memory.resource_cells)
+        occupied = {unit.position for unit in turn.units}
+        current_block = resource_block_index(origin)
+        current_ring = resource_block_ring(current_block)
+        movement_cap = self._campaign_movement_cap(turn)
+        blocks = (current_block, *cardinal_block_neighbors(current_block))
+        candidates: list[tuple[int, int, int, int, int, Position]] = []
+        for block in blocks:
+            adjacent = block != current_block
+            if (
+                adjacent
+                and self.config.campaign_mode
+                and (movement_cap is None or resource_block_quota(block) > movement_cap)
+            ):
+                continue
+            candidates.extend(
+                (
+                    int(adjacent),
+                    resource_block_ring(block) - current_ring,
+                    int(cell in resources),
+                    int(cell in occupied),
+                    manhattan(origin, cell),
+                    cell,
+                )
+                for cell in _resource_block_center_cells(
+                    (
+                        block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                        block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                    )
+                )
+            )
+        return next(
+            (
+                candidate[-1]
+                for candidate in sorted(candidates)
+                if self._has_core_static_route(
+                    origin,
+                    candidate[-1],
+                    obstacles,
+                )
+            ),
+            None,
+        )
+
+    def _repair_unreachable_home_target(
+        self,
+        turn: Turn,
+        origin: Position,
+    ) -> Position | None:
+        """Replace an unreachable home or release the Core from the wait."""
+
+        target = self._reachable_home_target(turn, origin)
+        if target is None:
+            self.memory.core_home_position = None
+            self.memory.core_migration_start_position = None
+            self._reset_core_migration_progress()
+            return None
+        self._set_campaign_hop_target(target)
+        return target
+
     def _repair_campaign_home(self, turn: Turn, core: Core) -> None:
         """Discard a stale positional target after a restart or location jump."""
 
@@ -8294,15 +8396,13 @@ class AggressiveStrategy:
             )
             if valid and not block_changed:
                 return
-        obstacles = self._rock_map(turn)
-        target = self._current_block_home_candidate(
-            core.position,
-            obstacles,
-            set(turn.resource_cells) | set(self.memory.resource_cells),
-            {unit.position for unit in turn.units},
-        )
+        target = self._reachable_home_target(turn, core.position)
         self.memory.core_migration_start_position = None
-        self._commit_symmetric_home(target)
+        if target is None:
+            self.memory.core_home_position = None
+            self._reset_core_migration_progress()
+        else:
+            self._commit_symmetric_home(target)
 
     def _advance_campaign_phase(self, turn: Turn) -> None:
         """Advance only on completed composition; casualties never demote."""
@@ -8977,13 +9077,10 @@ class AggressiveStrategy:
         target = self.memory.core_home_position
         obstacles = self._rock_map(context.turn)
         if target is None or target in obstacles:
-            target = self._current_block_home_candidate(
-                target or core.position,
-                obstacles,
-                set(context.turn.resource_cells) | set(self.memory.resource_cells),
-                set(context.occupied),
+            target = self._repair_unreachable_home_target(
+                context.turn,
+                core.position,
             )
-            self._set_campaign_hop_target(target)
         if target is None or core.position == target:
             return None
         blocked = (
@@ -8997,6 +9094,27 @@ class AggressiveStrategy:
             recent=recent,
             direction_offset=self._direction_offset(core.id),
         )
+        if direction is None and not self._has_core_static_route(
+            core.position,
+            target,
+            obstacles,
+        ):
+            target = self._repair_unreachable_home_target(
+                context.turn,
+                core.position,
+            )
+            if target is None or core.position == target:
+                return None
+            blocked = (
+                obstacles | set(context.turn.resource_cells) | context.enemy_positions
+            ) - {core.position}
+            direction = next_step(
+                core.position,
+                target,
+                blocked=blocked,
+                recent=recent,
+                direction_offset=self._direction_offset(core.id),
+            )
         if (
             direction is not None
             and recent

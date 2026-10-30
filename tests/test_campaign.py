@@ -6,7 +6,7 @@ from pathlib import Path
 
 from arena_hero import UnitType, core_resource_capacity, unit_cost
 
-from arena_hero_bot.geometry import add, manhattan
+from arena_hero_bot.geometry import add, manhattan, next_step
 from arena_hero_bot.memory import ExpeditionSquad, WorldMemory
 from arena_hero_bot.migration import (
     blocks_are_cardinally_adjacent,
@@ -68,6 +68,55 @@ def _max_roster() -> tuple[
         },
     }
     return workers, rangers, roles
+
+
+def test_campaign_replaces_a_rock_sealed_block_center() -> None:
+    """An unreachable center cannot freeze the Core between two resources."""
+
+    origin = (-1074, -17)
+    sealed_center = (-1072, -17)
+    core_object = core(9, position=origin)
+    workers, rangers, roles = _max_roster()
+    memory = WorldMemory(
+        core_home_position=sealed_center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=origin,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(
+        objects=[core_object, *workers, *rangers],
+        obstacles=[
+            (-1073, -17),
+            (-1073, -16),
+            (-1072, -16),
+            (-1072, -18),
+            (-1071, -17),
+        ],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.core_home_position is not None
+    assert memory.core_home_position != sealed_center
+    assert blocks_are_cardinally_adjacent(
+        resource_block_index(origin),
+        resource_block_index(memory.core_home_position),
+    )
+    assert (
+        next_step(
+            origin,
+            memory.core_home_position,
+            blocked=memory.obstacles,
+            require_path=True,
+        )
+        is not None
+    )
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
 
 
 def test_explicit_quota_plan_publishes_one_adjacent_hop() -> None:
