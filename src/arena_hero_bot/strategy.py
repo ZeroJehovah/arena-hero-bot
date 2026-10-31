@@ -619,6 +619,9 @@ class AggressiveStrategy:
             None
         )
         self._patrol_ring_phase_tick = -1
+        # Unseen cells that the fixed scout anchors cannot see are rebuilt
+        # once per Tick instead of once per patrol Ranger.
+        self._scout_gap_cache: tuple[int, Position, tuple[Position, ...]] | None = None
         self._campaign_defense_pressure_active = False
         self._expedition_serial = max(
             self.memory.next_expedition_serial,
@@ -10319,28 +10322,94 @@ class AggressiveStrategy:
                     candidate,
                 )
             )
-        for _gain, _distance, _negative_x, candidate in sorted(scored, reverse=True)[
-            :8
-        ]:
+        ordered = sorted(scored, reverse=True)
+        if ordered and ordered[0][0] > 0:
+            for _gain, _distance, _negative_x, candidate in ordered[:8]:
+                if context is not None and (
+                    self._predicted_friendly_occupancy(candidate, context) >= 2
+                    or not self._has_static_route(
+                        unit,
+                        candidate,
+                        context,
+                        allow_goal=True,
+                    )
+                ):
+                    continue
+                goal = UnitGoal(
+                    position=candidate,
+                    assigned_tick=turn.tick,
+                    purpose=purpose,
+                    last_progress_position=unit.position,
+                )
+                self.memory.set_goal(unit_id, goal)
+                return candidate
+        # Every anchor disc is already covered: walk the remaining gaps between
+        # them.  Without this an arrived Ranger simply holds its anchor and the
+        # sweep stalls a few percent short until the rejection timer fires.
+        for cell in self._campaign_scout_gaps(turn, target, obstacles, target_cells):
+            if cell in claimed:
+                continue
             if context is not None and (
-                self._predicted_friendly_occupancy(candidate, context) >= 2
+                self._predicted_friendly_occupancy(cell, context) >= 2
                 or not self._has_static_route(
                     unit,
-                    candidate,
+                    cell,
                     context,
                     allow_goal=True,
                 )
             ):
                 continue
             goal = UnitGoal(
-                position=candidate,
+                position=cell,
                 assigned_tick=turn.tick,
                 purpose=purpose,
                 last_progress_position=unit.position,
             )
             self.memory.set_goal(unit_id, goal)
-            return candidate
+            return cell
         return unit.position
+
+    def _campaign_scout_gaps(
+        self,
+        turn: Turn,
+        target: Position,
+        obstacles: set[Position],
+        target_cells: set[Position],
+    ) -> tuple[Position, ...]:
+        """Return unseen cells that no fixed anchor disc can reveal."""
+
+        cached = self._scout_gap_cache
+        if cached is not None and cached[0] == turn.tick and cached[1] == target:
+            return cached[2]
+        size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+        min_x = (target[0] // size) * size
+        min_y = (target[1] // size) * size
+        anchors = {
+            (min_x + 4 + column * 8, min_y + 4 + row * 8)
+            for column in range(4)
+            for row in range(4)
+        }
+        anchors.add(target)
+        anchor_view: set[Position] = set()
+        for anchor in anchors:
+            anchor_view |= visible_cells(anchor, RANGER_VISION_RADIUS, obstacles)
+        started = self.memory.campaign_scout_started_tick
+        seen = self.memory.campaign_scout_seen_ticks
+        gaps = [
+            cell
+            for cell in target_cells
+            if seen.get(cell, -1) < started and cell not in anchor_view
+        ]
+        # Deepest gaps first: they are farthest from every anchor, so a Ranger
+        # standing there reveals cells no anchor disc can reach.
+        gaps.sort(
+            key=lambda cell: (
+                -min(manhattan(cell, anchor) for anchor in anchors),
+                cell,
+            )
+        )
+        self._scout_gap_cache = (turn.tick, target, tuple(gaps))
+        return self._scout_gap_cache[2]
 
     def _enemy_score(
         self,

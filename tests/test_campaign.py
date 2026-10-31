@@ -1492,6 +1492,69 @@ def test_campaign_scout_ignores_cells_sealed_inside_rocks() -> None:
     assert block not in memory.campaign_scout_rejections
 
 
+def test_campaign_scout_fills_the_gaps_between_anchor_discs() -> None:
+    """A staffed anchor grid must not stall a few percent short."""
+
+    center = (-817, 16)
+    target = (-785, 15)
+    gap = (-793, 0)
+    core_object = core(position=center)
+    workers = [
+        unit(100 + index, "WORKER", position=(-824 + index, -8 - index // 4))
+        for index in range(16)
+    ]
+    defense = [
+        unit(
+            1000 + index,
+            "RANGER",
+            position=(center[0] + index % 5, center[1] - 4 - index // 5),
+        )
+        for index in range(20)
+    ]
+    anchors = [(-796 + 8 * column, 4 + 8 * row) for column in range(4) for row in range(4)]
+    patrol = [
+        unit(2000 + index, "RANGER", position=anchors[index]) for index in range(16)
+    ]
+    rangers = [*defense, *patrol]
+    roles = {
+        **{str(worker["id"]): "staged" for worker in workers},
+        **{str(ranger["id"]): "defense" for ranger in defense},
+        **{
+            str(ranger["id"]): f"patrol-{index // 2 + 1}"
+            for index, ranger in enumerate(patrol)
+        },
+    }
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        campaign_scout_target=target,
+        campaign_scout_started_tick=100,
+        campaign_scout_last_gain_tick=100,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    for x in range(-800, -768):
+        for y in range(0, 32):
+            if (x, y) != gap:
+                memory.campaign_scout_seen_ticks[(x, y)] = 100
+    turn = make_turn(tick=100, objects=[core_object, *workers, *rangers])
+
+    report = _strategy(memory).decide(turn)
+
+    decisions = {decision.actor_id: decision for decision in report.decisions}
+    moves = [
+        decisions[str(ranger["id"])]
+        for ranger in patrol
+        if decisions[str(ranger["id"])].action == "MOVE"
+    ]
+    assert any(decision.target == gap for decision in moves)
+    assert memory.campaign_scout_target == target
+
+
 def test_campaign_scouts_use_the_full_patrol_leash_before_cover_fire() -> None:
     center = (-817, -16)
     target = (-784, -17)
