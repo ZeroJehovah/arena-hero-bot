@@ -189,6 +189,8 @@ def test_migration_schedule_survives_memory_round_trip(tmp_path: Path) -> None:
         core_migration_steps_since_pause=5,
         core_migration_pause_until_tick=900,
         campaign_scout_last_gain_tick=777,
+        campaign_scout_unobservable={(-786, -7)},
+        campaign_scout_unobservable_target=(-784, -17),
     )
     path = tmp_path / "memory.json"
 
@@ -200,6 +202,8 @@ def test_migration_schedule_survives_memory_round_trip(tmp_path: Path) -> None:
     assert restored.core_migration_steps_since_pause == 5
     assert restored.core_migration_pause_until_tick == 900
     assert restored.campaign_scout_last_gain_tick == 777
+    assert restored.campaign_scout_unobservable == {(-786, -7)}
+    assert restored.campaign_scout_unobservable_target == (-784, -17)
 
 
 def test_committed_migration_resets_identity_and_tuning_state() -> None:

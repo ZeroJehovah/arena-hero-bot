@@ -8862,6 +8862,7 @@ class AggressiveStrategy:
         self.memory.campaign_scout_last_gain_tick = turn.tick
         self.memory.campaign_scout_last_enemy_tick = 0
         self.memory.campaign_scout_seen_ticks.clear()
+        self._cache_campaign_scout_unobservable(turn, target)
 
     def _clear_campaign_scout(self) -> None:
         """Forget one completed or rejected forward sweep."""
@@ -8871,6 +8872,75 @@ class AggressiveStrategy:
         self.memory.campaign_scout_last_gain_tick = 0
         self.memory.campaign_scout_last_enemy_tick = 0
         self.memory.campaign_scout_seen_ticks.clear()
+        self.memory.campaign_scout_unobservable.clear()
+        self.memory.campaign_scout_unobservable_target = None
+
+    def _cache_campaign_scout_unobservable(self, turn: Turn, target: Position) -> None:
+        """Remember target-block cells that no friendly unit can ever see.
+
+        A 32x32 block can hold free-looking cells sealed inside rock walls.
+        They are neither reachable nor visible from any passable cell, so
+        requiring them would time out every sweep and bounce the Core between
+        quota-equivalent blocks.  Cells next to rocks stay in the sweep; only
+        terrain that literally cannot be observed is dropped.
+        """
+
+        obstacles = self._rock_map(turn)
+        size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+        min_x = (target[0] // size) * size
+        min_y = (target[1] // size) * size
+        max_x = min_x + size - 1
+        max_y = min_y + size - 1
+        unobservable: set[Position] = set()
+        core = turn.core
+        # Only a neighbouring hop is ever scouted; a target farther away is a
+        # stale save, so leave its sweep untouched instead of flooding the
+        # whole board on one Turn.
+        if core is not None and (
+            abs(core.position[0] - min_x) <= 2 * size
+            and abs(core.position[1] - min_y) <= 2 * size
+        ):
+            # Flood the free ground around both the Core and the destination.
+            # A full-block margin keeps ordinary detours inside the window, so
+            # only genuinely sealed terrain is excluded.
+            low_x = min(core.position[0], min_x) - size
+            high_x = max(core.position[0], max_x) + size
+            low_y = min(core.position[1], min_y) - size
+            high_y = max(core.position[1], max_y) + size
+            reachable = {core.position}
+            frontier = [core.position]
+            while frontier:
+                x, y = frontier.pop()
+                for neighbor in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                    if neighbor in reachable or neighbor in obstacles:
+                        continue
+                    if not (low_x <= neighbor[0] <= high_x):
+                        continue
+                    if not (low_y <= neighbor[1] <= high_y):
+                        continue
+                    reachable.add(neighbor)
+                    frontier.append(neighbor)
+            stranded = [
+                (x, y)
+                for x in range(min_x, max_x + 1)
+                for y in range(min_y, max_y + 1)
+                if (x, y) not in obstacles and (x, y) not in reachable
+            ]
+            if stranded:
+                # Sealed cells may still be watchable from a nearby passable
+                # cell; only those no observer can ever see are dropped.
+                radius = RANGER_VISION_RADIUS
+                observable: set[Position] = set()
+                for position in reachable:
+                    if not (
+                        min_x - radius <= position[0] <= max_x + radius
+                        and min_y - radius <= position[1] <= max_y + radius
+                    ):
+                        continue
+                    observable.update(visible_cells(position, radius, obstacles))
+                unobservable.update(cell for cell in stranded if cell not in observable)
+        self.memory.campaign_scout_unobservable = unobservable
+        self.memory.campaign_scout_unobservable_target = target
 
     def _update_campaign_scout(self, turn: Turn) -> None:
         """Publish the held hop only after the target block is visibly clear."""
@@ -8883,6 +8953,10 @@ class AggressiveStrategy:
         target = self.memory.campaign_scout_target
         if target is None:
             return
+        if self.memory.campaign_scout_unobservable_target != target:
+            # Older saves and restarts can hold a sweep that was started
+            # before the sealed-cell filter existed.
+            self._cache_campaign_scout_unobservable(turn, target)
         started = self.memory.campaign_scout_started_tick
         block = resource_block_index(target)
         target_cells = {
@@ -8897,6 +8971,7 @@ class AggressiveStrategy:
             )
             if (x, y) not in self.memory.obstacles
         }
+        target_cells -= self.memory.campaign_scout_unobservable
         covered = all(
             self.memory.campaign_scout_seen_ticks.get(cell, -1) >= started
             for cell in target_cells
@@ -10182,7 +10257,7 @@ class AggressiveStrategy:
             for y in range(min_y, min_y + size)
         )
         obstacles = self._rock_map(turn)
-        target_cells = block_cells - obstacles
+        target_cells = block_cells - obstacles - self.memory.campaign_scout_unobservable
         unit_id = str(unit.id)
         purpose = f"{CAMPAIGN_SCOUT_PURPOSE}-{target[0]}-{target[1]}"
         current = self.memory.goal_for(unit_id)

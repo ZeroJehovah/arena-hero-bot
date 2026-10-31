@@ -183,6 +183,11 @@ class WorldMemory:
     campaign_scout_last_enemy_tick: int = 0
     campaign_scout_seen_ticks: dict[Position, int] = field(default_factory=dict)
     campaign_scout_rejections: dict[Position, int] = field(default_factory=dict)
+    # A free-looking cell can still be sealed inside rocks: no ground unit
+    # can stand there and no observer can see through the wall.  Such a cell
+    # is not passable, so a full-block sweep must not wait for it.
+    campaign_scout_unobservable: set[Position] = field(default_factory=set)
+    campaign_scout_unobservable_target: Position | None = None
     # The twenty defensive Rangers normally cover radius eight and fold into
     # a radius-four inner screen under sustained pressure.
     defense_compressed: bool = False
@@ -796,6 +801,14 @@ class WorldMemory:
                 {"block": list(block), "tick": tick}
                 for block, tick in sorted(self.campaign_scout_rejections.items())
             ],
+            "campaign_scout_unobservable": [
+                list(position) for position in sorted(self.campaign_scout_unobservable)
+            ],
+            "campaign_scout_unobservable_target": (
+                list(self.campaign_scout_unobservable_target)
+                if self.campaign_scout_unobservable_target is not None
+                else None
+            ),
             "defense_compressed": self.defense_compressed,
             "defense_calm_since_tick": self.defense_calm_since_tick,
             "worker_sectors": dict(sorted(self.worker_sectors.items())),
@@ -1004,6 +1017,12 @@ class WorldMemory:
                 _position(value["block"]): int(value["tick"])
                 for value in raw.get("campaign_scout_rejections", [])
             },
+            campaign_scout_unobservable={
+                _position(value) for value in raw.get("campaign_scout_unobservable", [])
+            },
+            campaign_scout_unobservable_target=_optional_position(
+                raw.get("campaign_scout_unobservable_target")
+            ),
             defense_compressed=bool(raw.get("defense_compressed", False)),
             defense_calm_since_tick=_optional_integer(
                 raw.get("defense_calm_since_tick")

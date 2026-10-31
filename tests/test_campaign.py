@@ -1442,6 +1442,56 @@ def test_quota_four_hop_waits_for_forward_scout_and_enemy_settle() -> None:
     assert memory.campaign_scout_target is None
 
 
+def test_campaign_scout_ignores_cells_sealed_inside_rocks() -> None:
+    """A sealed pocket must not stall every sweep into a timeout loop."""
+
+    center = (815, 15)
+    core_object = core(position=center)
+    workers, rangers, roles = _max_roster()
+    sealed = (799, 0)
+    seal = [(800, 0), (799, 1), (798, 0), (799, -1)]
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(
+        tick=100,
+        objects=[core_object, *workers, *rangers],
+        obstacles=seal,
+    )
+    strategy = _strategy(memory)
+
+    strategy.decide(turn)
+
+    scout_target = memory.campaign_scout_target
+    assert scout_target is not None
+    assert sealed in memory.campaign_scout_unobservable
+    assert memory.campaign_scout_unobservable_target == scout_target
+    block = resource_block_index(scout_target)
+    for x in range(block[0] * 32, (block[0] + 1) * 32):
+        for y in range(block[1] * 32, (block[1] + 1) * 32):
+            if (x, y) in memory.obstacles or (x, y) == sealed:
+                continue
+            memory.campaign_scout_seen_ticks[(x, y)] = turn.tick
+
+    settled = make_turn(
+        tick=108,
+        objects=[core_object, *workers, *rangers],
+        obstacles=seal,
+    )
+    strategy._update_campaign_scout(settled)
+
+    assert memory.campaign_scout_target is None
+    assert memory.core_home_position == scout_target
+    assert block not in memory.campaign_scout_rejections
+
+
 def test_campaign_scouts_use_the_full_patrol_leash_before_cover_fire() -> None:
     center = (-817, -16)
     target = (-784, -17)
