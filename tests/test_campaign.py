@@ -1493,7 +1493,7 @@ def test_campaign_scouts_use_the_full_patrol_leash_before_cover_fire() -> None:
         for ranger in patrol
         if decisions[str(ranger["id"])].action == "MOVE"
     ]
-    assert moves
+    assert len(moves) == len(patrol)
     assert all(
         decision.target is not None
         and resource_block_index(decision.target) == resource_block_index(target)
