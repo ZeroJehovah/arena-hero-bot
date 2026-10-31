@@ -1634,6 +1634,12 @@ class AggressiveStrategy:
                     wait_at_goal=True,
                     avoid_new_threats=True,
                     offensive=offensive,
+                    # A target block can extend just beyond the generic
+                    # Core-centred combat leash, especially at a far corner.
+                    # Sweeping the whole destination block is an explicit,
+                    # bounded campaign task, so that leash must not leave the
+                    # last two cells permanently unreachable.
+                    allow_outside_combat_leash=True,
                 )
                 return
         if self._defensive_cover_fire(ranger, context, recent_enemies):
@@ -4522,6 +4528,7 @@ class AggressiveStrategy:
         intent: _MoveIntent = _MoveIntent.STAND,
         avoid_new_threats: bool = False,
         offensive: bool = False,
+        allow_outside_combat_leash: bool = False,
     ) -> None:
         if unit.position == goal:
             self._record_wait(unit, context, reason)
@@ -4537,6 +4544,7 @@ class AggressiveStrategy:
                     reason=reason,
                     avoid_new_threats=True,
                     intent=intent,
+                    allow_outside_combat_leash=allow_outside_combat_leash,
                 )
                 if isinstance(unit, Ranger) and avoid_new_threats
                 else self._move(
@@ -11345,10 +11353,13 @@ class AggressiveStrategy:
         extra_blockers: Container[Position] | None = None,
         avoid_new_threats: bool = False,
         intent: _MoveIntent = _MoveIntent.TRANSIT,
+        allow_outside_combat_leash: bool = False,
     ) -> bool:
         """Move towards ``goal`` only while it stays inside the combat zone."""
 
-        if not self._within_combat_leash(unit, goal, context, offensive=offensive):
+        if not allow_outside_combat_leash and not self._within_combat_leash(
+            unit, goal, context, offensive=offensive
+        ):
             return False
         return self._move(
             unit,
