@@ -179,6 +179,7 @@ class WorldMemory:
     # follows only the active one- or two-block harvest area.
     campaign_scout_target: Position | None = None
     campaign_scout_started_tick: int = 0
+    campaign_scout_last_gain_tick: int = 0
     campaign_scout_last_enemy_tick: int = 0
     campaign_scout_seen_ticks: dict[Position, int] = field(default_factory=dict)
     campaign_scout_rejections: dict[Position, int] = field(default_factory=dict)
@@ -408,6 +409,8 @@ class WorldMemory:
         for position, radius in self._vision_observers(turn):
             seen.update(visible_cells(position, radius, self.obstacles) & block)
         for position in seen:
+            if position not in self.campaign_scout_seen_ticks:
+                self.campaign_scout_last_gain_tick = turn.tick
             self.campaign_scout_seen_ticks[position] = turn.tick
         self.campaign_scout_seen_ticks = {
             position: tick
@@ -783,6 +786,7 @@ class WorldMemory:
                 else None
             ),
             "campaign_scout_started_tick": self.campaign_scout_started_tick,
+            "campaign_scout_last_gain_tick": self.campaign_scout_last_gain_tick,
             "campaign_scout_last_enemy_tick": self.campaign_scout_last_enemy_tick,
             "campaign_scout_seen_ticks": [
                 {"position": list(position), "tick": tick}
@@ -986,6 +990,9 @@ class WorldMemory:
             campaign_resting=bool(raw.get("campaign_resting", False)),
             campaign_scout_target=_optional_position(raw.get("campaign_scout_target")),
             campaign_scout_started_tick=int(raw.get("campaign_scout_started_tick", 0)),
+            campaign_scout_last_gain_tick=int(
+                raw.get("campaign_scout_last_gain_tick", 0)
+            ),
             campaign_scout_last_enemy_tick=int(
                 raw.get("campaign_scout_last_enemy_tick", 0)
             ),

@@ -115,6 +115,36 @@ def test_quota_planner_skips_a_center_sealed_by_rocks() -> None:
     )
 
 
+def test_lateral_detour_requires_a_reachable_inward_exit() -> None:
+    """Do not cross a quota-equivalent block into another scouted dead end."""
+
+    origin = (-817, -16)
+    memory = WorldMemory(core_home_position=origin)
+
+    blocked = plan_resource_cap(
+        memory,
+        target_quota=8,
+        stop_ring=8,
+        current_position=origin,
+        excluded_blocks=frozenset({(-25, -1), (-25, 0)}),
+        allow_lateral=True,
+    )
+
+    assert blocked is None
+
+    detour = plan_resource_cap(
+        memory,
+        target_quota=8,
+        stop_ring=8,
+        current_position=origin,
+        excluded_blocks=frozenset({(-25, -1)}),
+        allow_lateral=True,
+    )
+
+    assert detour is not None
+    assert detour.target_block == (-26, 0)
+
+
 def test_migration_request_round_trip_is_atomic_and_private(tmp_path: Path) -> None:
     path = tmp_path / "control" / "core-migration.json"
     target = (-368, 432)
@@ -158,6 +188,7 @@ def test_migration_schedule_survives_memory_round_trip(tmp_path: Path) -> None:
         core_migration_start_position=(-400, 432),
         core_migration_steps_since_pause=5,
         core_migration_pause_until_tick=900,
+        campaign_scout_last_gain_tick=777,
     )
     path = tmp_path / "memory.json"
 
@@ -168,6 +199,7 @@ def test_migration_schedule_survives_memory_round_trip(tmp_path: Path) -> None:
     assert restored.core_migration_start_position == (-400, 432)
     assert restored.core_migration_steps_since_pause == 5
     assert restored.core_migration_pause_until_tick == 900
+    assert restored.campaign_scout_last_gain_tick == 777
 
 
 def test_committed_migration_resets_identity_and_tuning_state() -> None:

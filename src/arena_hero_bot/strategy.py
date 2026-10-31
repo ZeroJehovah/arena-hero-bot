@@ -289,6 +289,7 @@ CAMPAIGN_DEFENSE_PRESSURE_ENEMIES = ALL_HANDS_DEFENSE_MIN_ENEMIES
 CAMPAIGN_DEFENSE_CALM_TICKS = 8
 CAMPAIGN_SCOUT_SETTLE_TICKS = 8
 CAMPAIGN_SCOUT_TIMEOUT_TICKS = 160
+CAMPAIGN_SCOUT_STALL_TICKS = 64
 CAMPAIGN_SCOUT_REJECTION_TICKS = 512
 CAMPAIGN_RECALL_RADIUS = 8
 CAMPAIGN_SCOUT_PURPOSE = "campaign-migration-scout-v1"
@@ -1592,15 +1593,48 @@ class AggressiveStrategy:
         """Defend a firing position; patrol pursuit is a separate exception."""
 
         obstacles = self._rock_map(context.turn)
+        role = self.memory.unit_roles.get(str(ranger.id))
+        fighters = tuple(
+            enemy
+            for enemy in enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+        )
         if len(
             self._visible_attackers_at(ranger.position, context.turn, obstacles)
         ) >= ranger.hp and self._move_ranger_toward_core(
             ranger, context, reason="leave a lethal multi-source firing line"
         ):
             return
+        if (
+            self.config.campaign_mode
+            and self.memory.campaign_scout_target is not None
+            and self._patrol_team_from_role(role) is not None
+            and offensive
+            and not fighters
+            and not context.all_hands_defense
+            and not context.combat_assault
+            and ranger.id not in context.campaign_patrol_recall_ids
+        ):
+            # A migration scout is a deliberate forward task, not a defensive
+            # firing post. Run it before frontier cover fire can consume the
+            # Ranger's Tick and leave stale claimed cells blocking the patrol.
+            goal = self._campaign_scout_goal(ranger, context.turn, context)
+            if goal != ranger.position:
+                self._move_or_wait(
+                    ranger,
+                    goal,
+                    context,
+                    reason=(
+                        "scout the next migration block for enemies and blind cells"
+                    ),
+                    wait_at_goal=True,
+                    avoid_new_threats=True,
+                    offensive=offensive,
+                )
+                return
         if self._defensive_cover_fire(ranger, context, recent_enemies):
             return
-        role = self.memory.unit_roles.get(str(ranger.id))
         if role == DEFENSE_ROLE or context.all_hands_defense:
             goal = self._defensive_support_goal(ranger, enemies, context)
             if goal is not None and self._move_within_leash(
@@ -1624,12 +1658,6 @@ class AggressiveStrategy:
                 self._hold_defensive_ranger(ranger, context)
                 return
         elif self._patrol_team_from_role(role) is not None:
-            fighters = tuple(
-                enemy
-                for enemy in enemies
-                if isinstance(enemy, UnitView)
-                and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
-            )
             target = self._best_visible_target(ranger.position, context.turn, fighters)
             if target is not None:
                 goals = [
@@ -1711,6 +1739,7 @@ class AggressiveStrategy:
             reason=reason,
             wait_at_goal=True,
             avoid_new_threats=True,
+            offensive=offensive,
         )
         # A blocked post is still a firing platform. Replace only its WAIT;
         # movement, healing and every resource/capacity reservation stay intact.
@@ -4489,6 +4518,7 @@ class AggressiveStrategy:
         wait_at_goal: bool = False,
         intent: _MoveIntent = _MoveIntent.STAND,
         avoid_new_threats: bool = False,
+        offensive: bool = False,
     ) -> None:
         if unit.position == goal:
             self._record_wait(unit, context, reason)
@@ -4500,7 +4530,7 @@ class AggressiveStrategy:
                     unit,
                     goal,
                     context,
-                    offensive=False,
+                    offensive=offensive,
                     reason=reason,
                     avoid_new_threats=True,
                     intent=intent,
@@ -8829,6 +8859,7 @@ class AggressiveStrategy:
             return
         self.memory.campaign_scout_target = target
         self.memory.campaign_scout_started_tick = turn.tick
+        self.memory.campaign_scout_last_gain_tick = turn.tick
         self.memory.campaign_scout_last_enemy_tick = 0
         self.memory.campaign_scout_seen_ticks.clear()
 
@@ -8837,6 +8868,7 @@ class AggressiveStrategy:
 
         self.memory.campaign_scout_target = None
         self.memory.campaign_scout_started_tick = 0
+        self.memory.campaign_scout_last_gain_tick = 0
         self.memory.campaign_scout_last_enemy_tick = 0
         self.memory.campaign_scout_seen_ticks.clear()
 
@@ -8899,6 +8931,13 @@ class AggressiveStrategy:
             self._clear_campaign_scout()
             return
         if turn.tick - started >= CAMPAIGN_SCOUT_TIMEOUT_TICKS:
+            self.memory.campaign_scout_rejections[block] = turn.tick
+            self._clear_campaign_scout()
+            return
+        last_gain = self.memory.campaign_scout_last_gain_tick or started
+        if turn.tick - last_gain >= CAMPAIGN_SCOUT_STALL_TICKS:
+            # A fixed scout has already had enough time to cross this block.
+            # Stop paying for a sweep that is no longer adding any coverage.
             self.memory.campaign_scout_rejections[block] = turn.tick
             self._clear_campaign_scout()
 

@@ -1442,6 +1442,81 @@ def test_quota_four_hop_waits_for_forward_scout_and_enemy_settle() -> None:
     assert memory.campaign_scout_target is None
 
 
+def test_campaign_scouts_use_the_full_patrol_leash_before_cover_fire() -> None:
+    center = (-817, -16)
+    target = (-784, -17)
+    core_object = core(position=center)
+    workers = [
+        unit(100 + index, "WORKER", position=(-824 + index, -8 - index // 4))
+        for index in range(16)
+    ]
+    defense = [
+        unit(
+            1000 + index,
+            "RANGER",
+            position=(center[0] + index % 5, center[1] + 4 + index // 5),
+        )
+        for index in range(20)
+    ]
+    patrol = [
+        unit(2000 + index, "RANGER", position=(-819 + index, -24)) for index in range(8)
+    ]
+    rangers = [*defense, *patrol]
+    roles = {
+        **{str(worker["id"]): "staged" for worker in workers},
+        **{str(ranger["id"]): "defense" for ranger in defense},
+        **{
+            str(ranger["id"]): f"patrol-{index // 2 + 1}"
+            for index, ranger in enumerate(patrol)
+        },
+    }
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        campaign_scout_target=target,
+        campaign_scout_started_tick=200,
+        campaign_scout_last_gain_tick=200,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(tick=200, objects=[core_object, *workers, *rangers])
+
+    report = _strategy(memory).decide(turn)
+
+    decisions = {decision.actor_id: decision for decision in report.decisions}
+    moves = [
+        decisions[str(ranger["id"])]
+        for ranger in patrol
+        if decisions[str(ranger["id"])].action == "MOVE"
+    ]
+    assert moves
+    assert all(
+        decision.target is not None
+        and resource_block_index(decision.target) == resource_block_index(target)
+        for decision in moves
+    )
+
+
+def test_campaign_scout_rejects_after_coverage_stalls() -> None:
+    target = (-784, -17)
+    memory = WorldMemory(
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_scout_target=target,
+        campaign_scout_started_tick=100,
+        campaign_scout_last_gain_tick=100,
+    )
+
+    _strategy(memory)._update_campaign_scout(make_turn(tick=164))
+
+    assert memory.campaign_scout_target is None
+    assert resource_block_index(target) in memory.campaign_scout_rejections
+
+
 def test_campaign_reserve_starts_only_at_the_max_formation() -> None:
     core_object = core(position=(0, 0))
     pre_stage2 = WorldMemory(

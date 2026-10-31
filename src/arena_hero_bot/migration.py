@@ -270,6 +270,36 @@ def plan_resource_cap(
     def candidates(
         *, inward: bool
     ) -> list[tuple[int, int, int, int, int, int, Position, Position]]:
+        def has_reachable_inward_exit(block: Position, target: Position) -> bool:
+            """Whether a same-ring detour can still make inward progress."""
+
+            for next_block in cardinal_block_neighbors(block):
+                if (
+                    resource_block_ring(next_block) >= current_ring
+                    or next_block in excluded_blocks
+                    or resource_block_quota(next_block) > target_quota
+                ):
+                    continue
+                for next_target in _resource_block_center_cells(
+                    (
+                        next_block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                        next_block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                    )
+                ):
+                    if next_target in memory.obstacles:
+                        continue
+                    if (
+                        next_step(
+                            target,
+                            next_target,
+                            blocked=memory.obstacles,
+                            require_path=True,
+                        )
+                        is not None
+                    ):
+                        return True
+            return False
+
         found: list[tuple[int, int, int, int, int, int, Position, Position]] = []
         for block in cardinal_block_neighbors(current_block):
             ring = resource_block_ring(block)
@@ -304,6 +334,8 @@ def plan_resource_cap(
                     (target[0] + dx, target[1] + dy) in memory.obstacles
                     for dx, dy in _DEFENSE_OFFSETS
                 )
+                if not inward and not has_reachable_inward_exit(block, target):
+                    continue
                 found.append(
                     (
                         ring,
