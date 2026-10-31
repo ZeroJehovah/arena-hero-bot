@@ -316,7 +316,10 @@ def test_stage_two_publishes_only_one_adjacent_hop() -> None:
     rangers = _rangers(8)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(objects=[current_core, *_workers(16), *rangers])
+    planned = plan_resource_quota(memory, 3, current_position=current_center)
+    assert planned is not None
+    memory.campaign_scout_rejections = {planned.target_block: 100}
+    turn = make_turn(tick=100, objects=[current_core, *_workers(16), *rangers])
 
     _strategy(memory).decide(turn)
 
@@ -325,6 +328,8 @@ def test_stage_two_publishes_only_one_adjacent_hop() -> None:
     target_block = resource_block_index(memory.core_home_position)
     assert blocks_are_cardinally_adjacent(previous_block, target_block)
     assert resource_block_ring(target_block) < resource_block_ring(previous_block)
+    assert target_block == planned.target_block
+    assert not memory.campaign_scout_rejections
     assert memory.campaign_resting is False
 
 

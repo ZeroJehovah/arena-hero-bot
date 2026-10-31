@@ -289,7 +289,6 @@ CAMPAIGN_DEFENSE_PRESSURE_ENEMIES = ALL_HANDS_DEFENSE_MIN_ENEMIES
 CAMPAIGN_DEFENSE_CALM_TICKS = 8
 CAMPAIGN_SCOUT_SETTLE_TICKS = 8
 CAMPAIGN_SCOUT_RANGERS_PER_UNSEEN_CELL = 4
-CAMPAIGN_SCOUT_REJECTION_TICKS = 512
 CAMPAIGN_RECALL_RADIUS = 8
 CAMPAIGN_SCOUT_PURPOSE = "campaign-migration-scout-v1"
 # The clear-terrain template covers a radius-20 Manhattan disk.  On a remembered
@@ -8838,12 +8837,11 @@ class AggressiveStrategy:
         if current_quota > movement_cap:
             self.memory.campaign_target_quota = target_quota
             return
-        rejections = {
-            block: tick
-            for block, tick in self.memory.campaign_scout_rejections.items()
-            if turn.tick - tick < CAMPAIGN_SCOUT_REJECTION_TICKS
-        }
-        self.memory.campaign_scout_rejections = rejections
+        # Older versions stored a rejection when coverage stopped making
+        # progress.  A coverage stall is no longer a scouting failure, so those
+        # entries are not evidence of a dangerous block and must not suppress
+        # a legal inward hop.
+        self.memory.campaign_scout_rejections.clear()
         stop_ring = campaign_stop_ring(movement_cap)
         if stop_ring is None:
             return
@@ -8852,7 +8850,6 @@ class AggressiveStrategy:
             target_quota=movement_cap,
             stop_ring=stop_ring,
             current_position=core.position,
-            excluded_blocks=frozenset(rejections),
         )
         if plan is not None:
             self.memory.campaign_target_quota = target_quota
