@@ -188,6 +188,10 @@ class WorldMemory:
     # is not passable, so a full-block sweep must not wait for it.
     campaign_scout_unobservable: set[Position] = field(default_factory=set)
     campaign_scout_unobservable_target: Position | None = None
+    # Rocks arrive incrementally through vision.  Recompute the sealed-cell
+    # filter whenever the durable obstacle map grows, otherwise a pocket that
+    # becomes enclosed after the sweep starts remains a false scan target.
+    campaign_scout_unobservable_obstacle_count: int = 0
     # The twenty defensive Rangers normally cover radius eight and fold into
     # a radius-four inner screen under sustained pressure.
     defense_compressed: bool = False
@@ -809,6 +813,9 @@ class WorldMemory:
                 if self.campaign_scout_unobservable_target is not None
                 else None
             ),
+            "campaign_scout_unobservable_obstacle_count": (
+                self.campaign_scout_unobservable_obstacle_count
+            ),
             "defense_compressed": self.defense_compressed,
             "defense_calm_since_tick": self.defense_calm_since_tick,
             "worker_sectors": dict(sorted(self.worker_sectors.items())),
@@ -1022,6 +1029,9 @@ class WorldMemory:
             },
             campaign_scout_unobservable_target=_optional_position(
                 raw.get("campaign_scout_unobservable_target")
+            ),
+            campaign_scout_unobservable_obstacle_count=int(
+                raw.get("campaign_scout_unobservable_obstacle_count", 0)
             ),
             defense_compressed=bool(raw.get("defense_compressed", False)),
             defense_calm_since_tick=_optional_integer(

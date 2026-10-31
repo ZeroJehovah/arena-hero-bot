@@ -1492,6 +1492,113 @@ def test_campaign_scout_ignores_cells_sealed_inside_rocks() -> None:
     assert block not in memory.campaign_scout_rejections
 
 
+def test_campaign_scout_refreshes_sealed_cells_after_new_rocks() -> None:
+    """A pocket enclosed after the sweep starts must stop blocking coverage."""
+
+    center = (815, 15)
+    core_object = core(position=center)
+    workers, rangers, roles = _max_roster()
+    sealed = (799, 0)
+    seal = [(800, 0), (799, 1), (798, 0), (799, -1)]
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    initial = make_turn(tick=100, objects=[core_object, *workers, *rangers])
+    strategy = _strategy(memory)
+    strategy.decide(initial)
+
+    scout_target = memory.campaign_scout_target
+    assert scout_target is not None
+    assert sealed not in memory.campaign_scout_unobservable
+    block = resource_block_index(scout_target)
+    pending = {scout_target}
+    for x in range(block[0] * 32, (block[0] + 1) * 32):
+        for y in range(block[1] * 32, (block[1] + 1) * 32):
+            if (x, y) != sealed and len(pending) < 8:
+                pending.add((x, y))
+    for x in range(block[0] * 32, (block[0] + 1) * 32):
+        for y in range(block[1] * 32, (block[1] + 1) * 32):
+            if (x, y) != sealed and (x, y) not in pending:
+                memory.campaign_scout_seen_ticks[(x, y)] = initial.tick
+
+    observed_rocks = make_turn(
+        tick=108,
+        objects=[core_object, *workers, *rangers],
+        obstacles=seal,
+    )
+    memory.observe(observed_rocks)
+    strategy._update_campaign_scout(observed_rocks)
+
+    assert sealed in memory.campaign_scout_unobservable
+    assert memory.campaign_scout_target == scout_target
+    assert memory.core_home_position == center
+
+    for position in pending:
+        memory.campaign_scout_seen_ticks[position] = observed_rocks.tick
+    completed = make_turn(
+        tick=109,
+        objects=[core_object, *workers, *rangers],
+        obstacles=seal,
+    )
+    memory.observe(completed)
+    strategy._update_campaign_scout(completed)
+
+    assert memory.campaign_scout_target is None
+    assert memory.core_home_position == scout_target
+    assert block not in memory.campaign_scout_rejections
+
+
+def test_campaign_scout_allows_one_unseen_cell_per_four_rangers() -> None:
+    """Blind cells may hide at most half the live Ranger force."""
+
+    center = (815, 15)
+    target = (784, 15)
+    core_object = core(position=center)
+    workers, rangers, roles = _max_roster()
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        campaign_scout_target=target,
+        campaign_scout_started_tick=100,
+        campaign_scout_last_gain_tick=100,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(tick=100, objects=[core_object, *workers, *rangers])
+    block = resource_block_index(target)
+    unseen: list[tuple[int, int]] = []
+    for x in range(block[0] * 32, (block[0] + 1) * 32):
+        for y in range(block[1] * 32, (block[1] + 1) * 32):
+            if len(unseen) < 8:
+                unseen.append((x, y))
+            else:
+                memory.campaign_scout_seen_ticks[(x, y)] = turn.tick
+
+    strategy = _strategy(memory)
+    strategy._update_campaign_scout(turn)
+
+    assert len(rangers) // 4 == 7
+    assert memory.campaign_scout_target == target
+    assert memory.core_home_position == center
+
+    memory.campaign_scout_seen_ticks[unseen[0]] = turn.tick
+    strategy._update_campaign_scout(turn)
+
+    assert memory.campaign_scout_target is None
+    assert memory.core_home_position == target
+
+
 def test_campaign_scout_fills_the_gaps_between_anchor_discs() -> None:
     """A staffed anchor grid must not stall a few percent short."""
 
@@ -1512,9 +1619,7 @@ def test_campaign_scout_fills_the_gaps_between_anchor_discs() -> None:
         for index in range(20)
     ]
     anchors = [
-        (-796 + 8 * column, 4 + 8 * row)
-        for column in range(4)
-        for row in range(4)
+        (-796 + 8 * column, 4 + 8 * row) for column in range(4) for row in range(4)
     ]
     patrol = [
         unit(2000 + index, "RANGER", position=anchors[index]) for index in range(16)
@@ -1541,11 +1646,18 @@ def test_campaign_scout_fills_the_gaps_between_anchor_discs() -> None:
         unit_roles=roles,
         unit_roles_initialized=True,
     )
-    for x in range(-800, -768):
-        for y in range(32):
-            if (x, y) != gap:
-                memory.campaign_scout_seen_ticks[(x, y)] = 100
     turn = make_turn(tick=100, objects=[core_object, *workers, *rangers])
+    gap_strategy = _strategy(memory)
+    block_cells = {(x, y) for x in range(-800, -768) for y in range(32)}
+    gaps = gap_strategy._campaign_scout_gaps(turn, target, set(), block_cells)
+    unseen = {gap}
+    for cell in gaps:
+        if len(unseen) >= 10:
+            break
+        if cell != gap:
+            unseen.add(cell)
+    for cell in block_cells - unseen:
+        memory.campaign_scout_seen_ticks[cell] = 100
 
     report = _strategy(memory).decide(turn)
 
@@ -1579,9 +1691,7 @@ def test_campaign_scout_reaches_a_far_corner_outside_the_combat_leash() -> None:
         for index in range(20)
     ]
     anchors = [
-        (-796 + 8 * column, 4 + 8 * row)
-        for column in range(4)
-        for row in range(4)
+        (-796 + 8 * column, 4 + 8 * row) for column in range(4) for row in range(4)
     ]
     patrol = [
         unit(2000 + index, "RANGER", position=anchors[index]) for index in range(16)
@@ -1617,15 +1727,29 @@ def test_campaign_scout_reaches_a_far_corner_outside_the_combat_leash() -> None:
         unit_roles=roles,
         unit_roles_initialized=True,
     )
-    for x in range(-800, -768):
-        for y in range(32):
-            if (x, y) != gap and (x, y) not in obstacles:
-                memory.campaign_scout_seen_ticks[(x, y)] = 100
     turn = make_turn(
         tick=100,
         objects=[core_object, *workers, *rangers],
         obstacles=sorted(obstacles),
     )
+    gap_strategy = _strategy(memory)
+    block_cells = {
+        (x, y) for x in range(-800, -768) for y in range(32) if (x, y) not in obstacles
+    }
+    gaps = gap_strategy._campaign_scout_gaps(
+        turn,
+        target,
+        obstacles,
+        block_cells,
+    )
+    unseen = {gap}
+    for cell in gaps:
+        if len(unseen) >= 10:
+            break
+        if cell != gap:
+            unseen.add(cell)
+    for cell in block_cells - unseen:
+        memory.campaign_scout_seen_ticks[cell] = 100
 
     report = _strategy(memory).decide(turn)
 
@@ -1698,7 +1822,7 @@ def test_campaign_scouts_use_the_full_patrol_leash_before_cover_fire() -> None:
     )
 
 
-def test_campaign_scout_rejects_after_coverage_stalls() -> None:
+def test_campaign_scout_waits_instead_of_failing_when_coverage_stalls() -> None:
     target = (-784, -17)
     memory = WorldMemory(
         campaign_phase=CAMPAIGN_PHASE_STAGE4,
@@ -1708,10 +1832,10 @@ def test_campaign_scout_rejects_after_coverage_stalls() -> None:
         campaign_scout_last_gain_tick=100,
     )
 
-    _strategy(memory)._update_campaign_scout(make_turn(tick=164))
+    _strategy(memory)._update_campaign_scout(make_turn(tick=1000))
 
-    assert memory.campaign_scout_target is None
-    assert resource_block_index(target) in memory.campaign_scout_rejections
+    assert memory.campaign_scout_target == target
+    assert not memory.campaign_scout_rejections
 
 
 def test_campaign_reserve_starts_only_at_the_max_formation() -> None:

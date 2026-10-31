@@ -288,8 +288,7 @@ CAMPAIGN_DEFENSE_COMPRESSED_RADIUS = 4
 CAMPAIGN_DEFENSE_PRESSURE_ENEMIES = ALL_HANDS_DEFENSE_MIN_ENEMIES
 CAMPAIGN_DEFENSE_CALM_TICKS = 8
 CAMPAIGN_SCOUT_SETTLE_TICKS = 8
-CAMPAIGN_SCOUT_TIMEOUT_TICKS = 160
-CAMPAIGN_SCOUT_STALL_TICKS = 64
+CAMPAIGN_SCOUT_RANGERS_PER_UNSEEN_CELL = 4
 CAMPAIGN_SCOUT_REJECTION_TICKS = 512
 CAMPAIGN_RECALL_RADIUS = 8
 CAMPAIGN_SCOUT_PURPOSE = "campaign-migration-scout-v1"
@@ -8854,7 +8853,6 @@ class AggressiveStrategy:
             stop_ring=stop_ring,
             current_position=core.position,
             excluded_blocks=frozenset(rejections),
-            allow_lateral=True,
         )
         if plan is not None:
             self.memory.campaign_target_quota = target_quota
@@ -8885,6 +8883,7 @@ class AggressiveStrategy:
         self.memory.campaign_scout_seen_ticks.clear()
         self.memory.campaign_scout_unobservable.clear()
         self.memory.campaign_scout_unobservable_target = None
+        self.memory.campaign_scout_unobservable_obstacle_count = 0
 
     def _cache_campaign_scout_unobservable(self, turn: Turn, target: Position) -> None:
         """Remember target-block cells that no friendly unit can ever see.
@@ -8952,6 +8951,9 @@ class AggressiveStrategy:
                 unobservable.update(cell for cell in stranded if cell not in observable)
         self.memory.campaign_scout_unobservable = unobservable
         self.memory.campaign_scout_unobservable_target = target
+        self.memory.campaign_scout_unobservable_obstacle_count = len(
+            self.memory.obstacles
+        )
 
     def _update_campaign_scout(self, turn: Turn) -> None:
         """Publish the held hop only after the target block is visibly clear."""
@@ -8964,9 +8966,16 @@ class AggressiveStrategy:
         target = self.memory.campaign_scout_target
         if target is None:
             return
-        if self.memory.campaign_scout_unobservable_target != target:
+        if (
+            self.memory.campaign_scout_unobservable_target != target
+            or self.memory.campaign_scout_unobservable_obstacle_count
+            != len(self.memory.obstacles)
+        ):
             # Older saves and restarts can hold a sweep that was started
-            # before the sealed-cell filter existed.
+            # before the sealed-cell filter existed.  The obstacle map also
+            # grows while patrols approach the target; refresh the filter so
+            # a newly discovered rock pocket cannot masquerade as unseen
+            # traversable ground.
             self._cache_campaign_scout_unobservable(turn, target)
         started = self.memory.campaign_scout_started_tick
         block = resource_block_index(target)
@@ -8983,10 +8992,16 @@ class AggressiveStrategy:
             if (x, y) not in self.memory.obstacles
         }
         target_cells -= self.memory.campaign_scout_unobservable
-        covered = all(
-            self.memory.campaign_scout_seen_ticks.get(cell, -1) >= started
+        unseen = sum(
+            self.memory.campaign_scout_seen_ticks.get(cell, -1) < started
             for cell in target_cells
         )
+        # One unseen cell can hide at most two enemy combat Units.  Keeping
+        # the unseen-cell budget at one quarter of the live Ranger roster
+        # bounds that hidden force at half of ours while still allowing a
+        # completed safety sweep to tolerate a small number of blind corners.
+        unseen_allowance = len(turn.rangers) // CAMPAIGN_SCOUT_RANGERS_PER_UNSEEN_CELL
+        safety_covered = unseen <= unseen_allowance
         enemy_present = any(
             resource_block_index(enemy.position) == block
             for enemy in turn.visible_enemies
@@ -8996,7 +9011,7 @@ class AggressiveStrategy:
             last_enemy < started
             or turn.tick - last_enemy >= CAMPAIGN_SCOUT_SETTLE_TICKS
         )
-        if covered and enemy_cleared:
+        if safety_covered and enemy_cleared:
             movement_cap = self._campaign_movement_cap(turn)
             current_quota = resource_block_quota(
                 resource_block_index(turn.core.position)
@@ -9016,16 +9031,6 @@ class AggressiveStrategy:
             self._set_campaign_hop_target(target)
             self._clear_campaign_scout()
             return
-        if turn.tick - started >= CAMPAIGN_SCOUT_TIMEOUT_TICKS:
-            self.memory.campaign_scout_rejections[block] = turn.tick
-            self._clear_campaign_scout()
-            return
-        last_gain = self.memory.campaign_scout_last_gain_tick or started
-        if turn.tick - last_gain >= CAMPAIGN_SCOUT_STALL_TICKS:
-            # A fixed scout has already had enough time to cross this block.
-            # Stop paying for a sweep that is no longer adding any coverage.
-            self.memory.campaign_scout_rejections[block] = turn.tick
-            self._clear_campaign_scout()
 
     def _set_campaign_hop_target(self, target: Position) -> None:
         """Retarget one hop without resetting the running economy."""
@@ -10353,7 +10358,7 @@ class AggressiveStrategy:
                 return candidate
         # Every anchor disc is already covered: walk the remaining gaps between
         # them.  Without this an arrived Ranger simply holds its anchor and the
-        # sweep stalls a few percent short until the rejection timer fires.
+        # sweep can stall above the blind-cell allowance.
         for cell in self._campaign_scout_gaps(turn, target, obstacles, target_cells):
             if cell in claimed:
                 continue
@@ -10382,7 +10387,7 @@ class AggressiveStrategy:
         turn: Turn,
         target: Position,
         obstacles: set[Position],
-        target_cells: set[Position],
+        target_cells: Iterable[Position],
     ) -> tuple[Position, ...]:
         """Return unseen cells that no fixed anchor disc can reveal."""
 

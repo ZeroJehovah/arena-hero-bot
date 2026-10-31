@@ -244,14 +244,12 @@ def plan_resource_cap(
     stop_ring: int,
     current_position: Position | None = None,
     excluded_blocks: frozenset[Position] = frozenset(),
-    allow_lateral: bool = False,
 ) -> MigrationPlan | None:
-    """Plan one hop without crossing a formation tier's quota ceiling.
+    """Plan one inward cardinal hop without crossing a quota ceiling.
 
-    The planner first uses an inward cardinal neighbor.  Lateral same-ring
-    neighbors are considered only when explicitly allowed and no inward
-    candidate remains, which gives blocked scouting targets a bounded detour
-    without ever increasing the block ring.
+    A blocked or unsafe forward block never justifies a same-ring lateral hop.
+    The Core stays at its current centre, keeps harvesting, and retries only
+    when an inward block becomes available again.
     """
 
     origin = (
@@ -267,47 +265,13 @@ def plan_resource_cap(
     if current_quota > target_quota or current_ring <= stop_ring:
         return None
 
-    def candidates(
-        *, inward: bool
-    ) -> list[tuple[int, int, int, int, int, int, Position, Position]]:
-        def has_reachable_inward_exit(block: Position, target: Position) -> bool:
-            """Whether a same-ring detour can still make inward progress."""
-
-            for next_block in cardinal_block_neighbors(block):
-                if (
-                    resource_block_ring(next_block) >= current_ring
-                    or next_block in excluded_blocks
-                    or resource_block_quota(next_block) > target_quota
-                ):
-                    continue
-                for next_target in _resource_block_center_cells(
-                    (
-                        next_block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
-                        next_block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
-                    )
-                ):
-                    if next_target in memory.obstacles:
-                        continue
-                    if (
-                        next_step(
-                            target,
-                            next_target,
-                            blocked=memory.obstacles,
-                            require_path=True,
-                        )
-                        is not None
-                    ):
-                        return True
-            return False
-
+    def candidates() -> list[tuple[int, int, int, int, int, int, Position, Position]]:
         found: list[tuple[int, int, int, int, int, int, Position, Position]] = []
         for block in cardinal_block_neighbors(current_block):
             ring = resource_block_ring(block)
             if block in excluded_blocks or resource_block_quota(block) > target_quota:
                 continue
-            if inward and ring >= current_ring:
-                continue
-            if not inward and ring != current_ring:
+            if ring >= current_ring:
                 continue
             block_rocks = sum(cell in memory.obstacles for cell in _block_cells(block))
             for target in _resource_block_center_cells(
@@ -334,8 +298,6 @@ def plan_resource_cap(
                     (target[0] + dx, target[1] + dy) in memory.obstacles
                     for dx, dy in _DEFENSE_OFFSETS
                 )
-                if not inward and not has_reachable_inward_exit(block, target):
-                    continue
                 found.append(
                     (
                         ring,
@@ -350,14 +312,10 @@ def plan_resource_cap(
                 )
         return found
 
-    pools = [sorted(candidates(inward=True))]
-    if allow_lateral:
-        pools.append(sorted(candidates(inward=False)))
     chosen = next(
         (
             candidate
-            for pool in pools
-            for candidate in pool
+            for candidate in sorted(candidates())
             if next_step(
                 origin,
                 candidate[-1],
