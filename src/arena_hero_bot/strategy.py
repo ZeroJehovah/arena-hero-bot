@@ -2741,6 +2741,15 @@ class AggressiveStrategy:
                 or context.core_build_priority
             )
             queue_head = context.core_queue_head_id
+            core_distance = manhattan(worker.position, core.position)
+            require_progress = (
+                core_distance <= CORE_QUEUE_RADIUS
+                and self._has_static_step_toward(
+                    worker,
+                    core.position,
+                    context,
+                )
+            )
             tried_service_approach = service_available and (
                 queue_head is None or worker.id == queue_head
             )
@@ -2751,9 +2760,8 @@ class AggressiveStrategy:
                 reason="return carried resources to Core",
                 allow_goal=True,
                 intent=_MoveIntent.INBOUND,
-                avoid_recent=(
-                    manhattan(worker.position, core.position) > CORE_QUEUE_RADIUS
-                ),
+                avoid_recent=core_distance > CORE_QUEUE_RADIUS,
+                progress_toward=(core.position if require_progress else None),
             ):
                 return
             if tried_service_approach:
@@ -4857,6 +4865,29 @@ class AggressiveStrategy:
                     require_path=True,
                 )
         return direction is not None
+
+    def _has_static_step_toward(
+        self,
+        unit: Unit,
+        target: Position,
+        context: _TurnContext,
+    ) -> bool:
+        """Return whether terrain leaves a safe first step toward ``target``.
+
+        Friendly congestion is deliberately absent from these blockers.  If a
+        static step toward the Core exists, the Worker should wait behind
+        traffic instead of taking a lateral or outward detour.  A sealed
+        approach still needs the normal route search to go around it.
+        """
+
+        blockers = self._static_blockers(unit, context)
+        current_distance = manhattan(unit.position, target)
+        return any(
+            manhattan(position, target) < current_distance
+            and position not in blockers
+            and position not in context.enemy_positions
+            for position in adjacent_positions(unit.position)
+        )
 
     def _move(
         self,

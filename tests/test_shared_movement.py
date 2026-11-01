@@ -176,6 +176,38 @@ def test_busy_stationary_core_cargo_queue_does_not_shuffle_slots():
     )
 
 
+def test_loaded_worker_waits_instead_of_backtracking_around_a_full_approach():
+    """A crowded doorstep holds the line instead of routing outward."""
+
+    memory = WorldMemory(
+        core_home_position=(0, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    turn = make_turn(
+        resources=10,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(2, 0), cargo=1),
+            unit(3, "WORKER", position=(1, 0)),
+            unit(4, "WORKER", position=(1, 0)),
+        ],
+    )
+
+    report = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
+    ).decide(turn)
+    loaded = next(worker for worker in turn.workers if worker.cargo > 0)
+    decision = next(
+        item for item in report.decisions if item.actor_id == str(loaded.id)
+    )
+
+    assert decision.action == "WAIT"
+    assert decision.reason == "hold a unique Core queue slot"
+    assert loaded.id not in turn.plan.unit_actions
+
+
 @pytest.mark.parametrize(
     "kinds", [("WORKER", "WORKER"), ("RANGER", "VANGUARD"), ("WORKER", "RANGER")]
 )
