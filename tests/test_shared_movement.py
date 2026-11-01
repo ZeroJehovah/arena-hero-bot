@@ -3,10 +3,11 @@
 import pytest
 from arena_hero import Direction, MoveAction, core_resource_capacity
 
-from arena_hero_bot.geometry import add
+from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.strategy import (
+    CORE_LAYOUT_VERSION,
     AggressiveStrategy,
     StrategyConfig,
     _MoveIntent,
@@ -76,6 +77,103 @@ def test_queue_slots_are_unique_and_stationary_units_hold_them():
     second_destination = add(second.position, second_action.direction)
     assert first_destination != second_destination
     assert len(context.standing_reserved) == 2
+
+
+def test_stationary_core_cargo_queue_keeps_one_service_head():
+    """Only the selected head approaches; the line compacts toward Core."""
+
+    memory = WorldMemory(
+        core_home_position=(0, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    turn = make_turn(
+        resources=10,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, 1), cargo=1),
+            unit(3, "WORKER", position=(1, 0), cargo=1),
+            unit(4, "WORKER", position=(0, 2), cargo=1),
+        ],
+    )
+
+    report = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
+    ).decide(turn)
+    decisions = {
+        item.actor_id: item for item in report.decisions if item.actor_kind == "WORKER"
+    }
+    head, waiting, follower = turn.workers
+
+    assert decisions[str(head.id)].action == "MOVE"
+    assert decisions[str(head.id)].reason == "return carried resources to Core"
+    assert decisions[str(waiting.id)].action == "WAIT"
+    assert decisions[str(waiting.id)].reason == "hold a unique Core queue slot"
+    assert decisions[str(follower.id)].reason == (
+        "queue carried resources outside the Core service cell"
+    )
+    follower_action = turn.plan.unit_actions[follower.id]
+    assert follower_action.type == "MOVE"
+    assert manhattan(add(follower.position, follower_action.direction), (0, 0)) < (
+        manhattan(follower.position, (0, 0))
+    )
+    returns = [
+        item
+        for item in decisions.values()
+        if item.action == "MOVE" and item.reason == "return carried resources to Core"
+    ]
+    assert [item.actor_id for item in returns] == [str(head.id)]
+
+
+def test_busy_stationary_core_cargo_queue_does_not_shuffle_slots():
+    """A full waiting ring holds still instead of trading empty cells."""
+
+    memory = WorldMemory(
+        core_home_position=(0, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    positions = [
+        (1, 0),
+        (2, 0),
+        (0, 1),
+        (0, 2),
+        (-1, 0),
+        (-2, 0),
+        (0, -1),
+        (0, -2),
+        (1, 1),
+        (2, 1),
+    ]
+    turn = make_turn(
+        resources=10,
+        objects=[
+            core(),
+            unit(2, "WORKER", cargo=1),
+            *[
+                unit(10 + index, "WORKER", position=position, cargo=1)
+                for index, position in enumerate(positions)
+            ],
+        ],
+    )
+
+    report = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
+    ).decide(turn)
+    decisions = {
+        item.actor_id: item for item in report.decisions if item.actor_kind == "WORKER"
+    }
+    depositor = next(worker for worker in turn.workers if worker.position == (0, 0))
+    waiting = [worker for worker in turn.workers if worker.position != (0, 0)]
+
+    assert decisions[str(depositor.id)].action == "DEPOSIT"
+    assert all(
+        decisions[str(worker.id)].action == "WAIT"
+        and decisions[str(worker.id)].reason == "hold a unique Core queue slot"
+        for worker in waiting
+    )
 
 
 @pytest.mark.parametrize(

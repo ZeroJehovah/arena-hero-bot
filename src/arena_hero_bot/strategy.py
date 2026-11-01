@@ -432,6 +432,10 @@ class _TurnContext:
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
     core_arrival_worker_id: UUID | None = None
+    # One loaded Worker owns the stationary Core service approach for a
+    # Tick.  Other cargo stays in its unique queue cell even when a nearer
+    # cell opens; otherwise every service pause reorders the entire queue.
+    core_queue_head_id: UUID | None = None
     core_escape_direction: Direction | None = None
     core_escape_destination: Position | None = None
     core_resource_clearance_target: Position | None = None
@@ -982,10 +986,15 @@ class AggressiveStrategy:
             self._prepare_core_departure(context)
 
         if not deadlined:
+            context.core_queue_head_id = self._select_stationary_core_queue_head(
+                context
+            )
             for worker in sorted(
                 turn.workers,
                 key=lambda unit: (
                     0 if unit.id in threatened_worker_ids else 1,
+                    0 if unit.position == core_position else 1,
+                    0 if unit.id == context.core_queue_head_id else 1,
                     self._worker_priority(unit, core_position),
                 ),
             ):
@@ -2725,51 +2734,57 @@ class AggressiveStrategy:
                             "Core storage is full and no outbound queue slot is free",
                         )
                 return
-            if (
+            service_available = not (
                 context.remaining_resource_space <= 0
                 or context.core_service_action is not None
                 or context.core_inbound_id is not None
                 or context.core_build_priority
-            ):
-                if not self._move_to_core_queue(
-                    worker,
-                    context,
-                    reason="queue carried resources outside the Core service cell",
-                ):
-                    self._record_wait(
-                        worker,
-                        context,
-                        "Core service cell is occupied and no queue slot is free",
-                    )
-                return
-            if self._move(
+            )
+            queue_head = context.core_queue_head_id
+            tried_service_approach = service_available and (
+                queue_head is None or worker.id == queue_head
+            )
+            if tried_service_approach and self._move(
                 worker,
                 core.position,
                 context,
                 reason="return carried resources to Core",
                 allow_goal=True,
                 intent=_MoveIntent.INBOUND,
+                avoid_recent=(
+                    manhattan(worker.position, core.position) > CORE_QUEUE_RADIUS
+                ),
             ):
                 return
-            # A blocked home approach can end just outside the danger zone.
-            # Keep withdrawing from that nearby threat instead of treating
-            # the pathfinder's lack of progress as a normal cargo queue.
-            approach_threats = tuple(
-                position
-                for position in self._remembered_worker_danger_positions(context.turn)
-                if manhattan(worker.position, position)
-                <= self.config.worker_threat_radius + 1
-            )
-            if approach_threats and self._retreat_worker(
-                worker, core.position, context, approach_threats
-            ):
-                return
+            if tried_service_approach:
+                # A blocked home approach can end just outside the danger
+                # zone.  Keep withdrawing instead of treating the pathfinder's
+                # lack of progress as a normal cargo queue.
+                approach_threats = tuple(
+                    position
+                    for position in self._remembered_worker_danger_positions(
+                        context.turn
+                    )
+                    if manhattan(worker.position, position)
+                    <= self.config.worker_threat_radius + 1
+                )
+                if approach_threats and self._retreat_worker(
+                    worker,
+                    core.position,
+                    context,
+                    approach_threats,
+                ):
+                    return
             if not self._move_to_core_queue(
                 worker,
                 context,
-                reason="queue carried resources after a full Core approach",
+                reason="queue carried resources outside the Core service cell",
             ):
-                self._record_wait(worker, context, "no safe path to Core")
+                self._record_wait(
+                    worker,
+                    context,
+                    "Core service cell is occupied and no queue slot is free",
+                )
             return
 
         if worker_threats:
@@ -3357,6 +3372,47 @@ class AggressiveStrategy:
             )
         )
 
+    def _select_stationary_core_queue_head(
+        self,
+        context: _TurnContext,
+    ) -> UUID | None:
+        """Select the one loaded Worker allowed to approach a parked Core.
+
+        Recomputing every loaded Worker's nearest free cell made the whole
+        queue trade places whenever the service cell opened.  Keep one
+        routeable head until it reaches the Core, and let the remaining
+        Workers compact only by moving closer to the Core.
+        """
+
+        core = context.turn.core
+        if (
+            core is None
+            or core.view.state is not CoreState.NORMAL
+            or context.remaining_resource_space <= 0
+            or context.core_build_priority
+        ):
+            return None
+        candidates = sorted(
+            (
+                worker
+                for worker in context.turn.workers
+                if worker.cargo > 0 and worker.position != core.position
+            ),
+            key=lambda worker: (
+                manhattan(worker.position, core.position),
+                worker.id.bytes,
+            ),
+        )
+        for worker in candidates:
+            if self._has_static_route(
+                worker,
+                core.position,
+                context,
+                allow_goal=True,
+            ):
+                return worker.id
+        return None
+
     def _select_core_arrival_worker(
         self,
         context: _TurnContext,
@@ -3515,32 +3571,46 @@ class AggressiveStrategy:
         goals: tuple[Position, ...] | None = None
         if core is not None:
             distance = manhattan(unit.position, core.position)
+            if loaded_worker and 0 < distance <= CORE_QUEUE_RADIUS:
+                if self._predicted_friendly_occupancy(unit.position, context) >= 2:
+                    if self._separate_core_queue_waiter(unit, context):
+                        return True
+                    self._record_wait(
+                        unit,
+                        context,
+                        "hold a shared Core queue waiting cell",
+                    )
+                    return True
+                goals = tuple(
+                    goal
+                    for goal in self._core_queue_positions(unit, context)
+                    if manhattan(goal, core.position) < distance
+                )
+                for goal in goals:
+                    context.standing_reserved.add(goal)
+                    if self._move(
+                        unit,
+                        goal,
+                        context,
+                        reason=reason,
+                        allow_goal=True,
+                        intent=_MoveIntent.STAND,
+                        progress_toward=core.position,
+                        standing_steps=True,
+                        avoid_recent=False,
+                    ):
+                        return True
+                    context.standing_reserved.discard(goal)
+                self._record_wait(unit, context, "hold a unique Core queue slot")
+                return True
             if (
                 0 < distance <= CORE_QUEUE_RADIUS
                 and self._predicted_friendly_occupancy(unit.position, context) == 1
                 and unit.position not in self.memory.obstacles
                 and unit.position not in context.enemy_positions
             ):
-                closer_slot = (
-                    loaded_worker
-                    and distance > 1
-                    and self._has_open_core_queue_cell_closer_than(
-                        unit,
-                        core.position,
-                        context,
-                        distance,
-                    )
-                )
-                if not closer_slot:
-                    self._record_wait(unit, context, "hold a unique Core queue slot")
-                    return True
-                goals = self._core_queue_positions(unit, context)
-                goals = tuple(
-                    goal for goal in goals if manhattan(goal, core.position) < distance
-                )
-                if not goals:
-                    self._record_wait(unit, context, "hold a unique Core queue slot")
-                    return True
+                self._record_wait(unit, context, "hold a unique Core queue slot")
+                return True
         if goals is None:
             goals = self._core_queue_positions(unit, context)
         for goal in goals:
@@ -4802,6 +4872,8 @@ class AggressiveStrategy:
         extra_blockers: Container[Position] | None = None,
         avoid_recent: bool = True,
         avoid_new_threats: bool = False,
+        progress_toward: Position | None = None,
+        standing_steps: bool = False,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -4949,6 +5021,14 @@ class AggressiveStrategy:
         if direction is None:
             return False
         destination = add(unit.position, direction)
+        if progress_toward is not None and manhattan(
+            destination, progress_toward
+        ) >= manhattan(unit.position, progress_toward):
+            # Queue compaction must shorten the line.  The recency heuristic
+            # alone can choose a lateral or backward step around a crowded
+            # Core, which is precisely the A-B-A wandering the queue must not
+            # emit.
+            return False
         if destination in effective_blockers and not (
             allow_goal and destination == goal
         ):
@@ -4959,7 +5039,9 @@ class AggressiveStrategy:
             context,
             reason=reason,
             target=goal,
-            intent=intent if destination == goal else _MoveIntent.TRANSIT,
+            intent=(
+                intent if standing_steps or destination == goal else _MoveIntent.TRANSIT
+            ),
         )
 
     def _queue_move(
