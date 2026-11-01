@@ -3,7 +3,7 @@
 from uuid import UUID
 
 import pytest
-from arena_hero import Direction
+from arena_hero import Direction, ShootAction
 
 from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.models import DecisionReport
@@ -94,7 +94,7 @@ def test_rangers_keep_focus_until_damage_is_allocated_then_use_another_target(
 
 
 @pytest.mark.parametrize("blocker", ["rock", "friendly"])
-def test_local_shot_fallback_still_checks_rocks_and_friendly_firing_lines(blocker):
+def test_local_shot_fallback_only_rocks_obstruct_firing_lines(blocker):
     strategy, squad = expedition_strategy(2, 3)
     strategy._expedition_pursuits[squad] = _ExpeditionPursuit(
         target_id=object_id(90), position=(9, 6)
@@ -113,7 +113,11 @@ def test_local_shot_fallback_still_checks_rocks_and_friendly_firing_lines(blocke
 
     strategy._decide_ranger(turn.rangers[0], context, (), offensive=True)
 
-    assert turn.plan.unit_actions[turn.rangers[0].id].type == "MOVE"
+    action = turn.plan.unit_actions[turn.rangers[0].id]
+    assert action.type == ("MOVE" if blocker == "rock" else "SHOOT")
+    if blocker == "friendly":
+        assert isinstance(action, ShootAction)
+        assert action.target_id == UUID(int=91)
 
 
 @pytest.mark.parametrize("pursued_position", [(9, 5), (12, 5)])

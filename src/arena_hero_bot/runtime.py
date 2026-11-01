@@ -291,6 +291,12 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             unit_id: list(position)
             for unit_id, position in sorted(memory.defense_posts.items())
         },
+        "layered_defense": {
+            "anchor": memory.layered_defense_anchor,
+            "posts": memory.layered_defense_posts,
+            "ready_sides": sorted(memory.layered_defense_ready_sides),
+            "retreat_destination": memory.layered_retreat_destination,
+        },
         "defense_anchor": (
             list(memory.defense_anchor) if memory.defense_anchor is not None else None
         ),

@@ -196,6 +196,14 @@ class WorldMemory:
     # a radius-four inner screen under sustained pressure.
     defense_compressed: bool = False
     defense_calm_since_tick: int | None = None
+    layered_defense_core_id: str | None = None
+    layered_defense_anchor: Position | None = None
+    layered_defense_posts: dict[str, Position] = field(default_factory=dict)
+    layered_defense_ready_sides: set[str] = field(default_factory=set)
+    layered_defense_last_contact_tick: int = -1
+    # A tactical withdrawal is one cell, not a new campaign centre. Hold its
+    # destination while fighting instead of immediately walking back forward.
+    layered_retreat_destination: Position | None = None
     # Workers have one preferred 8x8 sector among the one- or two-chunk active
     # work area.  This is a soft patrol identity, not a resource-claim
     # restriction; every Worker may harvest anywhere in the area.
@@ -818,6 +826,12 @@ class WorldMemory:
             ),
             "defense_compressed": self.defense_compressed,
             "defense_calm_since_tick": self.defense_calm_since_tick,
+            "layered_defense_core_id": self.layered_defense_core_id,
+            "layered_defense_anchor": self.layered_defense_anchor,
+            "layered_defense_posts": self.layered_defense_posts,
+            "layered_defense_ready_sides": sorted(self.layered_defense_ready_sides),
+            "layered_defense_last_contact_tick": self.layered_defense_last_contact_tick,
+            "layered_retreat_destination": self.layered_retreat_destination,
             "worker_sectors": dict(sorted(self.worker_sectors.items())),
             "worker_sector_layout_version": self.worker_sector_layout_version,
             "worker_sector_count": self.worker_sector_count,
@@ -1036,6 +1050,21 @@ class WorldMemory:
             defense_compressed=bool(raw.get("defense_compressed", False)),
             defense_calm_since_tick=_optional_integer(
                 raw.get("defense_calm_since_tick")
+            ),
+            layered_defense_core_id=raw.get("layered_defense_core_id"),
+            layered_defense_anchor=_optional_position(
+                raw.get("layered_defense_anchor")
+            ),
+            layered_defense_posts={
+                str(actor_id): _position(position)
+                for actor_id, position in raw.get("layered_defense_posts", {}).items()
+            },
+            layered_defense_ready_sides=set(raw.get("layered_defense_ready_sides", [])),
+            layered_defense_last_contact_tick=int(
+                raw.get("layered_defense_last_contact_tick", -1)
+            ),
+            layered_retreat_destination=_optional_position(
+                raw.get("layered_retreat_destination")
             ),
             worker_sectors={
                 str(unit_id): int(block)

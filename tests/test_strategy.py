@@ -200,7 +200,7 @@ def test_defensive_second_rank_receives_local_contact() -> None:
     )
 
 
-def test_ranger_moves_to_clear_a_friendly_firing_line() -> None:
+def test_ranger_fires_through_a_friendly_unit() -> None:
     turn = make_turn(
         objects=[
             core(position=(100, 100)),
@@ -218,7 +218,8 @@ def test_ranger_moves_to_clear_a_friendly_firing_line() -> None:
     decide(turn)
 
     action = turn.plan.unit_actions[turn.rangers[0].id]
-    assert action.type == "MOVE"
+    assert action.type == "SHOOT"
+    assert action.target_id == UUID(int=4)
 
 
 def test_ranger_tracks_target_and_leads_one_cell() -> None:
@@ -286,8 +287,8 @@ def test_emergency_focuses_fire_and_bursts_combat_production() -> None:
     ]
     shoot_actions = [action for action in ranger_actions if action.type == "SHOOT"]
     move_actions = [action for action in ranger_actions if action.type == "MOVE"]
-    assert len(shoot_actions) == 1
-    assert len(move_actions) == 1
+    assert len(shoot_actions) == 2
+    assert len(move_actions) == 0
     assert shoot_actions[0].target_id == UUID(int=6)
     assert len({action.target_id for action in shoot_actions}) == 1
     assert turn.plan.core_action is not None
@@ -487,7 +488,7 @@ def test_core_holds_position_during_assault_without_escape_lane() -> None:
     assert turn.core is not None
 
 
-def test_massed_direct_assault_uses_a_non_worsening_core_escape_lane() -> None:
+def test_massed_direct_assault_rejects_a_fatal_four_tick_core_escape() -> None:
     turn = make_turn(
         resources=90,
         objects=[
@@ -517,11 +518,8 @@ def test_massed_direct_assault_uses_a_non_worsening_core_escape_lane() -> None:
     )
 
     assert turn.plan.core_action is not None
-    assert turn.plan.core_action.type == "START_MOVE"
-    assert any(
-        item.reason == "evacuate Core from overwhelming direct assault"
-        for item in report.decisions
-    )
+    assert turn.plan.core_action.type == "REPAIR_SHIELD"
+    assert not any(item.action == "START_MOVE" for item in report.decisions)
 
 
 def test_assault_limits_vanguard_strike_team_and_assigns_unique_screen_slots() -> None:

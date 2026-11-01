@@ -127,7 +127,7 @@ def test_trailing_defender_still_fires_at_a_combat_target():
     assert isinstance(_decide(strategy, turn.rangers[0], context), ShootAction)
 
 
-def test_front_rank_withdrawal_opens_a_covering_shot_for_the_next_rank():
+def test_front_rank_avoids_losing_trade_while_rear_covers_enemy_approach():
     strategy, turn, context = _scenario(
         [(2, (0, 6), 1), (3, (0, 3), 2)],
         [(30, "VANGUARD", (0, 7), 4)],
@@ -139,7 +139,9 @@ def test_front_rank_withdrawal_opens_a_covering_shot_for_the_next_rank():
     assert isinstance(front, MoveAction)
     destination = add((0, 6), front.direction)
     assert not strategy._visible_attackers_at(destination, turn, set())
-    assert destination in {(-1, 6), (1, 6)}
+    # Friendly Rangers do not block the rear's ray; withdrawing inward is
+    # just as legal as a lateral step and keeps the recovery route shorter.
+    assert destination in {(0, 5), (-1, 6), (1, 6)}
     assert isinstance(rear, ShootAction)
     assert rear.expected_cell == (0, 6)
     assert rear.target_id == UUID(int=30)
@@ -424,13 +426,13 @@ def test_pursuit_never_enters_a_lethal_cell_even_with_a_local_advantage():
     )
 
 
-def test_real_volley_count_excludes_blocked_and_doomed_rangers():
+def test_real_volley_count_ignores_friendly_obstructions_but_excludes_doomed():
     strategy, turn, context = _scenario(
         [(2, (0, 6), 2), (3, (0, 7), 1), (5, (3, 6), 2)],
         [(30, "RANGER", (0, 9), 2)],
     )
 
-    assert strategy._ranger_volley_count(turn.visible_enemies[0], context) == 1
+    assert strategy._ranger_volley_count(turn.visible_enemies[0], context) == 2
 
 
 def test_front_and_rear_wait_instead_of_targeting_a_friendly_reserved_endpoint():
@@ -505,7 +507,7 @@ def test_queued_waiting_patrol_mate_does_not_count_as_support():
     )
 
 
-def test_friendly_arrival_is_part_of_the_shooting_obstruction_picture():
+def test_friendly_arrival_does_not_obstruct_current_enemy_shot():
     strategy, turn, context = _scenario(
         [(2, (0, 6), 2), (3, (1, 8), 2)], [(30, "RANGER", (0, 9), 2)]
     )
@@ -516,7 +518,7 @@ def test_friendly_arrival_is_part_of_the_shooting_obstruction_picture():
 
     assert (0, 8) in positions
     assert (1, 8) not in positions
-    assert (0, 9) not in strategy._ranger_shot_cells(
+    assert (0, 9) in strategy._ranger_shot_cells(
         turn.rangers[0], turn.visible_enemies[0], turn, set(), positions
     )
 

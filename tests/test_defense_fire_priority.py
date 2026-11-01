@@ -101,7 +101,8 @@ def test_three_full_rangers_volley_a_stacked_pair_instead_of_all_withdrawing():
 
     assert all(action.type == "SHOOT" for action in actions)
     assert all(action.expected_cell == (-2, -5) for action in actions)
-    assert all(action.target_id == UUID(int=31) for action in actions)
+    assert sum(action.target_id == UUID(int=31) for action in actions) == 1
+    assert sum(action.target_id == UUID(int=30) for action in actions) == 2
 
 
 def test_existing_direct_shots_win_over_friendly_stack_spreading():
@@ -120,7 +121,7 @@ def test_existing_direct_shots_win_over_friendly_stack_spreading():
     )
 
 
-def test_enemy_core_in_the_target_cell_prevents_a_false_guaranteed_kill():
+def test_precision_volley_can_target_a_unit_sharing_an_enemy_core_cell():
     turn = make_turn(
         objects=[
             core(),
@@ -133,7 +134,7 @@ def test_enemy_core_in_the_target_cell_prevents_a_false_guaranteed_kill():
 
     strategy._prepare_defensive_trade_shots(context)
 
-    assert context.defensive_trade_shots == {}
+    assert context.defensive_trade_shots[UUID(int=2)].id == UUID(int=30)
 
 
 def test_healthy_ranger_leaves_core_without_a_service_request():
@@ -165,7 +166,7 @@ def test_wounded_defender_waits_in_a_safe_unique_healing_queue_slot():
     action = _ranger_action(strategy, context, turn.rangers[0])
 
     assert action.type == "WAIT"
-    assert "queue" in context.report.decisions[-1].reason
+    assert "healing slot" in context.report.decisions[-1].reason
 
 
 @pytest.mark.parametrize("funds,service", [(0, None), (5, "DEPOSIT"), (5, "HEAL")])

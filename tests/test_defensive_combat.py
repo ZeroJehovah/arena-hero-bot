@@ -35,7 +35,7 @@ def _decisions_by_number(report: DecisionReport) -> dict[int, str]:
     }
 
 
-def test_a_volley_hedges_across_the_targets_possible_next_cells() -> None:
+def test_defensive_volley_prioritizes_visible_current_occupancy() -> None:
     # Two shooters see the same legal cells: the predicted lead (3, 4) and
     # the cell the target would step into on its way to our Core (1, 4).
     # Once the first shooter covers the cell that can kill the target, the
@@ -72,8 +72,8 @@ def test_a_volley_hedges_across_the_targets_possible_next_cells() -> None:
         action = turn.plan.unit_actions[UUID(int=number)]
         assert action.type == "SHOOT"
         aims[number] = action.expected_cell
-    assert aims[2] == (3, 4)
-    assert aims[5] == (1, 4)
+    assert aims[2] == (2, 4)
+    assert aims[5] == (2, 4)
     assert all(
         line_of_fire(position, aim, memory.obstacles)
         for position, aim in (
@@ -82,7 +82,7 @@ def test_a_volley_hedges_across_the_targets_possible_next_cells() -> None:
         )
     )
     reasons = _decisions_by_number(report)
-    assert "covering a possible approach cell" in reasons[5]
+    assert "focus fire" in reasons[5]
 
 
 def test_a_far_side_defender_closes_on_a_massed_assault() -> None:
@@ -350,7 +350,7 @@ def test_mutual_kill_is_allowed_even_when_both_hostile_shots_still_resolve() -> 
     assert "fire" in _decisions_by_number(report)[2]
 
 
-def test_straight_moving_shooters_are_counted_before_they_enter_range() -> None:
+def test_moving_shooters_are_future_risk_without_current_arrows() -> None:
     memory = WorldMemory()
     for number in (30, 31):
         memory.enemy_position_history[object_id(number)] = [
@@ -370,8 +370,11 @@ def test_straight_moving_shooters_are_counted_before_they_enter_range() -> None:
 
     attackers = strategy._visible_attackers_at((0, 0), turn, set())
 
-    assert len(attackers) == 2
-    assert {str(enemy.id) for enemy in attackers} == {
+    assert len(attackers) == 0
+    assert len(strategy._future_attackers_at((0, 0), turn, set())) == 2
+    assert {
+        str(enemy.id) for enemy in strategy._future_attackers_at((0, 0), turn, set())
+    } == {
         object_id(30),
         object_id(31),
     }
@@ -482,9 +485,12 @@ def test_defensive_aim_covers_stops_reversals_and_turns(end) -> None:
     assert end not in strategy._ranger_shot_cells(
         turn.rangers[0], turn.visible_enemies[0], turn, {end}
     )
-    assert end not in strategy._ranger_shot_cells(
+    occupied_cells = strategy._ranger_shot_cells(
         turn.rangers[0], turn.visible_enemies[0], turn, set(), {end}
     )
+    # A friendly intermediate cell does not block fire, but a friendly
+    # endpoint cannot receive an enemy that moves into it this Tick.
+    assert (end in occupied_cells) == (end == (2, 4))
 
 
 def test_flickering_diagonal_drift_cannot_aim_two_steps_ahead() -> None:
