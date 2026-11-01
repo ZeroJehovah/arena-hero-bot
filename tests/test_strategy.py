@@ -557,7 +557,7 @@ def test_ranger_fires_at_close_focus_target_during_core_assault() -> None:
     turn = make_turn(
         objects=[
             core(),
-            unit(2, "RANGER", position=(0, 0)),
+            unit(2, "RANGER", position=(-1, 1)),
             unit(3, "VANGUARD", controlled=False, position=(0, 2)),
             unit(4, "RANGER", controlled=False, position=(0, 2)),
             unit(5, "VANGUARD", controlled=False, position=(1, 2)),
@@ -6105,7 +6105,7 @@ def test_core_holds_when_local_force_outmatches_approaching_enemy() -> None:
     assert second.plan.core_action is None
 
 
-def test_lone_ranger_declines_solo_duel_with_enemy_ranger() -> None:
+def test_lone_ranger_accepts_an_equal_duel_with_enemy_ranger() -> None:
     turn = make_turn(
         objects=[
             core(position=(0, 0)),
@@ -6117,8 +6117,8 @@ def test_lone_ranger_declines_solo_duel_with_enemy_ranger() -> None:
     report = decide(turn)
 
     action = turn.plan.unit_actions[turn.rangers[0].id]
-    assert action.type == "MOVE"
-    assert any("killing volley" in item.reason for item in report.decisions)
+    assert action.type == "SHOOT"
+    assert any("fire" in item.reason for item in report.decisions)
 
 
 def test_ranger_shoots_enemy_ranger_threatening_core() -> None:

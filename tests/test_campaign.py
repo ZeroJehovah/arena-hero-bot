@@ -1993,10 +1993,16 @@ def test_forward_patrols_are_all_recalled_when_the_defense_ring_is_hit() -> None
         assert action.type == "MOVE"
     assert (
         sum(
-            decision.reason == "recall forward patrol to defend the threatened Core"
+            decision.reason
+            == "reinforce the threatened side from a stable defensive post"
             for decision in report.decisions
         )
         == 8
+    )
+    assert all(
+        decision.target != center
+        for decision in report.decisions
+        if decision.actor_id in {str(i) for i in strategy._patrol_ids(turn)}
     )
 
 

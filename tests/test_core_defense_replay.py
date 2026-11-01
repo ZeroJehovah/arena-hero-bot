@@ -150,7 +150,7 @@ def test_defender_repositions_before_firing_only_a_predicted_cell() -> None:
     assert "clear firing lane" in context.report.decisions[-1].reason
 
 
-def test_overlapping_defenders_split_without_losing_the_direct_shot() -> None:
+def test_overlapping_defenders_keep_their_direct_shots_during_combat() -> None:
     memory = WorldMemory(
         unit_roles={object_id(2): DEFENSE_ROLE, object_id(3): DEFENSE_ROLE},
         unit_roles_initialized=True,
@@ -180,9 +180,11 @@ def test_overlapping_defenders_split_without_losing_the_direct_shot() -> None:
         )
 
     actions = [turn.plan.unit_actions[UUID(int=number)] for number in (2, 3)]
-    assert sum(isinstance(action, MoveAction) for action in actions) == 1
-    shooter = next(action for action in actions if isinstance(action, ShootAction))
-    assert shooter.expected_cell == (1, 1)
+    assert all(isinstance(action, ShootAction) for action in actions)
+    assert all(
+        isinstance(action, ShootAction) and action.expected_cell == (1, 1)
+        for action in actions
+    )
 
 
 def test_workers_in_an_assault_retreat_to_the_outer_standoff_ring() -> None:

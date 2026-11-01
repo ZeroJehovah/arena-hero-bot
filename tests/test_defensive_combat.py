@@ -329,7 +329,7 @@ def test_massed_assault_fallback_is_inert_without_the_shared_picture() -> None:
     )
 
 
-def test_killing_one_of_two_shooters_does_not_cancel_its_return_fire() -> None:
+def test_mutual_kill_is_allowed_even_when_both_hostile_shots_still_resolve() -> None:
     # Both attacks resolve even when the one-HP target dies in this volley.
     turn = make_turn(
         objects=[
@@ -344,10 +344,10 @@ def test_killing_one_of_two_shooters_does_not_cancel_its_return_fire() -> None:
     report = strategy.decide(turn)
 
     action = turn.plan.unit_actions[UUID(int=2)]
-    assert action.type == "MOVE"
-    destination = add((0, 0), action.direction)
-    assert len(strategy._visible_attackers_at(destination, turn, set())) < 2
-    assert "lethal multi-source" in _decisions_by_number(report)[2]
+    assert action.type == "SHOOT"
+    assert action.expected_cell == (0, 2)
+    assert len(strategy._visible_attackers_at((0, 0), turn, set())) == 2
+    assert "fire" in _decisions_by_number(report)[2]
 
 
 def test_straight_moving_shooters_are_counted_before_they_enter_range() -> None:
