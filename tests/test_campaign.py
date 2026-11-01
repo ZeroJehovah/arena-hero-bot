@@ -1124,6 +1124,43 @@ def test_campaign_rest_clears_the_service_cell_for_the_next_delivery() -> None:
     )
 
 
+def test_stationary_campaign_core_clears_service_cell_for_queued_cargo() -> None:
+    """Combat recall must not park a healthy guard on the only service slot."""
+
+    center = (-945, -945)
+    core_object = core(position=center)
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+    )
+    rangers = _rangers(20)
+    for ranger in rangers:
+        memory.unit_roles[str(ranger["id"])] = "defense"
+    parked = unit(600, "RANGER", position=center)
+    loaded = unit(500, "WORKER", position=(-943, -945), cargo=1)
+    turn = make_turn(
+        tick=100,
+        resources=10,
+        objects=[core_object, parked, *_workers(10), loaded, *rangers],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert memory.campaign_resting is False
+    parked_unit = next(unit for unit in turn.rangers if str(unit.id) == parked["id"])
+    action = turn.plan.unit_actions[parked_unit.id]
+    assert action.type == "MOVE"
+    assert any(
+        item.actor_id == parked["id"]
+        and item.reason == "leave Core service cell for unique traffic"
+        for item in report.decisions
+    )
+
+
 def test_campaign_rest_pipeline_admits_the_next_worker_on_departure() -> None:
     """A resting Core swaps one service Worker for the next in one Tick."""
 

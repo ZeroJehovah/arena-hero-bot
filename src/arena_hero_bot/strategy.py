@@ -892,6 +892,13 @@ class AggressiveStrategy:
             self._prepare_core_departure(context)
             self._yield_core_migration_step(context)
             context.core_arrival_worker_id = self._select_core_arrival_worker(context)
+        elif turn.core is not None:
+            # A stationary Core still has one service slot.  Patrol recall and
+            # recovery can park a healthy combat unit on it indefinitely, so
+            # clear that cell before combat decisions consume the blockers'
+            # actions.  The final pass below remains necessary for combat
+            # units that vacate the cell on this Tick.
+            self._prepare_core_departure(context)
         combat_units = [
             unit
             for unit in (*turn.rangers, *turn.vanguards)
@@ -3832,6 +3839,7 @@ class AggressiveStrategy:
                 ),
                 None,
             )
+        stationary_delivery_window = False
         if context.core_build_priority:
             # A spawn lands on the Core cell, so every friendly occupant must
             # clear before the build-priority service Tick can produce.
@@ -3844,9 +3852,26 @@ class AggressiveStrategy:
             # same queue, so distant cargo never justifies the churn.
             service_window = self._campaign_pending_deliveries(context.turn) > 0
         else:
-            service_window = False
+            # A stationary Core can stay in combat posture for many hours.
+            # Without this queue-aware window, a healthy Ranger parked on the
+            # single service slot can block every cargo delivery even while
+            # storage has free capacity.  Workers in the delivery queue make
+            # that slot a service cell; critical healers still win the
+            # service_candidate check above and remain in place.
+            stationary_delivery_window = context.remaining_resource_space > 0 and any(
+                worker.cargo > 0
+                and manhattan(worker.position, core.position) <= CORE_QUEUE_RADIUS
+                for worker in context.turn.workers
+            )
+            service_window = stationary_delivery_window
         for unit in sorted(core_units, key=lambda candidate: candidate.id.bytes):
             if unit is service_candidate:
+                continue
+            if stationary_delivery_window and isinstance(unit, Worker):
+                # Worker-to-Worker swaps already use the dedicated service
+                # pipeline.  Pre-empting an empty Worker here would turn a
+                # same-Tick harvest/deposit swap into an unnecessary queue
+                # detour and leave the arriving cargo outside the Core.
                 continue
             critical_without_service = (
                 unit.hp <= (1 if isinstance(unit, (Worker, Ranger)) else 2)
