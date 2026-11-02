@@ -123,6 +123,8 @@ UNREACHABLE_PATROL_COOLDOWN = 128
 WORKER_PATROL_ROUTE_ATTEMPTS = 24
 WORKER_PATROL_SECTOR_SIZE = 8
 WORKER_PATROL_SECTOR_COUNT = 32
+# Two radius-three sightlines should meet rather than follow the same strip.
+WORKER_PATROL_SEPARATION = 6
 # Cap old sightings so a very stale region cannot dominate forever; a cell
 # without any recorded sighting still outranks every known recent sightline.
 WORKER_PATROL_AGE_CAP = 512
@@ -451,6 +453,8 @@ class _TurnContext:
     core_escape_destination: Position | None = None
     core_resource_clearance_target: Position | None = None
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
+    worker_patrol_roster: frozenset[UUID] = field(default_factory=frozenset)
+    worker_patrol_owners: dict[Position, UUID] = field(default_factory=dict)
     defensive_assignments: dict[UUID, Position] | None = None
     remaining_resources: int = 0
     remaining_resource_space: int = 0
@@ -11571,10 +11575,20 @@ class AggressiveStrategy:
                 pending.append(worker)
 
         for worker in pending:
+            occupied_centers = tuple(
+                _resource_block_center(sector) for sector in assignments.values()
+            )
             sector = min(
                 sectors,
                 key=lambda candidate: (
                     counts[candidate.index],
+                    -min(
+                        (
+                            manhattan(_resource_block_center(candidate), center)
+                            for center in occupied_centers
+                        ),
+                        default=0,
+                    ),
                     manhattan(worker.position, _resource_block_center(candidate)),
                     candidate.index,
                 ),
@@ -12856,7 +12870,7 @@ class AggressiveStrategy:
         worker: Worker,
         context: _TurnContext,
     ) -> Position:
-        """Cover the chunk by stale sightlines, with soft 8x8 sector balance."""
+        """Refresh separate patrol territories, sharing vacant Workers' areas."""
 
         turn = context.turn
         chunk = self._resource_chunk(context.turn)
@@ -12867,12 +12881,50 @@ class AggressiveStrategy:
         purpose = WORKER_PATROL_PURPOSE
         current = self.memory.goal_for(unit_id)
         block_cells = frozenset(_resource_block_cells(chunk)) - obstacles
+        sectors = _resource_area_patrol_sectors(chunk)
+        patrol_workers = [
+            other
+            for other in turn.workers
+            if other.id == worker.id
+            or (other.cargo == 0 and other.id not in context.resource_assignments)
+        ]
+        patrol_centers = {
+            other.id: _resource_block_center(sectors[index])
+            for other in patrol_workers
+            if (index := self.memory.worker_sectors.get(str(other.id))) is not None
+            and 0 <= index < len(sectors)
+        }
+        roster = frozenset(patrol_centers)
+        if roster and roster != context.worker_patrol_roster:
+            context.worker_patrol_roster = roster
+            context.worker_patrol_owners = {
+                position: min(
+                    patrol_centers,
+                    key=lambda other_id, position=position: (
+                        manhattan(position, patrol_centers[other_id]),
+                        other_id.bytes,
+                    ),
+                )
+                for position in block_cells
+            }
+
+        def owns(position: Position) -> bool:
+            # UUID sectors persist, but an empty Worker's responsibility grows
+            # while a neighbor harvests or delivers.  A lone patrol still sweeps
+            # the whole chunk.  These boundaries only rank idle goals; they do
+            # not block movement or prevent cross-sector resource claims.
+            return (
+                not patrol_centers
+                or context.worker_patrol_owners.get(position) == worker.id
+            )
+
         patrol_goals = [
             (other, goal)
-            for other in turn.workers
+            for other in patrol_workers
             if other.id != worker.id
             if (goal := self.memory.goal_for(str(other.id))) is not None
             and _is_worker_patrol_goal(goal)
+            and chunk.contains(goal.position)
         ]
         claimed_positions = {goal.position for _other, goal in patrol_goals}
         other_positions = {
@@ -12887,6 +12939,12 @@ class AggressiveStrategy:
             sector_index = _worker_patrol_sector_index(chunk, goal.position)
             if 0 <= sector_index < WORKER_PATROL_SECTOR_COUNT:
                 sector_loads[sector_index] += 1
+
+        def separation(position: Position) -> int:
+            return min(
+                (manhattan(position, goal.position) for _other, goal in patrol_goals),
+                default=WORKER_PATROL_SEPARATION,
+            )
 
         def age(position: Position) -> int:
             seen_tick = self.memory.worker_seen_ticks.get(position)
@@ -12936,6 +12994,8 @@ class AggressiveStrategy:
             current is not None
             and current.purpose == purpose
             and worker.position != current.position
+            and owns(current.position)
+            and separation(current.position) >= WORKER_PATROL_SEPARATION
             and current_gain > 0
             and usable(current.position)
             and not self._near_remembered_worker_danger(current.position, turn)
@@ -12975,7 +13035,7 @@ class AggressiveStrategy:
             if position != worker.position and usable(position)
         ]
         preferred_sector = self.memory.worker_sectors.get(unit_id)
-        scored: list[tuple[int, float, int, int, int, int, Position]] = []
+        scored: list[tuple[int, int, int, float, int, int, int, int, Position]] = []
         for position in candidates:
             gain = marginal_gain(position)
             distance = manhattan(worker.position, position)
@@ -12991,7 +13051,9 @@ class AggressiveStrategy:
                 score *= WORKER_PATROL_PREFERRED_BONUS
             scored.append(
                 (
+                    int(owns(position)),
                     int(load == 0 and gain > 0),
+                    int(separation(position) >= WORKER_PATROL_SEPARATION),
                     score,
                     -load,
                     int(sector_index == preferred_sector),
@@ -13002,15 +13064,24 @@ class AggressiveStrategy:
             )
         scored.sort(reverse=True)
         patrol_position = worker.position
+        # Check a bounded set within the territory first, then leave it only
+        # when rocks or danger make those local targets unusable/unreachable.
+        route_candidates = [item for item in scored if item[0]][
+            : WORKER_PATROL_ROUTE_ATTEMPTS // 2
+        ] + [item for item in scored if not item[0]][
+            : WORKER_PATROL_ROUTE_ATTEMPTS // 2
+        ]
         for (
+            _owned,
             _empty_sector,
+            _separated,
             _score,
             _load,
             _preferred,
             _gain,
             _distance,
             candidate,
-        ) in scored[:WORKER_PATROL_ROUTE_ATTEMPTS]:
+        ) in route_candidates:
             if self._has_static_route(
                 worker,
                 candidate,

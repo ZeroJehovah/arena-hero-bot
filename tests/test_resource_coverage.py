@@ -9,7 +9,7 @@ from arena_hero import Direction
 
 from arena_hero_bot.exploration import visible_cells
 from arena_hero_bot.geometry import manhattan
-from arena_hero_bot.memory import UnitGoal, WorldMemory
+from arena_hero_bot.memory import WORKER_SECTOR_LAYOUT_VERSION, UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
     PATROL_RING_PURPOSE,
@@ -178,7 +178,7 @@ def test_legacy_worker_blocks_migrate_to_fresh_patrol_sectors(tmp_path) -> None:
     turn = make_turn(objects=[core(position=HOME), *workers])
     strategy._reconcile_worker_sectors(turn)
 
-    assert restored.worker_sector_layout_version == 1
+    assert restored.worker_sector_layout_version == WORKER_SECTOR_LAYOUT_VERSION
     assert sorted(restored.worker_sectors.values()) == list(range(16))
 
 
@@ -561,6 +561,110 @@ def test_idle_workers_still_fill_distinct_sectors_when_four_are_returning() -> N
         assert goal.purpose == WORKER_PATROL_PURPOSE
         patrol_sectors.append(_worker_patrol_sector_index(chunk, goal.position))
     assert len(set(patrol_sectors)) == 12
+
+
+def test_new_worker_fills_the_distant_patrol_gap_without_reassigning_survivors():
+    workers = [
+        unit(301, "WORKER", position=(HOME[0] - 14, HOME[1] - 14)),
+        unit(302, "WORKER", position=(HOME[0] - 13, HOME[1] - 14)),
+    ]
+    memory = WorldMemory(
+        core_home_position=HOME,
+        worker_sector_layout_version=WORKER_SECTOR_LAYOUT_VERSION,
+        worker_sector_count=16,
+        worker_sectors={workers[0]["id"]: 0},
+    )
+    strategy = _strategy(memory)
+
+    strategy._reconcile_worker_sectors(
+        make_turn(objects=[core(position=HOME), *workers])
+    )
+
+    assert memory.worker_sectors[workers[0]["id"]] == 0
+    assert memory.worker_sectors[workers[1]["id"]] == 15
+
+
+def test_close_patrol_routes_separate_and_keep_refreshing_their_own_areas():
+    sectors = _single_chunk_patrol_sectors(HOME)
+    left, right = sectors[5], sectors[6]
+    workers = [
+        unit(301, "WORKER", position=(left.max_x - 3, left.min_y + 2)),
+        unit(302, "WORKER", position=(right.min_x + 2, right.min_y + 2)),
+    ]
+    memory = WorldMemory(
+        core_home_position=HOME,
+        worker_sector_layout_version=WORKER_SECTOR_LAYOUT_VERSION,
+        worker_sector_count=16,
+        worker_sectors={workers[0]["id"]: 5, workers[1]["id"]: 6},
+    )
+    for worker, position in zip(
+        workers,
+        [(left.max_x, left.min_y + 2), (right.min_x, right.min_y + 2)],
+        strict=True,
+    ):
+        memory.set_goal(worker["id"], UnitGoal(position, 100, WORKER_PATROL_PURPOSE))
+    strategy = _strategy(memory)
+    distances = []
+    positions = [set(), set()]
+    for tick in range(100, 140):
+        turn = make_turn(tick=tick, objects=[core(position=HOME), *workers])
+        strategy.decide(turn)
+        left_goal = memory.goal_for(workers[0]["id"])
+        right_goal = memory.goal_for(workers[1]["id"])
+        assert left_goal is not None
+        assert right_goal is not None
+        assert manhattan(left_goal.position, right_goal.position) >= 6
+        assert left_goal.position[0] < right.min_x
+        assert right_goal.position[0] >= right.min_x
+        for index, worker in enumerate(workers):
+            action = turn.plan.unit_actions[UUID(worker["id"])]
+            if action.type == "MOVE":
+                dx, dy = action.direction.delta
+                worker["position"][0] += dx
+                worker["position"][1] += dy
+            positions[index].add(tuple(worker["position"]))
+        distances.append(
+            manhattan(tuple(workers[0]["position"]), tuple(workers[1]["position"]))
+        )
+
+    assert max(distances[10:]) >= 12
+    assert sum(distance <= 3 for distance in distances[10:]) <= 2
+    assert all(len(visited) >= 20 for visited in positions)
+
+
+def test_idle_patrol_can_leave_a_territory_with_no_traversable_target():
+    sectors = _single_chunk_patrol_sectors(HOME)
+    chunk = _single_chunk_resource_block(HOME)
+    first_center = (sectors[0].min_x + 3, sectors[0].min_y + 3)
+    last_center = (sectors[15].min_x + 3, sectors[15].min_y + 3)
+    rocks = {
+        position
+        for position in _resource_block_cells(chunk)
+        if manhattan(position, first_center) <= manhattan(position, last_center)
+    }
+    workers = [
+        unit(301, "WORKER", position=(chunk.max_x - 2, chunk.max_y - 2)),
+        unit(302, "WORKER", position=(chunk.max_x - 5, chunk.max_y - 2)),
+    ]
+    memory = WorldMemory(
+        core_home_position=HOME,
+        worker_sector_layout_version=WORKER_SECTOR_LAYOUT_VERSION,
+        worker_sector_count=16,
+        worker_sectors={workers[0]["id"]: 0, workers[1]["id"]: 15},
+    )
+    strategy = _strategy(memory)
+    turn = make_turn(objects=[core(position=HOME), *workers], obstacles=rocks)
+
+    report = strategy.decide(turn)
+
+    decision = next(
+        item for item in report.decisions if item.actor_id == workers[0]["id"]
+    )
+    goal = memory.goal_for(workers[0]["id"])
+    assert decision.action == "MOVE"
+    assert goal is not None
+    assert goal.position not in rocks
+    assert chunk.contains(goal.position)
 
 
 def test_ring_contact_alert_uses_clockwise_path_distance() -> None:
