@@ -174,6 +174,17 @@ PATROL_PURSUIT_DISTANCE = 4
 PATROL_PURSUIT_TICKS = 6
 PATROL_CONTACT_RESET_TICKS = 8
 PATROL_COMBAT_SUPPORT_RADIUS = 6
+# A stationary wounded fighter in a small contact just beyond the defensive firing
+# range used to be left alone while the whole ring fired speculative edge
+# cells.  A tiny local firing-lane response can remove that contact without
+# turning the defensive ring into a pursuit force.  The response is available
+# only in campaign defence, keeps every participant within three cells of its
+# assigned post, and requires a route of at most three steps to a real ray.
+LOCAL_FIRELINE_MAX_FIGHTERS = 2
+LOCAL_FIRELINE_MAX_TARGET_HP = 2
+LOCAL_FIRELINE_MAX_STEPS = 3
+LOCAL_FIRELINE_MIN_HEALTHY_RESERVE = 2
+LOCAL_FIRELINE_MAX_TICKS = 8
 RANGER_STANDOFF_RANGE = 3
 RANGER_RETURN_THREAT_RADIUS = 5
 COMBAT_SCREEN_RADIUS = 3
@@ -202,6 +213,7 @@ EARLY_COMBAT_GUARD_WORKERS = 4
 GARRISON_MIN_GUARDS = 3
 GARRISON_ROSTER_SHARE = 4
 ALL_HANDS_DEFENSE_MIN_ENEMIES = 3
+ALL_HANDS_DEFENSE_MEMORY_TICKS = 16
 DEFENSIVE_LANE_ROTATIONS_PER_TICK = 2
 RAID_ABORT_SCAN_RADIUS = 6
 # Active-offense ("expedition") posture: a fixed formation saturates the Core
@@ -481,6 +493,9 @@ class _TurnContext:
     defensive_lane_moves: int = 0
     defensive_trade_shots: dict[UUID, UnitView] | None = None
     defensive_firing_lanes: set[Position] = field(default_factory=set)
+    local_fireline_orders: dict[UUID, tuple[UnitView, Position]] = field(
+        default_factory=dict
+    )
     reinforcement_assignments: dict[UUID, Position] | None = None
     layered_assignments: dict[UUID, Position] = field(default_factory=dict)
     layered_steps: dict[UUID, Direction] = field(default_factory=dict)
@@ -652,6 +667,10 @@ class AggressiveStrategy:
         self._core_hunt_until_tick: int = -1
         self._core_hunt_last_seen_tick: int = -1
         self._core_hunt_cooldown_until: int = -1
+        self._local_fireline_target_id: str | None = None
+        self._local_fireline_ranger_ids: frozenset[UUID] = frozenset()
+        self._local_fireline_goals: dict[UUID, Position] = {}
+        self._local_fireline_until_tick: int = -1
         # Expedition posture state.  Surplus combat units are staged at the
         # defensive ring edge until a full expedition can depart.  Each
         # expedition keeps its membership, pursuit and shared exploration
@@ -960,6 +979,7 @@ class AggressiveStrategy:
             # actions.  The final pass below remains necessary for combat
             # units that vacate the cell on this Tick.
             self._prepare_core_departure(context)
+        self._prepare_local_fireline(context)
         combat_units = [
             unit
             for unit in (*turn.rangers, *turn.vanguards)
@@ -1222,6 +1242,29 @@ class AggressiveStrategy:
             for enemy, shot_cells in shootable
             if enemy.position in shot_cells
         ]
+        local_fireline = context.local_fireline_orders.get(ranger.id)
+        if local_fireline is not None:
+            target, _goal = local_fireline
+            if not direct_shootable:
+                self._take_local_fireline(ranger, context)
+                return
+            assigned = tuple(
+                candidate
+                for candidate in context.turn.rangers
+                if candidate.id in context.local_fireline_orders
+            )
+            all_ready = len(assigned) == len(context.local_fireline_orders) and all(
+                self._line_of_fire_clear(other.position, target.position, obstacles)
+                for other in assigned
+            )
+            if not all_ready:
+                self._record_wait(
+                    ranger,
+                    context,
+                    "hold for the bounded local firing pair to line up",
+                )
+                ranger.wait()
+                return
         self._prepare_defensive_trade_shots(context)
         if local_formation and direct_shootable:
             shootable = direct_shootable
@@ -1943,6 +1986,339 @@ class AggressiveStrategy:
             ranger, context, recent_enemies, frontier=True
         ):
             del context.report.decisions[-2]
+
+    def _clear_local_fireline(self) -> None:
+        """Abort the ephemeral local firing-lane task."""
+
+        self._local_fireline_target_id = None
+        self._local_fireline_ranger_ids = frozenset()
+        self._local_fireline_goals = {}
+        self._local_fireline_until_tick = -1
+
+    def _prepare_local_fireline(self, context: _TurnContext) -> None:
+        """Assign a bounded response to a wounded fighter in a small contact.
+
+        The ordinary defensive ring is intentionally stationary.  However, a
+        wounded fighter parked just outside Ranger range can otherwise hold
+        visual contact indefinitely while the entire formation spends arrows
+        on speculative edge cells.  This rule only authorises a short move to
+        a *currently valid* firing ray.  It never follows a remembered cell,
+        never reacts to a moving target, and does not run outside campaign
+        defence.
+        """
+
+        context.local_fireline_orders.clear()
+        if not self.config.campaign_mode or not self._symmetric_posture():
+            self._clear_local_fireline()
+            return
+        core = context.turn.core
+        if (
+            core is None
+            or core.hp < 5
+            or core.shield < 5
+            or context.emergency
+            or context.all_hands_defense
+            or context.combat_assault
+            or context.threat.projected_core_damage > 0
+        ):
+            self._clear_local_fireline()
+            return
+        fighters = tuple(
+            enemy
+            for enemy in context.turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+        )
+        if not 1 <= len(fighters) <= LOCAL_FIRELINE_MAX_FIGHTERS:
+            self._clear_local_fireline()
+            return
+        radius = self.config.core_assault_radius + RANGER_VISION_RADIUS + 1
+        local_fighters = tuple(
+            enemy
+            for enemy in fighters
+            if manhattan(core.position, enemy.position) <= radius
+        )
+        if len(local_fighters) != len(fighters):
+            # A second fighter elsewhere is not another combat front.  Keep
+            # the whole ring on station and leave remote contacts to the
+            # existing patrol/scout policy.
+            self._clear_local_fireline()
+            return
+        available = tuple(
+            ranger
+            for ranger in context.turn.rangers
+            if ranger.hp > 1
+            and ranger.id not in context.planned_ids
+            and ranger.id not in context.garrison_ids
+            and ranger.id not in context.core_hunt_ids
+            and ranger.id not in context.clearance_ids
+            and ranger.id not in context.raid_ids
+            and self.memory.unit_roles.get(str(ranger.id)) == DEFENSE_ROLE
+        )
+        obstacles = self._rock_map(context.turn)
+        if self._local_fireline_target_id is not None:
+            target = next(
+                (
+                    enemy
+                    for enemy in local_fighters
+                    if str(enemy.id) == self._local_fireline_target_id
+                ),
+                None,
+            )
+            available_by_id = {ranger.id: ranger for ranger in available}
+            assigned = tuple(
+                available_by_id[ranger_id]
+                for ranger_id in self._local_fireline_ranger_ids
+                if ranger_id in available_by_id
+            )
+            goals_valid = all(
+                goal not in obstacles
+                and goal not in context.enemy_positions
+                and goal != core.position
+                for goal in self._local_fireline_goals.values()
+            )
+            if (
+                target is None
+                or context.turn.tick > self._local_fireline_until_tick
+                or len(assigned) != len(self._local_fireline_ranger_ids)
+                or not goals_valid
+                or target.hp > LOCAL_FIRELINE_MAX_TARGET_HP
+                or not self.memory.enemy_is_stationary(
+                    str(target.id), context.turn.tick
+                )
+            ):
+                self._clear_local_fireline()
+                return
+            ready = tuple(
+                ranger
+                for ranger in assigned
+                if line_of_fire(ranger.position, target.position, obstacles)
+            )
+            if len(ready) >= target.hp:
+                self._clear_local_fireline()
+                return
+            context.local_fireline_orders = {
+                ranger.id: (
+                    target,
+                    self._local_fireline_goals[ranger.id],
+                )
+                for ranger in assigned
+            }
+            return
+        for target in sorted(
+            local_fighters,
+            key=lambda enemy: (
+                enemy.hp,
+                manhattan(core.position, enemy.position),
+                str(enemy.id),
+            ),
+        ):
+            if (
+                target.hp > LOCAL_FIRELINE_MAX_TARGET_HP
+                or not self.memory.enemy_is_stationary(
+                    str(target.id), context.turn.tick
+                )
+            ):
+                continue
+            required = target.hp
+            if len(available) < required + LOCAL_FIRELINE_MIN_HEALTHY_RESERVE:
+                continue
+            all_ready = tuple(
+                ranger
+                for ranger in context.turn.rangers
+                if line_of_fire(ranger.position, target.position, obstacles)
+            )
+            if len(all_ready) >= required:
+                continue
+            if any(ranger not in available for ranger in all_ready):
+                continue
+            selected: list[tuple[Ranger, Position]] = [
+                (ranger, ranger.position) for ranger in all_ready
+            ]
+            routes: dict[UUID, tuple[Position, ...]] = {
+                ranger.id: () for ranger in all_ready
+            }
+            used_ids = {ranger.id for ranger in all_ready}
+            goal_counts: dict[Position, int] = {
+                ranger.position: 1 for ranger in all_ready
+            }
+            options: list[
+                tuple[
+                    tuple[object, ...],
+                    Ranger,
+                    Position,
+                    tuple[Position, ...],
+                ]
+            ] = []
+            for ranger in available:
+                if ranger.id in used_ids:
+                    continue
+                post = (
+                    context.layered_assignments.get(ranger.id)
+                    or (context.defensive_assignments or {}).get(ranger.id)
+                    or self.memory.defense_posts.get(str(ranger.id))
+                    or ranger.position
+                )
+                for goal in firing_positions(target.position):
+                    if (
+                        goal == ranger.position
+                        or goal in obstacles
+                        or goal in context.enemy_positions
+                        or goal == core.position
+                        or goal in context.turn.resource_cells
+                        or manhattan(post, goal) > DEFENSIVE_POST_SUPPORT_DISTANCE
+                        or not self._within_combat_leash(
+                            ranger, goal, context, offensive=False
+                        )
+                        or not self._line_of_fire_clear(
+                            goal, target.position, obstacles
+                        )
+                        or self._predicted_friendly_occupancy(goal, context) >= 2
+                    ):
+                        continue
+                    route = self._local_fireline_route(ranger, goal, context)
+                    if route is None:
+                        continue
+                    blockers = self._visible_attackers_at(goal, context.turn, obstacles)
+                    if len(blockers) >= ranger.hp:
+                        continue
+                    current_attackers = {
+                        str(enemy.id)
+                        for enemy in self._visible_attackers_at(
+                            ranger.position, context.turn, obstacles
+                        )
+                    }
+                    if any(
+                        {
+                            str(enemy.id)
+                            for enemy in self._visible_attackers_at(
+                                step, context.turn, obstacles
+                            )
+                        }
+                        - current_attackers
+                        for step in route[:-1]
+                    ):
+                        continue
+                    options.append(
+                        (
+                            (
+                                len(route),
+                                len(blockers),
+                                manhattan(ranger.position, goal),
+                                manhattan(post, goal),
+                                ranger.id.bytes,
+                                goal,
+                            ),
+                            ranger,
+                            goal,
+                            route,
+                        )
+                    )
+            for _score, ranger, goal, route in sorted(
+                options, key=lambda item: item[0]
+            ):
+                if ranger.id in used_ids or goal_counts.get(goal, 0) >= 2:
+                    continue
+                selected.append((ranger, goal))
+                routes[ranger.id] = route
+                used_ids.add(ranger.id)
+                goal_counts[goal] = goal_counts.get(goal, 0) + 1
+                if len(selected) == required:
+                    break
+            if len(selected) == required:
+                volley_tick = max(len(route) for route in routes.values())
+                # A pair can arrive on different Ticks.  Every shooter must
+                # survive the hostile fire it will take while waiting for the
+                # final member to reach its lane; it may still trade its shot
+                # on the volley Tick itself.  Without this check an early
+                # HP2 arrival could die before the two-arrow kill is ready.
+                if any(
+                    ranger.hp
+                    <= len(self._visible_attackers_at(goal, context.turn, obstacles))
+                    * (volley_tick - len(routes[ranger.id]))
+                    for ranger, goal in selected
+                ):
+                    continue
+                self._local_fireline_target_id = str(target.id)
+                self._local_fireline_ranger_ids = frozenset(
+                    ranger.id for ranger, _goal in selected
+                )
+                self._local_fireline_goals = {
+                    ranger.id: goal for ranger, goal in selected
+                }
+                self._local_fireline_until_tick = (
+                    context.turn.tick + LOCAL_FIRELINE_MAX_TICKS
+                )
+                context.local_fireline_orders = {
+                    ranger.id: (target, goal) for ranger, goal in selected
+                }
+                return
+
+    def _local_fireline_route(
+        self,
+        ranger: Ranger,
+        goal: Position,
+        context: _TurnContext,
+    ) -> tuple[Position, ...] | None:
+        """Return a clear route of at most three steps, excluding the origin."""
+
+        if ranger.position == goal:
+            return ()
+        blocked = self._static_blockers(ranger, context)
+        if context.enemy_positions:
+            blocked = overlay_blockers(blocked, context.enemy_positions)
+        if context.turn.core is not None:
+            blocked = overlay_blockers(blocked, {context.turn.core.position})
+        frontier: list[tuple[Position, tuple[Position, ...]]] = [(ranger.position, ())]
+        for _depth in range(LOCAL_FIRELINE_MAX_STEPS):
+            next_frontier: list[tuple[Position, tuple[Position, ...]]] = []
+            for position, route in frontier:
+                for neighbour in adjacent_positions(position):
+                    if neighbour in route or neighbour in blocked:
+                        continue
+                    if self._predicted_friendly_occupancy(neighbour, context) >= 2:
+                        continue
+                    extended = (*route, neighbour)
+                    if neighbour == goal:
+                        return extended
+                    next_frontier.append((neighbour, extended))
+            frontier = next_frontier
+        return None
+
+    def _take_local_fireline(
+        self,
+        ranger: Ranger,
+        context: _TurnContext,
+    ) -> None:
+        """Take the prepared short firing-lane move without chasing."""
+
+        target, goal = context.local_fireline_orders[ranger.id]
+        steps = manhattan(ranger.position, goal)
+        intent = (
+            _MoveIntent.TRANSIT
+            if self._predicted_friendly_occupancy(goal, context) > 0
+            else _MoveIntent.STAND
+        )
+        if self._move_within_leash(
+            ranger,
+            goal,
+            context,
+            offensive=False,
+            reason=(
+                f"shift to a bounded local firing lane on {self._enemy_label(target)}"
+            ),
+            # The first step must not enter any new enemy field.  The final
+            # step is deliberately allowed to trade with a one- or two-HP
+            # target; the shared fire budget keeps the rest of the ring out.
+            avoid_new_threats=steps > 1,
+            intent=intent,
+        ):
+            return
+        self._hold_defensive_ranger(
+            ranger,
+            context,
+            reason="hold while the bounded local firing lane is blocked",
+        )
 
     def _defensive_support_goal(
         self,
@@ -6244,7 +6620,10 @@ class AggressiveStrategy:
         nearby_ids = {
             enemy.object_id
             for enemy in tactical_enemies
-            if enemy.kind == "UNIT"
+            if (
+                turn.tick - enemy.tick <= ALL_HANDS_DEFENSE_MEMORY_TICKS
+                and enemy.kind == "UNIT"
+            )
             and enemy.unit_type
             in {
                 UnitType.VANGUARD.value,

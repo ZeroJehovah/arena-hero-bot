@@ -5584,6 +5584,48 @@ def test_massed_approach_starts_local_defense_before_first_core_hit() -> None:
     assert add((0, -10), action.direction)[1] > -10
 
 
+def test_stale_contact_memory_does_not_keep_the_whole_ring_in_all_hands() -> None:
+    config = StrategyConfig(target_workers=0, max_population=None)
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, -4)),
+            unit(40, "RANGER", controlled=False, position=(0, -9)),
+        ],
+    )
+    memory = WorldMemory(
+        enemies={
+            object_id(30): EnemySighting(
+                object_id=object_id(30),
+                kind="UNIT",
+                position=(0, 3),
+                hp=2,
+                tick=80,
+                unit_type="RANGER",
+            ),
+            object_id(31): EnemySighting(
+                object_id=object_id(31),
+                kind="UNIT",
+                position=(1, 3),
+                hp=2,
+                tick=80,
+                unit_type="RANGER",
+            ),
+        },
+    )
+    strategy = AggressiveStrategy(memory, config)
+    strategy.memory.observe(turn)
+
+    tactical = strategy._tactical_enemies(
+        turn,
+        strategy.memory.recent_enemies(turn.tick, config.enemy_memory_ttl),
+    )
+
+    assert len(tactical) == 3
+    assert not strategy._all_hands_defense(turn, tactical)
+
+
 def test_two_contacts_do_not_empty_the_far_side_of_the_ring() -> None:
     config = StrategyConfig(target_workers=0, max_population=None)
     turn = make_turn(

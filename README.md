@@ -88,6 +88,18 @@ threatened ally or Core, stays within the defensive layers, and avoids new
 firing sources. A necessary withdrawal is planned before rear-rank shots and
 prefers an equally safe cell that preserves supporting fire.
 
+In a one- or two-fighter campaign contact, a stationary wounded fighter
+with one or two HP may pull
+one or two healthy non-garrison Rangers onto a real firing line when the whole
+move stays within three cells of its assigned post and completes in at most
+three steps. The task is fixed for at most eight Ticks. The first shooter waits
+at the lane until the pair can volley only if it can survive the worst current
+fire until that volley; otherwise any existing shot proceeds normally. Target
+movement, Core pressure, extra fighters or timeout cancels the task without
+following the last seen cell. Stale remembered
+contacts keep all-hands defence active only for a sixteen-Tick flicker window;
+three visible or still-current fighters are still required to trigger it.
+
 Patrol Rangers may pursue a visible fighter only with a healthy local force
 advantage and a supporting shooter that can actually cover the contact. Each
 engagement is limited to four cells from its original contact position and
