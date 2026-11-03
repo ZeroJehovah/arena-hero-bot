@@ -2079,7 +2079,10 @@ def _clearance_workers(count: int) -> list[dict[str, object]]:
         unit(
             300 + index,
             "WORKER",
-            position=(CLEARANCE_HOME[0] - 8 + index % 8, CLEARANCE_HOME[1] - 8 + index // 8),
+            position=(
+                CLEARANCE_HOME[0] - 8 + index % 8,
+                CLEARANCE_HOME[1] - 8 + index // 8,
+            ),
         )
         for index in range(count)
     ]

@@ -5053,8 +5053,7 @@ class AggressiveStrategy:
             )
             if (
                 enemy.kind == "UNIT"
-                and enemy.unit_type
-                in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
                 and context.turn.tick - enemy.tick
                 <= self.config.worker_threat_memory_ttl
             )
@@ -5296,9 +5295,7 @@ class AggressiveStrategy:
             # Core, which is precisely the A-B-A wandering the queue must not
             # emit.
             return False
-        if destination in blocked and not (
-            allow_goal and destination == goal
-        ):
+        if destination in blocked and not (allow_goal and destination == goal):
             return False
         return self._queue_move(
             unit,
@@ -12592,8 +12589,7 @@ class AggressiveStrategy:
                 self.config.worker_threat_memory_ttl,
             )
             if sighting.kind == "UNIT"
-            and sighting.unit_type
-            in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            and sighting.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
             and turn.tick - sighting.tick <= self.config.worker_threat_memory_ttl
         )
         if not fighters:
@@ -12602,10 +12598,7 @@ class AggressiveStrategy:
         covering = tuple(
             fighter
             for fighter in dict.fromkeys(fighters)
-            if any(
-                manhattan(cell, fighter) <= radius
-                for cell in known
-            )
+            if any(manhattan(cell, fighter) <= radius for cell in known)
         )
         if not covering:
             return None
@@ -12655,11 +12648,7 @@ class AggressiveStrategy:
         core = turn.core
         if core is None:
             return True
-        return (
-            threat.should_evacuate_core
-            or core.hp < 5
-            or core.shield < 5
-        )
+        return threat.should_evacuate_core or core.hp < 5 or core.shield < 5
 
     def _update_resource_clearance(
         self,
