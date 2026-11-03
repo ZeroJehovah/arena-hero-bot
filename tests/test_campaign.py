@@ -2236,3 +2236,199 @@ def test_enemy_cores_do_not_seal_a_resource_block() -> None:
 
     assert memory.campaign_emergency_target is None
     assert memory.core_home_position == CLEARANCE_HOME
+
+
+CORE_HUNT_TARGET = (-485, 719)
+
+
+def _rival_core(position: tuple[int, int] = CORE_HUNT_TARGET) -> dict[str, object]:
+    return core(7, controlled=False, owner_username="rival", position=position)
+
+
+def _core_hunt_reasons(report) -> list:
+    return [
+        decision for decision in report.decisions if "enemy Core" in decision.reason
+    ]
+
+
+def test_enemy_core_in_the_block_detaches_one_defender() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(objects=[core_object, *rangers, _rival_core()])
+
+    report = _strategy(memory).decide(turn)
+
+    hunting = _core_hunt_reasons(report)
+    assert hunting
+    assert len({decision.actor_id for decision in hunting}) == 1
+    assert hunting[0].actor_id in {str(ranger["id"]) for ranger in rangers}
+    assert turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
+    assert memory.core_home_position == CLEARANCE_HOME
+    assert memory.campaign_emergency_target is None
+
+
+def test_detached_defender_shoots_the_enemy_core_in_range() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = [
+        unit(101, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] + 3)),
+        unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
+        unit(103, "RANGER", position=(CORE_HUNT_TARGET[0] + 2, CORE_HUNT_TARGET[1])),
+    ]
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(objects=[core_object, *rangers, _rival_core()])
+
+    report = _strategy(memory).decide(turn)
+
+    assert any(
+        decision.action == "SHOOT" and decision.target == CORE_HUNT_TARGET
+        for decision in report.decisions
+    )
+
+
+def test_enemy_core_hunt_is_vetoed_by_a_nearby_fighter() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[
+            core_object,
+            *rangers,
+            _rival_core(),
+            unit(200, "RANGER", controlled=False, position=(-482, 719)),
+        ]
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert not _core_hunt_reasons(report)
+
+
+def test_enemy_core_hunt_keeps_a_pair_on_station() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(2)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(objects=[core_object, *rangers, _rival_core()])
+
+    report = _strategy(memory).decide(turn)
+
+    assert not _core_hunt_reasons(report)
+
+
+def test_enemy_core_outside_the_hunt_radius_is_left_alone() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[core_object, *rangers, _rival_core((CLEARANCE_HOME[0] + 40, 719))]
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert not _core_hunt_reasons(report)
+
+
+def test_enemy_core_hunt_aborts_when_a_fighter_appears() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+    first = make_turn(objects=[core_object, *rangers, _rival_core()], tick=100)
+
+    assert _core_hunt_reasons(strategy.decide(first))
+
+    second = make_turn(
+        tick=101,
+        objects=[
+            core_object,
+            *rangers,
+            _rival_core(),
+            unit(200, "RANGER", controlled=False, position=(-494, 719)),
+        ],
+    )
+
+    assert not _core_hunt_reasons(strategy.decide(second))
+
+
+def test_core_hunt_hunter_closes_and_destroys_the_core() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    hunter = unit(
+        103, "RANGER", position=(CORE_HUNT_TARGET[0] + 4, CORE_HUNT_TARGET[1])
+    )
+    rangers = [
+        unit(101, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] + 3)),
+        unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
+        hunter,
+    ]
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+
+    approach = make_turn(objects=[core_object, *rangers, _rival_core()], tick=100)
+    report = strategy.decide(approach)
+    closing = [d for d in report.decisions if d.actor_id == str(hunter["id"])]
+    assert closing and closing[0].action == "MOVE"
+    firing_cell = closing[0].target
+    assert firing_cell is not None
+    assert manhattan(firing_cell, CORE_HUNT_TARGET) == 3
+
+    hunter["position"] = list(firing_cell)
+    in_range = make_turn(objects=[core_object, *rangers, _rival_core()], tick=101)
+    report = strategy.decide(in_range)
+    assert any(
+        decision.actor_id == str(hunter["id"])
+        and decision.action == "SHOOT"
+        and decision.target == CORE_HUNT_TARGET
+        for decision in report.decisions
+    )
+
+
+def test_core_hunt_ends_when_the_last_seen_cell_is_empty() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    hunter = unit(
+        103, "RANGER", position=(CORE_HUNT_TARGET[0] + 4, CORE_HUNT_TARGET[1])
+    )
+    rangers = [
+        unit(101, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] + 3)),
+        unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
+        hunter,
+    ]
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+
+    strategy.decide(make_turn(objects=[core_object, *rangers, _rival_core()], tick=100))
+    hunter["position"] = [CORE_HUNT_TARGET[0] + 2, CORE_HUNT_TARGET[1]]
+
+    report = strategy.decide(make_turn(objects=[core_object, *rangers], tick=101))
+
+    assert not _core_hunt_reasons(report)
+    assert memory.core_home_position == CLEARANCE_HOME
+
+
+def test_core_hunt_does_not_restart_during_its_cooldown() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    hunter = unit(
+        103, "RANGER", position=(CORE_HUNT_TARGET[0] + 4, CORE_HUNT_TARGET[1])
+    )
+    rangers = [
+        unit(101, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] + 3)),
+        unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
+        hunter,
+    ]
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+
+    assert _core_hunt_reasons(
+        strategy.decide(
+            make_turn(objects=[core_object, *rangers, _rival_core()], tick=100)
+        )
+    )
+    hunter["position"] = [CORE_HUNT_TARGET[0] + 2, CORE_HUNT_TARGET[1]]
+    assert not _core_hunt_reasons(
+        strategy.decide(make_turn(objects=[core_object, *rangers], tick=101))
+    )
+
+    report = strategy.decide(
+        make_turn(objects=[core_object, *rangers, _rival_core()], tick=102)
+    )
+
+    assert not _core_hunt_reasons(report)
