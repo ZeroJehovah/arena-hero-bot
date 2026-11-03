@@ -2286,6 +2286,37 @@ def test_detached_defender_shoots_the_enemy_core_in_range() -> None:
     )
 
 
+def test_core_hunter_ignores_bycatch_while_the_core_has_no_ray() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    hunter = unit(103, "RANGER", position=(-484, 721))
+    rangers = [
+        unit(101, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] + 3)),
+        unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
+        hunter,
+    ]
+    memory = _sealed_memory(core_object, rangers)
+    # The Core is three cells away but on no legal eight-direction ray from
+    # the hunter, while the enemy Worker sharing its cell does offer one.
+    turn = make_turn(
+        objects=[
+            core_object,
+            *rangers,
+            _rival_core(),
+            unit(300, "WORKER", controlled=False, position=CORE_HUNT_TARGET),
+        ]
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    hunter_decisions = [
+        decision
+        for decision in report.decisions
+        if decision.actor_id == str(hunter["id"])
+    ]
+    assert [decision.action for decision in hunter_decisions] == ["MOVE"]
+    assert "enemy Core" in hunter_decisions[0].reason
+
+
 def test_enemy_core_hunt_is_vetoed_by_a_nearby_fighter() -> None:
     core_object = core(1, position=CLEARANCE_HOME)
     rangers = _clearance_rangers(4)

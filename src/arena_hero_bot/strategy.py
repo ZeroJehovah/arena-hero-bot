@@ -1199,6 +1199,24 @@ class AggressiveStrategy:
                 )
             )
         ]
+        if ranger.id in context.core_hunt_ids:
+            # MOVE and SHOOT are mutually exclusive, so every Tick the hunter
+            # spends on a speculative lead against some other enemy is a Tick
+            # it did not spend closing the firing angle it was sent out for.
+            # The hunted Core is also the only kill that ends the trip, so the
+            # detached Ranger fires at nothing else.  A fighter close enough
+            # to answer that fire would already have aborted the hunt in
+            # ``_core_hunt_contested``, so no return fire goes unanswered.
+            hunted = self._core_hunt_core_view(context.turn)
+            core_shots = [
+                (enemy, cells)
+                for enemy, cells in shootable
+                if hunted is not None and str(enemy.id) == str(hunted.id)
+            ]
+            if not core_shots:
+                self._decide_core_hunt_ranger(ranger, context)
+                return
+            shootable = core_shots
         direct_shootable = [
             (enemy, (enemy.position,))
             for enemy, shot_cells in shootable
@@ -1462,9 +1480,12 @@ class AggressiveStrategy:
                 return
 
         if ranger.id in context.core_hunt_ids:
-            # The detached hunter is not a defensive post this Tick.  Without
-            # this hand-off the layered formation would walk it back to the
-            # ring between shots, so a Core seen from outside the defensive
+            # Belt and braces: the firing solution above already hands a
+            # detached hunter with no Core ray straight back to the hunt, so
+            # reaching here means the Core shot itself failed a later gate.
+            # The hunter is never a defensive post this Tick - without this
+            # hand-off the layered formation would walk it back to the ring
+            # between shots, so a Core seen from outside the defensive
             # support radius would never take damage at all.
             self._decide_core_hunt_ranger(ranger, context)
             return
@@ -6655,6 +6676,10 @@ class AggressiveStrategy:
             ally.id: (ally.position, ally.hp)
             for ally in context.turn.rangers
             if not self._is_expedition_member(ally, context.turn)
+            # A detached Core hunter spends its whole trip on one target, so
+            # counting its arrow towards a defensive exchange would commit the
+            # rest of the formation to a volley it never fires.
+            and ally.id not in context.core_hunt_ids
             and not self._has_unit_action(ally, context)
             and any(
                 line_of_fire(ally.position, enemy.position, obstacles)
