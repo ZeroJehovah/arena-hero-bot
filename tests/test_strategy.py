@@ -1044,7 +1044,8 @@ def test_worker_does_not_retreat_from_noncombat_enemy_worker() -> None:
     )
 
 
-def test_worker_retreats_from_visible_enemy_core() -> None:
+def test_worker_does_not_retreat_from_visible_enemy_core() -> None:
+    # An enemy Core cannot attack, so it may not freeze the local economy.
     turn = make_turn(
         objects=[
             core(),
@@ -1059,18 +1060,46 @@ def test_worker_retreats_from_visible_enemy_core() -> None:
     )
     report = decide(turn)
 
-    action = turn.plan.unit_actions[turn.workers[0].id]
-    assert action.type == "MOVE"
-    assert action.direction is Direction.LEFT
-    assert any(
+    assert not any(
         item.reason == "retreat from visible enemy pressure"
         for item in report.decisions
     )
 
 
-def test_worker_retreats_from_recently_seen_enemy_core() -> None:
+def test_worker_harvests_beside_visible_enemy_core() -> None:
+    config = StrategyConfig(
+        resource_target=95,
+        resource_patrol_radius=18,
+        worker_threat_radius=2,
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(3, 0)),
+            core(
+                3,
+                controlled=False,
+                owner_username="rival",
+                position=(6, 0),
+            ),
+        ],
+        resource_cells=[(4, 0)],
+    )
+    report = decide(turn, config=config)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.RIGHT
+    assert any(
+        item.reason == "claim nearest unassigned known resource"
+        for item in report.decisions
+    )
+
+
+def test_worker_ignores_recently_seen_enemy_core() -> None:
     memory = WorldMemory()
-    strategy = AggressiveStrategy(memory)
+    config = StrategyConfig(worker_threat_radius=2)
+    strategy = AggressiveStrategy(memory, config)
     first = make_turn(
         tick=100,
         objects=[
@@ -1085,17 +1114,14 @@ def test_worker_retreats_from_recently_seen_enemy_core() -> None:
         ],
     )
     strategy.decide(first)
+    assert (8, 0) not in strategy._remembered_worker_danger_positions(first)
 
     second = make_turn(
         tick=101,
         objects=[core(), unit(2, "WORKER", position=(5, 0))],
     )
     report = strategy.decide(second)
-
-    action = second.plan.unit_actions[second.workers[0].id]
-    assert action.type == "MOVE"
-    assert action.direction is Direction.LEFT
-    assert any(
+    assert not any(
         item.reason == "retreat from visible enemy pressure"
         for item in report.decisions
     )
@@ -1105,19 +1131,9 @@ def test_worker_retreats_from_recently_seen_enemy_core() -> None:
         objects=[core(), unit(2, "WORKER", position=(5, 0))],
     )
     remembered_report = strategy.decide(still_remembered)
-    assert any(
-        item.reason == "retreat from visible enemy pressure"
-        for item in remembered_report.decisions
-    )
-
-    long_term = make_turn(
-        tick=261,
-        objects=[core(), unit(2, "WORKER", position=(5, 0))],
-    )
-    long_term_report = strategy.decide(long_term)
     assert not any(
         item.reason == "retreat from visible enemy pressure"
-        for item in long_term_report.decisions
+        for item in remembered_report.decisions
     )
 
 
@@ -4186,7 +4202,7 @@ def test_resource_patrol_splits_duplicate_existing_goals() -> None:
     assert len({goal.position for goal in goals if goal is not None}) == 2
 
 
-def test_resource_patrol_replaces_goal_near_remembered_enemy_core() -> None:
+def test_resource_patrol_keeps_goal_near_remembered_enemy_core() -> None:
     memory = WorldMemory()
     config = StrategyConfig(
         resource_target=95,
@@ -4214,14 +4230,12 @@ def test_resource_patrol_replaces_goal_near_remembered_enemy_core() -> None:
     )
     strategy.decide(hidden)
 
-    replacement = memory.goal_for(object_id(2))
-    assert replacement is not None
-    assert replacement.position != (6, 0)
-    assert replacement.position != hidden.workers[0].position
-    assert manhattan(replacement.position, (6, 0)) > 2
+    retained = memory.goal_for(object_id(2))
+    assert retained is not None
+    assert retained.position == (6, 0)
 
 
-def test_worker_path_avoids_remembered_enemy_core_exclusion() -> None:
+def test_worker_path_crosses_remembered_enemy_core_area() -> None:
     memory = WorldMemory()
     config = StrategyConfig(
         resource_target=95,
@@ -4251,10 +4265,10 @@ def test_worker_path_avoids_remembered_enemy_core_exclusion() -> None:
 
     action = hidden.plan.unit_actions[hidden.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction is not Direction.RIGHT
+    assert action.direction is Direction.RIGHT
 
 
-def test_worker_releases_stale_enemy_core_exclusion() -> None:
+def test_worker_ignores_enemy_core_threat_exclusion() -> None:
     memory = WorldMemory()
     config = StrategyConfig(worker_threat_radius=2)
     strategy = AggressiveStrategy(memory, config)
@@ -4267,16 +4281,27 @@ def test_worker_releases_stale_enemy_core_exclusion() -> None:
         ],
     )
     strategy.decide(observed)
-    assert (6, 0) in strategy._remembered_worker_danger_positions(observed)
-    assert (5, 0) in strategy._worker_threat_exclusion_cells(observed)
+    assert (6, 0) not in strategy._remembered_worker_danger_positions(observed)
+    assert (5, 0) not in strategy._worker_threat_exclusion_cells(observed)
 
-    expired = make_turn(
-        tick=261,
-        objects=[core(), unit(2, "WORKER", position=(3, 0))],
+
+def test_worker_threat_exclusion_tracks_only_hostile_fighters() -> None:
+    memory = WorldMemory()
+    config = StrategyConfig(worker_threat_radius=2)
+    strategy = AggressiveStrategy(memory, config)
+    observed = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(3, 0)),
+            unit(3, "RANGER", controlled=False, position=(6, 0)),
+            unit(4, "WORKER", controlled=False, position=(-6, 0)),
+        ],
     )
-    strategy.decide(expired)
-    assert (6, 0) not in strategy._remembered_worker_danger_positions(expired)
-    assert (5, 0) not in strategy._worker_threat_exclusion_cells(expired)
+    strategy.decide(observed)
+
+    assert (6, 0) in strategy._remembered_worker_danger_positions(observed)
+    assert (-6, 0) not in strategy._remembered_worker_danger_positions(observed)
 
 
 def test_worker_path_temporarily_avoids_recent_combat_enemy() -> None:
@@ -5991,7 +6016,7 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
     assert targets[CLAIM_STALL_BUDGET + 3] == (5, 0)
 
 
-def test_worker_claim_skips_resource_inside_enemy_core_exclusion() -> None:
+def test_worker_claims_resource_beside_enemy_core() -> None:
     memory = WorldMemory()
     config = StrategyConfig(
         resource_target=95,
@@ -6019,10 +6044,10 @@ def test_worker_claim_skips_resource_inside_enemy_core_exclusion() -> None:
     claim = memory.goal_for(object_id(2))
     assert claim is not None
     assert claim.purpose == "resource-claim-v1"
-    assert claim.position == (-4, 0)
+    assert claim.position == (5, 0)
     hidden_action = hidden.plan.unit_actions[hidden.workers[0].id]
     assert hidden_action.type == "MOVE"
-    assert hidden_action.direction is Direction.LEFT
+    assert hidden_action.direction is Direction.RIGHT
 
 
 def test_worker_rests_a_resource_no_route_can_reach() -> None:

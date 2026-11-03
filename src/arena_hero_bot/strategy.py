@@ -482,6 +482,7 @@ class _TurnContext:
     layered_steps: dict[UUID, Direction] = field(default_factory=dict)
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
+    clearance_ids: frozenset[UUID] = field(default_factory=frozenset)
     campaign_patrol_recall_ids: frozenset[UUID] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
@@ -626,6 +627,14 @@ class AggressiveStrategy:
         self._raid_target: Position | None = None
         self._raid_until_tick: int = -1
         self._raid_cooldown_until: int = -1
+        # A block whose natural quota is fully discovered but whose every node
+        # is sealed by hostile fighters has no safe income.  Campaign mode has
+        # no expeditions to answer that, so the standing defenders themselves
+        # become the clearance detachment.  Kept off ``WorldMemory`` for the
+        # same reason as the raid: a restart sends them home.
+        self._clearance_ids: frozenset[UUID] = frozenset()
+        self._clearance_target: Position | None = None
+        self._clearance_until_tick: int = -1
         # Expedition posture state.  Surplus combat units are staged at the
         # defensive ring edge until a full expedition can depart.  Each
         # expedition keeps its membership, pursuit and shared exploration
@@ -809,6 +818,9 @@ class AggressiveStrategy:
             all_hands_defense=all_hands_defense,
             garrison_ids=garrison_ids,
             raid_ids=raid_ids,
+            clearance_ids=(
+                self._clearance_ids if self.config.campaign_mode else frozenset()
+            ),
             campaign_patrol_recall_ids=campaign_patrol_recall_ids,
         )
         context.core_build_priority = self._campaign_build_priority(context)
@@ -1630,6 +1642,61 @@ class AggressiveStrategy:
             enemy.hp for enemy in opponents
         )
 
+    def _decide_clearance_ranger(
+        self,
+        ranger: Ranger,
+        context: _TurnContext,
+        fighters: tuple[CoreView | UnitView, ...],
+    ) -> bool:
+        """Walk a detachment Ranger onto the fighters sealing this block.
+
+        Shooting is already resolved earlier in ``_decide_ranger``; this only
+        chooses the approach.  Visible fighters are approached through the
+        ordinary safe firing-position search, and a dark Tick falls back to
+        the last covering position rather than dropping the detachment's
+        objective.  Returning ``False`` hands the Tick back to the defensive
+        rules when neither exists, so an unclearable block never strands a
+        guard between posts.
+        """
+
+        target = self._preferred_target(context.focus_target, fighters)
+        if target is None and fighters:
+            target = self._best_visible_target(
+                ranger.position,
+                context.turn,
+                fighters,
+            )
+        if target is not None:
+            goal = self._ranger_approach_goal(
+                ranger,
+                target,
+                context,
+                friendly_positions=self._predicted_friendly_positions(context),
+            )
+            if goal is not None and self._move_within_leash(
+                ranger,
+                goal,
+                context,
+                offensive=True,
+                reason=(
+                    "close a firing angle on the fighter sealing this "
+                    "block's resource quota"
+                ),
+                avoid_new_threats=True,
+            ):
+                return True
+        anchor = self._clearance_target
+        if anchor is None or anchor == ranger.position:
+            return False
+        return self._move_within_leash(
+            ranger,
+            anchor,
+            context,
+            offensive=True,
+            reason="advance on the last seen fighter sealing this block",
+            avoid_new_threats=True,
+        )
+
     def _decide_local_ranger(
         self,
         ranger: Ranger,
@@ -1653,6 +1720,12 @@ class AggressiveStrategy:
             self._visible_attackers_at(ranger.position, context.turn, obstacles)
         ) >= ranger.hp and self._move_ranger_toward_core(
             ranger, context, reason="leave a lethal multi-source firing line"
+        ):
+            return
+        if ranger.id in context.clearance_ids and self._decide_clearance_ranger(
+            ranger,
+            context,
+            fighters,
         ):
             return
         if (
@@ -4956,17 +5029,18 @@ class AggressiveStrategy:
         worker: Worker,
         context: _TurnContext,
     ) -> tuple[Position, ...]:
+        # Only hostile fighters are dangerous.  An enemy Core cannot attack
+        # and an enemy Worker cannot attack, so neither may freeze the local
+        # economy or force a retreat: a Core parked beside the only nodes in a
+        # low-quota block would otherwise make the whole block unharvestable.
         if worker.position in self._worker_safe_defense_cells(context.turn):
             return ()
         visible = [
             enemy.position
             for enemy in context.turn.visible_enemies
             if (
-                isinstance(enemy, CoreView)
-                or (
-                    isinstance(enemy, UnitView)
-                    and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                )
+                isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             )
             and manhattan(worker.position, enemy.position)
             <= self.config.worker_threat_radius
@@ -4975,20 +5049,14 @@ class AggressiveStrategy:
             enemy.position
             for enemy in self.memory.recent_enemies(
                 context.turn.tick,
-                self.config.enemy_core_memory_ttl,
+                self.config.worker_threat_memory_ttl,
             )
             if (
-                (
-                    enemy.kind == "CORE"
-                    and context.turn.tick - enemy.tick <= self.config.enemy_memory_ttl
-                )
-                or (
-                    enemy.kind == "UNIT"
-                    and enemy.unit_type
-                    in {UnitType.VANGUARD.value, UnitType.RANGER.value}
-                    and context.turn.tick - enemy.tick
-                    <= self.config.worker_threat_memory_ttl
-                )
+                enemy.kind == "UNIT"
+                and enemy.unit_type
+                in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+                and context.turn.tick - enemy.tick
+                <= self.config.worker_threat_memory_ttl
             )
             and manhattan(worker.position, enemy.position)
             <= self.config.worker_threat_radius
@@ -5049,16 +5117,6 @@ class AggressiveStrategy:
             allow_goal=allow_goal,
             require_path=True,
         )
-        if direction is None and isinstance(unit, Worker):
-            escape_blockers = self._worker_core_escape_blockers(unit, context, blocked)
-            if escape_blockers is not None:
-                direction = next_step(
-                    unit.position,
-                    goal,
-                    blocked=escape_blockers,
-                    allow_goal=allow_goal,
-                    require_path=True,
-                )
         return direction is not None
 
     def _has_static_step_toward(
@@ -5227,25 +5285,6 @@ class AggressiveStrategy:
             allow_goal=allow_goal,
             require_path=require_path,
         )
-        effective_blockers = blocked
-        if direction is None and isinstance(unit, Worker):
-            escape_blockers = self._worker_core_escape_blockers(unit, context, blocked)
-            if escape_blockers is not None:
-                effective_blockers = escape_blockers
-                direction = next_step(
-                    unit.position,
-                    goal,
-                    blocked=effective_blockers,
-                    recent=(
-                        self.memory.recent_positions(str(unit.id))
-                        if avoid_recent
-                        else ()
-                    ),
-                    direction_offset=self._direction_offset(unit.id),
-                    max_expansions=max_expansions,
-                    allow_goal=allow_goal,
-                    require_path=require_path,
-                )
         if direction is None:
             return False
         destination = add(unit.position, direction)
@@ -5257,7 +5296,7 @@ class AggressiveStrategy:
             # Core, which is precisely the A-B-A wandering the queue must not
             # emit.
             return False
-        if destination in effective_blockers and not (
+        if destination in blocked and not (
             allow_goal and destination == goal
         ):
             return False
@@ -6251,6 +6290,7 @@ class AggressiveStrategy:
             for ranger in context.turn.rangers
             if ranger.hp > 1
             and not self._is_expedition_member(ranger, context.turn)
+            and ranger.id not in context.clearance_ids
             and manhattan(core.position, ranger.position)
             <= self.config.combat_pursuit_radius
         )
@@ -9258,7 +9298,12 @@ class AggressiveStrategy:
         ):
             return (
                 self._raid_target,
-                "raid the enemy Core along the attack bearing",
+                (
+                    "clear the hostile fighters sealing every resource "
+                    "site in this block"
+                    if unit.id in context.clearance_ids
+                    else "raid the enemy Core along the attack bearing"
+                ),
             )
         if (
             context is not None
@@ -9445,6 +9490,8 @@ class AggressiveStrategy:
         self.memory.core_migration_start_position = None
         self._clear_campaign_scout()
         self.memory.campaign_scout_rejections.clear()
+        self.memory.campaign_emergency_target = None
+        self.memory.campaign_emergency_started_tick = 0
         self.memory.defense_compressed = False
         self.memory.defense_calm_since_tick = None
         self._commit_symmetric_home(target)
@@ -9628,6 +9675,21 @@ class AggressiveStrategy:
             self.memory.core_migration_steps_since_pause = 0
         home = self.memory.core_home_position
         if home is not None:
+            if home == self.memory.campaign_emergency_target:
+                # The emergency hop is deliberately outside the formation
+                # gate, so the ordinary quota validation would cancel it and
+                # walk the Core back toward the fighters.  It is still only
+                # honoured while the Core is in or beside the target block; a
+                # teleport or a stale save must not drag the Core across the
+                # map.
+                current_block = resource_block_index(core.position)
+                home_block = resource_block_index(home)
+                if current_block == home_block or blocks_are_cardinally_adjacent(
+                    current_block, home_block
+                ):
+                    return
+                self.memory.campaign_emergency_target = None
+                self.memory.campaign_emergency_started_tick = 0
             current_block = resource_block_index(core.position)
             home_block = resource_block_index(home)
             same_block = current_block == home_block
@@ -9715,6 +9777,8 @@ class AggressiveStrategy:
         parks off one either.
         """
 
+        if self._continue_emergency_migration(turn):
+            return
         if self.memory.campaign_resting:
             return
         if self.memory.campaign_scout_target is not None:
@@ -9728,6 +9792,99 @@ class AggressiveStrategy:
         if not self._campaign_hop_pending(turn):
             return
         self._campaign_retarget(turn, self.memory.campaign_target_quota)
+
+    def _continue_emergency_migration(self, turn: Turn) -> bool:
+        """Abandon a block whose entire quota is sealed by hostile fighters.
+
+        The ordinary campaign only steps inward and only with a completed
+        formation, so a starved block with no combat unit left cannot move at
+        all: there is no income to finish the formation and no formation to
+        earn movement.  This path is the escape hatch.  It publishes one hop
+        into a cardinal neighbouring block whose center is farther from the
+        danger bearing, never into a higher quota block, and holds that single
+        target until the Core arrives - so it cannot oscillate, cannot walk
+        back toward the fighters on the next tick, and cannot be mistaken for
+        a new campaign stage.
+        """
+
+        core = turn.core
+        if core is None:
+            return False
+        target = self.memory.campaign_emergency_target
+        if target is not None:
+            if core.position == target:
+                self.memory.campaign_emergency_target = None
+                self.memory.campaign_emergency_started_tick = 0
+                return False
+            # Already committed.  Keep the published home even if the danger
+            # picture changes mid-hop: turning around in the middle of a
+            # block would just walk back into the fighters.
+            return True
+        decision = self._resource_block_clearance(turn)
+        if decision is None:
+            return False
+        if self._clearing_combat_units(turn):
+            # Combat units exist, so clearing the block is rule two's job.
+            return False
+        objective, _covering, _cells = decision
+        target = self._emergency_migration_target(turn, core.position, objective)
+        if target is None:
+            return False
+        self._clear_campaign_scout()
+        self.memory.campaign_emergency_target = target
+        self.memory.campaign_emergency_started_tick = turn.tick
+        self._set_campaign_hop_target(target)
+        return True
+
+    def _emergency_migration_target(
+        self,
+        turn: Turn,
+        origin: Position,
+        danger: Position,
+    ) -> Position | None:
+        """Pick one reachable adjacent block center away from ``danger``."""
+
+        from .migration import (
+            cardinal_block_neighbors,
+            resource_block_index,
+            resource_block_quota,
+        )
+
+        core = turn.core
+        if core is None:
+            return None
+        current_block = resource_block_index(origin)
+        current_quota = resource_block_quota(current_block)
+        obstacles = self._rock_map(turn)
+        resources = set(turn.resource_cells) | set(self.memory.resource_cells)
+        current_distance = manhattan(origin, danger)
+        candidates: list[tuple[int, int, int, int, Position]] = []
+        for block in cardinal_block_neighbors(current_block):
+            if resource_block_quota(block) > current_quota:
+                continue
+            for cell in _resource_block_center_cells(
+                (
+                    block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                    block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
+                )
+            ):
+                distance = manhattan(cell, danger)
+                if distance <= current_distance:
+                    continue
+                if not self._has_core_static_route(origin, cell, obstacles):
+                    continue
+                candidates.append(
+                    (
+                        -distance,
+                        int(cell in resources),
+                        manhattan(origin, cell),
+                        int(cell in obstacles),
+                        cell,
+                    )
+                )
+        if not candidates:
+            return None
+        return min(candidates)[-1]
 
     def _campaign_retarget(self, turn: Turn, target_quota: int) -> None:
         """Publish one safe adjacent hop, holding for a high-block scout."""
@@ -12342,11 +12499,16 @@ class AggressiveStrategy:
         """
 
         if self.config.expedition_mode:
-            # The bounded raid is superseded by the non-returning expedition
-            # squads, which already seek and destroy every hostile they see.
             self._raid_ids = frozenset()
             self._raid_target = None
             self._raid_until_tick = -1
+            if self.config.campaign_mode:
+                # Campaign mode has no expedition squads, so the ordinary raid
+                # has nothing to answer a sealed resource block with.  Hand the
+                # decision to the clearance detachment instead.
+                return self._update_resource_clearance(turn, threat)
+            # The bounded raid is superseded by the non-returning expedition
+            # squads, which already seek and destroy every hostile they see.
             return frozenset()
 
         core = turn.core
@@ -12390,6 +12552,220 @@ class AggressiveStrategy:
         self._raid_until_tick = turn.tick + self.config.raid_max_ticks
         self._combat_kills.clear()
         return self._raid_ids
+
+    def _resource_block_clearance(
+        self,
+        turn: Turn,
+    ) -> tuple[Position, tuple[Position, ...], tuple[Position, ...]] | None:
+        """Return the fighters sealing every known node of the current block.
+
+        A block only counts as sealed when its natural quota has been fully
+        discovered: a partially explored block can still hide a safe node, and
+        committing combat units or abandoning the block for a half-known map
+        would be premature.  Every discovered node must then sit inside the
+        recent sighting disc of a hostile fighter.  Enemy Cores and Workers
+        cannot attack, so they never seal a node - only Vanguards and Rangers
+        do.
+
+        Returns ``(objective, fighter_positions, resource_cells)`` where the
+        objective is the covering fighter closest to our Core, or ``None`` when
+        the block still has a safe site.
+        """
+
+        from .migration import resource_block_index, resource_block_quota
+
+        core = turn.core
+        if core is None:
+            return None
+        block = resource_block_index(core.position)
+        known = {
+            cell
+            for cell in (set(turn.resource_cells) | set(self.memory.resource_cells))
+            if resource_block_index(cell) == block
+        }
+        if len(known) < resource_block_quota(block):
+            return None
+        fighters = tuple(
+            sighting.position
+            for sighting in self.memory.recent_enemies(
+                turn.tick,
+                self.config.worker_threat_memory_ttl,
+            )
+            if sighting.kind == "UNIT"
+            and sighting.unit_type
+            in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            and turn.tick - sighting.tick <= self.config.worker_threat_memory_ttl
+        )
+        if not fighters:
+            return None
+        radius = self.config.worker_threat_radius
+        covering = tuple(
+            fighter
+            for fighter in dict.fromkeys(fighters)
+            if any(
+                manhattan(cell, fighter) <= radius
+                for cell in known
+            )
+        )
+        if not covering:
+            return None
+        if not all(
+            any(manhattan(cell, fighter) <= radius for fighter in covering)
+            for cell in known
+        ):
+            return None
+        if not any(
+            manhattan(core.position, fighter) <= self.config.raid_radius
+            for fighter in covering
+        ):
+            return None
+        objective = min(
+            covering,
+            key=lambda fighter: (manhattan(core.position, fighter), fighter),
+        )
+        return objective, covering, tuple(sorted(known))
+
+    def _clearing_combat_units(
+        self,
+        turn: Turn,
+    ) -> tuple[Ranger | Vanguard, ...]:
+        """Return live combat units that can leave station for a clearance."""
+
+        return tuple(
+            unit
+            for unit in (*turn.rangers, *turn.vanguards)
+            if not self._is_expedition_member(unit, turn)
+        )
+
+    def _clearance_recall_needed(
+        self,
+        turn: Turn,
+        threat: ThreatAssessment,
+    ) -> bool:
+        """Whether the Core itself now outranks the clearance objective.
+
+        A fighter sealing the block's nodes necessarily stands close to the
+        Core, so the raid's ``near_core_enemy_ids`` test would abort every
+        clearance the moment it launched.  Only evidence that the Core can no
+        longer wait - an attack already in flight, an enemy able to fire on it,
+        a Core that has taken damage, or a predicted strike - recalls the
+        detachment.
+        """
+
+        core = turn.core
+        if core is None:
+            return True
+        return (
+            threat.should_evacuate_core
+            or core.hp < 5
+            or core.shield < 5
+        )
+
+    def _update_resource_clearance(
+        self,
+        turn: Turn,
+        threat: ThreatAssessment,
+    ) -> frozenset[UUID]:
+        """Send standing defenders against fighters sealing this block.
+
+        The rule is deliberately narrow: the block's natural quota is fully
+        discovered, every discovered node is covered by hostile fighters, and
+        there is no safe site left to harvest.  With income at zero the economy
+        cannot fund its own way out, so the defenders that would only wait on
+        the ring become the detachment that clears the block.
+
+        The squad is bounded exactly like the ordinary raid: it needs a local
+        numeric advantage, it aborts when a fighter turns towards the Core, it
+        disengages when the objective is held by more fighters than it brought,
+        and it is recalled by the same tick budget.  Campaign defence keeps one
+        guard on station whenever the roster has more than one combat unit.
+        """
+
+        live = frozenset(unit.id for unit in (*turn.rangers, *turn.vanguards))
+        self._clearance_ids &= live
+        core = turn.core
+        decision = self._resource_block_clearance(turn)
+        if core is None or decision is None:
+            self._abort_resource_clearance(turn)
+            return frozenset()
+        objective, covering, _cells = decision
+        if self._clearance_ids:
+            if (
+                turn.tick > self._clearance_until_tick
+                or self._clearance_recall_needed(turn, threat)
+                or self._clearance_outmatched(turn, covering)
+            ):
+                self._abort_resource_clearance(turn)
+                return frozenset()
+            self._clearance_target = objective
+            return self._clearance_ids
+        if self._clearance_recall_needed(turn, threat):
+            return frozenset()
+        squad = self._clearance_squad(turn, objective)
+        if len(squad) <= len(covering):
+            return frozenset()
+        self._clearance_ids = frozenset(unit.id for unit in squad)
+        self._clearance_target = objective
+        self._clearance_until_tick = turn.tick + self.config.raid_max_ticks
+        return self._clearance_ids
+
+    def _clearance_squad(
+        self,
+        turn: Turn,
+        objective: Position,
+    ) -> tuple[Ranger | Vanguard, ...]:
+        """Pick the closest fighters, keeping one guard when possible."""
+
+        combat = self._clearing_combat_units(turn)
+        keep_home = 1 if len(combat) > 1 else 0
+        available = max(1, min(len(combat) - keep_home, self.config.raid_squad_size))
+        ordered = sorted(
+            combat,
+            key=lambda unit: (
+                unit.hp <= 1,
+                manhattan(unit.position, objective),
+                unit.id.bytes,
+            ),
+        )
+        return tuple(ordered[:available])
+
+    def _clearance_outmatched(
+        self,
+        turn: Turn,
+        covering: tuple[Position, ...],
+    ) -> bool:
+        """Whether more fighters are converging than the detachment brought."""
+
+        members = {
+            str(unit.id)
+            for unit in (*turn.rangers, *turn.vanguards)
+            if unit.id in self._clearance_ids
+        }
+        if not members:
+            return True
+        positions = tuple(
+            unit.position
+            for unit in (*turn.rangers, *turn.vanguards)
+            if str(unit.id) in members
+        )
+        fighters = sum(
+            1
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and any(
+                manhattan(member, enemy.position) <= RAID_ABORT_SCAN_RADIUS
+                for member in positions
+            )
+        )
+        return fighters >= len(members) or len(covering) > len(members)
+
+    def _abort_resource_clearance(self, turn: Turn) -> None:
+        """Release the clearance detachment back to its defence posts."""
+
+        self._clearance_ids = frozenset()
+        self._clearance_target = None
+        self._clearance_until_tick = -1
 
     def _raid_recall_needed(self, turn: Turn, threat: ThreatAssessment) -> bool:
         """Whether the Core itself needs the detachment back at home.
@@ -13104,24 +13480,17 @@ class AggressiveStrategy:
         self,
         turn: Turn,
     ) -> tuple[Position, ...]:
+        """Return recently seen hostile fighters, the only Workers fear."""
+
         return tuple(
             enemy.position
             for enemy in self.memory.recent_enemies(
                 turn.tick,
-                self.config.enemy_core_memory_ttl,
+                self.config.worker_threat_memory_ttl,
             )
-            if (
-                (
-                    enemy.kind == "CORE"
-                    and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
-                )
-                or (
-                    enemy.kind == "UNIT"
-                    and enemy.unit_type
-                    in {UnitType.VANGUARD.value, UnitType.RANGER.value}
-                    and turn.tick - enemy.tick <= self.config.worker_threat_memory_ttl
-                )
-            )
+            if enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            and turn.tick - enemy.tick <= self.config.worker_threat_memory_ttl
         )
 
     def _near_remembered_worker_danger(
@@ -13137,27 +13506,9 @@ class AggressiveStrategy:
         )
 
     def _worker_threat_exclusion_cells(self, turn: Turn) -> set[Position]:
-        return self._worker_core_threat_exclusion_cells(
-            turn
-        ) | self._worker_combat_threat_exclusion_cells(turn)
+        """Return danger cells for Workers: hostile fighters only."""
 
-    def _worker_core_threat_positions(self, turn: Turn) -> tuple[Position, ...]:
-        """Return recently remembered hostile Core positions."""
-
-        return tuple(
-            enemy.position
-            for enemy in self.memory.recent_enemies(
-                turn.tick,
-                self.config.enemy_core_memory_ttl,
-            )
-            if enemy.kind == "CORE"
-            and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
-        )
-
-    def _worker_core_threat_exclusion_cells(self, turn: Turn) -> set[Position]:
-        """Return only the conservative danger disks around remembered Cores."""
-
-        return self._worker_threat_disks(self._worker_core_threat_positions(turn))
+        return self._worker_combat_threat_exclusion_cells(turn)
 
     def _worker_combat_threat_positions(self, turn: Turn) -> tuple[Position, ...]:
         """Return recently remembered hostile combat Units."""
@@ -13208,7 +13559,6 @@ class AggressiveStrategy:
                 and enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
                 and enemy.object_id not in visible_ids
             ]
-            cores = self._worker_core_threat_positions(turn)
             enemy_cells = {enemy.position for enemy in turn.visible_enemies}
             obstacles = self._rock_map(turn)
             radius = CAMPAIGN_DEFENSE_RADIUS
@@ -13225,7 +13575,7 @@ class AggressiveStrategy:
                         )
                         or any(
                             manhattan(cell, enemy) <= self.config.worker_threat_radius
-                            for enemy in (*hidden, *cores)
+                            for enemy in hidden
                         )
                         or self._future_attackers_at(cell, turn, obstacles)
                     ):
@@ -13244,40 +13594,6 @@ class AggressiveStrategy:
             for dy in range(-radius, radius + 1)
             if abs(dx) + abs(dy) <= radius
         }
-
-    def _worker_core_escape_blockers(
-        self,
-        unit: Worker,
-        context: _TurnContext,
-        blockers: Container[Position],
-    ) -> set[Position] | None:
-        """Open a stale Core disk only when it is the sole physical exit.
-
-        A Worker can settle at the rim of a remembered Core exclusion and then
-        find every free neighbor one step closer to that Core.  Treating the
-        heuristic disk as solid terrain stranded the Worker indefinitely.  If
-        no hostile is visible, permit a route that crosses only remembered Core
-        disks; remembered combat Units, rocks, the Core itself and all other
-        blockers remain in force.
-        """
-
-        if context.turn.visible_enemies:
-            return None
-        core_threat = self._worker_core_threat_exclusion_cells(context.turn)
-        if not core_threat:
-            return None
-        neighbors = adjacent_positions(unit.position)
-        if any(position not in blockers for position in neighbors):
-            return None
-        escaped = self._worker_combat_threat_exclusion_cells(context.turn)
-        escaped.update(self.memory.obstacles)
-        escaped.update(context.turn.obstacle_cells)
-        escaped.update(context.enemy_positions)
-        escaped.update(self.memory.contested_positions)
-        escaped.update(self._worker_core_threat_positions(context.turn))
-        if any(position not in escaped for position in neighbors):
-            return escaped
-        return None
 
     def _core_can_spawn(self, context: _TurnContext) -> bool:
         core = context.turn.core

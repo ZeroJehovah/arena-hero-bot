@@ -610,3 +610,16 @@ def test_worker_coverage_follows_the_moving_core_not_the_final_home() -> None:
         position[0] // 32 == 0 and position[1] // 32 == 0
         for position in memory.worker_seen_ticks
     )
+
+
+def test_campaign_emergency_hop_round_trips(tmp_path) -> None:
+    path = tmp_path / "memory.json"
+    memory = WorldMemory()
+    memory.campaign_emergency_target = (-529, 720)
+    memory.campaign_emergency_started_tick = 1234
+    memory.save(path)
+
+    loaded = WorldMemory.load(path)
+
+    assert loaded.campaign_emergency_target == (-529, 720)
+    assert loaded.campaign_emergency_started_tick == 1234

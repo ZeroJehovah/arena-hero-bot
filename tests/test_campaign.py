@@ -2055,3 +2055,181 @@ def test_returned_legacy_expedition_joins_the_patrol_roster() -> None:
 
     assert memory.unit_roles[str(returned["id"])].startswith("patrol-")
     assert memory.expedition_squads == []
+
+
+CLEARANCE_HOME = (-497, 719)
+CLEARANCE_NODES = [(-493, 719), (-487, 720)]
+CLEARANCE_FIGHTER = (-490, 719)
+
+
+def _clearance_rangers(count: int) -> list[dict[str, object]]:
+    offsets = [(0, 3), (0, -3), (3, 0), (-3, 0), (5, 5), (-5, 5)]
+    return [
+        unit(
+            100 + index,
+            "RANGER",
+            position=(CLEARANCE_HOME[0] + dx, CLEARANCE_HOME[1] + dy),
+        )
+        for index, (dx, dy) in enumerate(offsets[:count])
+    ]
+
+
+def _clearance_workers(count: int) -> list[dict[str, object]]:
+    return [
+        unit(
+            300 + index,
+            "WORKER",
+            position=(CLEARANCE_HOME[0] - 8 + index % 8, CLEARANCE_HOME[1] - 8 + index // 8),
+        )
+        for index in range(count)
+    ]
+
+
+def _sealed_memory(
+    core_object: dict[str, object],
+    rangers: list[dict[str, object]],
+) -> WorldMemory:
+    return WorldMemory(
+        core_home_position=CLEARANCE_HOME,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE2,
+        campaign_target_quota=3,
+        campaign_last_core_id=str(core_object["id"]),
+        unit_roles={str(ranger["id"]): "defense" for ranger in rangers},
+        unit_roles_initialized=True,
+    )
+
+
+def _sealed_fighters(count: int) -> list[dict[str, object]]:
+    cells = [(-490, 719), (-489, 719), (-490, 720), (-489, 720)]
+    return [
+        unit(200 + index, "RANGER", controlled=False, position=cell)
+        for index, cell in enumerate(cells[:count])
+    ]
+
+
+def test_sealed_block_sends_defenders_to_clear_the_fighters() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[core_object, *rangers, *_sealed_fighters(1)],
+        resource_cells=CLEARANCE_NODES,
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    clearing = [
+        decision
+        for decision in report.decisions
+        if "sealing this block" in decision.reason
+    ]
+    assert clearing
+    assert len({decision.actor_id for decision in clearing}) < len(rangers)
+    assert memory.core_home_position == CLEARANCE_HOME
+    assert memory.campaign_emergency_target is None
+
+
+def test_sealed_block_without_a_numeric_advantage_keeps_the_defenders_home() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[core_object, *rangers, *_sealed_fighters(4)],
+        resource_cells=CLEARANCE_NODES,
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert not any(
+        "sealing this block" in decision.reason for decision in report.decisions
+    )
+    assert memory.campaign_emergency_target is None
+    assert memory.core_home_position == CLEARANCE_HOME
+
+
+def test_sealed_block_with_combat_units_does_not_abandon_the_core() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(1)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[core_object, *rangers, *_sealed_fighters(1)],
+        resource_cells=CLEARANCE_NODES,
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.campaign_emergency_target is None
+    assert memory.core_home_position == CLEARANCE_HOME
+
+
+def test_sealed_block_without_combat_units_migrates_away_from_the_danger() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    workers = _clearance_workers(16)
+    memory = _sealed_memory(core_object, [])
+    turn = make_turn(
+        objects=[core_object, *workers, *_sealed_fighters(1)],
+        resource_cells=CLEARANCE_NODES,
+    )
+
+    _strategy(memory).decide(turn)
+
+    target = memory.campaign_emergency_target
+    assert target is not None
+    origin_block = resource_block_index(CLEARANCE_HOME)
+    target_block = resource_block_index(target)
+    assert blocks_are_cardinally_adjacent(origin_block, target_block)
+    assert resource_block_quota(target_block) <= resource_block_quota(origin_block)
+    assert manhattan(target, CLEARANCE_FIGHTER) > manhattan(
+        CLEARANCE_HOME, CLEARANCE_FIGHTER
+    )
+    assert memory.core_home_position == target
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+
+
+def test_partially_discovered_block_does_not_trigger_a_clearance() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[core_object, *rangers, *_sealed_fighters(1)],
+        resource_cells=[CLEARANCE_NODES[0]],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert not any(
+        "sealing this block" in decision.reason for decision in report.decisions
+    )
+    assert memory.campaign_emergency_target is None
+
+
+def test_enemy_cores_do_not_seal_a_resource_block() -> None:
+    core_object = core(1, position=CLEARANCE_HOME)
+    workers = _clearance_workers(16)
+    memory = _sealed_memory(core_object, [])
+    turn = make_turn(
+        objects=[
+            core_object,
+            *workers,
+            core(
+                7,
+                controlled=False,
+                owner_username="rival",
+                position=CLEARANCE_NODES[0],
+            ),
+            core(
+                8,
+                controlled=False,
+                owner_username="rival",
+                position=CLEARANCE_NODES[1],
+            ),
+        ],
+        resource_cells=[],
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.campaign_emergency_target is None
+    assert memory.core_home_position == CLEARANCE_HOME

@@ -192,6 +192,13 @@ class WorldMemory:
     # filter whenever the durable obstacle map grows, otherwise a pocket that
     # becomes enclosed after the sweep starts remains a false scan target.
     campaign_scout_unobservable_obstacle_count: int = 0
+    # A block whose quota is fully discovered and wholly sealed by hostile
+    # fighters, with no combat unit left to clear it, is abandoned instead of
+    # starving on zero income.  The emergency hop is one adjacent block away
+    # from the danger bearing, not necessarily inward, and it is persisted so
+    # a restart cannot turn it into a walk back toward the fighters.
+    campaign_emergency_target: Position | None = None
+    campaign_emergency_started_tick: int = 0
     # The twenty defensive Rangers normally cover radius eight and fold into
     # a radius-four inner screen under sustained pressure.
     defense_compressed: bool = False
@@ -824,6 +831,12 @@ class WorldMemory:
             "campaign_scout_unobservable_obstacle_count": (
                 self.campaign_scout_unobservable_obstacle_count
             ),
+            "campaign_emergency_target": (
+                list(self.campaign_emergency_target)
+                if self.campaign_emergency_target is not None
+                else None
+            ),
+            "campaign_emergency_started_tick": self.campaign_emergency_started_tick,
             "defense_compressed": self.defense_compressed,
             "defense_calm_since_tick": self.defense_calm_since_tick,
             "layered_defense_core_id": self.layered_defense_core_id,
@@ -1046,6 +1059,12 @@ class WorldMemory:
             ),
             campaign_scout_unobservable_obstacle_count=int(
                 raw.get("campaign_scout_unobservable_obstacle_count", 0)
+            ),
+            campaign_emergency_target=_optional_position(
+                raw.get("campaign_emergency_target")
+            ),
+            campaign_emergency_started_tick=int(
+                raw.get("campaign_emergency_started_tick", 0)
             ),
             defense_compressed=bool(raw.get("defense_compressed", False)),
             defense_calm_since_tick=_optional_integer(
