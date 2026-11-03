@@ -774,6 +774,58 @@ def test_campaign_mid_leg_cargo_holds_without_delaying_core() -> None:
     )
 
 
+def test_campaign_defense_hold_services_and_compacts_loaded_workers() -> None:
+    """A held Core must accept cargo and collect even distant cargo."""
+
+    core_object = core(position=(0, 0))
+    memory = WorldMemory(
+        core_home_position=(10, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+        core_migration_pause_until_tick=-1,
+        campaign_phase=CAMPAIGN_PHASE_STAGE2,
+        campaign_target_quota=3,
+        campaign_last_core_id=core_object["id"],
+    )
+    loaded = unit(500, "WORKER", position=(1, 0), cargo=1)
+    distant = unit(501, "WORKER", position=(20, 0), cargo=1)
+    rangers = [
+        unit(1000 + index, "RANGER", position=(-4, index - 2)) for index in range(5)
+    ]
+    enemy = unit(900, "RANGER", controlled=False, position=(0, 8))
+    turn = make_turn(
+        tick=100,
+        objects=[core_object, *_workers(16), loaded, distant, *rangers, enemy],
+    )
+
+    report = _strategy(memory).decide(turn)
+
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "WAIT"
+    assert any(
+        item.actor_kind == "CORE"
+        and item.reason == "hold Core behind the two defensive firing ranks"
+        for item in report.decisions
+    )
+    decision = next(
+        item for item in report.decisions if item.actor_id == str(loaded["id"])
+    )
+    assert decision.action == "MOVE"
+    assert decision.target == (0, 0)
+    assert decision.reason == "return carried resources to Core"
+    assert not any(
+        item.actor_id == str(loaded["id"])
+        and item.reason == "hold the next Core arrival slot for in-transit delivery"
+        for item in report.decisions
+    )
+    distant_decision = next(
+        item for item in report.decisions if item.actor_id == str(distant["id"])
+    )
+    assert distant_decision.action == "MOVE"
+    assert distant_decision.target is not None
+    assert manhattan(distant_decision.target, core_object["position"]) < 20
+
+
 def test_campaign_migration_builds_on_the_arrival_tick_then_resumes() -> None:
     """A formation gap spends the one service Tick before migration resumes."""
 

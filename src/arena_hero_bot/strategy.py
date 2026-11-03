@@ -3367,6 +3367,16 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None or not self._core_migration_in_progress(core.view):
             return
+        if (
+            core.view.state is not CoreState.MOVING
+            and context.layered_assignments
+            and context.core_escape_direction is None
+        ):
+            # Layered defense deliberately holds a stationary Core behind its
+            # firing ranks.  Do not reserve a route for a move that cannot
+            # start this Tick: doing so parks loaded Workers in the forward
+            # lane while the Core service cell stays empty for the whole hold.
+            return
         if core.view.state is CoreState.MOVING:
             direction = core.view.move_direction
             if direction is None or core.view.destination is None:
