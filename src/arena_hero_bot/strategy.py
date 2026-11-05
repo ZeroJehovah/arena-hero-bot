@@ -2527,6 +2527,7 @@ class AggressiveStrategy:
                     and self._aim_cell_has_enemy_opportunity(cell, context.turn)
                 ):
                     candidates[cell] = max(candidates.get(cell, 0), 10 - age)
+        contact_shot = bool(candidates)
         if not candidates and frontier:
             core = context.turn.core
             vision = visible_cells(ranger.position, RANGER_VISION_RADIUS, obstacles)
@@ -2561,7 +2562,12 @@ class AggressiveStrategy:
             ),
         )
         ranger.shoot_cell(cell)
-        self._reserve_ranger_firing_lane(ranger.position, cell, context)
+        # A speculative frontier shot must not reserve an economy route.
+        # Otherwise a guard can shoot the same narrow mine every Tick and
+        # turn the claimant's final step into an endless patrol/claim orbit.
+        # Visible/recent contacts retain their coordinated aim reservations.
+        if contact_shot:
+            self._reserve_ranger_firing_lane(ranger.position, cell, context)
         context.defensive_fire_cells[cell] = (
             context.defensive_fire_cells.get(cell, 0) + 1
         )

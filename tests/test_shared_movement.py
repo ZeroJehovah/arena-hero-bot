@@ -28,6 +28,45 @@ def context_for(turn):
     )
 
 
+def test_frontier_cover_fire_allows_a_worker_to_enter_and_harvest_a_narrow_mine():
+    strategy = AggressiveStrategy(WorldMemory(), StrategyConfig(target_workers=0))
+    resource = (0, 10)
+    position = (0, 9)
+    obstacles = {(x, y) for x in (-1, 1) for y in range(8, 11)} | {(0, 11)}
+    actions = []
+    for tick in range(100, 102):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(),
+                unit(2, "RANGER", position=(0, 8)),
+                unit(3, "WORKER", position=position),
+            ],
+            resource_cells=[resource],
+            obstacles=obstacles,
+        )
+        strategy.memory.observe(turn)
+        context = context_for(turn)
+        worker = turn.workers[0]
+        context.resource_assignments = {worker.id: resource}
+
+        # Combat plans first. Its speculative endpoint must not turn the
+        # last mining step into a retreat followed by a fresh claim.
+        strategy._hold_defensive_ranger(turn.rangers[0], context)
+        if tick == 100:
+            shot = turn.plan.unit_actions[turn.rangers[0].id]
+            assert shot.type == "SHOOT"
+            assert shot.expected_cell == resource
+        strategy._decide_worker(worker, context)
+        action = turn.plan.unit_actions[worker.id]
+        actions.append(action.type)
+        if isinstance(action, MoveAction):
+            position = add(position, action.direction)
+
+    assert position == resource
+    assert actions == ["MOVE", "HARVEST"]
+
+
 @pytest.mark.parametrize("kind", ["WORKER", "RANGER", "VANGUARD"])
 def test_core_capacity_allows_one_inbound_and_rejects_the_next(kind):
     turn = make_turn(
