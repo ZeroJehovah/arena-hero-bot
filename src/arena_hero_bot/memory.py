@@ -17,6 +17,7 @@ POSITION_HISTORY_LIMIT = 8
 ENEMY_POSITION_HISTORY_LIMIT = 4
 ENEMY_DRIFT_MAX_GAP = 3
 CONTESTED_CELL_TTL = 80
+INCOMING_DAMAGE_TTL = 16
 RESOURCE_MEMORY_TTL = 65536
 RESOURCE_MEMORY_LIMIT = 2048
 WORKER_COVERAGE_SIZE = 32
@@ -119,6 +120,9 @@ class WorldMemory:
     goals: dict[str, UnitGoal] = field(default_factory=dict)
     pending_move_targets: dict[str, Position] = field(default_factory=dict)
     contested_positions: dict[Position, int] = field(default_factory=dict)
+    # Actual incoming fire can reveal danger even when its source is unseen.
+    # Each cell retains (last attack Tick, strongest observed damage) briefly.
+    incoming_damage: dict[Position, tuple[int, int]] = field(default_factory=dict)
     resource_cells: dict[Position, int] = field(default_factory=dict)
     # Combat identities are durable: a live Unit keeps its assigned role when
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
@@ -249,6 +253,7 @@ class WorldMemory:
         self._observe_worker_coverage(turn)
         self._observe_campaign_scout_coverage(turn)
         self._observe_resource_cells(turn)
+        self._observe_incoming_damage(turn)
         destroyed_enemy_ids = {
             str(event.target_id)
             for event in turn.events
@@ -532,6 +537,37 @@ class WorldMemory:
             )
         )
 
+    def _observe_incoming_damage(self, turn: Turn) -> None:
+        self.incoming_damage = {
+            cell: evidence
+            for cell, evidence in self.incoming_damage.items()
+            if 0 <= turn.tick - evidence[0] <= INCOMING_DAMAGE_TTL
+        }
+        # A killed ally is absent from the new snapshot, but still occurs in
+        # our previous position history until observe() finishes this Turn.
+        friendly_ids = set(self.position_history) | {
+            str(unit.id) for unit in turn.units
+        }
+        for event in turn.events:
+            if (
+                event.event_type != "UNIT_DAMAGED"
+                or event.reason_code != "ATTACK"
+                or event.position is None
+                or str(event.target_id) not in friendly_ids
+                or not 0 <= turn.tick - event.tick <= INCOMING_DAMAGE_TTL
+            ):
+                continue
+            damage = (event.values or {}).get("damage")
+            if not isinstance(damage, int) or isinstance(damage, bool) or damage <= 0:
+                continue
+            previous_tick, previous_damage = self.incoming_damage.get(
+                event.position, (event.tick, 0)
+            )
+            self.incoming_damage[event.position] = (
+                max(previous_tick, event.tick),
+                max(previous_damage, damage),
+            )
+
     def predicted_enemy_position(
         self,
         enemy_id: str,
@@ -728,6 +764,10 @@ class WorldMemory:
             "contested_positions": [
                 {"position": list(position), "tick": observed_tick}
                 for position, observed_tick in sorted(self.contested_positions.items())
+            ],
+            "incoming_damage": [
+                {"position": list(position), "tick": tick, "damage": damage}
+                for position, (tick, damage) in sorted(self.incoming_damage.items())
             ],
             "resource_cells": [
                 {"position": list(position), "tick": seen_tick}
@@ -941,6 +981,10 @@ class WorldMemory:
             contested_positions={
                 _position(value["position"]): int(value["tick"])
                 for value in raw.get("contested_positions", [])
+            },
+            incoming_damage={
+                _position(value["position"]): (int(value["tick"]), int(value["damage"]))
+                for value in raw.get("incoming_damage", [])
             },
             resource_cells=resource_cells,
             unit_roles={

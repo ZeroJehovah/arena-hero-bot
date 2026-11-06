@@ -222,6 +222,86 @@ def test_next_tick_threat_is_not_current_damage():
     assert len(strategy._future_attackers_at((0, 0), turn, set())) == 1
 
 
+def test_replacements_avoid_a_recent_lethal_post_and_transit_cell(tmp_path):
+    strategy = _strategy()
+    strategy.memory.observe(
+        make_turn(tick=99, objects=[core(), unit(9, "RANGER", position=(-3, -4))])
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(-2, -4)),
+            unit(3, "RANGER", position=(1, 0)),
+            unit(4, "RANGER", position=(0, 1)),
+            unit(5, "RANGER", position=(1, 1)),
+            unit(50, "RANGER", controlled=False, position=(-8, -2)),
+        ],
+        events=[
+            {
+                "event_id": object_id(900),
+                "tick": 99,
+                "event_type": "UNIT_DAMAGED",
+                "reason_code": "ATTACK",
+                "target_id": object_id(9),
+                "position": [-3, -4],
+                "values": {"damage": 2, "hp": 0},
+            }
+        ],
+    )
+    strategy.memory.observe(turn)
+    path = tmp_path / "memory.json"
+    strategy.memory.save(path)
+    strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    context = _context(strategy, turn)
+    strategy._prepare_layered_defense(context)
+    assert (-3, -4) not in context.layered_assignments.values()
+
+    # The evidence also forbids passing through the cell towards another
+    # post; it is temporary tactical danger, not a permanent rock.
+    context.layered_assignments = {UUID(int=2): (-4, -4)}
+    context.layered_steps.clear()
+    strategy._prepare_layered_steps(
+        context,
+        tuple(enemy for enemy in turn.visible_enemies if isinstance(enemy, UnitView)),
+    )
+    strategy._move_layered_ranger(turn.rangers[0], context)
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert isinstance(action, MoveAction)
+    assert add((-2, -4), action.direction) != (-3, -4)
+    assert (-3, -4) not in strategy.memory.obstacles
+
+
+def test_recent_incoming_fire_keeps_a_current_winning_volley():
+    friends = [
+        unit(2, "RANGER", position=(0, -4)),
+        unit(3, "RANGER", position=(2, -4)),
+        unit(4, "RANGER", position=(0, -3)),
+        unit(5, "RANGER", position=(2, 0)),
+    ]
+    foes = [
+        unit(50, "RANGER", controlled=False, position=(0, -6)),
+        unit(51, "RANGER", controlled=False, position=(0, -6), hp=1),
+    ]
+    encounter = Encounter(friends, foes)
+    strategy = _strategy({o["id"]: "defense" for o in friends})
+    strategy.memory.incoming_damage[(0, -4)] = (99, 2)
+    plan, _ = _plan_encounter(strategy, encounter)
+    assert plan.unit_actions[UUID(int=2)].type == "SHOOT"
+    encounter.settle(
+        plan,
+        {
+            foe["id"]: {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": [0, -4],
+            }
+            for foe in foes
+        },
+    )
+    assert encounter.kills == 2
+    assert encounter.losses == 1
+
+
 def test_retreat_state_survives_restart_and_resets_with_core(tmp_path):
     strategy = _strategy()
     memory = strategy.memory

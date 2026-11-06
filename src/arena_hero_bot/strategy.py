@@ -6835,6 +6835,11 @@ class AggressiveStrategy:
             | set(context.turn.resource_cells)
             | {worker.position for worker in context.turn.workers}
             | {core.position}
+            | {
+                cell
+                for cell, (_tick, damage) in memory.incoming_damage.items()
+                if damage >= 2
+            }
         )
         assignments = layered_posts(
             anchor,
@@ -6991,6 +6996,11 @@ class AggressiveStrategy:
                 rocks,
                 context.enemy_positions,
                 {core.position},
+                {
+                    cell
+                    for cell, (_tick, damage) in self.memory.incoming_damage.items()
+                    if damage >= ranger.hp
+                },
                 {
                     cell
                     for cell in adjacent_positions(ranger.position)
@@ -13178,6 +13188,9 @@ class AggressiveStrategy:
         if len(squad) <= len(covering):
             return frozenset()
         self._clearance_ids = frozenset(unit.id for unit in squad)
+        if self._clearance_outmatched(turn, covering):
+            self._abort_resource_clearance(turn)
+            return frozenset()
         self._clearance_target = objective
         self._clearance_until_tick = turn.tick + self.config.raid_max_ticks
         return self._clearance_ids
@@ -13212,7 +13225,7 @@ class AggressiveStrategy:
         members = {
             str(unit.id)
             for unit in (*turn.rangers, *turn.vanguards)
-            if unit.id in self._clearance_ids
+            if unit.id in self._clearance_ids and unit.hp > 1
         }
         if not members:
             return True
@@ -13221,8 +13234,8 @@ class AggressiveStrategy:
             for unit in (*turn.rangers, *turn.vanguards)
             if str(unit.id) in members
         )
-        fighters = sum(
-            1
+        fighters = {
+            str(enemy.id)
             for enemy in turn.visible_enemies
             if isinstance(enemy, UnitView)
             and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
@@ -13230,8 +13243,22 @@ class AggressiveStrategy:
                 manhattan(member, enemy.position) <= RAID_ABORT_SCAN_RADIUS
                 for member in positions
             )
+        }
+        # Losing sight of a pair is not defeating it. The same remembered
+        # fighters that seal a mine must still count against its clearance
+        # party, including distinct enemies sharing a cell.
+        fighters.update(
+            enemy.object_id
+            for enemy in self.memory.recent_enemies(
+                turn.tick, self.config.worker_threat_memory_ttl
+            )
+            if enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
+            and any(
+                manhattan(member, enemy.position) <= RAID_ABORT_SCAN_RADIUS
+                for member in positions
+            )
         )
-        return fighters >= len(members) or len(covering) > len(members)
+        return len(fighters) >= len(members) or len(covering) > len(members)
 
     def _abort_resource_clearance(self, turn: Turn) -> None:
         """Release the clearance detachment back to its defence posts."""

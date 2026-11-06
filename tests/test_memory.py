@@ -5,9 +5,68 @@ import json
 import pytest
 
 from arena_hero_bot.exploration import ExplorationRoute
-from arena_hero_bot.memory import ExpeditionSquad, UnitGoal, WorldMemory
+from arena_hero_bot.memory import (
+    INCOMING_DAMAGE_TTL,
+    ExpeditionSquad,
+    UnitGoal,
+    WorldMemory,
+)
 
 from .factories import core, make_turn, object_id, unit
+
+
+def test_unseen_incoming_fire_survives_casualty_and_restart_then_expires(tmp_path):
+    memory = WorldMemory()
+    memory.observe(
+        make_turn(tick=99, objects=[core(), unit(2, "RANGER", position=(-3, -4))])
+    )
+    memory.observe(
+        make_turn(
+            objects=[core()],
+            events=[
+                {
+                    "event_id": object_id(900),
+                    "tick": 99,
+                    "event_type": "UNIT_DAMAGED",
+                    "reason_code": "ATTACK",
+                    "target_id": object_id(2),
+                    "position": [-3, -4],
+                    "values": {"damage": 2, "hp": 0},
+                }
+            ],
+        )
+    )
+    path = tmp_path / "memory.json"
+    memory.save(path)
+    loaded = WorldMemory.load(path)
+    assert loaded.incoming_damage == {(-3, -4): (99, 2)}
+
+    loaded.observe(make_turn(tick=99 + INCOMING_DAMAGE_TTL, objects=[core()]))
+    assert (-3, -4) in loaded.incoming_damage
+    loaded.observe(make_turn(tick=100 + INCOMING_DAMAGE_TTL, objects=[core()]))
+    assert not loaded.incoming_damage
+
+
+def test_incoming_fire_does_not_record_enemy_damage_or_non_attack_events():
+    memory = WorldMemory()
+    memory.observe(
+        make_turn(
+            objects=[core(), unit(2, "RANGER"), unit(3, "RANGER", controlled=False)],
+            events=[
+                {
+                    "event_id": object_id(900 + index),
+                    "tick": 99,
+                    "event_type": "UNIT_DAMAGED",
+                    "reason_code": reason,
+                    "target_id": object_id(target),
+                    "position": [1, 1],
+                    "values": {"damage": 2, "hp": 0},
+                }
+                for index, (target, reason) in enumerate([(3, "ATTACK"), (2, None)])
+            ],
+        )
+    )
+    assert not memory.incoming_damage
 
 
 def test_observations_round_trip_without_hidden_data(tmp_path) -> None:

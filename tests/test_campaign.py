@@ -2203,6 +2203,76 @@ def test_sealed_block_without_a_numeric_advantage_keeps_the_defenders_home() -> 
     assert memory.core_home_position == CLEARANCE_HOME
 
 
+def test_clearance_counts_stacked_enemies_before_launching():
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    strategy = _strategy(_sealed_memory(core_object, rangers))
+    turn = make_turn(
+        objects=[
+            core_object,
+            *rangers,
+            unit(200, "RANGER", controlled=False, position=CLEARANCE_FIGHTER),
+            unit(201, "RANGER", controlled=False, position=CLEARANCE_FIGHTER),
+            unit(202, "RANGER", controlled=False, position=(-490, 720)),
+        ],
+        resource_cells=CLEARANCE_NODES,
+    )
+    strategy.memory.observe(turn)
+    threat = strategy._combat_policy.assess(turn, set())
+
+    # Three available Rangers cannot claim an advantage over three enemies
+    # merely because the enemies occupy only two distinct cells.
+    assert not strategy._update_resource_clearance(turn, threat)
+    assert not strategy._clearance_ids
+
+
+def test_clearance_recalls_for_unseen_reinforcements_until_confirmed_destroyed():
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(4)
+    strategy = _strategy(_sealed_memory(core_object, rangers))
+    pair = [
+        unit(200, "RANGER", controlled=False, position=CLEARANCE_FIGHTER),
+        unit(201, "RANGER", controlled=False, position=CLEARANCE_FIGHTER),
+    ]
+
+    def update(tick, *, reinforcement=False, destroyed=False):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core_object,
+                *rangers,
+                *pair,
+                *(
+                    [unit(202, "RANGER", controlled=False, position=(-490, 720))]
+                    if reinforcement
+                    else []
+                ),
+            ],
+            resource_cells=CLEARANCE_NODES,
+            events=(
+                [
+                    {
+                        "event_id": object_id(900),
+                        "tick": tick - 1,
+                        "event_type": "DESTRUCTION_PARTICIPATION",
+                        "reason_code": "UNIT",
+                        "target_id": object_id(202),
+                    }
+                ]
+                if destroyed
+                else []
+            ),
+        )
+        strategy.memory.observe(turn)
+        threat = strategy._combat_policy.assess(turn, set())
+        return strategy._update_resource_clearance(turn, threat)
+
+    assert len(update(100)) == 3
+    assert not update(101, reinforcement=True)
+    assert not update(102)
+    assert len(update(103, destroyed=True)) == 3
+
+
 def test_sealed_block_with_combat_units_does_not_abandon_the_core() -> None:
     core_object = core(1, position=CLEARANCE_HOME)
     rangers = _clearance_rangers(1)
