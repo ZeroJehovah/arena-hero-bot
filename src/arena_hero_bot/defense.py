@@ -54,8 +54,13 @@ def precision_volley(
     enemies: Sequence[UnitView],
     core: Position,
     rocks: Container[Position],
+    shooter_hp: Mapping[UUID, int] | None = None,
 ) -> dict[UUID, UnitView]:
-    """Allocate real target UUIDs, including multiple occupants of one cell."""
+    """Allocate real target UUIDs, including multiple occupants of one cell.
+
+    Spare healthy shooters replace wounded ones without taking arrows from
+    another kill. Necessary wounded shooters still participate in the volley.
+    """
     free = dict(positions)
     result: dict[UUID, UnitView] = {}
     for enemy in sorted(
@@ -86,6 +91,20 @@ def precision_volley(
         for actor_id in shooters[: enemy.hp]:
             result[actor_id] = enemy
             del free[actor_id]
+    if shooter_hp is not None:
+        for actor_id, enemy in tuple(result.items()):
+            if shooter_hp[actor_id] > 1:
+                continue
+            replacements = [
+                spare_id
+                for spare_id, position in free.items()
+                if shooter_hp[spare_id] > 1
+                and line_of_fire(position, enemy.position, rocks)
+            ]
+            if replacements:
+                replacement = min(replacements, key=lambda spare_id: spare_id.int)
+                result[replacement] = result.pop(actor_id)
+                del free[replacement]
     return result
 
 

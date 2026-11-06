@@ -105,6 +105,87 @@ def test_three_full_rangers_volley_a_stacked_pair_instead_of_all_withdrawing():
     assert sum(action.target_id == UUID(int=30) for action in actions) == 2
 
 
+@pytest.mark.parametrize("wounded_id, healthy_id", [(2, 3), (3, 2)])
+@pytest.mark.parametrize("decision_order", [(2, 3), (3, 2)])
+def test_wounded_ranger_withdraws_when_a_healthy_ally_can_finish_one_hp_target(
+    wounded_id, healthy_id, decision_order
+):
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(healthy_id, "RANGER", position=(-3, -4)),
+            unit(wounded_id, "RANGER", position=(-2, -3), hp=1),
+            unit(30, "RANGER", controlled=False, position=(-4, -5), hp=1),
+        ]
+    )
+    strategy, context = _context(
+        turn,
+        roles={object_id(2): "defense", object_id(3): "defense"},
+    )
+
+    rangers = {r.id.int: r for r in turn.rangers}
+    actions = {
+        number: _ranger_action(strategy, context, rangers[number])
+        for number in decision_order
+    }
+
+    assert actions[healthy_id].type == "SHOOT"
+    assert actions[healthy_id].target_id == UUID(int=30)
+    assert actions[healthy_id].expected_cell == (-4, -5)
+    assert actions[wounded_id].type == "MOVE"
+    destination = add(rangers[wounded_id].position, actions[wounded_id].direction)
+    assert not strategy._visible_attackers_at(destination, turn, set())
+    assert context.damage_ledger.planned_damage == {object_id(30): 1}
+
+
+@pytest.mark.parametrize("escape_blocked", [False, True])
+def test_wounded_ranger_keeps_a_required_arrow_or_a_trapped_firing_position(
+    escape_blocked,
+):
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(-3, -4)),
+            unit(3, "RANGER", position=(-2, -3), hp=1),
+            unit(
+                30,
+                "RANGER",
+                controlled=False,
+                position=(-4, -5),
+                hp=1 if escape_blocked else 2,
+            ),
+        ],
+        obstacles=list(adjacent_positions((-2, -3))) if escape_blocked else (),
+    )
+    strategy, context = _context(
+        turn, roles={object_id(2): "defense", object_id(3): "defense"}
+    )
+
+    actions = [_ranger_action(strategy, context, r) for r in turn.rangers]
+
+    assert all(a.type == "SHOOT" and a.target_id == UUID(int=30) for a in actions)
+
+
+def test_healthy_replacement_does_not_take_the_only_shooter_from_another_kill():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, -3), hp=1),
+            unit(3, "RANGER", position=(0, -4)),
+            unit(30, "RANGER", controlled=False, position=(0, -6), hp=1),
+            unit(31, "RANGER", controlled=False, position=(3, -4), hp=1),
+        ]
+    )
+    strategy, context = _context(
+        turn, roles={object_id(2): "defense", object_id(3): "defense"}
+    )
+
+    actions = [_ranger_action(strategy, context, r) for r in turn.rangers]
+
+    assert all(a.type == "SHOOT" for a in actions)
+    assert {a.target_id for a in actions} == {UUID(int=30), UUID(int=31)}
+
+
 def test_existing_direct_shots_win_over_friendly_stack_spreading():
     turn = make_turn(
         objects=[

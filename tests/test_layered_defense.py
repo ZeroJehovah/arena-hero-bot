@@ -474,6 +474,37 @@ def _plan_encounter(strategy, encounter):
     return turn.plan, context
 
 
+def test_surplus_wounded_shooter_survives_while_healthy_ally_finishes_the_enemy():
+    encounter = Encounter(
+        [
+            unit(2, "RANGER", position=(-2, -3), hp=1),
+            unit(3, "RANGER", position=(-3, -4)),
+        ],
+        [unit(50, "RANGER", controlled=False, position=(-4, -5), hp=1)],
+        resources=0,
+    )
+    strategy = _strategy({object_id(n): "defense" for n in (2, 3)})
+    turn = encounter.turn()
+
+    strategy.decide(turn)
+
+    assert turn.plan.unit_actions[UUID(int=2)].type == "MOVE"
+    assert turn.plan.unit_actions[UUID(int=3)].type == "SHOOT"
+    encounter.settle(
+        turn.plan,
+        {
+            object_id(50): {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": [-2, -3],
+            }
+        },
+    )
+    assert (encounter.kills, encounter.losses) == (1, 0)
+    assert encounter.friends[object_id(2)]["hp"] == 1
+    assert encounter.friends[object_id(3)]["hp"] == 2
+
+
 def test_front_rank_loss_costs_enemy_units_then_core_retreats_and_rebuilds_depth():
     friends = [
         unit(2, "RANGER", position=(0, -4)),

@@ -7479,7 +7479,13 @@ class AggressiveStrategy:
         positions = {
             actor_id: position for actor_id, (position, _hp) in shooters.items()
         }
-        volley = precision_volley(positions, enemies, core.position, obstacles)
+        volley = precision_volley(
+            positions,
+            enemies,
+            core.position,
+            obstacles,
+            shooter_hp={actor_id: hp for actor_id, (_position, hp) in shooters.items()},
+        )
         if not volley:
             return
         losses = casualty_bound(shooters, enemies, obstacles)
@@ -7489,11 +7495,13 @@ class AggressiveStrategy:
             assigned_damage: dict[UUID, int] = {}
             for target in volley.values():
                 assigned_damage[target.id] = assigned_damage.get(target.id, 0) + 1
-            # The entire firing group commits to this exchange. Leaving an
-            # unallocated rear shooter to its individual retreat branch
-            # would still dismantle the second rank during a winning volley.
+            # Healthy surplus shooters keep the second rank firing. Wounded
+            # surplus shooters may escape lethal return fire without taking
+            # any required arrows away from the committed kills.
             for actor_id, position in positions.items():
                 if actor_id not in context.defensive_trade_shots:
+                    if shooters[actor_id][1] <= 1:
+                        continue
                     targets = [
                         enemy
                         for enemy in enemies
