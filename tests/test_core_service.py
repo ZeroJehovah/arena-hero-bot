@@ -382,6 +382,69 @@ def test_distant_cargo_passes_through_rangers_to_reach_a_unique_queue_slot():
     assert destinations == [(-5, 0), (-4, 0), (-3, 0), (-2, 0), (-1, 0)]
 
 
+@pytest.mark.parametrize("near_id, far_id", [(20, 10), (10, 20)])
+@pytest.mark.parametrize("shared", [False, True])
+def test_nearby_cargo_gets_the_open_queue_slot_before_distant_cargo(
+    monkeypatch, near_id, far_id, shared
+):
+    strategy = AggressiveStrategy(WorldMemory())
+    # Keep the guards at their posts while the complete planner arbitrates
+    # the depositing Worker, the waiting head and the two approaching loads.
+    monkeypatch.setattr(
+        strategy,
+        "_decide_ranger",
+        lambda ranger, context, *args, **kwargs: strategy._record_wait(
+            ranger, context, "hold guard post"
+        ),
+    )
+    corridor = (
+        {(x, 0) for x in range(-5, 1)} | {(-3, y) for y in range(1, 6)} | {(-4, -1)}
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", cargo=1),
+            unit(3, "WORKER", position=(-1, 0), cargo=1),
+            unit(near_id, "WORKER", position=(-4, 0), cargo=1),
+            unit(far_id, "WORKER", position=(-3, 5), cargo=1),
+            unit(100, "RANGER", position=(-2, 0)),
+            *([unit(101, "RANGER", position=(-4, 0))] if shared else []),
+        ],
+        obstacles=[
+            (x, y) for x in range(-6, 2) for y in range(-2, 7) if (x, y) not in corridor
+        ],
+    )
+
+    strategy.decide(turn)
+
+    nearby = next(worker for worker in turn.workers if worker.id.int == near_id)
+    action = turn.plan.unit_actions.get(nearby.id)
+    assert action is not None and action.type == "MOVE"
+    assert add(nearby.position, action.direction) == (-3, 0)
+    assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"
+
+
+def test_cargo_reservations_use_walking_distance_before_geometric_distance():
+    strategy = AggressiveStrategy(WorldMemory())
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", cargo=1),
+            unit(3, "WORKER", position=(-1, 0), cargo=1),
+            unit(10, "WORKER", position=(0, 2), cargo=1),
+            unit(20, "WORKER", position=(-3, 0), cargo=1),
+        ],
+        obstacles=[(-1, 1), (0, 1), (1, 1), (1, 2)],
+    )
+
+    strategy.decide(turn)
+
+    nearby = turn.workers[-1]
+    action = turn.plan.unit_actions.get(nearby.id)
+    assert action is not None and action.type == "MOVE"
+    assert add(nearby.position, action.direction) == (-2, 0)
+
+
 def test_unaffordable_emergency_ranger_does_not_reserve_the_delivery_window():
     strategy = campaign_strategy()
     turn = make_turn(

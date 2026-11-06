@@ -1080,7 +1080,7 @@ class AggressiveStrategy:
                     0 if unit.id in threatened_worker_ids else 1,
                     0 if unit.position == core_position else 1,
                     0 if unit.id == context.core_queue_head_id else 1,
-                    self._worker_priority(unit, core_position),
+                    self._worker_priority(unit, context),
                 ),
             ):
                 if not within_budget():
@@ -15407,13 +15407,26 @@ class AggressiveStrategy:
     def _direction_offset(unit_id: UUID) -> int:
         return unit_id.int % 4
 
-    @staticmethod
     def _worker_priority(
-        worker: Worker, core_position: Position | None
-    ) -> tuple[bool, bool, bytes]:
-        at_core = worker.position == core_position
+        self, worker: Worker, context: _TurnContext
+    ) -> tuple[bool, bool, int, bytes]:
+        core = context.turn.core
+        at_core = core is not None and worker.position == core.position
+        distance = 0
+        if (
+            worker.cargo > 0
+            and core is not None
+            and core.view.state is CoreState.NORMAL
+            and not context.core_migration_lane
+        ):
+            # Reserve parked-Core queue slots from front to back. UUID order
+            # lets distant cargo claim an empty cell beside a nearer Worker,
+            # forcing that Worker to wait or step out of a shared guard cell.
+            distance = self._core_service_distances(worker, context).get(
+                worker.position, 2**63 - 1
+            )
         # Process on-site deposits first for deterministic resource accounting.
-        return not at_core, worker.cargo > 0, worker.id.bytes
+        return not at_core, worker.cargo > 0, distance, worker.id.bytes
 
     @staticmethod
     def _enemy_label(enemy: CoreView | UnitView) -> str:
