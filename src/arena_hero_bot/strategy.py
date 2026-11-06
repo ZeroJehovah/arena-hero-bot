@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Container, Iterable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -466,6 +467,9 @@ class _TurnContext:
     # Tick.  Other cargo stays in its unique queue cell even when a nearer
     # cell opens; otherwise every service pause reorders the entire queue.
     core_queue_head_id: UUID | None = None
+    core_service_distances: dict[bool, dict[Position, int]] = field(
+        default_factory=dict
+    )
     core_escape_direction: Direction | None = None
     core_escape_destination: Position | None = None
     core_resource_clearance_target: Position | None = None
@@ -3341,15 +3345,7 @@ class AggressiveStrategy:
                 or context.core_build_priority
             )
             queue_head = context.core_queue_head_id
-            core_distance = manhattan(worker.position, core.position)
-            require_progress = (
-                core_distance <= CORE_QUEUE_RADIUS
-                and self._has_static_step_toward(
-                    worker,
-                    core.position,
-                    context,
-                )
-            )
+            distances = self._core_service_distances(worker, context)
             tried_service_approach = service_available and (
                 queue_head is None or worker.id == queue_head
             )
@@ -3360,8 +3356,8 @@ class AggressiveStrategy:
                 reason="return carried resources to Core",
                 allow_goal=True,
                 intent=_MoveIntent.INBOUND,
-                avoid_recent=core_distance > CORE_QUEUE_RADIUS,
-                progress_toward=(core.position if require_progress else None),
+                avoid_recent=False,
+                progress_distances=distances,
             ):
                 return
             if tried_service_approach:
@@ -3947,17 +3943,57 @@ class AggressiveStrategy:
                         break
                     context.standing_reserved.discard(position)
 
+    def _core_service_distances(
+        self,
+        unit: Unit,
+        context: _TurnContext,
+    ) -> dict[Position, int]:
+        """Cache bounded walking distances to Core, independent of traffic.
+
+        A geometrically nearby cell behind a rock can be further from service
+        than the cell a Worker just left.  Use the same safe route metric for
+        queue slots, the service head and every local cargo approach step.
+        Friendly arrivals/departures only affect capacity, never this field.
+        """
+
+        worker = isinstance(unit, Worker)
+        if worker in context.core_service_distances:
+            return context.core_service_distances[worker]
+        distances: dict[Position, int] = {}
+        context.core_service_distances[worker] = distances
+        core = context.turn.core
+        if core is None:
+            return distances
+        blockers = self._static_blockers(unit, context)
+        distances[core.position] = 0
+        frontier = deque([core.position])
+        while frontier and len(distances) < 4096:
+            position = frontier.popleft()
+            for neighbor in adjacent_positions(position):
+                if (
+                    neighbor in distances
+                    or neighbor in blockers
+                    or neighbor in context.enemy_positions
+                ):
+                    continue
+                distances[neighbor] = distances[position] + 1
+                frontier.append(neighbor)
+                if len(distances) >= 4096:
+                    break
+        return distances
+
     def _core_queue_positions(
         self,
         unit: Unit,
         context: _TurnContext,
     ) -> tuple[Position, ...]:
-        """Return empty, reachable cells near the Core in stable order."""
+        """Return unique queue cells within four safe walking steps of Core."""
 
         core = context.turn.core
         if core is None:
             return ()
         blockers = self._static_blockers(unit, context)
+        distances = self._core_service_distances(unit, context)
         candidates: list[Position] = []
         for radius in range(1, CORE_QUEUE_RADIUS + 1):
             for dx in range(-radius, radius + 1):
@@ -3970,6 +4006,8 @@ class AggressiveStrategy:
                     )
                     if (
                         position in blockers
+                        or distances.get(position, CORE_QUEUE_RADIUS + 1)
+                        > CORE_QUEUE_RADIUS
                         or position in context.enemy_positions
                         or position in context.core_migration_lane
                         or position == core.position
@@ -3999,7 +4037,7 @@ class AggressiveStrategy:
             sorted(
                 set(candidates),
                 key=lambda position: (
-                    manhattan(position, core.position),
+                    distances[position],
                     manhattan(unit.position, position),
                     position,
                 ),
@@ -4026,6 +4064,11 @@ class AggressiveStrategy:
             or context.core_build_priority
         ):
             return None
+        distances = (
+            self._core_service_distances(context.turn.workers[0], context)
+            if context.turn.workers
+            else {}
+        )
         candidates = sorted(
             (
                 worker
@@ -4038,12 +4081,13 @@ class AggressiveStrategy:
                 )
             ),
             key=lambda worker: (
+                distances.get(worker.position, 2**63 - 1),
                 manhattan(worker.position, core.position),
                 worker.id.bytes,
             ),
         )
         for worker in candidates:
-            if self._has_static_route(
+            if worker.position in distances or self._has_static_route(
                 worker,
                 core.position,
                 context,
@@ -4209,8 +4253,9 @@ class AggressiveStrategy:
             return True
         goals: tuple[Position, ...] | None = None
         if core is not None:
-            distance = manhattan(unit.position, core.position)
-            if loaded_worker and 0 < distance <= CORE_QUEUE_RADIUS:
+            distances = self._core_service_distances(unit, context)
+            distance = distances.get(unit.position)
+            if loaded_worker and distance is not None and distance > 0:
                 if self._predicted_friendly_occupancy(unit.position, context) >= 2:
                     if self._separate_core_queue_waiter(unit, context):
                         return True
@@ -4223,7 +4268,7 @@ class AggressiveStrategy:
                 goals = tuple(
                     goal
                     for goal in self._core_queue_positions(unit, context)
-                    if manhattan(goal, core.position) < distance
+                    if distances[goal] < distance
                 )
                 for goal in goals:
                     context.standing_reserved.add(goal)
@@ -4234,7 +4279,7 @@ class AggressiveStrategy:
                         reason=reason,
                         allow_goal=True,
                         intent=_MoveIntent.STAND,
-                        progress_toward=core.position,
+                        progress_distances=distances,
                         standing_steps=True,
                         avoid_recent=False,
                     ):
@@ -4243,7 +4288,8 @@ class AggressiveStrategy:
                 self._record_wait(unit, context, "hold a unique Core queue slot")
                 return True
             if (
-                0 < distance <= CORE_QUEUE_RADIUS
+                distance is not None
+                and 0 < distance <= CORE_QUEUE_RADIUS
                 and self._predicted_friendly_occupancy(unit.position, context) == 1
                 and unit.position not in self.memory.obstacles
                 and unit.position not in context.enemy_positions
@@ -4261,6 +4307,7 @@ class AggressiveStrategy:
                 reason=reason,
                 allow_goal=True,
                 intent=_MoveIntent.STAND,
+                avoid_recent=not loaded_worker,
                 avoid_new_threats=isinstance(unit, Ranger),
             ):
                 return True
@@ -4302,7 +4349,15 @@ class AggressiveStrategy:
             return False
         current_distance = manhattan(unit.position, core.position)
         blockers = self._static_blockers(unit, context)
-        for position in adjacent_positions(unit.position):
+        distances = self._core_service_distances(unit, context)
+        neighbors = adjacent_positions(unit.position)
+        if not context.core_migration_lane:
+            neighbors = tuple(
+                sorted(
+                    neighbors, key=lambda position: distances.get(position, 2**63 - 1)
+                )
+            )
+        for position in neighbors:
             if (
                 position == core.position
                 or position in context.core_migration_lane
@@ -4310,7 +4365,10 @@ class AggressiveStrategy:
                 or position in context.enemy_positions
                 or position in context.standing_reserved
                 or self._predicted_friendly_occupancy(position, context) != 0
-                or manhattan(position, core.position) < current_distance
+                or (
+                    context.core_migration_lane
+                    and manhattan(position, core.position) < current_distance
+                )
             ):
                 continue
             context.standing_reserved.add(position)
@@ -4772,9 +4830,9 @@ class AggressiveStrategy:
             not self.config.campaign_mode
             or self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
         )
-        if (
-            context.layered_assignments or context.counterattack_ids
-        ) and not context.core_build_priority:
+        if self._campaign_priority_spawn(context):
+            return
+        if context.layered_assignments or context.counterattack_ids:
             core.wait()
             context.report.add(
                 actor_id=str(core.id),
@@ -4790,8 +4848,6 @@ class AggressiveStrategy:
             and not nearby_combat_enemy
             and not at_home
         ):
-            if self._campaign_migration_spawn(context):
-                return
             if self._migration_pause_active(context.turn):
                 context.report.add(
                     actor_id=str(core.id),
@@ -4844,9 +4900,6 @@ class AggressiveStrategy:
                     reason="wait for a clear Core migration step",
                     target=core.position,
                 )
-            return
-
-        if context.core_build_priority and self._campaign_migration_spawn(context):
             return
 
         if (
@@ -5583,29 +5636,6 @@ class AggressiveStrategy:
         )
         return direction is not None
 
-    def _has_static_step_toward(
-        self,
-        unit: Unit,
-        target: Position,
-        context: _TurnContext,
-    ) -> bool:
-        """Return whether terrain leaves a safe first step toward ``target``.
-
-        Friendly congestion is deliberately absent from these blockers.  If a
-        static step toward the Core exists, the Worker should wait behind
-        traffic instead of taking a lateral or outward detour.  A sealed
-        approach still needs the normal route search to go around it.
-        """
-
-        blockers = self._static_blockers(unit, context)
-        current_distance = manhattan(unit.position, target)
-        return any(
-            manhattan(position, target) < current_distance
-            and position not in blockers
-            and position not in context.enemy_positions
-            for position in adjacent_positions(unit.position)
-        )
-
     def _move(
         self,
         unit: Unit,
@@ -5620,7 +5650,7 @@ class AggressiveStrategy:
         extra_blockers: Container[Position] | None = None,
         avoid_recent: bool = True,
         avoid_new_threats: bool = False,
-        progress_toward: Position | None = None,
+        progress_distances: dict[Position, int] | None = None,
         standing_steps: bool = False,
     ) -> bool:
         if unit.position == goal:
@@ -5652,6 +5682,16 @@ class AggressiveStrategy:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
+        if progress_distances and unit.position in progress_distances:
+            distance = progress_distances[unit.position]
+            blocked = overlay_blockers(
+                blocked,
+                {
+                    position
+                    for position in adjacent_positions(unit.position)
+                    if progress_distances.get(position, distance) >= distance
+                },
+            )
         if context.defensive_firing_lanes:
             blocked = overlay_blockers(blocked, context.defensive_firing_lanes)
         core_resource_clearance = (
@@ -5752,14 +5792,6 @@ class AggressiveStrategy:
         if direction is None:
             return False
         destination = add(unit.position, direction)
-        if progress_toward is not None and manhattan(
-            destination, progress_toward
-        ) >= manhattan(unit.position, progress_toward):
-            # Queue compaction must shorten the line.  The recency heuristic
-            # alone can choose a lateral or backward step around a crowded
-            # Core, which is precisely the A-B-A wandering the queue must not
-            # emit.
-            return False
         if destination in blocked and not (allow_goal and destination == goal):
             return False
         return self._queue_move(
@@ -11199,17 +11231,13 @@ class AggressiveStrategy:
         )
 
     def _campaign_build_priority(self, context: _TurnContext) -> bool:
-        """Reserve the current service Tick for campaign production first."""
+        """Reserve production at every parked Core, including defensive holds."""
 
         core = context.turn.core
         if (
             not self.config.campaign_mode
             or core is None
             or core.view.state is not CoreState.NORMAL
-        ):
-            return False
-        if not (
-            self._core_migration_in_progress(core.view) or self.memory.campaign_resting
         ):
             return False
         if self._normal_growth_on_cooldown(context):
@@ -11219,8 +11247,8 @@ class AggressiveStrategy:
             context.remaining_resources,
         )
 
-    def _campaign_migration_spawn(self, context: _TurnContext) -> bool:
-        """Spend a migration service Tick on the next campaign Unit.
+    def _campaign_priority_spawn(self, context: _TurnContext) -> bool:
+        """Spend a stationary service Tick on the next campaign Unit.
 
         A service Tick that first has to clear a friendly from the Core cell
         cannot also spawn: the server resolves that departure before a new
@@ -11266,7 +11294,10 @@ class AggressiveStrategy:
             actor_id=str(core.id),
             actor_kind="CORE",
             action="SPAWN",
-            reason="produce the next campaign Unit during migration",
+            reason=self._spawn_reason(
+                unit_type,
+                emergency=self._local_core_attackers(context.turn) != (),
+            ),
             target=core.position,
         )
         return True
