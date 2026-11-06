@@ -10,6 +10,7 @@ from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
     AggressiveStrategy,
     StrategyConfig,
+    _MoveIntent,
 )
 
 from .factories import core, make_turn, unit
@@ -295,6 +296,9 @@ def test_shared_waiters_separate_into_the_open_forward_slot():
             core(),
             unit(2, "WORKER", position=(-1, 2), cargo=1),
             unit(3, "WORKER", position=(-1, 2), cargo=1),
+            unit(4, "RANGER", position=(-1, 0)),
+            unit(5, "RANGER", position=(0, -1)),
+            unit(6, "RANGER", position=(1, 0)),
         ],
         obstacles=[(0, 1)],
     )
@@ -308,3 +312,94 @@ def test_shared_waiters_separate_into_the_open_forward_slot():
     assert first.type == "MOVE"
     assert add(turn.workers[0].position, first.direction) == (-1, 1)
     assert turn.workers[1].id not in turn.plan.unit_actions
+
+
+def test_transit_through_a_queue_slot_does_not_evict_the_waiting_cargo():
+    """An empty Worker may pass through without making the waiter step out/back."""
+
+    strategy = AggressiveStrategy(WorldMemory())
+    for tick, passing_position in ((100, (-2, 0)), (101, (-3, 0))):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(),
+                unit(2, "WORKER", position=(-3, 0), cargo=1),
+                unit(3, "WORKER", position=passing_position),
+                unit(4, "RANGER", position=(-2, 0)),
+                unit(5, "RANGER", position=(-1, 0)),
+            ],
+            obstacles=[(x, y) for x in range(-5, 2) for y in (-1, 1)],
+        )
+        context = context_for(turn)
+        waiter, passing = turn.workers
+        assert strategy._move(
+            passing,
+            (-5, 0),
+            context,
+            reason="return to mining",
+            intent=_MoveIntent.TRANSIT,
+            avoid_recent=False,
+        )
+        assert strategy._move_to_core_queue(waiter, context, reason="queue cargo")
+
+        assert waiter.id not in turn.plan.unit_actions
+        assert strategy._predicted_friendly_occupancy((-3, 0), context) == (
+            2 if tick == 100 else 1
+        )
+
+
+def test_distant_cargo_passes_through_rangers_to_reach_a_unique_queue_slot():
+    """The path may share two guard cells; only the final waiting slot is unique."""
+
+    strategy = AggressiveStrategy(WorldMemory())
+    position = (-6, 0)
+    destinations = []
+    for tick in range(100, 106):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(),
+                unit(2, "WORKER", position=position, cargo=1),
+                unit(3, "RANGER", position=(-5, 0)),
+                unit(4, "RANGER", position=(-4, 0)),
+            ],
+            obstacles=[(x, y) for x in range(-7, 2) for y in (-1, 1)],
+        )
+        context = context_for(turn)
+        context.core_service_action = "DEPOSIT"
+        worker = turn.workers[0]
+
+        assert strategy._move_to_core_queue(worker, context, reason="queue cargo")
+
+        action = turn.plan.unit_actions.get(worker.id)
+        if position == (-1, 0):
+            assert action is None
+            break
+        assert action is not None and action.type == "MOVE"
+        position = add(position, action.direction)
+        destinations.append(position)
+        assert strategy._predicted_friendly_occupancy(position, context) <= 2
+    assert destinations == [(-5, 0), (-4, 0), (-3, 0), (-2, 0), (-1, 0)]
+
+
+def test_unaffordable_emergency_ranger_does_not_reserve_the_delivery_window():
+    strategy = campaign_strategy()
+    turn = make_turn(
+        resources=unit_cost(UnitType.WORKER, 30),
+        objects=[
+            core(),
+            unit(2, "WORKER", cargo=1),
+            *[unit(10 + n, "WORKER", position=(n, 10)) for n in range(13)],
+            *[unit(100 + n, "RANGER", position=(n, -5)) for n in range(16)],
+            unit(900, "RANGER", controlled=False, position=(7, 0)),
+            unit(901, "RANGER", controlled=False, position=(7, 1)),
+        ],
+    )
+    context = context_for(turn)
+    assert strategy._choose_spawn(turn, turn.resources) is None
+
+    context.core_build_priority = strategy._campaign_build_priority(context)
+
+    assert not context.core_build_priority
+    strategy._decide_worker(turn.workers[0], context)
+    assert turn.plan.unit_actions[turn.workers[0].id].type == "DEPOSIT"

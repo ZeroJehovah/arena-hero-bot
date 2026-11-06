@@ -148,6 +148,7 @@ def next_step(
     max_expansions: int = 4096,
     allow_goal: bool = False,
     require_path: bool = False,
+    progress_distances: dict[Position, int] | None = None,
 ) -> Direction | None:
     """Find one deterministic A* step with a penalty for recent cells.
 
@@ -177,6 +178,13 @@ def next_step(
 
         for direction in rotated:
             neighbor = add(current, direction)
+            if (
+                progress_distances is not None
+                and current in progress_distances
+                and progress_distances.get(neighbor, progress_distances[current])
+                >= progress_distances[current]
+            ):
+                continue
             if (
                 neighbor != origin
                 and (not allow_goal or neighbor != goal)

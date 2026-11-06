@@ -4256,15 +4256,13 @@ class AggressiveStrategy:
             distances = self._core_service_distances(unit, context)
             distance = distances.get(unit.position)
             if loaded_worker and distance is not None and distance > 0:
-                if self._predicted_friendly_occupancy(unit.position, context) >= 2:
-                    if self._separate_core_queue_waiter(unit, context):
-                        return True
-                    self._record_wait(
-                        unit,
-                        context,
-                        "hold a shared Core queue waiting cell",
-                    )
-                    return True
+                # Incoming traffic may share this cell for one Tick. Only
+                # disperse occupants already here who are both staying;
+                # otherwise a passing empty Worker pushes cargo outward and
+                # the next Tick's compaction sends it straight back.
+                staying = context.friendly_occupancy.get(
+                    unit.position, 0
+                ) - context.departure_counts.get(unit.position, 0)
                 goals = tuple(
                     goal
                     for goal in self._core_queue_positions(unit, context)
@@ -4280,11 +4278,22 @@ class AggressiveStrategy:
                         allow_goal=True,
                         intent=_MoveIntent.STAND,
                         progress_distances=distances,
-                        standing_steps=True,
                         avoid_recent=False,
                     ):
                         return True
                     context.standing_reserved.discard(goal)
+                # A Worker already sharing a guard cell must first try to
+                # continue through it. Only disperse when it actually needs
+                # to remain here; transit may use the second entity slot.
+                if staying >= 2:
+                    if self._separate_core_queue_waiter(unit, context):
+                        return True
+                    self._record_wait(
+                        unit,
+                        context,
+                        "hold a shared Core queue waiting cell",
+                    )
+                    return True
                 self._record_wait(unit, context, "hold a unique Core queue slot")
                 return True
             if (
@@ -5651,7 +5660,6 @@ class AggressiveStrategy:
         avoid_recent: bool = True,
         avoid_new_threats: bool = False,
         progress_distances: dict[Position, int] | None = None,
-        standing_steps: bool = False,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -5682,16 +5690,6 @@ class AggressiveStrategy:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
-        if progress_distances and unit.position in progress_distances:
-            distance = progress_distances[unit.position]
-            blocked = overlay_blockers(
-                blocked,
-                {
-                    position
-                    for position in adjacent_positions(unit.position)
-                    if progress_distances.get(position, distance) >= distance
-                },
-            )
         if context.defensive_firing_lanes:
             blocked = overlay_blockers(blocked, context.defensive_firing_lanes)
         core_resource_clearance = (
@@ -5787,7 +5785,9 @@ class AggressiveStrategy:
             direction_offset=self._direction_offset(unit.id),
             max_expansions=max_expansions,
             allow_goal=allow_goal,
-            require_path=require_path,
+            require_path=require_path
+            or (progress_distances is not None and unit.position in progress_distances),
+            progress_distances=progress_distances,
         )
         if direction is None:
             return False
@@ -5800,9 +5800,7 @@ class AggressiveStrategy:
             context,
             reason=reason,
             target=goal,
-            intent=(
-                intent if standing_steps or destination == goal else _MoveIntent.TRANSIT
-            ),
+            intent=intent if destination == goal else _MoveIntent.TRANSIT,
         )
 
     def _queue_move(
@@ -11242,9 +11240,10 @@ class AggressiveStrategy:
             return False
         if self._normal_growth_on_cooldown(context):
             return False
-        return self._campaign_spawn_ready(
-            context.turn,
-            context.remaining_resources,
+        return (
+            self._campaign_spawn_ready(context.turn, context.remaining_resources)
+            and self._choose_spawn(context.turn, context.remaining_resources)
+            is not None
         )
 
     def _campaign_priority_spawn(self, context: _TurnContext) -> bool:

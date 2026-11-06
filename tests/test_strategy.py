@@ -865,7 +865,7 @@ def test_returning_worker_enters_core_with_an_empty_worker_present() -> None:
 
 def test_core_defers_spawn_while_a_worker_enters() -> None:
     turn = make_turn(
-        resources=10,
+        resources=9,
         objects=[
             core(),
             unit(2, "WORKER", position=(1, 0), cargo=1),
@@ -876,7 +876,7 @@ def test_core_defers_spawn_while_a_worker_enters() -> None:
 
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction is not None
+    assert action.direction is Direction.LEFT
     assert turn.plan.core_action is None
 
 
@@ -2370,7 +2370,14 @@ def test_workers_enter_an_occupied_core_without_nudging() -> None:
         )
         == 1
     )
-    assert sum(action is not None and action.type == "MOVE" for action in actions) == 2
+    # The Vanguard passes through the second waiter's cell. It may share
+    # that cell for a Tick without pushing the cargo outward and back.
+    assert sum(action is not None and action.type == "MOVE" for action in actions) == 1
+    assert actions[1] is None
+    leaving = turn.plan.unit_actions[turn.vanguards[0].id]
+    assert leaving.type == "MOVE"
+    assert add(turn.vanguards[0].position, leaving.direction) == (-1, 0)
+    assert turn.workers[1].position == (-1, 0)
     assert len([d for d in report.decisions if d.actor_id == object_id(2)]) == 1
 
 
