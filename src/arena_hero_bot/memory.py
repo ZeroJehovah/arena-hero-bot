@@ -10,6 +10,7 @@ from typing import Any
 
 from arena_hero import CoreView, Position, Turn, UnitType, UnitView
 
+from .counterattack import CounterattackState
 from .exploration import ExplorationMap, ExplorationRoute, visible_cells
 
 SCHEMA_VERSION = 1
@@ -123,6 +124,7 @@ class WorldMemory:
     # Actual incoming fire can reveal danger even when its source is unseen.
     # Each cell retains (last attack Tick, strongest observed damage) briefly.
     incoming_damage: dict[Position, tuple[int, int]] = field(default_factory=dict)
+    counterattack: CounterattackState = field(default_factory=CounterattackState)
     resource_cells: dict[Position, int] = field(default_factory=dict)
     # Combat identities are durable: a live Unit keeps its assigned role when
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
@@ -254,6 +256,7 @@ class WorldMemory:
         self._observe_campaign_scout_coverage(turn)
         self._observe_resource_cells(turn)
         self._observe_incoming_damage(turn)
+        self.counterattack.observe(turn)
         destroyed_enemy_ids = {
             str(event.target_id)
             for event in turn.events
@@ -769,6 +772,7 @@ class WorldMemory:
                 {"position": list(position), "tick": tick, "damage": damage}
                 for position, (tick, damage) in sorted(self.incoming_damage.items())
             ],
+            "counterattack": self.counterattack.to_dict(),
             "resource_cells": [
                 {"position": list(position), "tick": seen_tick}
                 for position, seen_tick in sorted(self.resource_cells.items())
@@ -986,6 +990,7 @@ class WorldMemory:
                 _position(value["position"]): (int(value["tick"]), int(value["damage"]))
                 for value in raw.get("incoming_damage", [])
             },
+            counterattack=CounterattackState.from_dict(raw.get("counterattack", {})),
             resource_cells=resource_cells,
             unit_roles={
                 str(unit_id): str(role)

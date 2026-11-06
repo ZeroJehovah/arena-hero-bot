@@ -291,6 +291,7 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             unit_id: list(position)
             for unit_id, position in sorted(memory.defense_posts.items())
         },
+        "counterattack": memory.counterattack.to_dict(),
         "layered_defense": {
             "anchor": memory.layered_defense_anchor,
             "posts": memory.layered_defense_posts,

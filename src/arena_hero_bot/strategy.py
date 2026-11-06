@@ -29,6 +29,7 @@ from arena_hero import (
     unit_cost,
 )
 
+from . import counterattack as counter
 from .combat_policy import (
     CombatPolicy,
     CombatTargetLedger,
@@ -502,6 +503,8 @@ class _TurnContext:
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
     clearance_ids: frozenset[UUID] = field(default_factory=frozenset)
+    counterattack_ids: frozenset[UUID] = field(default_factory=frozenset)
+    counterattack_reserved: frozenset[Position] = field(default_factory=frozenset)
     core_hunt_ids: frozenset[UUID] = field(default_factory=frozenset)
     campaign_patrol_recall_ids: frozenset[UUID] = field(default_factory=frozenset)
 
@@ -942,6 +945,7 @@ class AggressiveStrategy:
         planning_started = monotonic()
         self._planning_deadline = planning_started + self.config.planning_time_limit
         self._simplify_planning = False
+        self._prepare_counterattack(context)
         self._prepare_layered_defense(context)
 
         def within_budget() -> bool:
@@ -3751,7 +3755,7 @@ class AggressiveStrategy:
             return
         if (
             core.view.state is not CoreState.MOVING
-            and context.layered_assignments
+            and (context.layered_assignments or context.counterattack_ids)
             and context.core_escape_direction is None
         ):
             # Layered defense deliberately holds a stationary Core behind its
@@ -4768,7 +4772,9 @@ class AggressiveStrategy:
             not self.config.campaign_mode
             or self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
         )
-        if context.layered_assignments and not context.core_build_priority:
+        if (
+            context.layered_assignments or context.counterattack_ids
+        ) and not context.core_build_priority:
             core.wait()
             context.report.add(
                 actor_id=str(core.id),
@@ -5780,6 +5786,11 @@ class AggressiveStrategy:
         destination = add(unit.position, direction)
         if self._has_unit_action(unit, context):
             return False
+        if (
+            destination in context.counterattack_reserved
+            and unit.id not in context.counterattack_ids
+        ):
+            return False
         # Also protect direct retreat moves and permissive goal paths.
         if (
             destination in self.memory.obstacles
@@ -6700,6 +6711,377 @@ class AggressiveStrategy:
             avoid_new_threats=True,
         )
 
+    def _counterattack_enemies(self, turn: Turn) -> tuple[UnitView, ...]:
+        """Keep unseen identities and threats beyond the target's contact radius."""
+        core = turn.core
+        if core is None:
+            return ()
+        known = {
+            enemy.object_id: UnitView(
+                kind="UNIT",
+                id=UUID(enemy.object_id),
+                controlled=False,
+                position=enemy.position,
+                hp=enemy.hp,
+                unit_type=UnitType(enemy.unit_type),
+            )
+            for enemy in self.memory.recent_enemies(
+                turn.tick, counter.THREAT_MEMORY_TICKS
+            )
+            if enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
+            # The ingress leash is 16 Manhattan cells. A diagonal Ranger ray
+            # plus one MOVE can reach seven more cells beyond that boundary.
+            and manhattan(core.position, enemy.position) <= counter.CONTACT_RADIUS + 11
+        }
+        known.update(
+            (str(enemy.id), enemy)
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+            and manhattan(core.position, enemy.position) <= counter.CONTACT_RADIUS + 11
+        )
+        return tuple(known.values())
+
+    def _prepare_counterattack(self, context: _TurnContext) -> None:
+        """Own a fixed group through safe assembly, atomic ingress and a volley."""
+        if not self.config.campaign_mode:
+            return
+        turn = context.turn
+        core = turn.core
+        state = self.memory.counterattack
+        enemies = self._counterattack_enemies(turn)
+        rocks = self._rock_map(turn)
+        if (
+            core is None
+            or core.view.state is not CoreState.NORMAL
+            or core.hp < 5
+            or core.shield < 5
+            or context.core_escape_direction is not None
+            or context.threat.recent_core_attack
+            or context.threat.projected_core_damage > 0
+            or self.memory.layered_retreat_destination not in {None, core.position}
+            or any(counter.can_attack(enemy, core.position, rocks) for enemy in enemies)
+        ):
+            if state.operation is not None:
+                state.finish(turn.tick, "Core safety takes priority")
+            return
+        healthy = tuple(
+            ranger
+            for ranger in turn.rangers
+            if ranger.hp == 2
+            and (
+                manhattan(core.position, ranger.position) <= counter.CONTACT_RADIUS
+                or (
+                    state.operation is not None
+                    and str(ranger.id) in state.operation.slots
+                    and manhattan(core.position, ranger.position)
+                    <= counter.CONTACT_RADIUS + 4
+                )
+            )
+            and not self._is_expedition_member(ranger, turn)
+            and ranger.id not in context.core_hunt_ids
+        )
+        local_enemies = tuple(
+            enemy
+            for enemy in enemies
+            if manhattan(core.position, enemy.position) <= counter.CONTACT_RADIUS + 4
+        )
+        operation = state.operation
+        # Once engaged, use the actual survivors/volley below. Reapplying the
+        # full-health launch ratio after one wound would abort every exchange.
+        if (operation is None or operation.entered is None) and (
+            not 1 <= len(local_enemies) <= counter.MAX_ENEMIES
+            or len(healthy) < counter.ARMY_RATIO * len(local_enemies)
+        ):
+            if operation is not None:
+                state.finish(turn.tick, "local force ratio no longer sufficient")
+            return
+        dangerous = {
+            cell
+            for cell, (_tick, damage) in self.memory.incoming_damage.items()
+            if damage >= 2
+            and damage
+            > sum(counter.can_attack(enemy, cell, rocks) for enemy in enemies)
+        }
+        if operation is None:
+            if turn.tick < max(state.cooldown_until, state.retry_after):
+                return
+            reserve = max(counter.MIN_RESERVE, (len(healthy) + 2) // 3)
+            available = tuple(
+                ranger
+                for ranger in healthy
+                if not self._has_unit_action(ranger, context)
+                and not any(
+                    line_of_fire(ranger.position, enemy.position, rocks)
+                    for enemy in enemies
+                )
+            )
+            max_party = min(counter.MAX_PARTY, len(healthy) - reserve, len(available))
+            if max_party < counter.MIN_PARTY:
+                return
+            targets_by_cell: dict[Position, list[UnitView]] = {}
+            for enemy in turn.visible_enemies:
+                if (
+                    isinstance(enemy, UnitView)
+                    and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+                    and manhattan(core.position, enemy.position)
+                    <= counter.CONTACT_RADIUS
+                ):
+                    targets_by_cell.setdefault(enemy.position, []).append(enemy)
+            for cell, targets in sorted(
+                targets_by_cell.items(),
+                key=lambda item: (manhattan(core.position, item[0]), item[0]),
+            ):
+                if not all(
+                    (contact := state.contacts.get(str(target.id))) is not None
+                    and turn.tick - contact.since >= counter.STANDOFF_TICKS
+                    and contact.seen == turn.tick
+                    and contact.still >= 3
+                    for target in targets
+                ):
+                    continue
+                slots = counter.choose_formation(
+                    turn, available, targets, enemies, rocks, dangerous, max_party
+                )
+                if slots:
+                    operation = counter.Counterattack(
+                        tuple(str(target.id) for target in targets),
+                        cell,
+                        turn.tick,
+                        slots,
+                    )
+                    state.operation = operation
+                    state.reason = "assembling paired counterattack"
+                    break
+            if operation is None:
+                state.retry_after = turn.tick + counter.RETRY_TICKS
+                return
+        visible = {str(enemy.id): enemy for enemy in turn.visible_enemies}
+        targets = tuple(
+            enemy
+            for key in operation.target_ids
+            if isinstance((enemy := visible.get(key)), UnitView)
+            and enemy.position == operation.target
+        )
+        # A partial disappearance is not a kill. Only a confirmed destruction
+        # removed from memory may reduce the intended volley target set.
+        unresolved = any(
+            key not in {str(target.id) for target in targets}
+            and key in self.memory.enemies
+            for key in operation.target_ids
+        )
+        members = tuple(
+            ranger for ranger in turn.rangers if str(ranger.id) in operation.slots
+        )
+        if (
+            not targets
+            or unresolved
+            or any(self._has_unit_action(member, context) for member in members)
+            or turn.tick - operation.started
+            > counter.ASSEMBLY_TICKS + counter.FIRE_TICKS
+        ):
+            state.finish(turn.tick, "target left or operation expired")
+            return
+        if operation.entered is not None:
+            self._counterattack_volley(context, members, targets, enemies)
+            return
+        guards = sum(str(ranger.id) not in operation.slots for ranger in healthy)
+        if (
+            len(members) != len(operation.slots)
+            or any(member.hp < 2 for member in members)
+            or guards < max(counter.MIN_RESERVE, (len(healthy) + 2) // 3)
+            or turn.tick - operation.started >= counter.ASSEMBLY_TICKS
+            or any(
+                slot.stage in rocks
+                or slot.firing in rocks
+                or slot.stage in dangerous
+                or slot.firing in dangerous
+                or slot.stage in context.enemy_positions
+                or slot.firing in context.enemy_positions
+                or slot.stage in turn.resource_cells
+                or slot.firing in turn.resource_cells
+                or any(
+                    counter.can_attack(enemy, slot.stage, rocks) for enemy in enemies
+                )
+                for slot in operation.slots.values()
+            )
+            or any(
+                counter.can_attack(enemy, member.position, rocks)
+                for enemy in enemies
+                for member in members
+            )
+            or not counter.entry_viable(
+                {
+                    member.id: (operation.slots[str(member.id)].firing, member.hp)
+                    for member in members
+                },
+                targets,
+                enemies,
+                rocks,
+            )
+        ):
+            state.finish(turn.tick, "assembly no longer safe or locally superior")
+            return
+        # The counterattack supersedes the older clearance detachment as one
+        # operation. Do not simultaneously send the retained guards on a raid.
+        self._abort_resource_clearance(turn)
+        context.clearance_ids = frozenset()
+        context.raid_ids = frozenset()
+        context.counterattack_ids = frozenset(member.id for member in members)
+        context.counterattack_reserved = frozenset(
+            cell
+            for slot in operation.slots.values()
+            for cell in (slot.stage, slot.firing)
+        )
+        ready = all(
+            member.position == operation.slots[str(member.id)].stage
+            for member in members
+        )
+        if ready:
+            if self._counterattack_enter(context, members, operation):
+                operation.entered = turn.tick
+                state.reason = "paired ingress submitted"
+                return
+            state.reason = "whole group waits for free ingress capacity"
+        else:
+            for member in members:
+                slot = operation.slots[str(member.id)]
+                if member.position == slot.stage:
+                    continue
+                blocked = overlay_blockers(
+                    rocks,
+                    dangerous,
+                    context.enemy_positions,
+                    set(turn.resource_cells),
+                    {core.position},
+                    context.counterattack_reserved - {slot.stage},
+                    {
+                        cell
+                        for cell in adjacent_positions(member.position)
+                        if self._predicted_friendly_occupancy(cell, context)
+                        >= (1 if cell == slot.stage else 2)
+                    },
+                )
+                route = counter.safe_routes(
+                    member.position, core.position, blocked, enemies, rocks
+                ).get(slot.stage)
+                if route:
+                    direction = direction_between(member.position, route[0])
+                    if direction is not None:
+                        self._queue_move(
+                            member,
+                            direction,
+                            context,
+                            reason="assemble safely for paired counterattack",
+                            target=slot.stage,
+                            intent=_MoveIntent.STAND
+                            if route[0] == slot.stage
+                            else _MoveIntent.TRANSIT,
+                        )
+        for member in members:
+            if not self._has_unit_action(member, context):
+                member.wait()
+                context.planned_ids.add(member.id)
+                self._record_wait(
+                    member, context, "wait for the whole counterattack group"
+                )
+
+    def _counterattack_enter(
+        self,
+        context: _TurnContext,
+        members: tuple[Ranger, ...],
+        operation: counter.Counterattack,
+    ) -> bool:
+        """Queue all ingress moves or restore every affected action/ledger."""
+        if any(
+            self._predicted_friendly_occupancy(slot.firing, context) != 0
+            for slot in operation.slots.values()
+        ):
+            return False
+        actions = context.turn._builder.unit_actions
+        old_actions = actions.copy()
+        old_targets = self.memory.pending_move_targets.copy()
+        old_arrivals = context.arrival_counts.copy()
+        old_departures = context.departure_counts.copy()
+        old_reserved = context.reserved.copy()
+        old_standing = context.standing_reserved.copy()
+        old_planned = context.planned_ids.copy()
+        decisions = len(context.report.decisions)
+        for member in members:
+            firing = operation.slots[str(member.id)].firing
+            direction = direction_between(member.position, firing)
+            if direction is not None and self._queue_move(
+                member,
+                direction,
+                context,
+                reason="enter together as paired Rangers against entrenched enemies",
+                target=firing,
+            ):
+                continue
+            actions.clear()
+            actions.update(old_actions)
+            self.memory.pending_move_targets = old_targets
+            context.arrival_counts = old_arrivals
+            context.departure_counts = old_departures
+            context.reserved = old_reserved
+            context.standing_reserved = old_standing
+            context.planned_ids = old_planned
+            del context.report.decisions[decisions:]
+            return False
+        return True
+
+    def _counterattack_volley(
+        self,
+        context: _TurnContext,
+        members: tuple[Ranger, ...],
+        targets: tuple[UnitView, ...],
+        enemies: tuple[UnitView, ...],
+    ) -> None:
+        state = self.memory.counterattack
+        operation = state.operation
+        core = context.turn.core
+        if operation is None or operation.entered is None or core is None:
+            return
+        rocks = self._rock_map(context.turn)
+        positions = {member.id: member.position for member in members}
+        volley = precision_volley(positions, targets, core.position, rocks)
+        if (
+            context.turn.tick - operation.entered > counter.FIRE_TICKS
+            or not members
+            or any(
+                member.position != operation.slots[str(member.id)].firing
+                for member in members
+            )
+            or len(members)
+            < counter.reachable_opposition(tuple(positions.values()), enemies, rocks)
+            + 2
+            or {target.id for target in volley.values()}
+            != {target.id for target in targets}
+        ):
+            state.finish(
+                context.turn.tick, "actual arrivals cannot sustain the joint volley"
+            )
+            return
+        context.counterattack_ids = frozenset(positions)
+        context.counterattack_reserved = frozenset(positions.values())
+        context.clearance_ids = frozenset()
+        context.raid_ids = frozenset()
+        self._abort_resource_clearance(context.turn)
+        state.reason = "focused fire by actual surviving arrivals"
+        for member in members:
+            target = volley.get(member.id, targets[0])
+            member.shoot(target, expected_cell=target.position)
+            context.planned_ids.add(member.id)
+            context.damage_ledger.record(target)
+            self._reserve_ranger_firing_lane(member.position, target.position, context)
+            context.report.add(
+                actor_id=str(member.id),
+                actor_kind="RANGER",
+                action="SHOOT",
+                reason="joint counterattack volley on entrenched enemy UUID",
+                target=target.position,
+            )
+
     def _prepare_layered_defense(self, context: _TurnContext) -> None:
         """Build firing depth and preserve the surviving rank through retreat."""
         core = context.turn.core
@@ -6750,6 +7132,7 @@ class AggressiveStrategy:
             if ranger.hp > 1
             and not self._is_expedition_member(ranger, context.turn)
             and ranger.id not in context.clearance_ids
+            and ranger.id not in context.counterattack_ids
             and ranger.id not in context.core_hunt_ids
             and manhattan(core.position, ranger.position)
             <= self.config.combat_pursuit_radius
@@ -6775,6 +7158,7 @@ class AggressiveStrategy:
                 memory.layered_defense_ready_sides.add(direction.value)
             if (
                 direction.value in memory.layered_defense_ready_sides
+                and not context.counterattack_ids
                 and front < MIN_RANK_SIZE
                 and rear >= MIN_RANK_SIZE
             ):
@@ -6832,6 +7216,7 @@ class AggressiveStrategy:
         anchor = memory.layered_defense_anchor or core.position
         unavailable = (
             context.enemy_positions
+            | set(context.counterattack_reserved)
             | set(context.turn.resource_cells)
             | {worker.position for worker in context.turn.workers}
             | {core.position}
