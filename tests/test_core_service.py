@@ -290,7 +290,7 @@ def test_queue_slots_keep_combat_danger_exclusion():
     assert (-1, 0) in positions
 
 
-def test_shared_waiters_separate_into_the_open_forward_slot():
+def test_shared_waiters_both_advance_into_the_open_forward_slot():
     turn = make_turn(
         objects=[
             core(),
@@ -311,7 +311,10 @@ def test_shared_waiters_separate_into_the_open_forward_slot():
     first = turn.plan.unit_actions[turn.workers[0].id]
     assert first.type == "MOVE"
     assert add(turn.workers[0].position, first.direction) == (-1, 1)
-    assert turn.workers[1].id not in turn.plan.unit_actions
+    second = turn.plan.unit_actions[turn.workers[1].id]
+    assert second.type == "MOVE"
+    assert add(turn.workers[1].position, second.direction) == (-1, 1)
+    assert strategy._predicted_friendly_occupancy((-1, 1), context) == 2
 
 
 def test_transit_through_a_queue_slot_does_not_evict_the_waiting_cargo():
@@ -342,10 +345,10 @@ def test_transit_through_a_queue_slot_does_not_evict_the_waiting_cargo():
         )
         assert strategy._move_to_core_queue(waiter, context, reason="queue cargo")
 
-        assert waiter.id not in turn.plan.unit_actions
-        assert strategy._predicted_friendly_occupancy((-3, 0), context) == (
-            2 if tick == 100 else 1
-        )
+        action = turn.plan.unit_actions[waiter.id]
+        assert action.type == "MOVE"
+        assert add(waiter.position, action.direction) == (-2, 0)
+        assert strategy._predicted_friendly_occupancy((-2, 0), context) == 2
 
 
 def test_distant_cargo_passes_through_rangers_to_reach_a_unique_queue_slot():
@@ -443,6 +446,73 @@ def test_cargo_reservations_use_walking_distance_before_geometric_distance():
     action = turn.plan.unit_actions.get(nearby.id)
     assert action is not None and action.type == "MOVE"
     assert add(nearby.position, action.direction) == (-2, 0)
+
+
+@pytest.mark.parametrize("head_id, empty_id", [(10, 20), (20, 10)])
+@pytest.mark.parametrize("departing", [True, False])
+def test_queue_head_fills_a_same_tick_worker_departure(head_id, empty_id, departing):
+    strategy = AggressiveStrategy(WorldMemory())
+    corridor = {(0, 0), (-1, 0), (-2, 0), (-3, 0), (-1, 1)}
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", cargo=1),
+            unit(head_id, "WORKER", position=(-1, 1), cargo=1),
+            unit(empty_id, "WORKER", position=(-1, 0)),
+        ],
+        resource_cells=[(-3, 0) if departing else (-1, 0)],
+        obstacles=[
+            (x, y) for x in range(-4, 2) for y in range(-1, 3) if (x, y) not in corridor
+        ],
+    )
+
+    strategy.decide(turn)
+
+    depositor, head, empty = turn.workers
+    assert turn.plan.unit_actions[depositor.id].type == "DEPOSIT"
+    empty_action = turn.plan.unit_actions[empty.id]
+    head_action = turn.plan.unit_actions.get(head.id)
+    if departing:
+        assert empty_action.type == "MOVE"
+        assert add(empty.position, empty_action.direction) == (-2, 0)
+        assert head_action is not None and head_action.type == "MOVE"
+        assert add(head.position, head_action.direction) == (-1, 0)
+    else:
+        assert empty_action.type == "HARVEST"
+        assert head_action is not None and head_action.type == "MOVE"
+        assert add(head.position, head_action.direction) == (-1, 0)
+
+
+@pytest.mark.parametrize("blocked_exit", [False, True])
+def test_production_clearance_shares_an_exit_without_pushing_cargo_back(blocked_exit):
+    strategy = campaign_strategy()
+    turn = make_turn(
+        resources=core_resource_capacity(5),
+        objects=[
+            core(),
+            unit(2, "WORKER"),
+            unit(3, "WORKER", position=(-2, 0), cargo=1),
+            unit(4, "RANGER", position=(-2, 0)),
+            unit(5, "WORKER", position=(0, -2), cargo=1),
+            unit(6, "WORKER", position=(0, -3), cargo=1),
+        ],
+        obstacles=[(0, 1), (1, 0), (-1, -1), *(([(0, -1)]) if blocked_exit else [])],
+    )
+    context = context_for(turn)
+    context.core_build_priority = strategy._campaign_build_priority(context)
+    assert context.core_build_priority
+
+    strategy._prepare_core_departure(context)
+    departing, cargo, *_ = turn.workers
+    departure = turn.plan.unit_actions[departing.id]
+    assert departure.type == "MOVE"
+    assert add(departing.position, departure.direction) == (-1, 0)
+    strategy._decide_worker(cargo, context)
+    action = turn.plan.unit_actions[cargo.id]
+    assert action.type == "MOVE"
+    destination = add(cargo.position, action.direction)
+    assert destination == (-1, 0)
+    assert strategy._predicted_friendly_occupancy(destination, context) == 2
 
 
 def test_unaffordable_emergency_ranger_does_not_reserve_the_delivery_window():

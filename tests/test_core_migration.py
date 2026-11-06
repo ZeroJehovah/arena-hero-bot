@@ -371,7 +371,11 @@ def test_migration_pause_clears_non_service_unit_from_core_cell() -> None:
     assert action.type == "MOVE"
     assert any(
         item.actor_id == ranger_object["id"]
-        and item.reason == "leave Core service cell for unique traffic"
+        and item.reason
+        in {
+            "leave Core service cell for unique traffic",
+            "leave Core service cell in simultaneous traffic",
+        }
         for item in report.decisions
     )
 

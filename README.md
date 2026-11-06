@@ -125,6 +125,22 @@ The supplied unit targets the canonical deployment path
 
 Runtime memory and JSONL telemetry are written under `var/` by default.
 
+## Traffic around a stationary Core
+
+Local Worker movements are collected before capacity is resolved. A cell can
+hold two entities, including the Core, so cargo may share a guard's cell or
+exchange places with departing traffic. Overlap alone never forces cargo to
+backtrack. Complete swaps, rotations and outward chains are committed together;
+an incomplete chain leaves no partial moves behind.
+
+Production reserves the Core cell: an outward chain frees it, then spawning
+follows once the departure is observed. Chains need spare capacity at their end;
+swaps cannot create space for an additional entity. Real attacks, harvesting,
+deposits, healing, terrain and enemy danger retain priority. The local search is
+bounded to eight cells around the Core, twelve dependent moves and 1,024 search
+attempts per Tick. Migration lanes still keep one slot available for the moving
+Core.
+
 ## Long Core migration
 
 The bot can relocate the Core between resource chunks without stopping the

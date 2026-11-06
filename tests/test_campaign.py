@@ -1171,7 +1171,7 @@ def test_campaign_rest_clears_the_service_cell_for_the_next_delivery() -> None:
     assert action.type == "MOVE"
     assert any(
         item.actor_id == parked["id"]
-        and item.reason == "leave Core service cell for unique traffic"
+        and item.reason == "leave Core service cell in simultaneous traffic"
         for item in report.decisions
     )
 
@@ -1208,7 +1208,7 @@ def test_stationary_campaign_core_clears_service_cell_for_queued_cargo() -> None
     assert action.type == "MOVE"
     assert any(
         item.actor_id == parked["id"]
-        and item.reason == "leave Core service cell for unique traffic"
+        and item.reason == "leave Core service cell in simultaneous traffic"
         for item in report.decisions
     )
 

@@ -95,7 +95,7 @@ def test_core_capacity_allows_one_inbound_and_rejects_the_next(kind):
     )
 
 
-def test_queue_slots_are_unique_and_stationary_units_hold_them():
+def test_queue_followers_advance_within_cell_capacity():
     turn = make_turn(
         objects=[
             core(),
@@ -115,7 +115,8 @@ def test_queue_slots_are_unique_and_stationary_units_hold_them():
     first_destination = add(first.position, first_action.direction)
     second_destination = add(second.position, second_action.direction)
     assert first_destination != second_destination
-    assert len(context.standing_reserved) == 2
+    assert strategy._predicted_friendly_occupancy(first_destination, context) <= 2
+    assert strategy._predicted_friendly_occupancy(second_destination, context) <= 2
 
 
 def test_stationary_core_cargo_queue_keeps_one_service_head():
@@ -148,7 +149,7 @@ def test_stationary_core_cargo_queue_keeps_one_service_head():
     assert decisions[str(head.id)].action == "MOVE"
     assert decisions[str(head.id)].reason == "return carried resources to Core"
     assert decisions[str(waiting.id)].action == "WAIT"
-    assert decisions[str(waiting.id)].reason == "hold a unique Core queue slot"
+    assert decisions[str(waiting.id)].reason == "hold position in Core traffic"
     assert decisions[str(follower.id)].reason == (
         "queue carried resources outside the Core service cell"
     )
@@ -166,7 +167,7 @@ def test_stationary_core_cargo_queue_keeps_one_service_head():
 
 
 def test_busy_stationary_core_cargo_queue_does_not_shuffle_slots():
-    """A full waiting ring holds still instead of trading empty cells."""
+    """Waiting cargo may compact into shared cells without moving outward."""
 
     memory = WorldMemory(
         core_home_position=(0, 0),
@@ -208,11 +209,14 @@ def test_busy_stationary_core_cargo_queue_does_not_shuffle_slots():
     waiting = [worker for worker in turn.workers if worker.position != (0, 0)]
 
     assert decisions[str(depositor.id)].action == "DEPOSIT"
-    assert all(
-        decisions[str(worker.id)].action == "WAIT"
-        and decisions[str(worker.id)].reason == "hold a unique Core queue slot"
-        for worker in waiting
-    )
+    for worker in waiting:
+        action = turn.plan.unit_actions.get(worker.id)
+        if action is not None and action.type == "MOVE":
+            assert manhattan(add(worker.position, action.direction), (0, 0)) < (
+                manhattan(worker.position, (0, 0))
+            )
+        else:
+            assert decisions[str(worker.id)].action == "WAIT"
 
 
 def test_loaded_worker_waits_instead_of_backtracking_around_a_full_approach():
@@ -233,17 +237,22 @@ def test_loaded_worker_waits_instead_of_backtracking_around_a_full_approach():
         ],
     )
 
-    report = AggressiveStrategy(
+    strategy = AggressiveStrategy(
         memory,
         StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
-    ).decide(turn)
+    )
+    memory.observe(turn)
+    context = context_for(turn)
     loaded = next(worker for worker in turn.workers if worker.cargo > 0)
+    # Keep both occupants in place. A committed departure should instead
+    # release capacity, as covered by the complete planner's queue tests.
+    strategy._decide_worker(loaded, context)
     decision = next(
-        item for item in report.decisions if item.actor_id == str(loaded.id)
+        item for item in context.report.decisions if item.actor_id == str(loaded.id)
     )
 
     assert decision.action == "WAIT"
-    assert decision.reason == "hold a unique Core queue slot"
+    assert decision.reason == "hold position in Core traffic"
     assert loaded.id not in turn.plan.unit_actions
 
 
@@ -460,7 +469,7 @@ def test_full_core_ring_clears_an_approach_before_core_departure():
     core_destination = add(core_worker.position, core_action.direction)
     assert core_destination in neighbors
     assert any(
-        item.action == "MOVE" and item.reason == "clear a full Core approach cell"
+        item.action == "MOVE" and item.reason == "complete simultaneous Core traffic"
         for item in report.decisions
     )
 

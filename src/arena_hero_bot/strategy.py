@@ -71,6 +71,7 @@ from .memory import (
     WorldMemory,
 )
 from .models import DecisionReport
+from .traffic import resolve_moves
 
 EXPLORATION_PURPOSE = "explore-center-v3"
 RESOURCE_PATROL_PURPOSE = "resource-patrol-v3"
@@ -354,6 +355,7 @@ SYMMETRIC_RANGER_OFFSETS: tuple[Position, ...] = (
     (10, -5),
 )
 CORE_QUEUE_RADIUS = 4
+CORE_TRAFFIC_RADIUS = 8
 # A campaign rest ends as soon as every Worker that was close enough to hand
 # cargo in has unloaded.  Cargo deeper in the block keeps walking with the Core
 # instead of parking the whole operation on the next hop.
@@ -439,6 +441,15 @@ class StrategyConfig:
 
 
 @dataclass(slots=True)
+class _TrafficMove:
+    unit: Unit
+    destination: Position
+    target: Position
+    reason: str
+    intent: _MoveIntent
+
+
+@dataclass(slots=True)
 class _TurnContext:
     turn: Turn
     report: DecisionReport
@@ -459,13 +470,14 @@ class _TurnContext:
     core_inbound_id: UUID | None = None
     core_service_action: str | None = None
     core_build_priority: bool = False
+    core_traffic_collecting: bool = False
+    core_traffic_moves: dict[UUID, _TrafficMove] = field(default_factory=dict)
     core_migration_direction: Direction | None = None
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
     core_arrival_worker_id: UUID | None = None
-    # One loaded Worker owns the stationary Core service approach for a
-    # Tick.  Other cargo stays in its unique queue cell even when a nearer
-    # cell opens; otherwise every service pause reorders the entire queue.
+    # One loaded Worker owns the stationary Core service approach per Tick;
+    # followers compact using both cell slots and simultaneous departures.
     core_queue_head_id: UUID | None = None
     core_service_distances: dict[bool, dict[Position, int]] = field(
         default_factory=dict
@@ -965,6 +977,7 @@ class AggressiveStrategy:
         deadlined = False
         if turn.core is not None:
             self._prepare_core_migration_step(context)
+            context.core_traffic_collecting = self._stationary_core_traffic(context)
             context.core_queue_head_id = self._select_stationary_core_queue_head(
                 context
             )
@@ -991,7 +1004,7 @@ class AggressiveStrategy:
         combat_units = [
             unit
             for unit in (*turn.rangers, *turn.vanguards)
-            if unit.id in combat_unit_ids and unit.id not in context.planned_ids
+            if unit.id in combat_unit_ids and not self._has_unit_action(unit, context)
         ]
         decided_ids: set[UUID] = set()
 
@@ -1042,7 +1055,7 @@ class AggressiveStrategy:
                 if not within_budget():
                     deadlined = True
                     break
-                if ranger.id in context.planned_ids or ranger.id in decided_ids:
+                if self._has_unit_action(ranger, context) or ranger.id in decided_ids:
                     continue
                 self._decide_ranger(
                     ranger,
@@ -1057,7 +1070,10 @@ class AggressiveStrategy:
                 if not within_budget():
                     deadlined = True
                     break
-                if vanguard.id in context.planned_ids or vanguard.id in decided_ids:
+                if (
+                    self._has_unit_action(vanguard, context)
+                    or vanguard.id in decided_ids
+                ):
                     continue
                 self._decide_vanguard(
                     vanguard,
@@ -1086,10 +1102,11 @@ class AggressiveStrategy:
                 if not within_budget():
                     deadlined = True
                     break
-                if worker.id in context.planned_ids:
+                if self._has_unit_action(worker, context):
                     continue
                 self._decide_worker(worker, context)
 
+        self._resolve_core_traffic(context)
         if deadlined:
             self._wait_unplanned_units(context, turn)
         else:
@@ -3608,7 +3625,254 @@ class AggressiveStrategy:
 
         builder = getattr(context.turn, "_builder", None)
         actions = getattr(builder, "unit_actions", {})
-        return unit.id in context.planned_ids or unit.id in actions
+        return (
+            unit.id in context.planned_ids
+            or unit.id in actions
+            or unit.id in context.core_traffic_moves
+        )
+
+    @staticmethod
+    def _stationary_core_traffic(context: _TurnContext) -> bool:
+        core = context.turn.core
+        return (
+            core is not None
+            and core.view.state is CoreState.NORMAL
+            and not context.core_migration_lane
+            and context.core_escape_direction is None
+        )
+
+    def _collect_core_move(self, unit: Unit, context: _TurnContext) -> bool:
+        core = context.turn.core
+        return (
+            context.core_traffic_collecting
+            and core is not None
+            and (isinstance(unit, Worker) or unit.position == core.position)
+            and manhattan(unit.position, core.position) <= CORE_TRAFFIC_RADIUS
+            and not (
+                isinstance(unit, Worker) and self._worker_combat_threats(unit, context)
+            )
+        )
+
+    def _core_traffic_step_safe(
+        self,
+        unit: Unit,
+        destination: Position,
+        context: _TurnContext,
+        *,
+        target: Position | None = None,
+    ) -> bool:
+        """Apply terrain and combat rules before considering friendly capacity."""
+
+        core = context.turn.core
+        if (
+            core is None
+            or manhattan(destination, core.position) > CORE_TRAFFIC_RADIUS + 1
+            or destination in self._static_blockers(unit, context)
+            or destination in context.enemy_positions
+            or destination in context.defensive_firing_lanes
+            or destination in context.counterattack_reserved
+        ):
+            return False
+        if destination == core.position:
+            return (
+                isinstance(unit, Worker)
+                and (
+                    (unit.cargo > 0 and unit.id == context.core_queue_head_id)
+                    or (
+                        unit.cargo == 0
+                        and context.core_queue_head_id is None
+                        and target is not None
+                        and target != core.position
+                    )
+                    or self._heal_available(unit, maximum_hp=2, context=context)
+                )
+                and context.core_inbound_id in (None, unit.id)
+                and not context.core_build_priority
+                and context.core_service_action is None
+                and (
+                    unit.cargo == 0
+                    or context.remaining_resource_space > 0
+                    or self._heal_available(unit, maximum_hp=2, context=context)
+                )
+                and not self._future_attackers_at(
+                    destination, context.turn, self._rock_map(context.turn)
+                )
+            )
+        if isinstance(unit, (Ranger, Vanguard)):
+            evidence = self.memory.incoming_damage.get(destination)
+            return not self._future_attackers_at(
+                destination, context.turn, self._rock_map(context.turn)
+            ) and not (evidence is not None and evidence[1] >= unit.hp)
+        return unit.hp > 1 or not self._future_attackers_at(
+            destination, context.turn, self._rock_map(context.turn)
+        )
+
+    def _resolve_core_traffic(self, context: _TurnContext) -> None:
+        """Resolve all local intents against their simultaneous final occupancy."""
+
+        core = context.turn.core
+        if core is None or not context.core_traffic_collecting:
+            return
+        context.core_traffic_collecting = False
+        intents = context.core_traffic_moves
+        context.core_traffic_moves = {}
+        if not intents:
+            return
+        actions = context.turn._builder.unit_actions
+        frontier_shooters = {
+            UUID(decision.actor_id)
+            for decision in context.report.decisions
+            if decision.action == "SHOOT"
+            and decision.reason
+            == "cover the outer firing and vision edge while holding position"
+        }
+        origins: dict[UUID, Position] = {}
+        alternatives: dict[UUID, tuple[Position, ...]] = {}
+        requests: dict[UUID, tuple[Position, ...]] = {}
+        by_id = {unit.id: unit for unit in context.turn.units}
+        clearing_core = any(
+            intent.unit.position == core.position for intent in intents.values()
+        ) and (context.core_build_priority or context.remaining_resource_space <= 0)
+        for unit in context.turn.units:
+            if manhattan(unit.position, core.position) > CORE_TRAFFIC_RADIUS:
+                continue
+            action = actions.get(unit.id)
+            if (
+                action is not None
+                and action.type != "WAIT"
+                and unit.id not in frontier_shooters
+            ):
+                continue
+            if unit.id in context.counterattack_ids or unit.id in context.core_hunt_ids:
+                continue
+            if isinstance(unit, Worker) and self._worker_combat_threats(unit, context):
+                continue
+            if isinstance(unit, Ranger) and any(
+                self._line_of_fire_clear(
+                    unit.position, enemy.position, self._rock_map(context.turn)
+                )
+                for enemy in context.turn.visible_enemies
+            ):
+                continue
+            origins[unit.id] = unit.position
+            distances = self._core_service_distances(unit, context)
+            distance = distances.get(unit.position)
+            intent = intents.get(unit.id)
+            choices = tuple(
+                destination
+                for destination in adjacent_positions(unit.position)
+                if self._core_traffic_step_safe(
+                    unit,
+                    destination,
+                    context,
+                    target=intent.target if intent else None,
+                )
+                and not (
+                    isinstance(unit, Worker)
+                    and unit.cargo > 0
+                    and unit.position != core.position
+                    and not clearing_core
+                    and distance is not None
+                    and distances.get(destination, distance + 1) > distance
+                )
+            )
+            if intent is not None:
+                target = intent.target
+                preferred = (
+                    (intent.destination,) if intent.destination in choices else ()
+                )
+                alternatives[unit.id] = (
+                    *preferred,
+                    *sorted(
+                        (p for p in choices if p not in preferred),
+                        key=lambda p: (
+                            manhattan(p, target),
+                            -distances.get(p, 0)
+                            if unit.position == core.position
+                            else 0,
+                            p,
+                        ),
+                    ),
+                )
+                # Outbound Core traffic may choose any safe exit. Other
+                # actors retain their route unless needed by another flow.
+                requests[unit.id] = (
+                    alternatives[unit.id]
+                    if unit.position == core.position
+                    else preferred
+                )
+            else:
+                alternatives[unit.id] = tuple(
+                    sorted(
+                        choices,
+                        key=lambda p: (
+                            -distances.get(p, 0),
+                            self._predicted_friendly_occupancy(p, context),
+                            p,
+                        ),
+                    )
+                )
+        occupancy = {
+            position: self._predicted_friendly_occupancy(position, context)
+            for position in context.friendly_occupancy.keys()
+            | context.arrival_counts.keys()
+        }
+        requests = dict(
+            sorted(
+                requests.items(),
+                key=lambda pair: (
+                    origins[pair[0]] != core.position,
+                    pair[0] != context.core_queue_head_id,
+                    self._core_service_distances(by_id[pair[0]], context).get(
+                        origins[pair[0]], 2**63 - 1
+                    ),
+                    pair[0].bytes,
+                ),
+            )
+        )
+        resolved = resolve_moves(occupancy, origins, requests, alternatives)
+        changed_ids = {str(actor) for actor in intents.keys() | resolved.keys()}
+        context.report.decisions[:] = [
+            decision
+            for decision in context.report.decisions
+            if decision.actor_id not in changed_ids
+        ]
+        # The resolver has validated the whole group. Commit without a
+        # sequential capacity recheck, which would reject closed cycles.
+        for actor, destination in resolved.items():
+            unit = by_id[actor]
+            intent = intents.get(actor)
+            direction = direction_between(unit.position, destination)
+            if direction is None:
+                continue
+            unit.move(direction)
+            self.memory.pending_move_targets[str(actor)] = destination
+            context.reserved.add(destination)
+            context.departure_counts[unit.position] = (
+                context.departure_counts.get(unit.position, 0) + 1
+            )
+            context.arrival_counts[destination] = (
+                context.arrival_counts.get(destination, 0) + 1
+            )
+            context.planned_ids.add(actor)
+            if destination == core.position:
+                context.core_inbound_id = actor
+            context.report.add(
+                actor_id=str(actor),
+                actor_kind=unit.unit_type.value,
+                action="MOVE",
+                reason=(
+                    intent.reason if intent else "complete simultaneous Core traffic"
+                ),
+                target=intent.target if intent else destination,
+            )
+        for actor, intent in intents.items():
+            if actor not in resolved:
+                if context.core_inbound_id == actor:
+                    context.core_inbound_id = None
+                self._record_wait(
+                    intent.unit, context, "wait for safe capacity in Core traffic"
+                )
 
     def _core_migration_in_progress(self, core: CoreView) -> bool:
         """Return whether the Core still has to travel to its persisted home."""
@@ -4192,16 +4456,11 @@ class AggressiveStrategy:
         *,
         reason: str,
     ) -> bool:
-        """Move a unit toward a unique temporary Core queue slot.
+        """Close cargo toward service while respecting the Core's two slots.
 
-        Loaded Workers must keep closing empty cells between them and the
-        Core.  Treating every unique cell inside the queue radius as a final
-        parking spot left the service doorstep empty whenever the Worker on
-        the Core finished depositing: the nearest loaded Worker could be two
-        or more cells away and no one could enter on the departure Tick.  A
-        loaded Worker now waits only on the adjacent front rank, or when every
-        closer queue cell is already occupied or reserved.  Other Units keep
-        the old stable-slot behavior.
+        Nearby stationary traffic shares cells and resolves moves together.
+        Distant Workers continue approaching by safe path distance. Moving
+        Core lanes reserve the second entity slot for the Core itself.
         """
 
         if self._has_unit_action(unit, context):
@@ -4255,14 +4514,43 @@ class AggressiveStrategy:
         if core is not None:
             distances = self._core_service_distances(unit, context)
             distance = distances.get(unit.position)
+            if (
+                loaded_worker
+                and distance is not None
+                and distance > 0
+                and self._stationary_core_traffic(context)
+                and manhattan(unit.position, core.position) <= CORE_TRAFFIC_RADIUS
+            ):
+                # Cargo shares the second entity slot and closes along its
+                # safe service route. A guard/queue overlap is never a reason
+                # to step outward; all simultaneous departures are resolved
+                # after intents have been collected.
+                for destination in sorted(
+                    adjacent_positions(unit.position),
+                    key=lambda p: (
+                        distances.get(p, distance + 1),
+                        self._predicted_friendly_occupancy(p, context),
+                        p,
+                    ),
+                ):
+                    if (
+                        destination == core.position
+                        or distances.get(destination, distance) >= distance
+                        or not self._core_traffic_step_safe(unit, destination, context)
+                    ):
+                        continue
+                    direction = direction_between(unit.position, destination)
+                    if direction is not None and self._queue_move(
+                        unit,
+                        direction,
+                        context,
+                        reason=reason,
+                        target=destination,
+                    ):
+                        return True
+                self._record_wait(unit, context, "hold position in Core traffic")
+                return True
             if loaded_worker and distance is not None and distance > 0:
-                # Incoming traffic may share this cell for one Tick. Only
-                # disperse occupants already here who are both staying;
-                # otherwise a passing empty Worker pushes cargo outward and
-                # the next Tick's compaction sends it straight back.
-                staying = context.friendly_occupancy.get(
-                    unit.position, 0
-                ) - context.departure_counts.get(unit.position, 0)
                 goals = tuple(
                     goal
                     for goal in self._core_queue_positions(unit, context)
@@ -4282,18 +4570,6 @@ class AggressiveStrategy:
                     ):
                         return True
                     context.standing_reserved.discard(goal)
-                # A Worker already sharing a guard cell must first try to
-                # continue through it. Only disperse when it actually needs
-                # to remain here; transit may use the second entity slot.
-                if staying >= 2:
-                    if self._separate_core_queue_waiter(unit, context):
-                        return True
-                    self._record_wait(
-                        unit,
-                        context,
-                        "hold a shared Core queue waiting cell",
-                    )
-                    return True
                 self._record_wait(unit, context, "hold a unique Core queue slot")
                 return True
             if (
@@ -4692,6 +4968,31 @@ class AggressiveStrategy:
                     # This is a firing task, not idle parking. Do not evict
                     # its shooter merely because distant cargo exists.
                     continue
+            if context.core_traffic_collecting:
+                distances = self._core_service_distances(unit, context)
+                for destination in sorted(
+                    adjacent_positions(core.position),
+                    key=lambda p: (
+                        self._predicted_friendly_occupancy(p, context),
+                        distances.get(p, 2**63 - 1),
+                        p,
+                    ),
+                ):
+                    direction = direction_between(unit.position, destination)
+                    if (
+                        direction is not None
+                        and self._core_traffic_step_safe(unit, destination, context)
+                        and self._queue_move(
+                            unit,
+                            direction,
+                            context,
+                            reason="leave Core service cell in simultaneous traffic",
+                            target=destination,
+                            intent=_MoveIntent.OUTBOUND,
+                        )
+                    ):
+                        break
+                continue
             if self._move_to_core_queue(
                 unit,
                 context,
@@ -5725,12 +6026,17 @@ class AggressiveStrategy:
         # Only the next step settles this Tick. Route around saturated
         # neighbours using departures and arrivals already planned, while
         # allowing single occupants, swaps and later transit through the cell.
-        full_neighbors = {
-            position
-            for position in adjacent_positions(unit.position)
-            if self._predicted_friendly_occupancy(position, context)
-            >= (1 if intent is _MoveIntent.STAND and position == goal else 2)
-        }
+        collecting = self._collect_core_move(unit, context)
+        full_neighbors = (
+            set()
+            if collecting
+            else {
+                position
+                for position in adjacent_positions(unit.position)
+                if self._predicted_friendly_occupancy(position, context)
+                >= (1 if intent is _MoveIntent.STAND and position == goal else 2)
+            }
+        )
         if goal in full_neighbors:
             return False
         if full_neighbors:
@@ -5918,6 +6224,17 @@ class AggressiveStrategy:
             # inside may still move outward; nobody may enter or move laterally
             # within it.
             return False
+        if self._collect_core_move(unit, context):
+            if not self._core_traffic_step_safe(
+                unit, destination, context, target=target
+            ):
+                return False
+            context.core_traffic_moves[unit.id] = _TrafficMove(
+                unit, destination, target, reason, intent
+            )
+            if core is not None and destination == core.position:
+                context.core_inbound_id = unit.id
+            return True
         if intent is _MoveIntent.STAND:
             if predicted != 0:
                 return False
