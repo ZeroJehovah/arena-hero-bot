@@ -9,7 +9,7 @@ import pytest
 from arena_hero import UnitType
 
 from arena_hero_bot import migration_cli
-from arena_hero_bot.geometry import manhattan, next_step
+from arena_hero_bot.geometry import add, manhattan, next_step
 from arena_hero_bot.memory import UnitGoal, WorldMemory
 from arena_hero_bot.migration import (
     blocks_are_cardinally_adjacent,
@@ -800,7 +800,7 @@ def test_core_arrival_worker_stays_committed_to_the_same_forward_cell() -> None:
     assert decisions[str(closer.id)].target != (1, 0)
 
 
-def test_stacked_loaded_workers_separate_when_the_forward_queue_is_full() -> None:
+def test_stacked_loaded_workers_approach_a_full_forward_queue_together() -> None:
     memory = WorldMemory(
         core_home_position=(8, 0),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -835,11 +835,13 @@ def test_stacked_loaded_workers_separate_when_the_forward_queue_is_full() -> Non
         for worker in stacked
         if worker.id in turn.plan.unit_actions
     ]
-    assert len(moved) == 1
-    assert moved[0].reason == "separate from a shared Core queue waiting cell"
-    assert moved[0].target not in {(1, 0), (2, 0), (3, 0), (4, 0), (0, 0)}
-    assert moved[0].target is not None
-    assert manhattan(moved[0].target, (0, 0)) >= 2
+    assert len(moved) == 2
+    assert all(item.reason == "approach the full Core forward queue" for item in moved)
+    assert all(item.target == (2, 0) for item in moved)
+    for worker in stacked:
+        action = turn.plan.unit_actions[worker.id]
+        assert action.type == "MOVE"
+        assert add(worker.position, action.direction) == (0, -1)
 
 
 def test_loaded_worker_in_the_next_core_cell_holds_for_the_arrival_tick() -> None:

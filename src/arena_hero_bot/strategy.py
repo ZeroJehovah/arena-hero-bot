@@ -475,6 +475,9 @@ class _TurnContext:
     core_migration_direction: Direction | None = None
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
+    core_lane_distances: dict[Position, dict[Position, int]] = field(
+        default_factory=dict
+    )
     core_arrival_worker_id: UUID | None = None
     # One loaded Worker owns the stationary Core service approach per Tick;
     # followers compact using both cell slots and simultaneous departures.
@@ -3269,10 +3272,11 @@ class AggressiveStrategy:
             ):
                 self.memory.clear_goal(str(worker.id))
                 if not (worker.position == core.position and accepts_deposits):
-                    staged = (
+                    if (
                         arrival is not None
                         and worker.id == context.core_arrival_worker_id
-                        and self._move(
+                    ):
+                        if not self._move_to_core_lane(
                             worker,
                             arrival,
                             context,
@@ -3280,15 +3284,15 @@ class AggressiveStrategy:
                                 "stage the next carried resources on the Core "
                                 "forward route"
                             ),
-                            allow_goal=True,
                             intent=_MoveIntent.INBOUND,
-                            extra_blockers=(
-                                {core.position, *adjacent_positions(core.position)}
-                                - {arrival}
-                            ),
-                        )
-                    )
-                    if staged or self._move_to_core_queue(
+                        ):
+                            self._record_wait(
+                                worker,
+                                context,
+                                "wait for safe progress to the Core arrival slot",
+                            )
+                        return
+                    if self._move_to_core_queue(
                         worker,
                         context,
                         reason="queue carried resources on the Core forward route",
@@ -4406,7 +4410,9 @@ class AggressiveStrategy:
                 )
             ),
             key=lambda worker: (
-                manhattan(worker.position, arrival),
+                self._core_lane_distances(worker, arrival, context).get(
+                    worker.position, 4096 + manhattan(worker.position, arrival)
+                ),
                 worker.id.bytes,
             ),
         )
@@ -4449,6 +4455,84 @@ class AggressiveStrategy:
             is not None
         )
 
+    @staticmethod
+    def _core_lane_exclusions(goal: Position, context: _TurnContext) -> set[Position]:
+        core = context.turn.core
+        if core is None:
+            return set()
+        excluded = {core.position}
+        arrival = context.core_migration_destination
+        # Side cells are legal transit cells for cargo. Only the queue's
+        # destinations belong on the forward lane; blocking side transit can
+        # seal the only entrance around rocks as the Core advances.
+        if arrival is not None and arrival != goal:
+            excluded.add(arrival)
+        return excluded - {goal}
+
+    def _core_lane_distances(
+        self, unit: Unit, goal: Position, context: _TurnContext
+    ) -> dict[Position, int]:
+        """Cache safe walking distances to each moving queue slot, without traffic."""
+
+        excluded = self._core_lane_exclusions(goal, context)
+        if goal not in context.core_lane_distances:
+            distances: dict[Position, int] = {}
+            context.core_lane_distances[goal] = distances
+            blockers = self._static_blockers(unit, context)
+            if goal not in blockers and goal not in context.enemy_positions:
+                distances[goal] = 0
+                frontier = deque([goal])
+                while frontier and len(distances) < 4096:
+                    position = frontier.popleft()
+                    for neighbor in adjacent_positions(position):
+                        if (
+                            neighbor in distances
+                            or neighbor in blockers
+                            or neighbor in excluded
+                            or neighbor in context.enemy_positions
+                        ):
+                            continue
+                        distances[neighbor] = distances[position] + 1
+                        frontier.append(neighbor)
+                        if len(distances) >= 4096:
+                            break
+        distances = context.core_lane_distances[goal]
+        if unit.position in excluded:
+            # A Worker already inside the approach may leave it. Do not open
+            # this excluded cell to other routes or alter the cached field.
+            exits = [
+                distances[position]
+                for position in adjacent_positions(unit.position)
+                if position in distances
+            ]
+            if exits:
+                return {**distances, unit.position: min(exits) + 1}
+        return distances
+
+    def _move_to_core_lane(
+        self,
+        unit: Unit,
+        goal: Position,
+        context: _TurnContext,
+        *,
+        reason: str,
+        intent: _MoveIntent = _MoveIntent.TRANSIT,
+    ) -> bool:
+        distances = self._core_lane_distances(unit, goal, context)
+        if not distances:
+            return False
+        return self._move(
+            unit,
+            goal,
+            context,
+            reason=reason,
+            allow_goal=True,
+            intent=intent,
+            extra_blockers=self._core_lane_exclusions(goal, context),
+            avoid_recent=False,
+            progress_distances=distances,
+        )
+
     def _move_to_core_queue(
         self,
         unit: Unit,
@@ -4481,29 +4565,36 @@ class AggressiveStrategy:
                 return True
             goals = self._core_lane_queue_positions(unit, context)
             if goals:
-                arrival = context.core_migration_destination
                 for goal in goals:
                     context.standing_reserved.add(goal)
-                    if self._move(
+                    if self._move_to_core_lane(
                         unit,
                         goal,
                         context,
                         reason=reason,
-                        allow_goal=True,
                         intent=_MoveIntent.STAND,
-                        extra_blockers=(
-                            {arrival}
-                            if arrival is not None and arrival != goal
-                            else None
-                        ),
                     ):
                         return True
                     context.standing_reserved.discard(goal)
                 return False
-            if self._predicted_friendly_occupancy(
-                unit.position, context
-            ) >= 2 and self._separate_core_queue_waiter(unit, context):
-                return True
+            # A full local queue must not freeze cargo still travelling to it.
+            # Approach without reserving a slot; the final step still needs
+            # the lane's one-Worker capacity. Off-route overlaps are harmless.
+            approach_goals = context.core_migration_lane[1:]
+            if approach_goals:
+                goal = min(
+                    approach_goals,
+                    key=lambda position: self._core_lane_distances(
+                        unit, position, context
+                    ).get(unit.position, 4096 + manhattan(unit.position, position)),
+                )
+                if self._move_to_core_lane(
+                    unit,
+                    goal,
+                    context,
+                    reason="approach the full Core forward queue",
+                ):
+                    return True
             self._record_wait(
                 unit,
                 context,
@@ -15799,7 +15890,14 @@ class AggressiveStrategy:
         core = context.turn.core
         at_core = core is not None and worker.position == core.position
         distance = 0
-        if (
+        if worker.cargo > 0 and context.core_migration_lane:
+            distance = min(
+                self._core_lane_distances(worker, goal, context).get(
+                    worker.position, 4096 + manhattan(worker.position, goal)
+                )
+                for goal in context.core_migration_lane
+            )
+        elif (
             worker.cargo > 0
             and core is not None
             and core.view.state is CoreState.NORMAL
