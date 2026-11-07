@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from pathlib import Path
 from time import monotonic
 from typing import Any, Protocol
@@ -105,13 +107,19 @@ def run_bot(
                     if request_signature is not None:
                         try:
                             request = load_migration_request(migration_request_path)
-                            if request is not None and strategy.request_core_migration(
-                                request.target
-                            ):
-                                LOGGER.info(
-                                    "accepted Core migration request target=%s",
-                                    request.target,
-                                )
+                            if request is not None:
+                                request_id = sha256(
+                                    json.dumps(asdict(request), sort_keys=True).encode()
+                                ).hexdigest()
+                                if request_id != memory.core_migration_request_id:
+                                    if strategy.request_core_migration(request.target):
+                                        LOGGER.info(
+                                            "accepted Core migration request target=%s",
+                                            request.target,
+                                        )
+                                    # An already-current target also consumes the
+                                    # request, so a later hop cannot replay it.
+                                    memory.core_migration_request_id = request_id
                         except (OSError, ValueError, TypeError) as exc:
                             LOGGER.warning(
                                 "ignored invalid Core migration request: %s", exc
@@ -263,6 +271,7 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
         {
             "serial": squad.serial,
             "members": list(squad.members),
+            "recalled": squad.recalled,
             "heading": list(squad.bearing),
             "navigation": {
                 "goal": squad.exploration_route.goal,

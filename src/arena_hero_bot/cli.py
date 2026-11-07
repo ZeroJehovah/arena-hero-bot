@@ -59,8 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     population_group.add_argument(
         "--max-population",
         type=_positive_integer,
-        default=12,
-        help="stop producing Units at this population (default: 12)",
+        help="stop producing Units at this population (non-campaign default: 12)",
     )
     population_group.add_argument(
         "--no-max-population",
@@ -89,7 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "stage-gated campaign: build 8W, 16W+8R and 16W+20R, add the "
-            "8R patrol screen, then migrate toward the quota-8 block"
+            "8R patrol screen, then migrate toward the quota-8 block; "
+            "enables formation management with no population cap"
         ),
     )
     parser.add_argument(
@@ -105,7 +105,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    max_population = None if args.no_max_population else args.max_population
+    if args.campaign_mode and (
+        args.max_population is not None or args.resource_target > 0
+    ):
+        parser.error("campaign mode requires no population cap or resource target")
+    max_population = (
+        None
+        if args.no_max_population or args.campaign_mode
+        else args.max_population or 12
+    )
     maximum_capacity = (
         core_resource_capacity(max_population) if max_population is not None else None
     )

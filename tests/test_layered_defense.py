@@ -55,6 +55,84 @@ def _context(strategy, turn):
     )
 
 
+def test_layered_trade_requires_capacity_for_the_whole_supporting_group():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(-1, -4)),
+            unit(3, "RANGER", position=(1, -4)),
+            unit(4, "RANGER", position=(0, -3)),
+            unit(50, "RANGER", controlled=False, position=(0, -7)),
+            unit(51, "RANGER", controlled=False, position=(0, -7)),
+        ],
+        obstacles=[(-1, -5), (1, -5)],
+    )
+    strategy = _strategy()
+    context = _context(strategy, turn)
+    context.layered_assignments = {
+        UUID(int=2): (0, -6),
+        UUID(int=3): (0, -5),
+        UUID(int=4): (0, -4),
+    }
+    enemies = tuple(e for e in turn.visible_enemies if isinstance(e, UnitView))
+    before_targets = dict(strategy.memory.pending_move_targets)
+
+    strategy._prepare_layered_steps(context, enemies)
+    for ranger in turn.rangers:
+        strategy._move_layered_ranger(ranger, context)
+
+    # Three arrivals could survive to kill one foe, but only two fit. With
+    # two hostile arrows, that unsupported pair loses one before it can fire.
+    assert not any(action.type == "MOVE" for action in turn.plan.unit_actions.values())
+    assert not context.arrival_counts and not context.departure_counts
+    assert strategy.memory.pending_move_targets == before_targets
+
+
+def test_layered_trade_commits_a_complete_group_that_can_return_a_kill():
+    friends = [
+        unit(2, "RANGER", position=(-1, -4)),
+        unit(3, "RANGER", position=(3, -6)),
+        unit(4, "RANGER", position=(1, -10)),
+    ]
+    foes = [unit(n, "RANGER", controlled=False, position=(0, -7)) for n in (50, 51)]
+    encounter = Encounter(friends, foes, resources=0)
+    turn = encounter.turn()
+    strategy = _strategy()
+    context = _context(strategy, turn)
+    context.layered_assignments = {
+        UUID(int=2): (0, -4),
+        UUID(int=3): (3, -7),
+        UUID(int=4): (0, -10),
+    }
+    enemies = tuple(e for e in turn.visible_enemies if isinstance(e, UnitView))
+
+    strategy._prepare_layered_steps(context, enemies)
+
+    assert len(turn.plan.unit_actions) == 3
+    assert all(action.type == "MOVE" for action in turn.plan.unit_actions.values())
+    encounter.settle(
+        turn.plan,
+        {
+            foe["id"]: {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": [0, -4],
+            }
+            for foe in foes
+        },
+    )
+    assert encounter.losses == 1
+    reply = encounter.turn()
+    targets = precision_volley(
+        {r.id: r.position for r in reply.rangers}, enemies, (0, 0), set()
+    )
+    for ranger in reply.rangers:
+        if ranger.id in targets:
+            ranger.shoot(targets[ranger.id], expected_cell=targets[ranger.id].position)
+    encounter.settle(reply.plan, {})
+    assert encounter.kills == encounter.losses == 1
+
+
 def test_north_and_east_receive_two_ranks_before_rear_watch():
     turn = make_turn(
         objects=[

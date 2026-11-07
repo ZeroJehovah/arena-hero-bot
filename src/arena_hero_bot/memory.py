@@ -151,6 +151,9 @@ class WorldMemory:
     # Selected once for the new symmetric defensive posture and retained
     # across restarts while the Core walks there.
     core_home_position: Position | None = None
+    # Keep consumed operator requests across restarts and Core replacement.
+    # The published file may remain after automatic migration has moved on.
+    core_migration_request_id: str | None = None
     # Version 3 isolates the economy to one centered 32x32 chunk.  Keep the
     # marker durable so a restart during migration does not choose a second
     # home or discard the current sector allocation.
@@ -826,6 +829,7 @@ class WorldMemory:
                 else None
             ),
             "core_layout_version": self.core_layout_version,
+            "core_migration_request_id": self.core_migration_request_id,
             "core_migration_last_position": (
                 list(self.core_migration_last_position)
                 if self.core_migration_last_position is not None
@@ -1055,6 +1059,7 @@ class WorldMemory:
                 raw.get("last_normal_growth_resources")
             ),
             core_home_position=_optional_position(raw.get("core_home_position")),
+            core_migration_request_id=raw.get("core_migration_request_id"),
             core_layout_version=int(raw.get("core_layout_version", 0)),
             core_migration_last_position=_optional_position(
                 raw.get("core_migration_last_position")

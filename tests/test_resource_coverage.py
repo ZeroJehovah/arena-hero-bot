@@ -765,3 +765,34 @@ def test_patrol_goal_identities_are_durable_across_restart(tmp_path) -> None:
 
     assert actual == expected
     assert len(actual) == 8
+
+
+def test_rock_shortened_patrol_ring_still_assigns_every_member():
+    memory = WorldMemory(core_home_position=HOME)
+    strategy = _strategy(memory)
+    ring = _single_chunk_outer_ring(HOME, set())
+    turn = make_turn(
+        objects=[
+            core(position=HOME),
+            *[
+                unit(100 + n, "VANGUARD", position=(HOME[0] - 1, HOME[1] - 1))
+                for n in range(12)
+            ],
+            *[
+                unit(200 + n, "RANGER", position=(HOME[0] - 1, HOME[1] - 1))
+                for n in range(24)
+            ],
+        ],
+        obstacles=list(ring[3:]),
+    )
+    strategy._reconcile_unit_roles(turn)
+
+    slots = strategy._reconcile_patrol_ring_slots(turn)
+    goals = {
+        member.id: strategy._combat_patrol_goal(member, turn)[0]
+        for member in (*turn.rangers, *turn.vanguards)
+        if member.id in slots
+    }
+
+    assert len(goals) == 8
+    assert set(goals.values()) <= set(ring[:3])

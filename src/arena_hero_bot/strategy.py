@@ -439,6 +439,15 @@ class StrategyConfig:
     expedition_mode: bool = False
     campaign_mode: bool = False
 
+    def __post_init__(self) -> None:
+        if self.campaign_mode:
+            # Campaign formation owns both growth controls.  Normalize direct
+            # StrategyConfig callers as well as the CLI so a campaign cannot
+            # silently stop at a legacy population cap or reserve target.
+            object.__setattr__(self, "max_population", None)
+            object.__setattr__(self, "resource_target", 0)
+            object.__setattr__(self, "expedition_mode", True)
+
 
 @dataclass(slots=True)
 class _TrafficMove:
@@ -2260,10 +2269,12 @@ class AggressiveStrategy:
                 # final member to reach its lane; it may still trade its shot
                 # on the volley Tick itself.  Without this check an early
                 # HP2 arrival could die before the two-arrow kill is ready.
+                # MOVE resolves before enemy fire, so a newly arriving
+                # shooter also takes damage on its ingress Tick.
                 if any(
                     ranger.hp
                     <= len(self._visible_attackers_at(goal, context.turn, obstacles))
-                    * (volley_tick - len(routes[ranger.id]))
+                    * (volley_tick - max(0, len(routes[ranger.id]) - 1))
                     for ranger, goal in selected
                 ):
                     continue
@@ -6836,10 +6847,8 @@ class AggressiveStrategy:
         return tuple(
             enemy
             for enemy in turn.visible_enemies
-            if (
-                isinstance(enemy, CoreView)
-                or enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
-            )
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
             and manhattan(core.position, enemy.position)
             <= self.config.core_assault_radius
         )
@@ -6928,10 +6937,8 @@ class AggressiveStrategy:
         nearby = tuple(
             enemy
             for enemy in turn.visible_enemies
-            if (
-                isinstance(enemy, CoreView)
-                or enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
-            )
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
             and manhattan(core.position, enemy.position)
             <= self.config.combat_alert_radius
         )
@@ -7049,8 +7056,8 @@ class AggressiveStrategy:
             combat_enemies = tuple(
                 enemy
                 for enemy in turn.visible_enemies
-                if isinstance(enemy, CoreView)
-                or enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                if isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             )
             nearby = tuple(
                 enemy
@@ -7066,10 +7073,8 @@ class AggressiveStrategy:
         nearby_combat = tuple(
             enemy
             for enemy in enemies
-            if (
-                enemy.kind == "CORE"
-                or enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
-            )
+            if enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
             and turn.tick - enemy.tick <= 16
             and manhattan(core.position, enemy.position) <= 12
         )
@@ -7508,15 +7513,16 @@ class AggressiveStrategy:
         if operation is None or operation.entered is None or core is None:
             return
         rocks = self._rock_map(context.turn)
+        members = tuple(
+            member
+            for member in members
+            if member.position == operation.slots[str(member.id)].firing
+        )
         positions = {member.id: member.position for member in members}
         volley = precision_volley(positions, targets, core.position, rocks)
         if (
             context.turn.tick - operation.entered > counter.FIRE_TICKS
             or not members
-            or any(
-                member.position != operation.slots[str(member.id)].firing
-                for member in members
-            )
             or len(members)
             < counter.reachable_opposition(tuple(positions.values()), enemies, rocks)
             + 2
@@ -7527,6 +7533,11 @@ class AggressiveStrategy:
                 context.turn.tick, "actual arrivals cannot sustain the joint volley"
             )
             return
+        # Keep only actual arrivals in this operation. A missed mover returns
+        # to ordinary defense and cannot replenish the volley on a later Tick.
+        operation.slots = {
+            str(member.id): operation.slots[str(member.id)] for member in members
+        }
         context.counterattack_ids = frozenset(positions)
         context.counterattack_reserved = frozenset(positions.values())
         context.clearance_ids = frozenset()
@@ -7923,16 +7934,59 @@ class AggressiveStrategy:
             >= enemy.hp
             for enemy in enemies
         )
+        safe_steps = {
+            actor_id: directions[actor_id]
+            for actor_id, (destination, hp) in proposals.items()
+            if len(self._visible_attackers_at(destination, context.turn, rocks)) < hp
+        }
+        context.layered_steps.update(safe_steps)
+        if len(safe_steps) == len(proposals) or not (
+            losses <= kills and survivors_can_kill
+        ):
+            return
+
+        # A lethal ingress is justified only by this whole supporting group.
+        # Commit its capacity now, before later individual decisions can fill
+        # a shared entrance or omit a promised shooter. Roll back every move
+        # if one fails, retaining only independently survivable steps.
+        actions = context.turn._builder.unit_actions
+        old_actions = actions.copy()
+        old_targets = self.memory.pending_move_targets.copy()
+        old_arrivals = context.arrival_counts.copy()
+        old_departures = context.departure_counts.copy()
+        old_reserved = context.reserved.copy()
+        old_standing = context.standing_reserved.copy()
+        old_planned = context.planned_ids.copy()
+        decisions = len(context.report.decisions)
         for ranger in context.turn.rangers:
-            proposed = proposals.get(ranger.id)
-            if proposed is None:
+            if ranger.id not in proposals:
                 continue
-            destination, hp = proposed
-            attackers = self._visible_attackers_at(destination, context.turn, rocks)
-            if len(attackers) < hp or (losses <= kills and survivors_can_kill):
-                context.layered_steps[ranger.id] = directions[ranger.id]
+            goal = context.layered_assignments[ranger.id]
+            if self._queue_move(
+                ranger,
+                directions[ranger.id],
+                context,
+                reason="establish the threatened side's two defensive firing ranks",
+                target=goal,
+                intent=_MoveIntent.STAND
+                if proposals[ranger.id][0] == goal
+                else _MoveIntent.TRANSIT,
+            ):
+                continue
+            actions.clear()
+            actions.update(old_actions)
+            self.memory.pending_move_targets = old_targets
+            context.arrival_counts = old_arrivals
+            context.departure_counts = old_departures
+            context.reserved = old_reserved
+            context.standing_reserved = old_standing
+            context.planned_ids = old_planned
+            del context.report.decisions[decisions:]
+            return
 
     def _move_layered_ranger(self, ranger: Ranger, context: _TurnContext) -> None:
+        if self._has_unit_action(ranger, context):
+            return
         goal = context.layered_assignments[ranger.id]
         direction = context.layered_steps.get(ranger.id)
         if direction is not None and self._queue_move(
@@ -8656,7 +8710,7 @@ class AggressiveStrategy:
 
     @staticmethod
     def _is_combat_memory_target(enemy: EnemySighting) -> bool:
-        """Whether a remembered hostile can attack and is worth intercepting."""
+        """Whether a remembered enemy is an attack objective for legacy combat."""
 
         return enemy.kind == "CORE" or enemy.unit_type in {
             UnitType.RANGER.value,
@@ -10962,6 +11016,7 @@ class AggressiveStrategy:
         occupied = {unit.position for unit in turn.units}
         current_block = resource_block_index(origin)
         current_ring = resource_block_ring(current_block)
+        current_quota = resource_block_quota(current_block)
         movement_cap = self._campaign_movement_cap(turn)
         preferred_block = (
             resource_block_index(preferred_target)
@@ -10975,10 +11030,28 @@ class AggressiveStrategy:
             if (
                 adjacent
                 and self.config.campaign_mode
-                and (movement_cap is None or resource_block_quota(block) > movement_cap)
+                and (
+                    movement_cap is None
+                    or current_quota > movement_cap
+                    or resource_block_quota(block) > movement_cap
+                )
             ):
                 continue
             ring_delta = resource_block_ring(block) - current_ring
+            if (
+                adjacent
+                and self.config.campaign_mode
+                and block != preferred_block
+                and (
+                    ring_delta >= 0
+                    or current_quota >= 4
+                    or resource_block_quota(block) >= 4
+                )
+            ):
+                # Terrain repair may keep the already published target block,
+                # but cannot authorize a lateral hop or a different high-quota
+                # block without the normal forward scouting gate.
+                continue
             if preferred_block is not None and preferred_block != current_block:
                 block_priority = (
                     0
@@ -11533,8 +11606,8 @@ class AggressiveStrategy:
             return False
         core = turn.core
         nearby = sum(
-            enemy.kind == "CORE"
-            or enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
+            enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
             for enemy in enemies
             if manhattan(core.position, enemy.position) <= CAMPAIGN_DEFENSE_RADIUS
         )
@@ -12740,7 +12813,9 @@ class AggressiveStrategy:
             observed = self.memory.campaign_scout_seen_ticks.get(position)
             if observed is None or observed < self.memory.campaign_scout_started_tick:
                 return WORKER_PATROL_AGE_CAP
-            return min(WORKER_PATROL_AGE_CAP, max(0, turn.tick - observed))
+            # This sweep measures coverage since it began. Aging a covered
+            # anchor must not keep it ahead of the remaining blind gaps.
+            return 0
 
         reserved_views: set[Position] = set()
         for other in (*turn.rangers, *turn.vanguards):
@@ -13679,16 +13754,13 @@ class AggressiveStrategy:
         self,
         turn: Turn,
     ) -> tuple[CoreView | UnitView, ...]:
-        """Return visible hostile combat objects relevant to Core survival."""
+        """Return visible hostile fighters relevant to Core survival."""
 
         return tuple(
             enemy
             for enemy in turn.visible_enemies
-            if isinstance(enemy, CoreView)
-            or (
-                isinstance(enemy, UnitView)
-                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-            )
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
         )
 
     def _record_combat_kills(self, turn: Turn) -> None:
@@ -14185,9 +14257,8 @@ class AggressiveStrategy:
 
         * only one ``DEFENSE_ROLE`` Ranger leaves, and only while at least
           two other healthy combat units stay on station;
-        * it launches only when no hostile fighter is visible around our Core
-          or the target, nor remembered near the target within the worker
-          threat memory window;
+        * it launches only when no hostile fighter is visible, nor remembered
+          around our Core, hunter or target within the worker threat window;
         * it aborts on any fighter that comes into view, on Core damage or
           evacuation pressure, when the Ranger itself is wounded, or after
           ``core_hunt_max_ticks``;
@@ -14368,7 +14439,6 @@ class AggressiveStrategy:
         if any(
             isinstance(enemy, UnitView)
             and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-            and near(enemy.position)
             for enemy in turn.visible_enemies
         ):
             return True
@@ -15313,6 +15383,8 @@ class AggressiveStrategy:
         return self._predicted_friendly_occupancy(core_position, context) < 2
 
     def _choose_spawn(self, turn: Turn, resources: int) -> UnitType | None:
+        if self.config.campaign_mode:
+            return self._expedition_spawn(turn, resources)
         growth_target = self._growth_population_target()
         if growth_target is not None and turn.state.population >= growth_target:
             return None
@@ -15438,11 +15510,13 @@ class AggressiveStrategy:
     def _campaign_spawn_candidates(self, turn: Turn) -> tuple[UnitType, ...] | None:
         """Return the exact next stage slot, or ``None`` when fully staffed.
 
-        Campaign production follows the configured order without emergency
-        substitutions.  The cumulative order is 8W, 16W, 8R(defense),
+        Visible hostile fighters in the Core assault ring temporarily require
+        a Ranger. Otherwise the cumulative order is 8W, 16W, 8R(defense),
         20R(defense), 8R(patrol), then patrol Rangers without a cap.
         """
 
+        if self._local_core_attackers(turn):
+            return (UnitType.RANGER,)
         workers = len(turn.workers)
         defense = self._campaign_defense_rangers(turn)
         patrol = self._campaign_patrol_rangers(turn)
@@ -15688,16 +15762,9 @@ class AggressiveStrategy:
             self.config.resource_patrol_radius + self.config.worker_threat_radius
         )
         return any(
-            (
-                (
-                    enemy.kind == "CORE"
-                    and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
-                )
-                or (
-                    enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
-                    and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
-                )
-            )
+            enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
+            and turn.tick - enemy.tick <= self.config.enemy_memory_ttl
             and manhattan(turn.core.position, enemy.position) <= local_radius
             for enemy in self.memory.recent_enemies(
                 turn.tick,
@@ -16097,7 +16164,7 @@ def _single_chunk_outer_ring(
 def _ring_slot_index(slot: int, slot_count: int, route_length: int) -> int:
     """Round a durable ring slot to the nearest evenly spaced path index."""
 
-    return (slot * route_length + slot_count // 2) // slot_count
+    return ((slot * route_length + slot_count // 2) // slot_count) % route_length
 
 
 def _nearest_ring_index(position: Position, route: tuple[Position, ...]) -> int:

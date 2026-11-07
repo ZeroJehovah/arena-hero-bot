@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from arena_hero import MoveAction
 
 from arena_hero_bot.geometry import line_of_fire, manhattan
@@ -27,7 +28,7 @@ RANGER_STARTS = (
 )
 
 
-def _make_turn(tick, ranger_starts, *, target_hp=2, ranger_hp=3):
+def _make_turn(tick, ranger_starts, *, target_hp=2, ranger_hp=2):
     return make_turn(
         tick=tick,
         objects=[
@@ -63,7 +64,7 @@ def _scenario(
     target_hp: int = 1,
     previous_target: tuple[int, int] = (0, -9),
     ranger_starts=RANGER_STARTS,
-    ranger_hp: int = 3,
+    ranger_hp: int = 2,
 ):
     positions = dict(ranger_starts)
     memory = WorldMemory(
@@ -242,3 +243,24 @@ def test_two_hp_target_commits_a_pair_before_either_ranger_fires() -> None:
         strategy.memory.recent_enemies(turn.tick, 32),
     )
     assert turn.plan.unit_actions[leading.id].type == "SHOOT"
+
+
+@pytest.mark.parametrize("partner, viable", [((0, -4), False), ((1, -6), True)])
+def test_pair_accounts_for_fire_on_the_first_arrival_tick(partner, viable):
+    strategy, turn, context = _scenario(
+        target_hp=2,
+        ranger_starts=((2, (0, -5)), (3, partner), *RANGER_STARTS[2:]),
+    )
+
+    strategy._prepare_local_fireline(context)
+
+    # A one-step arrival takes a shot on ingress. Waiting for a two-step
+    # partner costs another shot before the pair can shoot, exhausting HP2.
+    # Simultaneous one-step arrivals survive until their shared volley.
+    assert bool(context.local_fireline_orders) is viable
+    if viable:
+        assert len(context.local_fireline_orders) == 2
+        for actor_id, (_target, goal) in context.local_fireline_orders.items():
+            ranger = next(actor for actor in turn.rangers if actor.id == actor_id)
+            assert manhattan(ranger.position, goal) == 1
+            assert ranger.hp - 1 > 0

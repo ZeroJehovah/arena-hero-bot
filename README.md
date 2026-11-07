@@ -78,6 +78,14 @@ Legacy expedition squads are recalled, fight normally while returning, and join
 the patrol roster within eight cells of the Core; campaign mode creates no new
 expeditions and no Vanguards.
 
+`--campaign-mode` enables the required formation management and uncapped growth
+on its own. It rejects `--max-population` and a positive `--resource-target`,
+which would prevent the campaign from following its formation sequence.
+When a hostile fighter enters the Core assault ring, even a single contact
+temporarily selects a Ranger. If that Ranger is unaffordable, delivery remains
+available until it can be funded. Once the contact leaves, normal production
+resumes. Expedition telemetry includes the persisted recall flag.
+
 Fixed defenders do not pursue enemies. During a Core assault they shoot at an
 enemy's current cell when a real ray exists; without one, up to two defenders
 may rotate onto a safe adjacent firing lane before speculative cover fire is

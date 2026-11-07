@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from arena_hero import UnitType, core_resource_capacity, unit_cost
 
+from arena_hero_bot.exploration import visible_cells
 from arena_hero_bot.geometry import add, manhattan, next_step
 from arena_hero_bot.memory import ExpeditionSquad, WorldMemory
 from arena_hero_bot.migration import (
@@ -21,6 +23,7 @@ from arena_hero_bot.strategy import (
     CAMPAIGN_PHASE_STAGE3,
     CAMPAIGN_PHASE_STAGE4,
     CORE_LAYOUT_VERSION,
+    RANGER_VISION_RADIUS,
     AggressiveStrategy,
     StrategyConfig,
     _uncovered_symmetric_cells,
@@ -41,10 +44,106 @@ def _strategy(memory: WorldMemory) -> AggressiveStrategy:
     )
 
 
+def test_campaign_alone_advances_and_builds_the_ranger_formation():
+    memory = WorldMemory()
+    turn = make_turn(
+        resources=100,
+        objects=[core(position=(16, 16)), *_workers(16), *_rangers(8)],
+    )
+    strategy = AggressiveStrategy(memory, StrategyConfig(campaign_mode=True))
+
+    strategy.decide(turn)
+
+    assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE3
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
+@pytest.mark.parametrize("enemy_count", [1, 2])
+@pytest.mark.parametrize("resources", [10, 12])
+def test_campaign_local_contact_never_builds_worker_or_melee_fallback(
+    enemy_count, resources
+):
+    memory = WorldMemory()
+    strategy = _strategy(memory)
+    objects = [core(position=(16, 16)), *_workers(3)]
+    turn = make_turn(
+        resources=resources,
+        objects=[
+            *objects,
+            *[
+                unit(900 + index, "RANGER", controlled=False, position=(16 + index, 10))
+                for index in range(enemy_count)
+            ],
+        ],
+    )
+
+    strategy.decide(turn)
+
+    action = turn.plan.core_action
+    if resources < 12:
+        assert action is None or action.type != "SPAWN"
+    else:
+        assert action is not None
+        assert action.type == "SPAWN"
+        assert action.unit_type is UnitType.RANGER
+
+    calm = make_turn(tick=101, resources=10, objects=objects)
+    strategy.decide(calm)
+    assert calm.plan.core_action is not None
+    assert calm.plan.core_action.type == "SPAWN"
+    assert calm.plan.core_action.unit_type is UnitType.WORKER
+
+
+@pytest.mark.parametrize("enemy_type", ["WORKER", "CORE"])
+def test_campaign_noncombat_contacts_do_not_override_worker_production(enemy_type):
+    enemy = (
+        core(900, controlled=False, position=(16, 10))
+        if enemy_type == "CORE"
+        else unit(900, "WORKER", controlled=False, position=(16, 10))
+    )
+    turn = make_turn(
+        resources=12, objects=[core(position=(16, 16)), *_workers(3), enemy]
+    )
+    _strategy(WorldMemory()).decide(turn)
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
+
+
 def _workers(count: int) -> list[dict[str, object]]:
     return [
         unit(100 + index, "WORKER", position=(20 + index, 20)) for index in range(count)
     ]
+
+
+@pytest.mark.parametrize("remembered", [False, True])
+@pytest.mark.parametrize("enemy_type", ["CORE", "WORKER"])
+def test_noncombat_contacts_do_not_trigger_campaign_defense(enemy_type, remembered):
+    friendlies = [core(position=(16, 16)), *_workers(3)]
+    enemies = [
+        core(900 + n, controlled=False, position=(18 + n, 16))
+        if enemy_type == "CORE"
+        else unit(900 + n, "WORKER", controlled=False, position=(18 + n, 16))
+        for n in range(3)
+    ]
+    strategy = _strategy(WorldMemory())
+    strategy.decide(make_turn(tick=99, objects=[*friendlies, *enemies]))
+    turn = make_turn(
+        objects=friendlies if remembered else [*friendlies, *enemies], resources=10
+    )
+
+    report = strategy.decide(turn)
+
+    assert not strategy.memory.defense_compressed
+    assert report.threat_level == "NORMAL"
+    assert not strategy._emergency_combat_mode(turn)
+    assert not strategy._core_assault_enemies(turn)
+    assert not strategy._visible_combat_enemies(turn)
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "SPAWN"
+    assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
 def _rangers(count: int, *, offset: int = 1000) -> list[dict[str, object]]:
@@ -1765,6 +1864,60 @@ def test_campaign_scout_fills_the_gaps_between_anchor_discs() -> None:
     assert memory.campaign_scout_target == target
 
 
+@pytest.mark.parametrize("age", [0, 50])
+def test_campaign_scout_prioritizes_unseen_gaps_over_aging_covered_cells(age):
+    target = (-785, 15)
+    unseen = (-793, 0)
+    memory = WorldMemory(
+        campaign_scout_target=target,
+        campaign_scout_started_tick=100,
+        campaign_scout_seen_ticks={
+            (x, y): 150
+            for x in range(-800, -768)
+            for y in range(32)
+            if (x, y) != unseen
+        },
+    )
+    turn = make_turn(
+        tick=150 + age,
+        objects=[core(position=(-817, 16)), unit(2, "RANGER", position=(-796, 4))],
+    )
+
+    goal = _strategy(memory)._campaign_scout_goal(turn.rangers[0], turn)
+
+    assert unseen in visible_cells(goal, RANGER_VISION_RADIUS, set())
+
+
+@pytest.mark.parametrize("phase", [CAMPAIGN_PHASE_STAGE3, CAMPAIGN_PHASE_STAGE4])
+def test_campaign_rock_repair_cannot_sidestep_or_skip_forward_scout(phase):
+    origin = (-818, 16)
+    sealed_centers = [(-817, 15), (-817, 16), (-816, 15), (-816, 16)]
+    workers, rangers, roles = _max_roster()
+    if phase == CAMPAIGN_PHASE_STAGE3:
+        rangers = rangers[:20]
+        roles = {
+            key: role for key, role in roles.items() if not role.startswith("patrol-")
+        }
+    memory = WorldMemory(
+        core_home_position=sealed_centers[0],
+        campaign_phase=phase,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(
+        objects=[core(position=origin), *workers, *rangers],
+        obstacles=sealed_centers,
+    )
+    strategy = _strategy(memory)
+    memory.observe(turn)
+
+    replacement = strategy._repair_unreachable_home_target(turn, origin)
+
+    assert replacement is None
+    assert memory.core_home_position is None
+    assert memory.core_migration_start_position is None
+
+
 def test_campaign_scout_reaches_a_far_corner_outside_the_combat_leash() -> None:
     """A full block sweep may cross the generic 60-cell patrol leash."""
 
@@ -2481,7 +2634,8 @@ def test_enemy_core_outside_the_hunt_radius_is_left_alone() -> None:
     assert not _core_hunt_reasons(report)
 
 
-def test_enemy_core_hunt_aborts_when_a_fighter_appears() -> None:
+@pytest.mark.parametrize("enemy_position", [(-494, 719), (-394, 719)])
+def test_enemy_core_hunt_aborts_when_a_fighter_appears(enemy_position) -> None:
     core_object = core(1, position=CLEARANCE_HOME)
     rangers = _clearance_rangers(4)
     memory = _sealed_memory(core_object, rangers)
@@ -2496,7 +2650,8 @@ def test_enemy_core_hunt_aborts_when_a_fighter_appears() -> None:
             core_object,
             *rangers,
             _rival_core(),
-            unit(200, "RANGER", controlled=False, position=(-494, 719)),
+            unit(200, "RANGER", controlled=False, position=enemy_position),
+            unit(201, "WORKER", position=(enemy_position[0] + 1, enemy_position[1])),
         ],
     )
 

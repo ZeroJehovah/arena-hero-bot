@@ -175,6 +175,8 @@ class CombatPolicy:
         self.enemy_motion: dict[str, EnemyMotion] = {}
         self.recent_attack_until_tick = -1
         self.recent_core_attack_until_tick = -1
+        self._core_id: str | None = None
+        self._friendly_unit_ids: set[str] = set()
 
     def assess(
         self,
@@ -184,6 +186,19 @@ class CombatPolicy:
         """Update motion memory and classify the current Turn."""
 
         core = turn.core
+        core_id = str(core.id) if core is not None else None
+        own_respawn = any(
+            _event_name(event, "event_type") == "CORE_RESPAWNED"
+            and core_id is not None
+            and str(event.target_id) == core_id
+            for event in turn.events
+        )
+        if core_id != self._core_id or own_respawn:
+            self.enemy_motion.clear()
+            self.recent_attack_until_tick = -1
+            self.recent_core_attack_until_tick = -1
+            self._friendly_unit_ids.clear()
+        self._core_id = core_id
         visible = {
             str(enemy.id): enemy
             for enemy in turn.visible_enemies
@@ -217,6 +232,7 @@ class CombatPolicy:
 
         self.enemy_motion = current_motion
         self._observe_attack_events(turn, visible, prior)
+        self._friendly_unit_ids = {str(unit.id) for unit in turn.units}
 
         active_ids = frozenset(
             enemy_id
@@ -403,14 +419,27 @@ class CombatPolicy:
     ) -> None:
         respawned = any(
             _event_name(event, "event_type") == "CORE_RESPAWNED"
+            and self._core_id is not None
+            and str(event.target_id) == self._core_id
             for event in turn.events
         )
+        friendly_ids = self._friendly_unit_ids | {str(unit.id) for unit in turn.units}
         attack_events = tuple(
             event
             for event in turn.events
             if not respawned
             and _event_name(event, "reason_code") == "ATTACK"
-            and _event_name(event, "event_type") in {"CORE_DAMAGED", "UNIT_DAMAGED"}
+            and (
+                (
+                    _event_name(event, "event_type") == "CORE_DAMAGED"
+                    and self._core_id is not None
+                    and str(event.target_id) == self._core_id
+                )
+                or (
+                    _event_name(event, "event_type") == "UNIT_DAMAGED"
+                    and str(event.target_id) in friendly_ids
+                )
+            )
         )
         if not attack_events:
             return

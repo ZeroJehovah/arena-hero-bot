@@ -9,7 +9,7 @@ import pytest
 from arena_hero import APIError, ArenaHeroError, Turn
 
 from arena_hero_bot import cli, runtime
-from arena_hero_bot.memory import PatrolContact, WorldMemory
+from arena_hero_bot.memory import ExpeditionSquad, PatrolContact, WorldMemory
 from arena_hero_bot.migration import write_migration_request
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.runtime import RuntimeConfig
@@ -195,6 +195,44 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
     assert "api_key" not in json.dumps(record).lower()
 
 
+@pytest.mark.parametrize("recalled", [False, True])
+def test_expedition_telemetry_preserves_recall_status(recalled):
+    memory = WorldMemory(
+        expedition_squads=[
+            ExpeditionSquad(1, (object_id(2),), (1, 0), recalled=recalled)
+        ]
+    )
+    snapshot = runtime._identity_snapshot(memory)
+    assert snapshot["expedition_squads"][0]["recalled"] is recalled
+
+
+def test_cli_campaign_alone_enables_the_complete_uncapped_mode(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("ARENA_HERO_API_KEY", "test-key")
+
+    def fake_run(_runtime, *, strategy_config):
+        captured["strategy"] = strategy_config
+
+    monkeypatch.setattr(cli, "run_bot", fake_run)
+    cli.main(["--campaign-mode"])
+    strategy = captured["strategy"]
+    assert strategy.campaign_mode
+    assert strategy.expedition_mode
+    assert strategy.max_population is None
+    assert strategy.resource_target == 0
+
+
+@pytest.mark.parametrize(
+    "conflict", [["--max-population", "12"], ["--resource-target", "10"]]
+)
+def test_cli_campaign_rejects_fixed_growth_limits(conflict, capsys, monkeypatch):
+    monkeypatch.setenv("ARENA_HERO_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "run_bot", lambda *_args, **_kwargs: None)
+    with pytest.raises(SystemExit):
+        cli.main(["--campaign-mode", *conflict])
+    assert "campaign mode" in capsys.readouterr().err
+
+
 def test_runtime_tick_log_includes_resource_progress(
     tmp_path, monkeypatch, caplog
 ) -> None:
@@ -338,6 +376,49 @@ def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> Non
     records = [json.loads(line) for line in telemetry_path.read_text().splitlines()]
     assert [record["tick"] for record in records] == [101]
     assert WorldMemory.load(tmp_path / "memory.json").last_tick == 101
+
+
+@pytest.mark.parametrize("new_request", [False, True])
+def test_restart_consumes_each_migration_request_only_once(
+    tmp_path, monkeypatch, new_request
+):
+    request_path = tmp_path / "core-migration.json"
+    memory_path = tmp_path / "memory.json"
+    write_migration_request(request_path, (16, 16))
+    current = make_turn(objects=[core(position=(16, 16))])
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def turns(self):
+            yield current
+
+    monkeypatch.setattr(runtime, "ArenaHeroClient", FakeClient)
+    config = RuntimeConfig(
+        api_key="test-key", data_dir=tmp_path, observe_only=True, max_turns=1
+    )
+    runtime.run_bot(config)
+    memory = WorldMemory.load(memory_path)
+    # The campaign has since advanced one block beyond the old request.
+    memory.core_home_position = (48, 16)
+    memory.core_migration_last_position = (48, 16)
+    memory.save(memory_path)
+    if new_request:
+        write_migration_request(request_path, (16, 16))
+    current = make_turn(tick=101, objects=[core(position=(48, 16))])
+
+    runtime.run_bot(config)
+
+    assert WorldMemory.load(memory_path).core_home_position == (
+        (16, 16) if new_request else (48, 16)
+    )
 
 
 @pytest.mark.parametrize("error", ("TICK_MISMATCH", "COMMAND_WINDOW_CLOSED"))

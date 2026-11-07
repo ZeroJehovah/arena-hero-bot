@@ -365,7 +365,8 @@ def test_real_settlement_enters_in_pairs_then_kills_both_overlapped_targets(tmp_
     assert encounter.core["hp"] == encounter.core["shield"] == 5
 
 
-def test_failed_actual_arrival_never_gets_a_late_solo_ingress():
+@pytest.mark.parametrize("failed_count", [1, 3])
+def test_failed_actual_arrival_never_gets_a_late_solo_ingress(failed_count):
     strategy, _, _ = _start()
     turn, context = _at_stage(strategy)
     strategy._prepare_counterattack(context)
@@ -374,15 +375,26 @@ def test_failed_actual_arrival_never_gets_a_late_solo_ingress():
     for actor in friends:
         if actor["id"] in operation.slots:
             actor["position"] = list(operation.slots[actor["id"]].firing)
-    key = next(iter(operation.slots))
-    next(o for o in friends if o["id"] == key)["position"] = list(
-        operation.slots[key].stage
-    )
+    failed = set(list(operation.slots)[:failed_count])
+    for key in failed:
+        next(o for o in friends if o["id"] == key)["position"] = list(
+            operation.slots[key].stage
+        )
     turn = make_turn(tick=102, objects=[core(), *friends, *_foes()])
     context = _context(strategy, turn)
     strategy._prepare_counterattack(context)
-    assert strategy.memory.counterattack.operation is None
-    assert not turn.plan.unit_actions
+    assert not any(UUID(key) in turn.plan.unit_actions for key in failed)
+    if failed_count == 3:
+        assert strategy.memory.counterattack.operation is None
+        assert not turn.plan.unit_actions
+    else:
+        assert strategy.memory.counterattack.operation is not None
+        assert not failed & operation.slots.keys()
+        assert len(turn.plan.unit_actions) == 5
+        assert all(action.type == "SHOOT" for action in turn.plan.unit_actions.values())
+        encounter = Encounter(friends, _foes(), resources=0)
+        encounter.settle(turn.plan, {})
+        assert encounter.kills == 2
 
 
 def test_full_planner_preserves_counterattack_and_stationary_worker_service():

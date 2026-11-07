@@ -110,7 +110,12 @@ def test_full_parked_core_clears_cargo_then_builds_before_reopening_delivery():
             assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def test_actual_layered_planning_does_not_suppress_full_bank_production():
+@pytest.mark.parametrize(
+    "enemy_y, expected_type", [(-7, UnitType.RANGER), (-9, UnitType.WORKER)]
+)
+def test_actual_layered_planning_does_not_suppress_full_bank_production(
+    enemy_y, expected_type
+):
     strategy = campaign_strategy()
     guards = [unit(20 + n, "RANGER", position=(n - 3, -3)) for n in range(8)]
     strategy.memory.unit_roles = {guard["id"]: "defense" for guard in guards}
@@ -121,7 +126,7 @@ def test_actual_layered_planning_does_not_suppress_full_bank_production():
             unit(2, "WORKER", position=(0, 2), cargo=1),
             unit(3, "WORKER", position=(1, 2), cargo=1),
             *guards,
-            unit(90, "RANGER", controlled=False, position=(0, -7)),
+            unit(90, "RANGER", controlled=False, position=(0, enemy_y)),
         ],
     )
     assert turn.core is not None
@@ -132,7 +137,7 @@ def test_actual_layered_planning_does_not_suppress_full_bank_production():
     assert strategy.memory.layered_defense_posts
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "SPAWN"
-    assert turn.plan.core_action.unit_type is UnitType.WORKER
+    assert turn.plan.core_action.unit_type is expected_type
 
 
 def test_queue_head_uses_walkable_distance_around_rocks():
