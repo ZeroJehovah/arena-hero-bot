@@ -4516,6 +4516,29 @@ class AggressiveStrategy:
             distance = distances.get(unit.position)
             if (
                 loaded_worker
+                and self._stationary_core_traffic(context)
+                and manhattan(unit.position, core.position) > CORE_TRAFFIC_RADIUS
+            ):
+                # Remote cargo needs a safe route prefix, not a free local
+                # queue slot or proof of a complete route hundreds of cells
+                # away. Only this step consumes capacity; local arbitration
+                # takes over once the Worker enters the traffic radius.
+                if self._move(
+                    unit,
+                    core.position,
+                    context,
+                    reason="return carried resources toward the Core queue",
+                    allow_goal=True,
+                    progress_distances=distances,
+                    avoid_recent=False,
+                ):
+                    return True
+                self._record_wait(
+                    unit, context, "no safe progress toward the Core queue"
+                )
+                return True
+            if (
+                loaded_worker
                 and distance is not None
                 and distance > 0
                 and self._stationary_core_traffic(context)
@@ -7752,6 +7775,27 @@ class AggressiveStrategy:
                     for cell, (_tick, damage) in self.memory.incoming_damage.items()
                     if damage >= ranger.hp
                 },
+            )
+            # A full friendly cell is temporary capacity, not terrain. Keep
+            # steps on a route that actually approaches the post; otherwise
+            # routing around only the first full neighbor sends the Ranger
+            # backwards, then straight back when that blocker is two cells
+            # away. Rock detours still shorten this walking distance.
+            distances = {goal: 0}
+            frontier = deque([goal])
+            while (
+                frontier and ranger.position not in distances and len(distances) < 512
+            ):
+                cell = frontier.popleft()
+                for neighbor in adjacent_positions(cell):
+                    if neighbor in distances or neighbor in blockers:
+                        continue
+                    distances[neighbor] = distances[cell] + 1
+                    frontier.append(neighbor)
+                    if len(distances) >= 512:
+                        break
+            blockers = overlay_blockers(
+                blockers,
                 {
                     cell
                     for cell in adjacent_positions(ranger.position)
@@ -7759,7 +7803,13 @@ class AggressiveStrategy:
                 },
             )
             direction = next_step(
-                ranger.position, goal, blocked=blockers, max_expansions=512
+                ranger.position,
+                goal,
+                blocked=blockers,
+                max_expansions=512,
+                progress_distances=(
+                    distances if ranger.position in distances else None
+                ),
             )
             if direction is not None:
                 destination = add(ranger.position, direction)

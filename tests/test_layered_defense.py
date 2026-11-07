@@ -302,6 +302,62 @@ def test_recent_incoming_fire_keeps_a_current_winning_volley():
     assert encounter.losses == 1
 
 
+def test_blocked_post_waits_for_capacity_then_advances_without_backtracking():
+    strategy = _strategy({object_id(2): "defense"})
+    position = (-2, 1)
+    for tick in range(100, 104):
+        crowded = tick < 103
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(position=(0, 5)),
+                unit(2, "RANGER", position=position),
+                unit(3, "RANGER", position=(-1, 1)),
+                unit(4, "RANGER", position=(-1, 1) if crowded else (3, 4)),
+                unit(50, "RANGER", controlled=False, position=(5, -2)),
+            ],
+            obstacles=[(-2, 0), (-2, 2)],
+        )
+        context = _context(strategy, turn)
+        context.layered_assignments = {UUID(int=2): (0, 0)}
+
+        strategy._prepare_layered_steps(
+            context,
+            tuple(e for e in turn.visible_enemies if isinstance(e, UnitView)),
+        )
+        strategy._move_layered_ranger(turn.rangers[0], context)
+
+        action = turn.plan.unit_actions.get(UUID(int=2))
+        if action is not None and action.type == "MOVE":
+            position = add(position, action.direction)
+        assert position == ((-2, 1) if crowded else (-1, 1))
+        assert strategy._predicted_friendly_occupancy(position, context) <= 2
+
+
+def test_post_route_can_temporarily_increase_geometric_distance_around_rocks():
+    strategy = _strategy({object_id(2): "defense"})
+    turn = make_turn(
+        objects=[
+            core(position=(0, 5)),
+            unit(2, "RANGER"),
+            unit(50, "RANGER", controlled=False, position=(8, 0)),
+        ],
+        obstacles=[(1, 0), (0, -1), (0, 1)],
+    )
+    context = _context(strategy, turn)
+    context.layered_assignments = {UUID(int=2): (2, 0)}
+
+    strategy._prepare_layered_steps(
+        context,
+        tuple(e for e in turn.visible_enemies if isinstance(e, UnitView)),
+    )
+    strategy._move_layered_ranger(turn.rangers[0], context)
+
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert isinstance(action, MoveAction)
+    assert action.direction is Direction.LEFT
+
+
 def test_retreat_state_survives_restart_and_resets_with_core(tmp_path):
     strategy = _strategy()
     memory = strategy.memory

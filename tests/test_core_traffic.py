@@ -175,6 +175,109 @@ def test_distant_cargo_keeps_closing_outside_the_local_traffic_radius():
     assert settled_positions(turn)[turn.workers[-1].id] == (19, 0)
 
 
+@pytest.mark.parametrize("start_distance", [20, 600])
+def test_distant_cargo_returns_while_every_local_queue_slot_is_full(start_distance):
+    strategy = AggressiveStrategy(WorldMemory())
+    position = (start_distance, 0)
+    queue_cells = [
+        (x, y) for x in range(-4, 5) for y in range(-4, 5) if 0 < abs(x) + abs(y) <= 4
+    ]
+    guards = [
+        unit(100 + 2 * index + slot, "RANGER", position=cell)
+        for index, cell in enumerate(queue_cells)
+        for slot in range(2)
+    ]
+    for tick in range(100, 112):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(),
+                unit(2, "WORKER", cargo=1),
+                unit(3, "WORKER", position=position, cargo=1),
+                *guards,
+            ],
+        )
+        context = context_for(turn)
+        context.core_service_action = "DEPOSIT"
+        context.core_traffic_collecting = True
+        worker = turn.workers[-1]
+
+        strategy._decide_worker(worker, context)
+        strategy._resolve_core_traffic(context)
+
+        assert context.core_inbound_id is None
+        assert not context.standing_reserved
+        assert settled_positions(turn)[worker.id] == (position[0] - 1, 0)
+        position = settled_positions(turn)[worker.id]
+    assert position == (start_distance - 12, 0)
+
+
+def test_returning_cargo_does_not_override_local_queue_capacity():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(5, 0), cargo=1),
+            unit(3, "RANGER", position=(4, 0)),
+            unit(4, "RANGER", position=(4, 0)),
+        ],
+        obstacles=[(x, y) for x in range(-1, 8) for y in (-1, 1)],
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    context = context_for(turn)
+    context.core_service_action = "DEPOSIT"
+    context.core_traffic_collecting = True
+    for ranger in turn.rangers:
+        ranger.shoot_cell((7, 0))
+
+    strategy._decide_worker(turn.workers[0], context)
+    strategy._resolve_core_traffic(context)
+
+    assert settled_positions(turn)[turn.workers[0].id] == (5, 0)
+
+
+@pytest.mark.parametrize("remembered", [False, True])
+def test_remote_return_keeps_rocks_and_combat_exclusion(remembered):
+    strategy = AggressiveStrategy(WorldMemory())
+    enemy = unit(90, "RANGER", controlled=False, position=(40, 0))
+    strategy.memory.observe(make_turn(tick=99, objects=[core(), enemy]))
+    position = (50, 0)
+    for tick in range(100, 112):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(),
+                unit(2, "WORKER", position=position, cargo=1),
+                *([] if remembered else [enemy]),
+            ],
+            obstacles=[(49, 0)],
+        )
+        strategy.memory.observe(turn)
+        context = context_for(turn)
+        context.core_service_action = "DEPOSIT"
+
+        strategy._decide_worker(turn.workers[0], context)
+
+        position = settled_positions(turn)[turn.workers[0].id]
+        assert abs(position[0] - 40) + abs(position[1]) > 6
+        assert position != (49, 0)
+        assert context.core_inbound_id is None
+    assert abs(position[0]) + abs(position[1]) < 50
+
+
+def test_remote_return_waits_when_every_exit_is_a_rock():
+    turn = make_turn(
+        objects=[core(), unit(2, "WORKER", position=(600, 0), cargo=1)],
+        obstacles=[(599, 0), (601, 0), (600, -1), (600, 1)],
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    context = context_for(turn)
+    context.core_service_action = "DEPOSIT"
+
+    strategy._decide_worker(turn.workers[0], context)
+
+    assert settled_positions(turn)[turn.workers[0].id] == (600, 0)
+
+
 @pytest.mark.parametrize("reason", ["combat shot", "heal", "harvest"])
 def test_chain_never_overrides_committed_combat_or_service(reason):
     turn = make_turn(
