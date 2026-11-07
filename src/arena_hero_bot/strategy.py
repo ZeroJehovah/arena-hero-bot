@@ -8947,7 +8947,11 @@ class AggressiveStrategy:
                 if (
                     self._patrol_team_from_role(role) is not None
                     and live_units[unit_id].unit_type is UnitType.VANGUARD
+                    and not self.config.campaign_mode
                 ):
+                    # Campaign recalls transfer every surviving member into
+                    # patrol, including legacy Vanguards. They are never new
+                    # expedition recruits or part of the Ranger build quota.
                     roles[unit_id] = STAGED_ROLE
 
         def candidate_key(unit_id: str) -> tuple[object, ...]:
@@ -9008,9 +9012,20 @@ class AggressiveStrategy:
                 ),
                 key=lambda value: UUID(value).bytes,
             )
-            for index, unit_id in enumerate(surplus_rangers):
-                team = SYMMETRIC_PATROL_TEAM_COUNT + index // PATROL_TEAM_RANGERS + 1
+            counts: dict[int, int] = {}
+            for unit_id, role in roles.items():
+                team = self._patrol_team_from_role(role)
+                if (
+                    team is not None
+                    and live_units[unit_id].unit_type is UnitType.RANGER
+                ):
+                    counts[team] = counts.get(team, 0) + 1
+            team = SYMMETRIC_PATROL_TEAM_COUNT + 1
+            for unit_id in surplus_rangers:
+                while counts.get(team, 0) >= PATROL_TEAM_RANGERS:
+                    team += 1
                 roles[unit_id] = f"{PATROL_ROLE_PREFIX}{team}"
+                counts[team] = counts.get(team, 0) + 1
 
         for unit_id in sorted(
             live_ids - set(roles), key=lambda value: UUID(value).bytes
@@ -10940,8 +10955,8 @@ class AggressiveStrategy:
         obstacles: set[Position],
         resources: set[Position],
         occupied: set[Position],
-    ) -> Position:
-        """Return one center cell in ``position``'s block, never an old home."""
+    ) -> Position | None:
+        """Return a reachable center in ``position``'s block, never an old home."""
 
         centers = sorted(
             _resource_block_center_cells(position),
@@ -10957,11 +10972,9 @@ class AggressiveStrategy:
             (
                 cell
                 for cell in centers
-                if cell not in obstacles
-                and cell not in resources
-                and cell not in occupied
+                if self._has_core_static_route(position, cell, obstacles)
             ),
-            next((cell for cell in centers if cell not in obstacles), centers[0]),
+            None,
         )
 
     @staticmethod
@@ -10970,7 +10983,7 @@ class AggressiveStrategy:
         target: Position,
         obstacles: Container[Position],
     ) -> bool:
-        """Return whether a Core can reach a target without clearing resources."""
+        """Return whether a Core can reach a target through permanent terrain."""
 
         if target in obstacles:
             return False
@@ -11023,13 +11036,29 @@ class AggressiveStrategy:
             if preferred_target is not None
             else None
         )
-        blocks = (current_block, *cardinal_block_neighbors(current_block))
+        emergency = (
+            self.config.campaign_mode
+            and preferred_target is not None
+            and preferred_target == self.memory.campaign_emergency_target
+        )
+        if emergency and preferred_block is not None:
+            # The escape was authorized without a combat formation. Repair
+            # only that block; terrain cannot authorize another lateral hop.
+            if preferred_block != current_block and (
+                preferred_block not in cardinal_block_neighbors(current_block)
+                or resource_block_quota(preferred_block) > current_quota
+            ):
+                return None
+            blocks = (preferred_block,)
+        else:
+            blocks = (current_block, *cardinal_block_neighbors(current_block))
         candidates: list[tuple[int, int, int, int, int, Position]] = []
         for block in blocks:
             adjacent = block != current_block
             if (
                 adjacent
                 and self.config.campaign_mode
+                and not emergency
                 and (
                     movement_cap is None
                     or current_quota > movement_cap
@@ -11041,6 +11070,7 @@ class AggressiveStrategy:
             if (
                 adjacent
                 and self.config.campaign_mode
+                and not emergency
                 and block != preferred_block
                 and (
                     ring_delta >= 0
@@ -11100,29 +11130,50 @@ class AggressiveStrategy:
     ) -> Position | None:
         """Replace an unreachable home or release the Core from the wait."""
 
+        previous = self.memory.core_home_position
+        migration_origin = self.memory.core_migration_start_position or origin
+        emergency = (
+            previous is not None and previous == self.memory.campaign_emergency_target
+        )
         target = self._reachable_home_target(
             turn,
             origin,
-            preferred_target=self.memory.core_home_position,
+            preferred_target=previous,
         )
+        if emergency:
+            self.memory.campaign_emergency_target = target
+            if target is None:
+                self.memory.campaign_emergency_started_tick = 0
         if target is None:
             self.memory.core_home_position = None
             self.memory.core_migration_start_position = None
             self._reset_core_migration_progress()
             return None
         self._set_campaign_hop_target(target)
+        # Replacing the destination mid-hop must keep the economy's original
+        # source block, including after the Core crosses the block boundary.
+        self.memory.core_migration_start_position = migration_origin
         return target
 
     def _repair_campaign_home(self, turn: Turn, core: Core) -> None:
         """Discard a stale positional target after a restart or location jump."""
 
-        from .migration import blocks_are_cardinally_adjacent, resource_block_index
+        from .migration import (
+            blocks_are_cardinally_adjacent,
+            resource_block_index,
+            resource_block_quota,
+        )
 
         previous = self.memory.core_migration_last_position
         jumped = previous is not None and manhattan(previous, core.position) > 1
         if jumped:
             self.memory.core_migration_steps_since_pause = 0
         home = self.memory.core_home_position
+        if self.memory.campaign_emergency_target is not None and (
+            self.memory.campaign_emergency_target != home or jumped
+        ):
+            self.memory.campaign_emergency_target = None
+            self.memory.campaign_emergency_started_tick = 0
         if home is not None:
             if home == self.memory.campaign_emergency_target:
                 # The emergency hop is deliberately outside the formation
@@ -11133,9 +11184,18 @@ class AggressiveStrategy:
                 # map.
                 current_block = resource_block_index(core.position)
                 home_block = resource_block_index(home)
-                if current_block == home_block or blocks_are_cardinally_adjacent(
-                    current_block, home_block
+                if home in _resource_block_center_cells(home) and (
+                    current_block == home_block
+                    or (
+                        blocks_are_cardinally_adjacent(current_block, home_block)
+                        and resource_block_quota(home_block)
+                        <= resource_block_quota(current_block)
+                    )
                 ):
+                    if not self._has_core_static_route(
+                        core.position, home, self._rock_map(turn)
+                    ):
+                        self._repair_unreachable_home_target(turn, core.position)
                     return
                 self.memory.campaign_emergency_target = None
                 self.memory.campaign_emergency_started_tick = 0
@@ -11143,8 +11203,6 @@ class AggressiveStrategy:
             home_block = resource_block_index(home)
             same_block = current_block == home_block
             adjacent_block = blocks_are_cardinally_adjacent(current_block, home_block)
-            from .migration import resource_block_quota
-
             movement_cap = self._campaign_movement_cap(turn)
             current_quota = resource_block_quota(current_block)
             adjacent_allowed = (
@@ -11167,6 +11225,12 @@ class AggressiveStrategy:
                 and resource_block_index(previous) != current_block
             )
             if valid and not block_changed:
+                # A partial A* route can still point toward a distant sealed
+                # center. Validate before combat/service can skip movement.
+                if not self._has_core_static_route(
+                    core.position, home, self._rock_map(turn)
+                ):
+                    self._repair_unreachable_home_target(turn, core.position)
                 return
         target = self._reachable_home_target(
             turn,
@@ -11965,8 +12029,6 @@ class AggressiveStrategy:
     def _commit_symmetric_home(self, target: Position | None) -> None:
         """Commit one layout migration without changing combat identities."""
 
-        if target is None:
-            return
         self.memory.core_home_position = target
         self.memory.core_layout_version = CORE_LAYOUT_VERSION
         self._reset_core_migration_progress()
@@ -12034,6 +12096,10 @@ class AggressiveStrategy:
         if core is None:
             return None
         target = self.memory.core_home_position
+        if target is None and self.config.campaign_mode:
+            # Campaign observation already validates/publishes the target.
+            # Do not undo a canceled hop later in the same plan.
+            return None
         obstacles = self._rock_map(context.turn)
         if target is None or target in obstacles:
             target = self._repair_unreachable_home_target(
@@ -12874,9 +12940,9 @@ class AggressiveStrategy:
                 )
                 self.memory.set_goal(unit_id, goal)
                 return candidate
-        # Every anchor disc is already covered: walk the remaining gaps between
-        # them.  Without this an arrived Ranger simply holds its anchor and the
-        # sweep can stall above the blind-cell allowance.
+        # The anchor pass could find no useful reachable post. Sweep remaining
+        # unseen cells, including those near a blocked or unreachable anchor;
+        # a hypothetical view from that anchor is not observed coverage.
         for cell in self._campaign_scout_gaps(turn, target, obstacles, target_cells):
             if cell in claimed:
                 continue
@@ -12907,7 +12973,7 @@ class AggressiveStrategy:
         obstacles: set[Position],
         target_cells: Iterable[Position],
     ) -> tuple[Position, ...]:
-        """Return unseen cells that no fixed anchor disc can reveal."""
+        """Return all unseen cells, prioritizing gaps between anchor discs."""
 
         cached = self._scout_gap_cache
         if cached is not None and cached[0] == turn.tick and cached[1] == target:
@@ -12926,15 +12992,13 @@ class AggressiveStrategy:
             anchor_view |= visible_cells(anchor, RANGER_VISION_RADIUS, obstacles)
         started = self.memory.campaign_scout_started_tick
         seen = self.memory.campaign_scout_seen_ticks
-        gaps = [
-            cell
-            for cell in target_cells
-            if seen.get(cell, -1) < started and cell not in anchor_view
-        ]
-        # Deepest gaps first: they are farthest from every anchor, so a Ranger
-        # standing there reveals cells no anchor disc can reach.
+        gaps = [cell for cell in target_cells if seen.get(cell, -1) < started]
+        # Deep gaps retain priority, but an unusable anchor must not hide its
+        # unseen neighborhood from the fallback. Actual movement still checks
+        # terrain, reachability and same-Tick capacity in the caller.
         gaps.sort(
             key=lambda cell: (
+                cell in anchor_view,
                 -min(manhattan(cell, anchor) for anchor in anchors),
                 cell,
             )

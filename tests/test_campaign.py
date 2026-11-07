@@ -253,6 +253,65 @@ def test_campaign_repairs_a_blocked_adjacent_center_in_the_same_block() -> None:
     assert turn.plan.core_action.direction.value == "RIGHT"
 
 
+@pytest.mark.parametrize("under_pressure", [False, True])
+@pytest.mark.parametrize("fresh_core", [False, True])
+def test_campaign_revalidates_distant_centers_before_planning(
+    under_pressure, fresh_core
+):
+    origin = (-1104, -17) if not fresh_core else (-1086, -17)
+    target = (-1072, -17) if not fresh_core else (-1073, -17)
+    rocks = {
+        (target[0] + dx, target[1] + dy)
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
+    }
+    core_object = core(9, position=origin)
+    workers, rangers, roles = _max_roster()
+    memory = (
+        WorldMemory()
+        if fresh_core
+        else WorldMemory(
+            core_home_position=target,
+            core_layout_version=CORE_LAYOUT_VERSION,
+            core_migration_last_position=origin,
+            core_migration_start_position=origin,
+            campaign_phase=CAMPAIGN_PHASE_STAGE4,
+            campaign_target_quota=8,
+            campaign_last_core_id=core_object["id"],
+            unit_roles=roles,
+            unit_roles_initialized=True,
+        )
+    )
+    turn = make_turn(
+        objects=[
+            core_object,
+            *workers,
+            *rangers,
+            *(
+                [
+                    unit(
+                        900,
+                        "RANGER",
+                        controlled=False,
+                        position=(origin[0], origin[1] + 4),
+                    )
+                ]
+                if under_pressure
+                else []
+            ),
+        ],
+        obstacles=rocks,
+    )
+
+    _strategy(memory).decide(turn)
+
+    replacement = memory.core_home_position
+    assert replacement is not None and replacement != target
+    assert resource_block_index(replacement) == resource_block_index(target)
+    assert next_step(origin, replacement, blocked=rocks, require_path=True) is not None
+    if not fresh_core:
+        assert memory.core_migration_start_position == origin
+
+
 def test_explicit_quota_plan_publishes_one_adjacent_hop() -> None:
     memory = WorldMemory(core_home_position=(-2033, -2929))
 
@@ -324,6 +383,36 @@ def test_new_core_keeps_its_own_chunk_when_every_center_is_temporarily_busy() ->
     assert resource_block_index(memory.core_home_position) == resource_block_index(
         current_core["position"]
     )
+
+
+@pytest.mark.parametrize("layout_version", [0, CORE_LAYOUT_VERSION])
+def test_new_core_releases_migration_when_all_spawn_centers_are_sealed(layout_version):
+    origin = (-1740, -1900)
+    centers = {(-1745, -1905), (-1744, -1905), (-1745, -1904), (-1744, -1904)}
+    rocks = {
+        (x + dx, y + dy)
+        for x, y in centers
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
+    } - centers
+    memory = WorldMemory(
+        core_home_position=(-2033, -2929),
+        core_layout_version=layout_version,
+        core_migration_start_position=(-2065, -2929),
+        core_arrival_destination=(-2034, -2929),
+        core_arrival_worker_id=object_id(2),
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_last_core_id=object_id(1),
+    )
+    turn = make_turn(objects=[core(9, position=origin)], obstacles=rocks)
+
+    _strategy(memory).decide(turn)
+
+    assert memory.core_home_position is None
+    assert memory.core_layout_version == CORE_LAYOUT_VERSION
+    assert memory.core_migration_start_position is None
+    assert memory.core_arrival_destination is None
+    assert memory.core_arrival_worker_id is None
+    assert turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
 
 
 def test_core_respawn_event_resets_even_with_replayed_uuid() -> None:
@@ -1422,6 +1511,10 @@ def test_max_formation_migration_does_not_spawn_below_a_full_bank() -> None:
     center = (-945, -945)
     core_object = core(position=center)
     workers, rangers, roles = _max_roster()
+    # Keep the formation local so the spending assertion is independent of
+    # thousands of cells of return-path search under coverage instrumentation.
+    for index, actor in enumerate([*workers, *rangers]):
+        actor["position"] = [center[0] + 2 + index % 8, center[1] + 2 + index // 8]
     memory = WorldMemory(
         core_home_position=(-913, -945),
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -1918,6 +2011,67 @@ def test_campaign_rock_repair_cannot_sidestep_or_skip_forward_scout(phase):
     assert memory.core_migration_start_position is None
 
 
+@pytest.mark.parametrize("blocked_anchor", [False, True])
+def test_scout_finishes_observable_blind_cells_beside_a_blocked_anchor(blocked_anchor):
+    center, target, anchor = (815, 15), (783, 15), (772, 4)
+    obstacles = {anchor} if blocked_anchor else set()
+    unseen = {
+        (anchor[0] + dx, anchor[1] + dy)
+        for dx in range(-2, 3)
+        for dy in range(-2, 3)
+        if 0 < abs(dx) + abs(dy) <= 2
+    }
+    workers, rangers, roles = _max_roster()
+    scout = rangers[-1]
+    scout["position"] = [776, 8]
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_scout_target=target,
+        campaign_scout_started_tick=100,
+        campaign_scout_last_gain_tick=100,
+        campaign_scout_seen_ticks={
+            (x, y): 100
+            for x in range(768, 800)
+            for y in range(32)
+            if (x, y) not in unseen
+        },
+        obstacles=obstacles,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    assert len(unseen) == 12 > len(rangers) // 4
+
+    for tick in range(101, 121):
+        turn = make_turn(
+            tick=tick,
+            objects=[core(position=center), *workers, *rangers],
+            obstacles=obstacles,
+        )
+        memory.observe(turn)
+        strategy._update_campaign_scout(turn)
+        if tick == 101:
+            assert memory.campaign_scout_target == target
+        if memory.campaign_scout_target is None:
+            break
+        ranger = next(actor for actor in turn.rangers if str(actor.id) == scout["id"])
+        goal = strategy._campaign_scout_goal(ranger, turn)
+        assert goal != ranger.position
+        assert goal not in obstacles
+        assert unseen & visible_cells(goal, RANGER_VISION_RADIUS, obstacles)
+        step = next_step(ranger.position, goal, blocked=obstacles, require_path=True)
+        assert step is not None
+        # Observe only the actual one-cell move on the next Tick. Choosing a
+        # waypoint must never itself satisfy the coverage gate.
+        scout["position"] = list(add(ranger.position, step))
+
+    assert memory.campaign_scout_target is None
+    assert memory.core_home_position == target
+
+
 def test_campaign_scout_reaches_a_far_corner_outside_the_combat_leash() -> None:
     """A full block sweep may cross the generic 60-cell patrol leash."""
 
@@ -2166,6 +2320,81 @@ def test_max_formation_assigns_every_extra_ranger_to_patrol() -> None:
     assert strategy._campaign_spawn_candidates(turn) == (UnitType.RANGER,)
 
 
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("restart", [False, True])
+def test_incremental_patrol_recruits_fill_stable_pairs(
+    tmp_path: Path, batch_size: int, restart: bool
+) -> None:
+    workers, rangers, roles = _max_roster()
+    roles = {uid: role for uid, role in roles.items() if role != "staged"}
+    memory = WorldMemory(
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        unit_roles=roles.copy(),
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    objects = [core(position=(15, 15)), *workers, *rangers]
+    path = tmp_path / "memory.json"
+    for offset in range(0, 6, batch_size):
+        previous = memory.unit_roles.copy()
+        objects.extend(
+            unit(2000 - index, "RANGER", position=(20 + index, 10))
+            for index in range(offset, offset + batch_size)
+        )
+        strategy._update_expeditions(make_turn(tick=100 + offset, objects=objects))
+        assert all(memory.unit_roles[uid] == role for uid, role in previous.items())
+        assert not memory.expedition_squads
+        if restart:
+            memory.save(path)
+            memory = WorldMemory.load(path)
+            strategy = _strategy(memory)
+
+    patrol_sizes = [
+        sum(role == team for role in memory.unit_roles.values())
+        for team in ("patrol-5", "patrol-6", "patrol-7")
+    ]
+    assert patrol_sizes == [2, 2, 2]
+    assert all(memory.unit_roles[uid] == role for uid, role in roles.items())
+
+
+def test_surplus_patrol_recruit_fills_a_casualty_without_reshuffling() -> None:
+    workers, rangers, roles = _max_roster()
+    roles = {uid: role for uid, role in roles.items() if role != "staged"}
+    extra = [
+        unit(2000 + index, "RANGER", position=(20 + index, 10)) for index in range(4)
+    ]
+    roles.update(
+        {
+            object_id(2000): "patrol-5",
+            object_id(2001): "patrol-5",
+            object_id(2002): "patrol-6",
+            object_id(2003): "patrol-6",
+        }
+    )
+    memory = WorldMemory(
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        unit_roles=roles.copy(),
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    turn = make_turn(
+        objects=[
+            core(position=(15, 15)),
+            *workers,
+            *rangers,
+            *extra[1:],
+            unit(1999, "RANGER", position=(21, 11)),
+        ]
+    )
+
+    strategy._update_expeditions(turn)
+
+    assert memory.unit_roles == {
+        **{uid: role for uid, role in roles.items() if uid != object_id(2000)},
+        object_id(1999): "patrol-5",
+    }
+
+
 def test_forward_patrols_are_all_recalled_when_the_defense_ring_is_hit() -> None:
     center = (15, 15)
     core_object = core(position=center)
@@ -2237,10 +2466,13 @@ def test_legacy_expedition_recall_keeps_fighting_before_it_returns() -> None:
     assert memory.unit_roles[str(ranger.id)] == "expedition-7"
 
 
-def test_returned_legacy_expedition_joins_the_patrol_roster() -> None:
+@pytest.mark.parametrize("unit_type", ["RANGER", "VANGUARD"])
+def test_returned_legacy_expedition_joins_the_patrol_roster(
+    tmp_path: Path, unit_type: str
+) -> None:
     center = (15, 15)
     core_object = core(position=center)
-    returned = unit(2000, "RANGER", position=(18, 15))
+    returned = unit(2000, unit_type, position=(18, 15))
     rangers = _rangers(20)
     roles = {str(ranger["id"]): "defense" for ranger in rangers}
     roles[str(returned["id"])] = "expedition-7"
@@ -2260,6 +2492,14 @@ def test_returned_legacy_expedition_joins_the_patrol_roster() -> None:
 
     assert memory.unit_roles[str(returned["id"])].startswith("patrol-")
     assert memory.expedition_squads == []
+    role = memory.unit_roles[str(returned["id"])]
+    path = tmp_path / "memory.json"
+    memory.save(path)
+    resumed = _strategy(WorldMemory.load(path))
+    resumed.decide(make_turn(tick=101, objects=[core_object, *rangers, returned]))
+    assert resumed.memory.unit_roles[str(returned["id"])] == role
+    assert resumed.memory.expedition_squads == []
+    assert resumed._campaign_patrol_rangers(turn) == (unit_type == "RANGER")
 
 
 CLEARANCE_HOME = (-497, 719)
@@ -2464,6 +2704,90 @@ def test_sealed_block_without_combat_units_migrates_away_from_the_danger() -> No
     assert memory.core_home_position == target
     assert turn.plan.core_action is not None
     assert turn.plan.core_action.type == "START_MOVE"
+
+
+@pytest.mark.parametrize("all_centers_sealed", [False, True])
+def test_emergency_migration_repairs_its_own_target_or_releases_it(
+    tmp_path, all_centers_sealed
+):
+    core_object = core(position=CLEARANCE_HOME)
+    workers = _clearance_workers(16)
+    enemies = _sealed_fighters(1)
+    memory = _sealed_memory(core_object, [])
+    strategy = _strategy(memory)
+    first = make_turn(
+        objects=[core_object, *workers, *enemies], resource_cells=CLEARANCE_NODES
+    )
+    strategy.decide(first)
+    target = memory.campaign_emergency_target
+    assert target is not None
+    assert first.plan.core_action is not None
+    assert first.plan.core_action.type == "START_MOVE"
+    arrived = add(CLEARANCE_HOME, first.plan.core_action.direction)
+    core_object["position"] = list(arrived)
+    block = resource_block_index(target)
+    centers = {
+        (block[0] * 32 + x, block[1] * 32 + y) for x in (15, 16) for y in (15, 16)
+    }
+    rocks = (
+        {
+            (x + dx, y + dy)
+            for x, y in centers
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
+        }
+        - centers
+        if all_centers_sealed
+        else {target}
+    )
+    # The old escape remains committed even after the fighters are destroyed;
+    # only new permanent terrain can require replacement or cancellation.
+    changed = make_turn(
+        tick=104,
+        objects=[core_object, *workers],
+        obstacles=rocks,
+        events=[
+            {
+                "event_id": object_id(3000 + i),
+                "tick": 103,
+                "event_type": "UNIT_DESTROYED",
+                "target_id": enemy["id"],
+            }
+            for i, enemy in enumerate(enemies)
+        ],
+    )
+    strategy.decide(changed)
+
+    if all_centers_sealed:
+        assert memory.campaign_emergency_target is None
+        assert memory.campaign_emergency_started_tick == 0
+        assert memory.core_home_position is None
+        assert memory.core_migration_start_position is None
+    else:
+        replacement = memory.campaign_emergency_target
+        assert replacement is not None and replacement != target
+        assert replacement == memory.core_home_position
+        assert resource_block_index(replacement) == block
+        assert memory.campaign_emergency_started_tick == 100
+        assert memory.core_migration_start_position == CLEARANCE_HOME
+        assert (
+            next_step(
+                arrived,
+                replacement,
+                blocked=rocks,
+                require_path=True,
+            )
+            is not None
+        )
+
+    path = tmp_path / "memory.json"
+    memory.save(path)
+    resumed = _strategy(WorldMemory.load(path))
+    resumed.decide(
+        make_turn(tick=105, objects=[core_object, *workers], obstacles=rocks)
+    )
+    assert resumed.memory.campaign_emergency_target == memory.campaign_emergency_target
+    if not all_centers_sealed:
+        assert resumed.memory.core_home_position == memory.core_home_position
 
 
 def test_partially_discovered_block_does_not_trigger_a_clearance() -> None:
