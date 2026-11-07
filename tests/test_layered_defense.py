@@ -474,6 +474,115 @@ def _plan_encounter(strategy, encounter):
     return turn.plan, context
 
 
+@pytest.mark.parametrize("healthy_count", [0, 1, 3])
+@pytest.mark.parametrize("resources", [0, 100])
+def test_depleted_defense_still_withdraws_core_from_direct_fire(
+    healthy_count, resources
+):
+    positions = [(-4, -3), (-3, -4), (3, -4)]
+    friends = [
+        unit(2 + index, "RANGER", position=position)
+        for index, position in enumerate(positions[:healthy_count])
+    ] + [unit(8, "RANGER", position=(0, -4), hp=1)]
+    foes = [
+        unit(50, "RANGER", controlled=False, position=(0, 2)),
+        unit(51, "RANGER", controlled=False, position=(0, 2)),
+    ]
+    encounter = Encounter(friends, foes, resources=resources)
+    encounter.core["shield"] = 2
+    strategy = _strategy({o["id"]: "defense" for o in friends})
+
+    for offset in range(4):
+        turn = encounter.turn()
+        strategy.decide(turn)
+        if offset == 0:
+            assert isinstance(turn.plan.core_action, StartMoveAction)
+            destination = add((0, 0), turn.plan.core_action.direction)
+        encounter.settle(
+            turn.plan,
+            {
+                foe["id"]: {
+                    "type": "SHOOT",
+                    "target_id": object_id(1),
+                    "expected_cell": [0, 0],
+                }
+                for foe in foes
+            },
+        )
+
+    assert tuple(encounter.core["position"]) == destination
+    assert encounter.core["hp"] == 1
+    assert encounter.core["shield"] == 0
+    assert encounter.progress == 0
+
+
+def test_depleted_defense_rejects_a_fatal_core_withdrawal():
+    turn = make_turn(
+        objects=[
+            core(hp=5, shield=0),
+            unit(2, "RANGER", position=(0, -4), hp=1),
+            unit(50, "RANGER", controlled=False, position=(0, 2)),
+            unit(51, "RANGER", controlled=False, position=(0, 2)),
+        ],
+    )
+    strategy = _strategy({object_id(2): "defense"})
+
+    strategy.decide(turn)
+
+    assert not isinstance(turn.plan.core_action, StartMoveAction)
+
+
+def test_wounded_waiter_leaves_a_recent_hit_cell_with_an_unseen_shooter():
+    strategy = _strategy({object_id(2): "defense"})
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, -3), hp=1),
+            unit(3, "RANGER", position=(0, 0)),
+        ],
+        obstacles=[(0, -1)],
+        events=[
+            {
+                "event_id": object_id(900),
+                "tick": 99,
+                "event_type": "UNIT_DAMAGED",
+                "reason_code": "ATTACK",
+                "target_id": object_id(2),
+                "position": [0, -3],
+                "values": {"damage": 1, "hp": 1},
+            }
+        ],
+    )
+    context = _context(strategy, turn)
+
+    strategy._decide_ranger(turn.rangers[0], context, ())
+
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert isinstance(action, MoveAction)
+    assert add((0, -3), action.direction) == (0, -2)
+    assert strategy.memory.incoming_damage[(0, -3)] == (99, 1)
+    encounter = Encounter(
+        [
+            unit(2, "RANGER", position=(0, -3), hp=1),
+            unit(3, "RANGER", position=(0, 0)),
+        ],
+        [unit(50, "RANGER", controlled=False, position=(-2, -3))],
+        resources=0,
+    )
+    encounter.settle(
+        turn.plan,
+        {
+            object_id(50): {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": [0, -3],
+            }
+        },
+    )
+    assert encounter.losses == 0
+    assert encounter.friends[object_id(2)]["hp"] == 1
+
+
 def test_surplus_wounded_shooter_survives_while_healthy_ally_finishes_the_enemy():
     encounter = Encounter(
         [

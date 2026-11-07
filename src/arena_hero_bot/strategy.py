@@ -5480,6 +5480,10 @@ class AggressiveStrategy:
                 and not self._future_attackers_at(
                     unit.position, context.turn, self._rock_map(context.turn)
                 )
+                # An unseen shooter may have just hit this cell. A wounded
+                # waiter must try a safe exit before calling it a healing
+                # shelter; current profitable volleys were handled earlier.
+                and self.memory.incoming_damage.get(unit.position, (-1, 0))[1] < unit.hp
                 and (
                     not self._heal_available(
                         unit, maximum_hp=maximum_hp, context=context
@@ -7484,9 +7488,19 @@ class AggressiveStrategy:
             and manhattan(core.position, ranger.position)
             <= self.config.combat_pursuit_radius
         )
-        if len(allies) < 4 or not enemies:
+        if not enemies:
             return
         obstacles = self._rock_map(context.turn)
+        if (
+            len(allies) < 4
+            and context.core_build_priority
+            and maximum_core_damage((core.position,) * 4, enemies, obstacles)
+            < core.hp + core.shield
+        ):
+            # An affordable emergency defender can end an early isolated
+            # attack. Preserve that production window while the Core can
+            # survive the full movement horizon without leaving it.
+            return
         anchor = memory.layered_defense_anchor or core.position
         sides = threatened_sides(anchor, enemies)
         breached: set[Direction] = set()
@@ -7557,6 +7571,11 @@ class AggressiveStrategy:
             if memory.layered_defense_anchor != new_anchor:
                 memory.layered_defense_ready_sides.clear()
             memory.layered_defense_anchor = new_anchor
+        # Four healthy Rangers are needed to form two ranks, not to save a
+        # directly threatened Core. Evaluate the bounded withdrawal first,
+        # including when the surviving defenders are wounded or gone.
+        if len(allies) < 4:
+            return
         # During the four-Tick Core move retain world-coordinate firing
         # positions. On arrival the old rear becomes the new front; only the
         # vacated rear rank is built anew.
