@@ -1,5 +1,8 @@
 """Cargo keeps making safe progress while the Core's service queue moves."""
 
+from collections import Counter
+from uuid import UUID
+
 import pytest
 
 from arena_hero_bot.geometry import add, manhattan
@@ -219,3 +222,97 @@ def test_migration_waiters_share_an_off_route_cell_when_no_progress_is_safe():
         strategy._decide_worker(worker, context)
         action = turn.plan.unit_actions.get(worker.id)
         assert action is None or action.type == "WAIT"
+
+
+@pytest.mark.parametrize("moving", [False, True])
+def test_queueing_cargo_routes_through_the_core_cell_in_full_planning(moving):
+    turn = make_turn(
+        objects=[
+            moving_core() if moving else core(),
+            unit(2, "WORKER", position=(1, 0), cargo=1),
+            unit(3, "WORKER", position=(-2, 2), cargo=1),
+        ],
+        obstacles=[(-1, 1), (-1, 2), (-1, 3), (-3, 2)],
+    )
+    strategy = AggressiveStrategy(
+        WorldMemory(
+            core_home_position=(16, 0), core_layout_version=CORE_LAYOUT_VERSION
+        ),
+        StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
+    )
+
+    # Full planning installs standing blockers that a bare context omits.
+    # The queue endpoint is vacant; its shortest route crosses the moving
+    # Core's current cell, which must not block an earlier, empty step.
+    report = strategy.decide(turn)
+    action = turn.plan.unit_actions.get(UUID(int=3))
+    assert action is not None and action.type == "MOVE"
+    assert add((-2, 2), action.direction) == (-2, 1)
+    decision = next(d for d in report.decisions if d.actor_id == str(UUID(int=3)))
+    assert decision.target == (2, 0)
+
+
+def test_queued_cargo_catches_moving_core_and_delivers_across_restart(tmp_path):
+    memory = WorldMemory(
+        core_home_position=(16, 0), core_layout_version=CORE_LAYOUT_VERSION
+    )
+    config = StrategyConfig(
+        target_workers=16, max_population=None, expedition_mode=True
+    )
+    strategy = AggressiveStrategy(memory, config)
+    core_position = (0, 0)
+    destination = (1, 0)
+    progress = 1
+    positions = {2: (1, 0), 3: (-2, 2)}
+    cargo = {2: 1, 3: 1}
+    delivered = []
+    for tick in range(100, 124):
+        turn = make_turn(
+            tick=tick,
+            resources=len(delivered),
+            objects=[
+                core(
+                    position=core_position,
+                    state="MOVING" if progress else "NORMAL",
+                    move_direction="RIGHT" if progress else None,
+                    move_progress=progress if progress else None,
+                    move_required_ticks=4 if progress else None,
+                    destination=list(destination) if progress else None,
+                ),
+                *(
+                    unit(i, "WORKER", position=positions[i], cargo=cargo[i])
+                    for i in positions
+                ),
+            ],
+            obstacles=[(-1, 1), (-1, 2), (-1, 3), (-3, 2)],
+        )
+        strategy.decide(turn)
+        for ident in positions:
+            action = turn.plan.unit_actions.get(UUID(int=ident))
+            if tick == 100 and ident == 3:
+                assert action is not None and action.type == "MOVE"
+            if action is None:
+                continue
+            if action.type == "MOVE":
+                positions[ident] = add(positions[ident], action.direction)
+            elif action.type == "DEPOSIT":
+                assert progress == 0 and positions[ident] == core_position
+                assert turn.plan.core_action is None
+                cargo[ident] = 0
+                delivered.append(ident)
+        if progress:
+            progress += 1
+            if progress == 4:
+                core_position = destination
+                progress = 0
+        elif turn.plan.core_action and turn.plan.core_action.type == "START_MOVE":
+            destination = add(core_position, turn.plan.core_action.direction)
+            progress = 1
+        assert max(Counter([core_position, *positions.values()]).values()) <= 2
+        if tick == 102:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), config)
+        if len(delivered) == 2:
+            break
+    assert delivered == [2, 3]

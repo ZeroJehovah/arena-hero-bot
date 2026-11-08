@@ -3316,7 +3316,7 @@ class AggressiveStrategy:
                         self._record_wait(
                             worker,
                             context,
-                            "hold outside the full Core forward queue",
+                            "wait for safe progress to the Core forward queue",
                         )
                         return
             if (
@@ -6217,11 +6217,19 @@ class AggressiveStrategy:
     ) -> bool:
         if unit.position == goal:
             return False
+        # A queue endpoint reserves a standing slot, but cargo may transit
+        # the migrating Core's current cell on its way there. Its capacity
+        # and arrival ownership are checked only when taking that step.
         use_standing_blockers = (
             intent is _MoveIntent.STAND
             and context.turn.core is not None
             and goal != context.turn.core.position
             and unit.position != context.turn.core.position
+            and not (
+                isinstance(unit, Worker)
+                and unit.cargo > 0
+                and context.core_migration_lane
+            )
         )
         if context.dynamic_blockers is not None:
             if isinstance(unit, Worker):
