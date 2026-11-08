@@ -74,35 +74,34 @@ def test_arrival_worker_waits_at_a_full_entrance_then_delivers_after_restart(tmp
 
 def test_migration_cargo_takes_a_real_rock_detour_without_reversing():
     strategy = AggressiveStrategy(WorldMemory())
-    position = (0, 1)
+    position = (1, 2)
     visited = {position}
     for tick in range(100, 112):
         turn = make_turn(
             tick=tick,
             objects=[
                 moving_core(),
-                unit(2, "WORKER", position=(1, 0), cargo=1),
                 unit(3, "WORKER", position=position, cargo=1),
             ],
-            obstacles=[(1, 1), (1, 2), (1, 3)],
+            obstacles=[(0, 2), (1, 1), (2, 1)],
         )
         strategy.memory.observe(turn)
         context = migration_context(turn)
         context.core_arrival_worker_id = turn.workers[0].id
-        worker = turn.workers[1]
+        worker = turn.workers[0]
         strategy._decide_worker(worker, context)
         action = turn.plan.unit_actions.get(worker.id)
         assert action is not None and action.type == "MOVE"
         destination = add(position, action.direction)
         if tick == 100:
-            assert destination == (-1, 1)
-            assert manhattan(destination, (2, 0)) > manhattan(position, (2, 0))
+            assert destination == (2, 2)
+            assert manhattan(destination, (1, 0)) > manhattan(position, (1, 0))
         assert destination not in visited
         visited.add(destination)
         position = destination
-        if position == (2, 0):
+        if position == (1, 0):
             break
-    assert position == (2, 0)
+    assert position == (1, 0)
 
 
 @pytest.mark.parametrize("moving", [False, True])

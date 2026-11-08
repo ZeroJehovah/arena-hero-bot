@@ -484,10 +484,12 @@ class _TurnContext:
     core_migration_direction: Direction | None = None
     core_migration_destination: Position | None = None
     core_migration_lane: tuple[Position, ...] = ()
-    core_lane_distances: dict[Position, dict[Position, int]] = field(
+    core_lane_distances: dict[tuple[Position, bool], dict[Position, int]] = field(
         default_factory=dict
     )
     core_arrival_worker_id: UUID | None = None
+    core_arrival_healer_id: UUID | None = None
+    core_migration_healing_ids: frozenset[UUID] = field(default_factory=frozenset)
     # One loaded Worker owns the stationary Core service approach per Tick;
     # followers compact using both cell slots and simultaneous departures.
     core_queue_head_id: UUID | None = None
@@ -989,6 +991,7 @@ class AggressiveStrategy:
         deadlined = False
         if turn.core is not None:
             self._prepare_core_migration_step(context)
+            self._prepare_migration_healing(context)
             context.core_traffic_collecting = self._stationary_core_traffic(context)
             context.core_queue_head_id = self._select_stationary_core_queue_head(
                 context
@@ -4127,6 +4130,10 @@ class AggressiveStrategy:
                 and not self._has_unit_action(unit, context)
             ]
             for unit in sorted(blockers, key=lambda candidate: candidate.id.bytes):
+                if unit.id == context.core_arrival_healer_id:
+                    # One funded patient shares the arrival cell with the Core,
+                    # just as one loaded Worker does for a delivery.
+                    continue
                 if (
                     isinstance(unit, Worker)
                     and unit.cargo > 0
@@ -4375,6 +4382,111 @@ class AggressiveStrategy:
                 return worker.id
         return None
 
+    def _prepare_migration_healing(self, context: _TurnContext) -> None:
+        """Let wounded escorts catch up and reserve one actual arrival service."""
+
+        core = context.turn.core
+        arrival = context.core_migration_destination
+        if core is None or arrival is None or context.core_build_priority:
+            return
+        patients = [
+            ranger
+            for ranger in context.turn.rangers
+            if not self._is_expedition_member(ranger, context.turn)
+            and self._heal_available(
+                ranger, maximum_hp=2, context=context, on_arrival=True
+            )
+        ]
+        context.core_migration_healing_ids = frozenset(r.id for r in patients)
+        if not patients or any(
+            worker.position == arrival and worker.cargo > 0
+            for worker in context.turn.workers
+        ):
+            # An already occupied cargo slot completes its service. Patients
+            # still approach during MOVING so they can take the next free slot.
+            return
+        steps = (
+            (core.view.move_required_ticks or 4) - (core.view.move_progress or 0)
+            if core.view.state is CoreState.MOVING
+            else 4
+        )
+        candidates = []
+        for ranger in patients:
+            if (
+                (
+                    ranger.position == core.position
+                    and core.view.state is CoreState.NORMAL
+                )
+                or manhattan(ranger.position, arrival) > steps
+                or not self._migration_healing_cell_safe(ranger, arrival, context)
+            ):
+                continue
+            distance = self._core_lane_distances(ranger, arrival, context).get(
+                ranger.position
+            )
+            if distance is not None and distance <= steps:
+                candidates.append((distance, ranger.id.bytes, ranger.id))
+        if candidates:
+            context.core_arrival_healer_id = min(candidates)[2]
+
+    def _migration_healing_cell_safe(
+        self, ranger: Ranger, position: Position, context: _TurnContext
+    ) -> bool:
+        return (
+            position not in self._static_blockers(ranger, context)
+            and position not in context.enemy_positions
+            and self.memory.incoming_damage.get(position, (-1, 0))[1] < ranger.hp
+            and not self._future_attackers_at(
+                position, context.turn, self._rock_map(context.turn)
+            )
+        )
+
+    def _recover_during_migration(self, ranger: Ranger, context: _TurnContext) -> bool:
+        """Walk during the Core's travel Ticks, then heal on its arrival Tick."""
+
+        arrival = context.core_migration_destination
+        core = context.turn.core
+        if core is None or arrival is None:
+            return False
+        if ranger.id == context.core_arrival_healer_id:
+            goals = (arrival,)
+        else:
+            goals = tuple(
+                position
+                for position in adjacent_positions(arrival)
+                if position != core.position
+                and position not in context.core_migration_lane
+                and self._migration_healing_cell_safe(ranger, position, context)
+                and (
+                    position == ranger.position
+                    or self._predicted_friendly_occupancy(position, context) < 2
+                )
+            )
+            goals = tuple(
+                sorted(
+                    goals,
+                    key=lambda position: self._core_lane_distances(
+                        ranger, position, context
+                    ).get(ranger.position, 2**63 - 1),
+                )
+            )
+        for goal in goals:
+            if ranger.position == goal:
+                self._record_wait(
+                    ranger, context, "wait beside the next healing service"
+                )
+                ranger.wait()
+                return True
+            if self._move_to_core_lane(
+                ranger,
+                goal,
+                context,
+                reason="approach the next Core arrival for healing",
+                intent=_MoveIntent.INBOUND,
+            ):
+                return True
+        return False
+
     def _select_core_arrival_worker(
         self,
         context: _TurnContext,
@@ -4383,7 +4495,12 @@ class AggressiveStrategy:
 
         core = context.turn.core
         arrival = context.core_migration_destination
-        if core is None or arrival is None or not context.core_migration_lane:
+        if (
+            core is None
+            or arrival is None
+            or not context.core_migration_lane
+            or context.core_arrival_healer_id is not None
+        ):
             self.memory.core_arrival_worker_id = None
             self.memory.core_arrival_destination = None
             return None
@@ -4428,10 +4545,9 @@ class AggressiveStrategy:
             ),
         )
         for worker in candidates:
-            if self._has_core_avoiding_route(
+            if self._has_core_lane_route(
                 worker,
                 arrival,
-                core.position,
                 context,
             ):
                 self.memory.core_arrival_worker_id = str(worker.id)
@@ -4439,21 +4555,17 @@ class AggressiveStrategy:
         self.memory.core_arrival_worker_id = None
         return None
 
-    def _has_core_avoiding_route(
+    def _has_core_lane_route(
         self,
         unit: Unit,
         goal: Position,
-        core_position: Position,
         context: _TurnContext,
     ) -> bool:
-        """Return whether a Worker can reach the lane without crossing the Core."""
+        """Check terrain reachability; transient Core traffic is resolved per step."""
 
         if unit.position == goal:
             return True
-        blocked = overlay_blockers(
-            self._static_blockers(unit, context),
-            {core_position},
-        )
+        blocked = self._static_blockers(unit, context)
         return (
             next_step(
                 unit.position,
@@ -4467,17 +4579,16 @@ class AggressiveStrategy:
         )
 
     @staticmethod
-    def _core_lane_exclusions(goal: Position, context: _TurnContext) -> set[Position]:
+    def _core_lane_exclusions(
+        unit: Unit, goal: Position, context: _TurnContext
+    ) -> set[Position]:
         core = context.turn.core
-        if core is None:
+        if core is None or isinstance(unit, Worker):
+            # Core occupancy and an arrival reservation are temporary traffic,
+            # not terrain. Route toward them and wait at a full/reserved step
+            # instead of taking a long detour around a cell that will vacate.
             return set()
-        excluded = {core.position}
-        arrival = context.core_migration_destination
-        # Side cells are legal transit cells for cargo. Only the queue's
-        # destinations belong on the forward lane; blocking side transit can
-        # seal the only entrance around rocks as the Core advances.
-        if arrival is not None and arrival != goal:
-            excluded.add(arrival)
+        excluded = set(context.core_migration_lane)
         return excluded - {goal}
 
     def _core_lane_distances(
@@ -4485,10 +4596,11 @@ class AggressiveStrategy:
     ) -> dict[Position, int]:
         """Cache safe walking distances to each moving queue slot, without traffic."""
 
-        excluded = self._core_lane_exclusions(goal, context)
-        if goal not in context.core_lane_distances:
+        excluded = self._core_lane_exclusions(unit, goal, context)
+        key = goal, isinstance(unit, Worker)
+        if key not in context.core_lane_distances:
             distances: dict[Position, int] = {}
-            context.core_lane_distances[goal] = distances
+            context.core_lane_distances[key] = distances
             blockers = self._static_blockers(unit, context)
             if goal not in blockers and goal not in context.enemy_positions:
                 distances[goal] = 0
@@ -4507,7 +4619,7 @@ class AggressiveStrategy:
                         frontier.append(neighbor)
                         if len(distances) >= 4096:
                             break
-        distances = context.core_lane_distances[goal]
+        distances = context.core_lane_distances[key]
         if unit.position in excluded:
             # A Worker already inside the approach may leave it. Do not open
             # this excluded cell to other routes or alter the cached field.
@@ -4539,8 +4651,9 @@ class AggressiveStrategy:
             reason=reason,
             allow_goal=True,
             intent=intent,
-            extra_blockers=self._core_lane_exclusions(goal, context),
+            extra_blockers=self._core_lane_exclusions(unit, goal, context),
             avoid_recent=False,
+            avoid_new_threats=isinstance(unit, Ranger),
             progress_distances=distances,
         )
 
@@ -5504,6 +5617,7 @@ class AggressiveStrategy:
         maximum_hp: int,
         critical_hp: int | None = None,
         context: _TurnContext,
+        on_arrival: bool = False,
     ) -> bool:
         """Report whether the Core would fund a heal for ``unit``.
 
@@ -5521,7 +5635,10 @@ class AggressiveStrategy:
         return (
             core is not None
             and context.core_escape_direction is None
-            and core.view.state is CoreState.NORMAL
+            and (
+                core.view.state is CoreState.NORMAL
+                or (on_arrival and core.view.state is CoreState.MOVING)
+            )
             and unit.hp <= heal_threshold
             and missing_hp > 0
             and context.remaining_resources >= missing_hp
@@ -5590,6 +5707,13 @@ class AggressiveStrategy:
             maximum_hp=maximum_hp,
             critical_hp=critical_hp,
             context=context,
+        ):
+            return True
+
+        if (
+            isinstance(unit, Ranger)
+            and unit.id in context.core_migration_healing_ids
+            and self._recover_during_migration(unit, context)
         ):
             return True
 
@@ -6130,13 +6254,17 @@ class AggressiveStrategy:
         if context.core_migration_lane and not (
             isinstance(unit, Worker) and unit.cargo > 0
         ):
-            blocked = overlay_blockers(blocked, set(context.core_migration_lane))
+            lane_blockers = set(context.core_migration_lane)
+            if unit.id == context.core_arrival_healer_id:
+                lane_blockers.discard(context.core_migration_destination)
+            blocked = overlay_blockers(blocked, lane_blockers)
         core = context.turn.core
         if (
             core is not None
             and self._core_approach_locked(context.turn)
             and unit.position != core.position
             and not (isinstance(unit, Worker) and unit.cargo > 0)
+            and unit.id not in context.core_migration_healing_ids
             and not core_resource_clearance
         ):
             # The queue check below rejects a step that enters or moves
@@ -6274,6 +6402,14 @@ class AggressiveStrategy:
         ):
             return False
         loaded_worker = isinstance(unit, Worker) and unit.cargo > 0
+        arrival_healer = unit.id == context.core_arrival_healer_id
+        migration_healer = unit.id in context.core_migration_healing_ids
+        if (
+            migration_healer
+            and isinstance(unit, Ranger)
+            and not self._migration_healing_cell_safe(unit, destination, context)
+        ):
+            return False
         if (
             core is not None
             and destination == core.position
@@ -6284,6 +6420,11 @@ class AggressiveStrategy:
                 or self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
                 is not None
             )
+            and not (
+                migration_healer
+                and core.view.state is CoreState.MOVING
+                and target != core.position
+            )
             and (
                 not self._heal_available(unit, maximum_hp=2, context=context)
                 or context.core_service_action is not None
@@ -6291,7 +6432,13 @@ class AggressiveStrategy:
             )
         ):
             return False
-        if destination in context.core_migration_lane and not loaded_worker:
+        if (
+            destination in context.core_migration_lane
+            and not loaded_worker
+            and not (
+                arrival_healer and destination == context.core_migration_destination
+            )
+        ):
             return False
         migration_destination = context.core_migration_destination
         if migration_destination is None and core is not None:
@@ -6332,17 +6479,17 @@ class AggressiveStrategy:
             # destination at server resolution.
             return False
         if moving_core_destination:
-            # The Core occupies one of the destination cell's two slots.  Only
-            # a loaded Worker may reserve the other slot for the arrival Tick.
+            # Reserve one slot for the Core and one for its selected service.
             if predicted >= 1:
                 return False
-            if not loaded_worker:
+            if not loaded_worker and not arrival_healer:
                 return False
         elif (
             core is not None
             and self._core_approach_locked(context.turn)
             and not stationary_core_service
             and not (isinstance(unit, Worker) and unit.cargo > 0)
+            and not migration_healer
             and not core_resource_clearance
             and manhattan(destination, core.position) <= CORE_MIGRATION_CLEAR_RADIUS
             and manhattan(destination, core.position)

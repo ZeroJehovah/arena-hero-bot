@@ -695,15 +695,22 @@ def test_loaded_workers_queue_on_the_core_forward_route() -> None:
         for worker in turn.workers
         if worker.position != (2, 0)
     ]
-    assert sorted(target for item in queued if (target := item.target) is not None) == [
+    assert sorted(
+        item.target
+        for item in queued
+        if item.action == "MOVE" and item.target is not None
+    ) == [
         (2, 0),
         (3, 0),
-        (4, 0),
     ]
     assert all(
         item.reason == "queue carried resources on the Core forward route"
         for item in queued
+        if item.action == "MOVE"
     )
+    # The two open approaches use actual capacity; the third waits instead of
+    # routing around the temporarily full Core cell as if it were a rock.
+    assert sum(item.action == "WAIT" for item in queued) == 1
 
 
 def test_migrating_core_service_tick_queues_cargo_on_the_forward_route() -> None:
@@ -734,7 +741,11 @@ def test_migrating_core_service_tick_queues_cargo_on_the_forward_route() -> None
         if worker.position != (0, 0)
     ]
     assert all(item.target != (0, 0) for item in off_core)
-    assert all(item.target in {(1, 0), (2, 0), (3, 0), (4, 0)} for item in off_core)
+    assert all(
+        item.target in {(1, 0), (2, 0), (3, 0), (4, 0)}
+        for item in off_core
+        if item.action == "MOVE"
+    )
     assert any(
         item.reason == "stage the next carried resources on the Core forward route"
         for item in off_core
@@ -841,7 +852,7 @@ def test_stacked_loaded_workers_approach_a_full_forward_queue_together() -> None
     for worker in stacked:
         action = turn.plan.unit_actions[worker.id]
         assert action.type == "MOVE"
-        assert add(worker.position, action.direction) == (0, -1)
+        assert add(worker.position, action.direction) in {(0, -1), (-1, 0)}
 
 
 def test_loaded_worker_in_the_next_core_cell_holds_for_the_arrival_tick() -> None:
@@ -928,7 +939,7 @@ def test_loaded_worker_can_cross_clear_space_to_a_stationary_core() -> None:
     )
 
 
-def test_loaded_worker_routes_around_the_locked_core_approach() -> None:
+def test_loaded_worker_can_transit_the_moving_core_approach() -> None:
     moving = make_turn(
         objects=[
             core(
@@ -947,7 +958,7 @@ def test_loaded_worker_routes_around_the_locked_core_approach() -> None:
 
     action = moving.plan.unit_actions[moving.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction.value == "UP"
+    assert action.direction.value == "LEFT"
     assert any(
         item.reason == "stage the next carried resources on the Core forward route"
         for item in report.decisions
