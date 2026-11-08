@@ -695,14 +695,14 @@ def test_loaded_workers_queue_on_the_core_forward_route() -> None:
         for worker in turn.workers
         if worker.position != (2, 0)
     ]
-    assert sorted(
-        item.target
+    # Reserve all three endpoints together, including the approach that must
+    # wait for this Tick's capacity. Later Workers must not steal its slot.
+    assert sorted(memory.core_queue_targets.values()) == [(2, 0), (3, 0), (4, 0)]
+    assert all(
+        item.target == memory.core_queue_targets[item.actor_id]
         for item in queued
-        if item.action == "MOVE" and item.target is not None
-    ) == [
-        (2, 0),
-        (3, 0),
-    ]
+        if item.action == "MOVE"
+    )
     assert all(
         item.reason == "queue carried resources on the Core forward route"
         for item in queued

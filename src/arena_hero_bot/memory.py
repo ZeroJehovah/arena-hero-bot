@@ -172,6 +172,9 @@ class WorldMemory:
     # also prevents a service restart from restarting the same chase.
     core_arrival_worker_id: str | None = None
     core_arrival_destination: Position | None = None
+    # At most three forward waiting slots. Equal-cost assignments retain
+    # their owners across Ticks and restarts instead of crossing approaches.
+    core_queue_targets: dict[str, Position] = field(default_factory=dict)
     # Campaign state survives restarts.  ``campaign_phase`` is the highest
     # stage reached, not a live roster count: losing Units must not move the
     # whole operation back to an earlier resource tier.  The phase is reset
@@ -848,6 +851,10 @@ class WorldMemory:
                 if self.core_arrival_destination is not None
                 else None
             ),
+            "core_queue_targets": {
+                unit_id: list(position)
+                for unit_id, position in self.core_queue_targets.items()
+            },
             "campaign_phase": self.campaign_phase,
             "campaign_target_quota": self.campaign_target_quota,
             "campaign_last_core_id": self.campaign_last_core_id,
@@ -1081,6 +1088,10 @@ class WorldMemory:
             core_arrival_destination=_optional_position(
                 raw.get("core_arrival_destination")
             ),
+            core_queue_targets={
+                str(unit_id): _position(position)
+                for unit_id, position in raw.get("core_queue_targets", {}).items()
+            },
             campaign_phase=int(raw.get("campaign_phase", 0)),
             campaign_target_quota=int(raw.get("campaign_target_quota", 0)),
             campaign_last_core_id=(

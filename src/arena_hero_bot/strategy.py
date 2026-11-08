@@ -489,6 +489,7 @@ class _TurnContext:
     )
     core_arrival_worker_id: UUID | None = None
     core_arrival_healer_id: UUID | None = None
+    core_queue_targets: dict[UUID, Position] | None = None
     core_migration_healing_ids: frozenset[UUID] = field(default_factory=frozenset)
     # One loaded Worker owns the stationary Core service approach per Tick;
     # followers compact using both cell slots and simultaneous departures.
@@ -1105,6 +1106,7 @@ class AggressiveStrategy:
             context.core_queue_head_id = self._select_stationary_core_queue_head(
                 context
             )
+            self._prepare_core_lane_queue(context)
             for worker in sorted(
                 turn.workers,
                 key=lambda unit: (
@@ -3272,6 +3274,7 @@ class AggressiveStrategy:
                 worker.cargo > 0
                 and arrival is not None
                 and worker.position == arrival
+                and not context.core_build_priority
                 and not (accepts_deposits and worker.position == core.position)
             ):
                 self.memory.clear_goal(str(worker.id))
@@ -4024,6 +4027,7 @@ class AggressiveStrategy:
         self.memory.core_migration_start_position = None
         self.memory.core_arrival_worker_id = None
         self.memory.core_arrival_destination = None
+        self.memory.core_queue_targets.clear()
 
     def _prepare_core_migration_step(self, context: _TurnContext) -> None:
         """Reserve the Core's next homeward cell before units plan this Tick."""
@@ -4134,10 +4138,35 @@ class AggressiveStrategy:
                     # One funded patient shares the arrival cell with the Core,
                     # just as one loaded Worker does for a delivery.
                     continue
+                production_arrival = (
+                    context.core_build_priority
+                    and core.view.state is CoreState.MOVING
+                    and lane_position == destination
+                )
+                # Reserve the arrival for SPAWN while the Core is still
+                # moving. Cargo can wait in the next forward slot.
+                if (
+                    production_arrival
+                    and isinstance(unit, Worker)
+                    and unit.cargo > 0
+                    and any(
+                        self._predicted_friendly_occupancy(goal, context) == 0
+                        and self._move_to_core_lane(
+                            unit,
+                            goal,
+                            context,
+                            reason="clear Core arrival cell for production",
+                            intent=_MoveIntent.STAND,
+                        )
+                        for goal in context.core_migration_lane[1:]
+                    )
+                ):
+                    continue
                 if (
                     isinstance(unit, Worker)
                     and unit.cargo > 0
                     and self._predicted_friendly_occupancy(lane_position, context) == 1
+                    and not production_arrival
                 ):
                     # The Core may share any one forward-lane cell with a
                     # loaded Worker.  Keeping that Worker in place preserves
@@ -4392,7 +4421,11 @@ class AggressiveStrategy:
 
         core = context.turn.core
         arrival = context.core_migration_destination
-        if core is None or arrival is None or context.core_build_priority:
+        if (
+            core is None
+            or arrival is None
+            or (context.core_build_priority and core.view.state is CoreState.NORMAL)
+        ):
             return
         patients = [
             ranger
@@ -4403,9 +4436,13 @@ class AggressiveStrategy:
             )
         ]
         context.core_migration_healing_ids = frozenset(r.id for r in patients)
-        if not patients or any(
-            worker.position == arrival and worker.cargo > 0
-            for worker in context.turn.workers
+        if (
+            context.core_build_priority
+            or not patients
+            or any(
+                worker.position == arrival and worker.cargo > 0
+                for worker in context.turn.workers
+            )
         ):
             # An already occupied cargo slot completes its service. Patients
             # still approach during MOVING so they can take the next free slot.
@@ -4505,6 +4542,7 @@ class AggressiveStrategy:
             or arrival is None
             or not context.core_migration_lane
             or context.core_arrival_healer_id is not None
+            or (context.core_build_priority and core.view.state is CoreState.MOVING)
         ):
             self.memory.core_arrival_worker_id = None
             self.memory.core_arrival_destination = None
@@ -4696,13 +4734,23 @@ class AggressiveStrategy:
             and self._core_migration_in_progress(core.view)
             and context.core_migration_lane
         ):
+            if context.core_queue_targets is not None:
+                goal = context.core_queue_targets.get(unit.id)
+                if goal is not None and goal != unit.position:
+                    return self._move_to_core_lane(
+                        unit, goal, context, reason=reason, intent=_MoveIntent.STAND
+                    )
             if (
                 unit.position in context.core_migration_lane
                 and self._predicted_friendly_occupancy(unit.position, context) == 1
             ):
                 self._record_wait(unit, context, "hold the Core forward queue slot")
                 return True
-            goals = self._core_lane_queue_positions(unit, context)
+            goals = (
+                self._core_lane_queue_positions(unit, context)
+                if context.core_queue_targets is None
+                else ()
+            )
             if goals:
                 for goal in goals:
                     context.standing_reserved.add(goal)
@@ -4851,6 +4899,108 @@ class AggressiveStrategy:
                 return True
             context.standing_reserved.discard(goal)
         return False
+
+    def _prepare_core_lane_queue(self, context: _TurnContext) -> None:
+        """Compact on-route cargo, then match approaches to unique waiting slots.
+
+        Only three waiting slots exist, so a subset assignment has at most
+        eight states per Worker. Walking cost prevents crossed approaches;
+        persisted owners break equal-cost ties without pinning a vacant front.
+        """
+
+        core = context.turn.core
+        lane = context.core_migration_lane
+        assignments: dict[UUID, Position] = {}
+        context.core_queue_targets = assignments
+        if core is None or not lane:
+            self.memory.core_queue_targets.clear()
+            return
+        workers = {
+            worker.id: worker
+            for worker in context.turn.workers
+            if worker.cargo > 0
+            and not self._has_unit_action(worker, context)
+            and worker.id != context.core_arrival_worker_id
+            and not (
+                core.view.state is CoreState.NORMAL and worker.position == core.position
+            )
+        }
+        slots = [
+            position
+            for position in lane[1:]
+            if position not in context.standing_reserved
+            and (
+                self._predicted_friendly_occupancy(position, context) == 0
+                or (
+                    self._predicted_friendly_occupancy(position, context) == 1
+                    and any(
+                        w.position == position
+                        and (w.id in workers or w.id == context.core_arrival_worker_id)
+                        for w in context.turn.workers
+                    )
+                )
+            )
+        ]
+        # Existing waiters advance in route order before an off-route Worker
+        # can reserve the gap. Never send an on-route waiter farther ahead.
+        for worker in sorted(
+            (w for w in workers.values() if w.position in lane[1:]),
+            key=lambda w: (lane.index(w.position), w.id.bytes),
+        ):
+            goal = next(
+                (
+                    position
+                    for position in slots
+                    if lane.index(position) <= lane.index(worker.position)
+                    and position not in self._static_blockers(worker, context)
+                    and position not in context.enemy_positions
+                ),
+                None,
+            )
+            if goal is not None:
+                assignments[worker.id] = goal
+                slots.remove(goal)
+
+        # Each DP value is (walking cost, changed owners, owners by slot).
+        states = {0: (0, 0, ("",) * len(slots))}
+        previous = self.memory.core_queue_targets
+        for worker in sorted(workers.values(), key=lambda w: w.id.bytes):
+            if worker.id in assignments or worker.position in lane[1:]:
+                continue
+            worker_id = str(worker.id)
+            for mask, (cost, changes, owners) in tuple(states.items()):
+                for index, goal in enumerate(slots):
+                    bit = 1 << index
+                    if mask & bit:
+                        continue
+                    distances = self._core_lane_distances(worker, goal, context)
+                    if not distances:
+                        continue
+                    candidate = (
+                        cost
+                        + distances.get(
+                            worker.position, 4096 + manhattan(worker.position, goal)
+                        ),
+                        changes + (previous.get(worker_id) != goal),
+                        (*owners[:index], worker_id, *owners[index + 1 :]),
+                    )
+                    if mask | bit not in states or candidate < states[mask | bit]:
+                        states[mask | bit] = candidate
+        selected = min(
+            states,
+            key=lambda mask: (
+                -mask.bit_count(),
+                tuple(not mask & (1 << i) for i in range(len(slots))),
+                states[mask],
+            ),
+        )
+        for goal, worker_id in zip(slots, states[selected][2], strict=True):
+            if worker_id:
+                assignments[UUID(worker_id)] = goal
+        context.standing_reserved.update(assignments.values())
+        self.memory.core_queue_targets = {
+            str(worker_id): goal for worker_id, goal in assignments.items()
+        }
 
     def _core_lane_queue_positions(
         self,
@@ -6415,6 +6565,20 @@ class AggressiveStrategy:
         ):
             return False
         core = context.turn.core
+        if (
+            context.core_build_priority
+            and core is not None
+            and destination
+            == (
+                core.view.destination
+                if core.view.state is CoreState.MOVING
+                else core.position
+            )
+        ):
+            # This is a temporary service reservation, checked only for the
+            # actual step. Do not route cargo around it or refill a cleared
+            # production cell before the spawn has completed.
+            return False
         if (
             isinstance(unit, Ranger)
             and unit.hp <= 1
@@ -12013,14 +12177,10 @@ class AggressiveStrategy:
         )
 
     def _campaign_build_priority(self, context: _TurnContext) -> bool:
-        """Reserve production at every parked Core, including defensive holds."""
+        """Reserve funded production, including the moving Core's arrival cell."""
 
         core = context.turn.core
-        if (
-            not self.config.campaign_mode
-            or core is None
-            or core.view.state is not CoreState.NORMAL
-        ):
+        if not self.config.campaign_mode or core is None:
             return False
         if self._normal_growth_on_cooldown(context):
             return False
@@ -12052,25 +12212,18 @@ class AggressiveStrategy:
         if unit_type is None:
             return False
         if not self._core_can_spawn(context):
-            core_position = core.position
-            if (
-                context.core_service_action is None
-                and context.departure_counts.get(core_position, 0) > 0
-                and context.arrival_counts.get(core_position, 0) == 0
-                and self._predicted_friendly_occupancy(core_position, context) <= 1
-            ):
-                context.report.add(
-                    actor_id=str(core.id),
-                    actor_kind="CORE",
-                    action="WAIT",
-                    reason=(
-                        "hold one service Tick for the Core cell to clear before "
-                        "production"
-                    ),
-                    target=core.position,
-                )
-                return True
-            return False
+            context.report.add(
+                actor_id=str(core.id),
+                actor_kind="CORE",
+                action="WAIT",
+                reason=(
+                    "hold one service Tick for the Core cell to clear before production"
+                    if context.departure_counts.get(core.position, 0)
+                    else "wait for safe Core service clearance before production"
+                ),
+                target=core.position,
+            )
+            return True
         core.spawn(unit_type)
         context.core_service_action = "SPAWN"
         context.report.add(
@@ -16192,12 +16345,18 @@ class AggressiveStrategy:
         at_core = core is not None and worker.position == core.position
         distance = 0
         if worker.cargo > 0 and context.core_migration_lane:
-            distance = min(
-                self._core_lane_distances(worker, goal, context).get(
-                    worker.position, 4096 + manhattan(worker.position, goal)
+            target = (context.core_queue_targets or {}).get(worker.id)
+            if worker.id == context.core_arrival_worker_id:
+                distance = -1
+            elif target is not None:
+                distance = context.core_migration_lane.index(target)
+            else:
+                distance = 4 + min(
+                    self._core_lane_distances(worker, goal, context).get(
+                        worker.position, 4096 + manhattan(worker.position, goal)
+                    )
+                    for goal in context.core_migration_lane
                 )
-                for goal in context.core_migration_lane
-            )
         elif (
             worker.cargo > 0
             and core is not None
