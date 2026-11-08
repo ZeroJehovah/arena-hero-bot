@@ -14,6 +14,7 @@ from arena_hero_bot.strategy import (
 )
 
 from .factories import core, make_turn, unit
+from .test_core_traffic import settled_positions
 from .test_shared_movement import context_for
 
 
@@ -32,6 +33,57 @@ def migration_context(turn):
     context.core_migration_destination = (1, 0)
     context.core_migration_lane = ((1, 0), (2, 0), (3, 0), (4, 0))
     return context
+
+
+@pytest.mark.parametrize("moving", [False, True])
+@pytest.mark.parametrize("departing", [False, True])
+def test_migration_cargo_counts_later_worker_departures_in_full_planning(
+    moving, departing
+):
+    turn = make_turn(
+        objects=[
+            core(
+                position=(20, 16),
+                state="MOVING",
+                move_direction="RIGHT",
+                move_progress=2,
+                move_required_ticks=4,
+                destination=[21, 16],
+            )
+            if moving
+            else core(position=(20, 16)),
+            unit(2, "WORKER", position=(4, 16), cargo=1),
+            unit(3, "WORKER", position=(5, 16)),
+            unit(4, "RANGER", position=(5, 16)),
+        ],
+        resource_cells=[(2, 16) if departing else (5, 16)],
+    )
+    memory = WorldMemory(
+        core_home_position=(24, 16),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        defense_anchor=(20, 16),
+        defense_posts={str(UUID(int=4)): (5, 16)},
+        unit_roles={str(UUID(int=4)): "defense"},
+        unit_roles_initialized=True,
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
+    )
+
+    # The guard holds its post. Cargo may share it only if the other Worker
+    # actually leaves this Tick, including a NORMAL Tick between Core moves.
+    report = strategy.decide(turn)
+    positions = settled_positions(turn)
+    assert positions[UUID(int=4)] == (5, 16)
+    assert positions[UUID(int=3)] == ((4, 16) if departing else (5, 16))
+    assert positions[UUID(int=2)] == ((5, 16) if departing else (4, 16))
+    decisions = [d for d in report.decisions if d.actor_id == str(UUID(int=2))]
+    assert len(decisions) == 1
+    assert decisions[0].action == ("MOVE" if departing else "WAIT")
+    assert memory.core_arrival_worker_id == str(UUID(int=2))
+    if not departing:
+        assert turn.plan.unit_actions[UUID(int=3)].type == "HARVEST"
 
 
 def test_arrival_worker_waits_at_a_full_entrance_then_delivers_after_restart(tmp_path):

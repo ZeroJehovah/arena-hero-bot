@@ -4340,12 +4340,17 @@ class AggressiveStrategy:
         queue trade places whenever the service cell opened.  Keep one
         routeable head until it reaches the Core, and let the remaining
         Workers compact only by moving closer to the Core.
+
+        A NORMAL Tick between migration steps still uses the forward queue.
+        Promoting a stationary head there would plan cargo before outbound
+        Workers and miss the capacity their same-Tick departures release.
         """
 
         core = context.turn.core
         if (
             core is None
             or core.view.state is not CoreState.NORMAL
+            or context.core_migration_lane
             or context.remaining_resource_space <= 0
             or context.core_build_priority
         ):
