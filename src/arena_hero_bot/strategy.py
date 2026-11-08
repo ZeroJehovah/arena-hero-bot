@@ -3312,13 +3312,12 @@ class AggressiveStrategy:
                         reason="queue carried resources on the Core forward route",
                     ):
                         return
-                    if worker.position != core.position:
-                        self._record_wait(
-                            worker,
-                            context,
-                            "wait for safe progress to the Core forward queue",
-                        )
-                        return
+                    self._record_wait(
+                        worker,
+                        context,
+                        "wait for safe progress to the Core forward queue",
+                    )
+                    return
             if (
                 self._core_approach_locked(context.turn)
                 and assigned_resource != context.core_resource_clearance_target
@@ -3343,7 +3342,8 @@ class AggressiveStrategy:
             self.memory.clear_goal(str(worker.id))
             if worker.position == core.position:
                 if (
-                    context.remaining_resource_space > 0
+                    self._core_accepts_deposits(context.turn)
+                    and context.remaining_resource_space > 0
                     and context.core_service_action is None
                     and not context.core_build_priority
                 ):
@@ -4516,6 +4516,16 @@ class AggressiveStrategy:
             if worker.position == arrival:
                 self.memory.core_arrival_worker_id = str(worker.id)
                 return worker.id
+        if core.view.state is CoreState.MOVING:
+            for worker in workers:
+                if worker.position == core.position and self._has_core_lane_route(
+                    worker, arrival, context
+                ):
+                    # A retained waiter behind this Worker may need to cross
+                    # the already full Core cell. Let the on-site cargo stage
+                    # ahead first instead of making both wait for each other.
+                    self.memory.core_arrival_worker_id = str(worker.id)
+                    return worker.id
         existing_id = self.memory.core_arrival_worker_id
         if existing_id is not None:
             existing = next(

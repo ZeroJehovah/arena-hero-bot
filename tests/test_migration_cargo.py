@@ -316,3 +316,135 @@ def test_queued_cargo_catches_moving_core_and_delivers_across_restart(tmp_path):
         if len(delivered) == 2:
             break
     assert delivered == [2, 3]
+
+
+def test_cargo_on_moving_core_takes_arrival_slot_from_waiter_behind_it():
+    turn = make_turn(
+        objects=[
+            moving_core(),
+            unit(2, "WORKER", position=(-1, 0), cargo=1),
+            unit(3, "WORKER", position=(0, 0), cargo=1),
+        ],
+        obstacles=[(-1, -1), (0, -1)],
+    )
+    memory = WorldMemory(
+        core_home_position=(16, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_arrival_worker_id=str(UUID(int=2)),
+        core_arrival_destination=(1, 0),
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=16, max_population=None, expedition_mode=True),
+    )
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions.get(UUID(int=3))
+    assert action is not None and action.type == "MOVE"
+    assert add((0, 0), action.direction) == (1, 0)
+    assert memory.core_arrival_worker_id == str(UUID(int=3))
+    assert all(a.type != "DEPOSIT" for a in turn.plan.unit_actions.values())
+
+
+@pytest.mark.parametrize("reservation", ["cargo", "healing"])
+def test_blocked_cargo_on_moving_core_waits_without_booking_a_delivery(reservation):
+    turn = make_turn(
+        resources=1,
+        objects=[
+            moving_core(),
+            unit(2, "WORKER", cargo=1),
+            unit(3, "WORKER", position=(1, 0), cargo=1)
+            if reservation == "cargo"
+            else unit(3, "RANGER", position=(1, 0), hp=1),
+        ],
+    )
+    strategy = AggressiveStrategy(WorldMemory())
+    strategy.memory.observe(turn)
+    context = migration_context(turn)
+    if reservation == "cargo":
+        context.core_arrival_worker_id = UUID(int=3)
+    else:
+        context.core_arrival_healer_id = UUID(int=3)
+    worker = turn.workers[0]
+    initial_resources = context.remaining_resources
+    initial_space = context.remaining_resource_space
+
+    strategy._decide_worker(worker, context)
+
+    action = turn.plan.unit_actions.get(worker.id)
+    assert action is None or action.type == "WAIT"
+    assert context.report.decisions[-1].action == "WAIT"
+    assert context.core_service_action is None
+    assert context.remaining_resources == initial_resources
+    assert context.remaining_resource_space == initial_space
+
+
+def test_moving_core_overlap_clears_and_delivers_after_restart(tmp_path):
+    config = StrategyConfig(
+        target_workers=16, max_population=None, expedition_mode=True
+    )
+    strategy = AggressiveStrategy(
+        WorldMemory(
+            core_home_position=(16, 0),
+            core_layout_version=CORE_LAYOUT_VERSION,
+            core_arrival_worker_id=str(UUID(int=2)),
+            core_arrival_destination=(1, 0),
+        ),
+        config,
+    )
+    core_position = (0, 0)
+    destination = (1, 0)
+    progress = 1
+    positions = {2: (-1, 0), 3: (0, 0)}
+    cargo = {2: 1, 3: 1}
+    delivered = []
+    for tick in range(100, 120):
+        turn = make_turn(
+            tick=tick,
+            resources=len(delivered),
+            objects=[
+                core(
+                    position=core_position,
+                    state="MOVING" if progress else "NORMAL",
+                    move_direction="RIGHT" if progress else None,
+                    move_progress=progress if progress else None,
+                    move_required_ticks=4 if progress else None,
+                    destination=list(destination) if progress else None,
+                ),
+                *(
+                    unit(i, "WORKER", position=positions[i], cargo=cargo[i])
+                    for i in positions
+                ),
+            ],
+        )
+        strategy.decide(turn)
+        for ident in positions:
+            action = turn.plan.unit_actions.get(UUID(int=ident))
+            if action is None:
+                continue
+            if action.type == "MOVE":
+                positions[ident] = add(positions[ident], action.direction)
+            elif action.type == "DEPOSIT":
+                assert progress == 0 and positions[ident] == core_position
+                assert turn.plan.core_action is None
+                cargo[ident] = 0
+                delivered.append(ident)
+        if tick == 100:
+            assert positions[3] == (1, 0)
+        if progress:
+            progress += 1
+            if progress == 4:
+                core_position = destination
+                progress = 0
+        elif turn.plan.core_action and turn.plan.core_action.type == "START_MOVE":
+            destination = add(core_position, turn.plan.core_action.direction)
+            progress = 1
+        assert max(Counter([core_position, *positions.values()]).values()) <= 2
+        if tick == 100:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), config)
+        if len(delivered) == 2:
+            break
+    assert delivered == [3, 2]
