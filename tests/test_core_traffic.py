@@ -8,7 +8,11 @@ from arena_hero import core_resource_capacity
 
 from arena_hero_bot.geometry import add
 from arena_hero_bot.memory import WorldMemory
-from arena_hero_bot.strategy import AggressiveStrategy
+from arena_hero_bot.strategy import (
+    CORE_LAYOUT_VERSION,
+    AggressiveStrategy,
+    StrategyConfig,
+)
 from arena_hero_bot.traffic import resolve_moves
 
 from .factories import core, make_turn, unit
@@ -93,6 +97,80 @@ def test_full_core_and_full_doorstep_swap_in_the_complete_planner():
     outbound, inbound, _ = turn.workers
     assert positions[outbound.id] == (1, 0)
     assert positions[inbound.id] == (0, 0)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("departure", [-1, 1])
+def test_resting_core_worker_follows_its_task_through_a_full_queue(
+    departure, restart, tmp_path
+):
+    home = (15, 655)
+    doorstep = (home[0] + departure, home[1])
+    resource = (home[0] + 2 * departure, home[1])
+    roster = [
+        unit(2, "WORKER", position=home, cargo=1),
+        unit(3, "WORKER", position=doorstep, cargo=1),
+        unit(4, "WORKER", position=doorstep, cargo=1),
+        *[
+            unit(20 + n, "WORKER", position=(23 + n % 4, 661 + n // 4))
+            for n in range(13)
+        ],
+        *[
+            unit(100 + n, "RANGER", position=(21 + n % 7, 649 - n // 7))
+            for n in range(28)
+        ],
+    ]
+    strategy = AggressiveStrategy(
+        WorldMemory(
+            core_home_position=home,
+            core_layout_version=CORE_LAYOUT_VERSION,
+            campaign_phase=4,
+            campaign_target_quota=8,
+            campaign_last_core_id=core()["id"],
+            unit_roles_initialized=True,
+            unit_roles={
+                member["id"]: "defense" if n < 20 else f"patrol-{1 + (n - 20) // 2}"
+                for n, member in enumerate(roster[16:])
+            },
+        ),
+        StrategyConfig(target_workers=16, campaign_mode=True),
+    )
+    resources = 0
+    for tick in range(100, 104):
+        if restart and tick == 101:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+        turn = make_turn(
+            tick=tick,
+            resources=resources,
+            objects=[core(position=home), *roster],
+            # The new mine appears when the on-Core Worker finishes unloading.
+            resource_cells=[resource] if tick > 100 else [],
+        )
+        strategy.decide(turn)
+        assert strategy.memory.campaign_resting
+        positions = settled_positions(turn)
+        outbound, inbound = turn.workers[:2]
+        if tick == 100:
+            assert turn.plan.unit_actions[outbound.id].type == "DEPOSIT"
+        elif tick == 101:
+            # Both sideways exits are open. The full queue can exchange with
+            # Core this Tick, so choose the step toward the next real task.
+            assert positions[outbound.id] == doorstep
+            assert positions[inbound.id] == home
+        elif tick == 102:
+            assert positions[outbound.id] == resource
+            assert turn.plan.unit_actions[inbound.id].type == "DEPOSIT"
+        else:
+            assert turn.plan.unit_actions[outbound.id].type == "HARVEST"
+        for member in roster:
+            actor = UUID(member["id"])
+            member["position"] = list(positions[actor])
+            action = turn.plan.unit_actions.get(actor)
+            if action is not None and action.type == "DEPOSIT":
+                resources += member["cargo"]
+                member["cargo"] = 0
 
 
 def test_cargo_advances_onto_a_guard_and_does_not_disperse_while_front_is_busy():

@@ -5294,7 +5294,19 @@ class AggressiveStrategy:
                 ),
                 None,
             )
-        stationary_delivery_window = False
+        # A campaign rest is also stationary service. Let the empty Worker
+        # choose its next task before simultaneous traffic resolves its exit;
+        # an apparently full neighbour may be handing cargo into Core now.
+        stationary_delivery_window = (
+            not context.core_build_priority
+            and not self._core_migration_in_progress(core.view)
+            and context.remaining_resource_space > 0
+            and any(
+                worker.id == context.core_queue_head_id
+                and manhattan(worker.position, core.position) == 1
+                for worker in context.turn.workers
+            )
+        )
         if context.core_build_priority:
             # A spawn lands on the Core cell, so every friendly occupant must
             # clear before the build-priority service Tick can produce.
@@ -5313,11 +5325,6 @@ class AggressiveStrategy:
             # storage has free capacity.  Workers in the delivery queue make
             # that slot a service cell; critical healers still win the
             # service_candidate check above and remain in place.
-            stationary_delivery_window = context.remaining_resource_space > 0 and any(
-                worker.id == context.core_queue_head_id
-                and manhattan(worker.position, core.position) == 1
-                for worker in context.turn.workers
-            )
             service_window = stationary_delivery_window
         for unit in sorted(core_units, key=lambda candidate: candidate.id.bytes):
             if unit is service_candidate:
