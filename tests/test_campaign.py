@@ -32,6 +32,14 @@ from arena_hero_bot.strategy import (
 from .factories import core, make_turn, object_id, unit
 
 
+@pytest.fixture(autouse=True)
+def require_complete_campaign_plans(monkeypatch):
+    def deadline_reached(*_args):
+        pytest.fail("campaign scenario exhausted planning time before completion")
+
+    monkeypatch.setattr(AggressiveStrategy, "_wait_unplanned_units", deadline_reached)
+
+
 def _strategy(memory: WorldMemory) -> AggressiveStrategy:
     return AggressiveStrategy(
         memory,
@@ -112,9 +120,16 @@ def test_campaign_noncombat_contacts_do_not_override_worker_production(enemy_typ
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def _workers(count: int) -> list[dict[str, object]]:
+def _workers(
+    count: int, *, center: tuple[int, int] = (16, 16)
+) -> list[dict[str, object]]:
     return [
-        unit(100 + index, "WORKER", position=(20 + index, 20)) for index in range(count)
+        unit(
+            100 + index,
+            "WORKER",
+            position=(center[0] + 4 + index, center[1] + 4),
+        )
+        for index in range(count)
     ]
 
 
@@ -146,18 +161,24 @@ def test_noncombat_contacts_do_not_trigger_campaign_defense(enemy_type, remember
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
-def _rangers(count: int, *, offset: int = 1000) -> list[dict[str, object]]:
+def _rangers(
+    count: int, *, offset: int = 1000, center: tuple[int, int] = (16, 16)
+) -> list[dict[str, object]]:
     return [
-        unit(offset + index, "RANGER", position=(40 + index, 20))
+        unit(
+            offset + index,
+            "RANGER",
+            position=(center[0] + 24 + index, center[1] + 4),
+        )
         for index in range(count)
     ]
 
 
 def _roster(
-    count: int = 30,
+    count: int = 30, *, center: tuple[int, int] = (16, 16)
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, str]]:
-    workers = _workers(16)
-    rangers = _rangers(count)
+    workers = _workers(16, center=center)
+    rangers = _rangers(count, center=center)
     defense = (count + 1) // 2
     roles = {
         **{str(worker["id"]): "staged" for worker in workers},
@@ -176,7 +197,7 @@ def test_campaign_replaces_a_rock_sealed_block_center() -> None:
     origin = (-1074, -17)
     sealed_center = (-1072, -17)
     core_object = core(9, position=origin)
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _roster(center=origin)
     memory = WorldMemory(
         core_home_position=sealed_center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -225,7 +246,7 @@ def test_campaign_repairs_a_blocked_adjacent_center_in_the_same_block() -> None:
     origin = (-1033, -15)
     blocked_center = (-1008, -16)
     core_object = core(9, position=origin)
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _roster(center=origin)
     memory = WorldMemory(
         core_home_position=blocked_center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -266,7 +287,7 @@ def test_campaign_revalidates_distant_centers_before_planning(
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
     }
     core_object = core(9, position=origin)
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _roster(center=origin)
     memory = (
         WorldMemory()
         if fresh_core
@@ -502,13 +523,15 @@ def test_stage_two_publishes_only_one_adjacent_hop() -> None:
         campaign_last_core_id=current_core["id"],
         core_migration_last_position=current_center,
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=current_center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     planned = plan_resource_quota(memory, 3, current_position=current_center)
     assert planned is not None
     memory.campaign_scout_rejections = {planned.target_block: 100}
-    turn = make_turn(tick=100, objects=[current_core, *_workers(16), *rangers])
+    turn = make_turn(
+        tick=100, objects=[current_core, *_workers(16, center=current_center), *rangers]
+    )
 
     _strategy(memory).decide(turn)
 
@@ -520,6 +543,8 @@ def test_stage_two_publishes_only_one_adjacent_hop() -> None:
     assert target_block == planned.target_block
     assert not memory.campaign_scout_rejections
     assert memory.campaign_resting is False
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
 
 
 def test_campaign_memory_round_trip_preserves_stage_and_rest(tmp_path: Path) -> None:
@@ -672,10 +697,12 @@ def test_persisted_rest_off_the_published_center_resumes_the_hop() -> None:
         # of the published block center and must keep walking to it.
         campaign_resting=True,
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(objects=[core_object, *_workers(12), *rangers])
+    turn = make_turn(
+        objects=[core_object, *_workers(12, center=core_object["position"]), *rangers]
+    )
 
     _strategy(memory).decide(turn)
 
@@ -695,10 +722,13 @@ def test_stage_two_finishes_workers_before_expanding_its_screen() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(resources=60, objects=[core_object, *_workers(12), *rangers])
+    turn = make_turn(
+        resources=60,
+        objects=[core_object, *_workers(12, center=core_object["position"]), *rangers],
+    )
 
     _strategy(memory).decide(turn)
 
@@ -719,7 +749,9 @@ def test_stage_one_advances_but_waits_for_full_stage_two_before_interblock_move(
         campaign_last_core_id=core_object["id"],
         unit_roles_initialized=True,
     )
-    turn = make_turn(objects=[core_object, *_workers(8)])
+    turn = make_turn(
+        objects=[core_object, *_workers(8, center=core_object["position"])]
+    )
 
     _strategy(memory).decide(turn)
 
@@ -787,7 +819,7 @@ def test_completed_stage_three_reaches_max_and_targets_quota_four_boundary() -> 
         campaign_last_core_id=core_object["id"],
         unit_roles_initialized=True,
     )
-    workers, rangers, roles = _roster(20)
+    workers, rangers, roles = _roster(20, center=core_object["position"])
     memory.unit_roles = roles
     turn = make_turn(objects=[core_object, *workers, *rangers])
     strategy = _strategy(memory)
@@ -903,10 +935,13 @@ def test_campaign_continues_to_a_valid_adjacent_center() -> None:
         campaign_last_core_id=core_object["id"],
         campaign_resting=True,
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(tick=100, objects=[core_object, *_workers(16), *rangers])
+    turn = make_turn(
+        tick=100,
+        objects=[core_object, *_workers(16, center=core_object["position"]), *rangers],
+    )
 
     report = _strategy(memory).decide(turn)
 
@@ -934,11 +969,19 @@ def test_campaign_mid_leg_cargo_holds_without_delaying_core() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     loaded = unit(500, "WORKER", position=(-1685, -1904), cargo=1)
-    turn = make_turn(tick=100, objects=[core_object, *_workers(16), loaded, *rangers])
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core_object,
+            *_workers(16, center=core_object["position"]),
+            loaded,
+            *rangers,
+        ],
+    )
 
     report = _strategy(memory).decide(turn)
 
@@ -1024,14 +1067,14 @@ def test_campaign_migration_builds_on_the_arrival_tick_then_resumes() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(12)
+    rangers = _rangers(12, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     population = 16 + len(rangers)
     turn = make_turn(
         tick=100,
         resources=unit_cost(UnitType.RANGER, population),
-        objects=[core_object, *_workers(16), *rangers],
+        objects=[core_object, *_workers(16, center=core_object["position"]), *rangers],
     )
     strategy = _strategy(memory)
 
@@ -1044,7 +1087,7 @@ def test_campaign_migration_builds_on_the_arrival_tick_then_resumes() -> None:
 
     resumed = make_turn(
         tick=101,
-        objects=[core_object, *_workers(16), *rangers],
+        objects=[core_object, *_workers(16, center=core_object["position"]), *rangers],
     )
     strategy.decide(resumed)
 
@@ -1064,10 +1107,10 @@ def test_campaign_migration_build_priority_blocks_deposit_that_tick() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(12)
+    rangers = _rangers(12, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    workers = _workers(16)
+    workers = _workers(16, center=core_object["position"])
     loaded = workers[0]
     loaded["position"] = [-945, -945]
     loaded["cargo"] = 1
@@ -1104,10 +1147,10 @@ def test_campaign_migration_spawns_after_the_cleared_service_tick() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(12)
+    rangers = _rangers(12, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    workers = _workers(16)
+    workers = _workers(16, center=core_object["position"])
     loaded = workers[0]
     loaded["position"] = [-945, -945]
     loaded["cargo"] = 1
@@ -1146,7 +1189,7 @@ def test_full_bank_mid_migration_does_not_skip_the_cleared_spawn_tick() -> None:
         campaign_target_quota=8,
         campaign_last_core_id=core_object["id"],
     )
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _roster(center=core_object["position"])
     memory.unit_roles = roles
     memory.unit_roles_initialized = True
     loaded = workers[0]
@@ -1196,10 +1239,10 @@ def test_campaign_migration_build_priority_blocks_unit_heal_that_tick() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(12)
+    rangers = _rangers(12, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    workers = _workers(16)
+    workers = _workers(16, center=core_object["position"])
     critical = workers[0]
     critical["position"] = [-945, -945]
     critical["hp"] = 1
@@ -1230,10 +1273,10 @@ def test_campaign_migration_build_priority_clears_a_parked_worker() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(12)
+    rangers = _rangers(12, center=core_object["position"])
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    workers = _workers(16)
+    workers = _workers(16, center=core_object["position"])
     parked = workers[0]
     parked["position"] = [-945, -945]
     population = 16 + len(rangers)
@@ -1263,10 +1306,12 @@ def test_quota_two_block_departs_after_the_full_stage_two_formation() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(tick=100, objects=[core_object, *_workers(16), *rangers])
+    turn = make_turn(
+        tick=100, objects=[core_object, *_workers(16, center=center), *rangers]
+    )
 
     _strategy(memory).decide(turn)
 
@@ -1295,11 +1340,13 @@ def test_campaign_rest_holds_the_center_until_nearby_cargo_lands() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     loaded = unit(500, "WORKER", position=(-943, -945), cargo=1)
-    turn = make_turn(tick=100, objects=[core_object, *_workers(16), loaded, *rangers])
+    turn = make_turn(
+        tick=100, objects=[core_object, *_workers(16, center=center), loaded, *rangers]
+    )
 
     report = _strategy(memory).decide(turn)
 
@@ -1312,7 +1359,7 @@ def test_campaign_rest_holds_the_center_until_nearby_cargo_lands() -> None:
         tick=101,
         objects=[
             core_object,
-            *_workers(16),
+            *_workers(16, center=center),
             unit(500, "WORKER", position=(-944, -945)),
             *rangers,
         ],
@@ -1339,14 +1386,14 @@ def test_campaign_rest_clears_the_service_cell_for_the_next_delivery() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     parked = unit(600, "RANGER", position=center)
     loaded = unit(500, "WORKER", position=(-942, -945), cargo=1)
     turn = make_turn(
         tick=100,
-        objects=[core_object, parked, *_workers(16), loaded, *rangers],
+        objects=[core_object, parked, *_workers(16, center=center), loaded, *rangers],
     )
 
     report = _strategy(memory).decide(turn)
@@ -1375,7 +1422,7 @@ def test_stationary_campaign_core_clears_service_cell_for_queued_cargo() -> None
         campaign_target_quota=8,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(20)
+    rangers = _rangers(20, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     parked = unit(600, "RANGER", position=center)
@@ -1383,7 +1430,7 @@ def test_stationary_campaign_core_clears_service_cell_for_queued_cargo() -> None
     turn = make_turn(
         tick=100,
         resources=10,
-        objects=[core_object, parked, *_workers(10), loaded, *rangers],
+        objects=[core_object, parked, *_workers(10, center=center), loaded, *rangers],
     )
 
     report = _strategy(memory).decide(turn)
@@ -1413,7 +1460,7 @@ def test_campaign_rest_pipeline_admits_the_next_worker_on_departure() -> None:
         campaign_last_core_id=core_object["id"],
         campaign_resting=True,
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     leaving = unit(600, "WORKER", position=center)
@@ -1487,13 +1534,13 @@ def test_pre_max_migration_spends_an_affordable_formation_gap() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(19)
+    rangers = _rangers(19, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     turn = make_turn(
         tick=100,
         resources=65,
-        objects=[core_object, *_workers(16), *rangers],
+        objects=[core_object, *_workers(16, center=center), *rangers],
     )
 
     _strategy(memory).decide(turn)
@@ -1508,7 +1555,7 @@ def test_max_formation_migration_does_not_spawn_below_a_full_bank() -> None:
 
     center = (-945, -945)
     core_object = core(position=center)
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _roster(center=center)
     # Keep the formation local so the spending assertion is independent of
     # thousands of cells of return-path search under coverage instrumentation.
     for index, actor in enumerate([*workers, *rangers]):
@@ -1548,13 +1595,13 @@ def test_campaign_center_holds_for_an_affordable_build_before_the_next_hop() -> 
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(18)
+    rangers = _rangers(18, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     turn = make_turn(
         tick=100,
         resources=unit_cost(UnitType.RANGER, 16 + len(rangers)),
-        objects=[core_object, *_workers(16), *rangers],
+        objects=[core_object, *_workers(16, center=center), *rangers],
     )
     strategy = _strategy(memory)
 
@@ -1568,7 +1615,7 @@ def test_campaign_center_holds_for_an_affordable_build_before_the_next_hop() -> 
 
     depleted = make_turn(
         tick=101,
-        objects=[core_object, *_workers(16), *rangers],
+        objects=[core_object, *_workers(16, center=center), *rangers],
     )
     strategy.decide(depleted)
 
@@ -1591,13 +1638,13 @@ def test_campaign_build_priority_preempts_beacon_at_the_center() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(18)
+    rangers = _rangers(18, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     turn = make_turn(
         tick=100,
         resources=unit_cost(UnitType.RANGER, 16 + len(rangers)),
-        objects=[core_object, *_workers(16), *rangers],
+        objects=[core_object, *_workers(16, center=center), *rangers],
         beacon={"position": list(center)},
     )
 
@@ -1621,10 +1668,12 @@ def test_quota_three_block_waits_for_the_stage_two_roster() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8)
+    rangers = _rangers(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(tick=100, objects=[core_object, *_workers(12), *rangers])
+    turn = make_turn(
+        tick=100, objects=[core_object, *_workers(12, center=center), *rangers]
+    )
 
     _strategy(memory).decide(turn)
 
@@ -1646,10 +1695,12 @@ def test_twenty_rangers_reach_max_and_approach_quota_four() -> None:
         campaign_last_core_id=core_object["id"],
         unit_roles_initialized=True,
     )
-    rangers = _rangers(20)
+    rangers = _rangers(20, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(tick=100, objects=[core_object, *_workers(16), *rangers])
+    turn = make_turn(
+        tick=100, objects=[core_object, *_workers(16, center=center), *rangers]
+    )
 
     _strategy(memory).decide(turn)
 
@@ -1673,7 +1724,7 @@ def test_twenty_rangers_reach_max_and_approach_quota_four() -> None:
 def test_quota_four_hop_waits_for_forward_scout_and_enemy_settle() -> None:
     center = (815, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _roster(center=center)
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,

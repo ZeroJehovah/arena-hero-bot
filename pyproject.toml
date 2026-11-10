@@ -26,7 +26,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--cov=arena_hero_bot --cov-report=term-missing --cov-fail-under=85"
+addopts = "--cov=arena_hero_bot --cov-report=term-missing --cov-fail-under=85 --durations=20"
 testpaths = ["tests"]
 
 [tool.coverage.run]

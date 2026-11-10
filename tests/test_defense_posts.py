@@ -4,6 +4,7 @@ from uuid import UUID
 
 import pytest
 
+from arena_hero_bot import strategy as strategy_module
 from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.strategy import (
@@ -103,6 +104,74 @@ def test_rocky_home_reflows_posts_without_creating_blind_cells():
     assert not set(posts) & obstacles
     assert radius >= 10
     assert not _uncovered_symmetric_cells(center, posts, obstacles, radius)
+
+
+def test_layout_cache_reuses_results_and_invalidates_changed_inputs(monkeypatch):
+    cached = strategy_module._cached_symmetric_defense_posts
+    original = strategy_module._optimized_symmetric_defense_posts
+    calls = 0
+
+    def counted_search(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        strategy_module, "_optimized_symmetric_defense_posts", counted_search
+    )
+    cached.cache_clear()
+    try:
+        center = (17, -23)
+        config = StrategyConfig(campaign_mode=True, expedition_mode=True)
+        strategy = AggressiveStrategy(WorldMemory(), config)
+        rocks = set()
+        expected = strategy._symmetric_defense_posts(center, rocks)
+        restarted = AggressiveStrategy(WorldMemory(), config)
+        assert restarted._symmetric_defense_posts(center, rocks) == expected
+        assert calls == 1
+
+        rocks.add(expected[0][0])
+        posts, _radius = restarted._symmetric_defense_posts(center, rocks)
+        assert not set(posts) & rocks
+        assert calls == 2
+
+        restarted.memory.defense_compressed = True
+        assert restarted._symmetric_defense_posts(center, rocks)[1] == 4
+        assert calls == 3
+        shifted = (center[0] + 1, center[1])
+        assert restarted._symmetric_defense_posts(shifted, rocks) == original(
+            shifted, rocks, vanguard_slots=0, max_radius=4, min_radius=4
+        )
+        assert calls == 4
+
+        restarted.memory.defense_compressed = False
+        rocks.clear()
+        assert restarted._symmetric_defense_posts(center, rocks) == expected
+        assert calls == 4
+        assert cached.cache_info().maxsize == 64
+    finally:
+        cached.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("vanguard_slots", "max_radius", "min_radius"),
+    [(0, 8, 4), (0, 8, 8), (0, 4, 4), (4, 20, 10)],
+)
+def test_cached_layout_matches_full_search(vanguard_slots, max_radius, min_radius):
+    center = (2, -3)
+    rocks = ((2, 2), (6, -5))
+    parameters = {
+        "vanguard_slots": vanguard_slots,
+        "max_radius": max_radius,
+        "min_radius": min_radius,
+    }
+    expected = strategy_module._optimized_symmetric_defense_posts(
+        center, set(rocks), **parameters
+    )
+    assert (
+        strategy_module._cached_symmetric_defense_posts(center, rocks, **parameters)
+        == expected
+    )
 
 
 def test_defender_returns_to_original_post_after_combat_and_restart(tmp_path):

@@ -11837,10 +11837,9 @@ class AggressiveStrategy:
             and cached[5] == target_radius
         ):
             return cached[2], cached[3]
-        local_obstacle_set = set(local_obstacles)
-        posts, coverage_radius = _optimized_symmetric_defense_posts(
+        posts, coverage_radius = _cached_symmetric_defense_posts(
             center,
-            local_obstacle_set,
+            local_obstacles,
             vanguard_slots=vanguard_slots,
             max_radius=target_radius,
             min_radius=min_radius,
@@ -16301,8 +16300,10 @@ class AggressiveStrategy:
             if position != worker.position and usable(position)
         ]
         preferred_sector = self.memory.worker_sectors.get(unit_id)
-        scored: list[tuple[int, int, int, float, int, int, int, int, Position]] = []
-        for position in candidates:
+
+        def score(
+            position: Position,
+        ) -> tuple[int, int, float, int, int, int, int, Position]:
             gain = marginal_gain(position)
             distance = manhattan(worker.position, position)
             sector_index = _worker_patrol_sector_index(chunk, position)
@@ -16311,52 +16312,43 @@ class AggressiveStrategy:
                 if 0 <= sector_index < WORKER_PATROL_SECTOR_COUNT
                 else 0
             )
-            score = gain / (4 + distance)
-            score /= 1 + WORKER_PATROL_SECTOR_PENALTY * load
+            value = gain / (4 + distance)
+            value /= 1 + WORKER_PATROL_SECTOR_PENALTY * load
             if sector_index == preferred_sector:
-                score *= WORKER_PATROL_PREFERRED_BONUS
-            scored.append(
-                (
-                    int(owns(position)),
-                    int(load == 0 and gain > 0),
-                    int(separation(position) >= WORKER_PATROL_SEPARATION),
-                    score,
-                    -load,
-                    int(sector_index == preferred_sector),
-                    gain,
-                    -distance,
-                    position,
-                )
+                value *= WORKER_PATROL_PREFERRED_BONUS
+            return (
+                int(load == 0 and gain > 0),
+                int(separation(position) >= WORKER_PATROL_SEPARATION),
+                value,
+                -load,
+                int(sector_index == preferred_sector),
+                gain,
+                -distance,
+                position,
             )
-        scored.sort(reverse=True)
+
         patrol_position = worker.position
-        # Check a bounded set within the territory first, then leave it only
-        # when rocks or danger make those local targets unusable/unreachable.
-        route_candidates = [item for item in scored if item[0]][
-            : WORKER_PATROL_ROUTE_ATTEMPTS // 2
-        ] + [item for item in scored if not item[0]][
-            : WORKER_PATROL_ROUTE_ATTEMPTS // 2
-        ]
-        for (
-            _owned,
-            _empty_sector,
-            _separated,
-            _score,
-            _load,
-            _preferred,
-            _gain,
-            _distance,
-            candidate,
-        ) in route_candidates:
-            if self._has_static_route(
-                worker,
-                candidate,
-                context,
-                allow_goal=True,
-            ):
-                patrol_position = candidate
+        # Ownership is the leading rank, so foreign candidates cannot win
+        # until the bounded local route attempts all fail. Score that second
+        # group only when needed, retaining both groups' order and budgets.
+        for owned in (True, False):
+            route_candidates = sorted(
+                (position for position in candidates if owns(position) == owned),
+                key=score,
+                reverse=True,
+            )[: WORKER_PATROL_ROUTE_ATTEMPTS // 2]
+            for candidate in route_candidates:
+                if self._has_static_route(
+                    worker,
+                    candidate,
+                    context,
+                    allow_goal=True,
+                ):
+                    patrol_position = candidate
+                    break
+                self._unreachable_patrol_cells[candidate] = turn.tick
+            if patrol_position != worker.position:
                 break
-            self._unreachable_patrol_cells[candidate] = turn.tick
         goal = UnitGoal(
             position=patrol_position,
             assigned_tick=turn.tick,
@@ -17933,6 +17925,31 @@ def _search_symmetric_defense_posts(
             best_score = trial_score
             best_chosen = tuple(position for position, _mask in chosen)
     return best_chosen
+
+
+@lru_cache(maxsize=64)
+def _cached_symmetric_defense_posts(
+    center: Position,
+    obstacles: tuple[Position, ...],
+    *,
+    vanguard_slots: int,
+    max_radius: int,
+    min_radius: int,
+) -> tuple[tuple[Position, ...], int]:
+    """Reuse immutable deterministic layouts across instances and postures.
+
+    Absolute coordinates participate in the search seed, so they remain in
+    the key alongside the local rocks and every formation parameter. Bound
+    the cache while the Core travels through new terrain.
+    """
+
+    return _optimized_symmetric_defense_posts(
+        center,
+        set(obstacles),
+        vanguard_slots=vanguard_slots,
+        max_radius=max_radius,
+        min_radius=min_radius,
+    )
 
 
 def _optimized_symmetric_defense_posts(

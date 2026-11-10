@@ -758,6 +758,65 @@ def test_idle_patrol_can_leave_a_territory_with_no_traversable_target():
     assert chunk.contains(goal.position)
 
 
+def test_worker_patrol_scores_only_needed_territories(monkeypatch):
+    strategy = _strategy()
+    workers = _workers()
+    evaluations = 0
+    original = strategy._worker_patrol_view
+
+    def counted_view(*args):
+        nonlocal evaluations
+        evaluations += 1
+        return original(*args)
+
+    monkeypatch.setattr(strategy, "_worker_patrol_view", counted_view)
+    strategy.decide(make_turn(objects=[core(position=HOME), *workers]))
+
+    targets = set()
+    for worker in workers:
+        goal = strategy.memory.goal_for(worker["id"])
+        assert goal is not None
+        targets.add(goal.position)
+    assert len(targets) == 16
+    # Each idle Worker has a reachable local destination. A full sweep should
+    # score roughly one chunk, plus the other Workers' existing reservations,
+    # rather than scoring the entire chunk again for each Worker.
+    assert evaluations < 2 * len(
+        _resource_block_cells(_single_chunk_resource_block(HOME))
+    )
+
+
+def test_worker_patrol_uses_foreign_area_when_local_routes_are_sealed():
+    workers = [
+        unit(301, "WORKER", position=(HOME[0] + 9, HOME[1] + 9)),
+        unit(302, "WORKER", position=(HOME[0] + 12, HOME[1] + 10)),
+    ]
+    memory = WorldMemory(
+        core_home_position=HOME,
+        worker_sector_layout_version=WORKER_SECTOR_LAYOUT_VERSION,
+        worker_sector_count=16,
+        worker_sectors={workers[0]["id"]: 0, workers[1]["id"]: 15},
+    )
+    # The first Worker's own targets exist, but a closed room in the second
+    # Worker's territory makes every route to them impossible.
+    rocks = {
+        (HOME[0] + dx, HOME[1] + dy)
+        for dx in range(3, 16)
+        for dy in range(3, 16)
+        if dx in {3, 15} or dy in {3, 15}
+    }
+    strategy = _strategy(memory)
+    turn = make_turn(objects=[core(position=HOME), *workers], obstacles=rocks)
+
+    strategy.decide(turn)
+
+    goal = memory.goal_for(workers[0]["id"])
+    assert goal is not None
+    assert HOME[0] + 3 < goal.position[0] < HOME[0] + 15
+    assert HOME[1] + 3 < goal.position[1] < HOME[1] + 15
+    assert turn.plan.unit_actions[UUID(workers[0]["id"])].type == "MOVE"
+
+
 def test_ring_contact_alert_uses_clockwise_path_distance() -> None:
     memory = WorldMemory(core_home_position=HOME)
     strategy = _strategy(memory)
