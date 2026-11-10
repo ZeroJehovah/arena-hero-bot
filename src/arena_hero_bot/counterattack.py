@@ -208,6 +208,8 @@ def entry_viable(
     targets: Sequence[UnitView],
     enemies: Sequence[UnitView],
     rocks: Container[Position],
+    *,
+    army_size: int | None = None,
 ) -> bool:
     """Require advantage after the MOVE Tick, including adjacent enemy moves.
 
@@ -235,6 +237,10 @@ def entry_viable(
     ):
         return False
     opposition = reachable_opposition(cells, enemies, rocks)
+    if opposition > MAX_ENEMIES or (
+        army_size is not None and army_size < ARMY_RATIO * opposition
+    ):
+        return False
     survivors = len(positions) - casualty_bound(positions, enemies, rocks)
     return survivors >= max(opposition + 2, sum(target.hp for target in targets))
 
@@ -266,11 +272,13 @@ def choose_formation(
     rocks: Container[Position],
     dangerous: Container[Position],
     max_party: int,
+    *,
+    army_size: int | None = None,
 ) -> dict[str, AssaultSlot]:
-    """Bounded matching of safe unique stages to paired firing cells.
+    """Bounded matching of safe staging capacity to paired firing cells.
 
     No angular separation is required: two stacks may enter the same ray at
-    different distances. Every stack enters together from adjacent safe cells.
+    different distances. A pair may share a safe stage before entering together.
     """
     core = turn.core
     if core is None or not targets or max_party < MIN_PARTY:
@@ -280,6 +288,9 @@ def choose_formation(
     unavailable = {core.position, *turn.resource_cells}
     unavailable.update(enemy.position for enemy in turn.visible_enemies)
     occupied = {unit.position for unit in turn.units}
+    occupants: dict[Position, set[UUID]] = {}
+    for unit in turn.units:
+        occupants.setdefault(unit.position, set()).add(unit.id)
     candidates = sorted(
         allies, key=lambda ally: (manhattan(ally.position, target), ally.id)
     )[:24]
@@ -314,10 +325,7 @@ def choose_formation(
             if any(can_attack(enemy, stage, rocks) for enemy in enemies):
                 continue
             for ally in candidates:
-                if stage in occupied and (
-                    stage != ally.position
-                    or sum(unit.position == stage for unit in turn.units) != 1
-                ):
+                if len(occupants.get(stage, set()) - {ally.id}) >= 2:
                     continue
                 route = paths[ally.id].get(stage)
                 if route is not None:
@@ -333,7 +341,11 @@ def choose_formation(
         candidates_for_cell = [
             (left, right)
             for left, right in combinations(choices, 2)
-            if left[1] != right[1] and left[2] != right[2]
+            if left[1] != right[1]
+            and all(
+                count + len(occupants.get(stage, set()) - {left[1], right[1]}) <= 2
+                for stage, count in Counter((left[2], right[2])).items()
+            )
         ]
         candidates_for_cell.sort(
             key=lambda pair: (max(o[0] for o in pair), sum(o[0] for o in pair), pair)
@@ -368,6 +380,7 @@ def choose_formation(
                 targets,
                 enemies,
                 rocks,
+                army_size=army_size,
             ):
                 return {
                     str(actor_id): AssaultSlot(stage, firing)

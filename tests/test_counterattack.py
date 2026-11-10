@@ -169,7 +169,7 @@ def test_observation_gaps_displacement_and_core_identity_reset_contact():
 
 @pytest.mark.parametrize(
     "case",
-    ["short", "ratio", "reserve", "too_many", "hp", "shield", "moving", "direct_core"],
+    ["short", "ratio", "reserve", "hp", "shield", "moving", "direct_core"],
 )
 def test_admission_rejects_short_or_unsafe_or_not_overwhelming_force(case):
     friends, foes, c, ticks = _friends(), _foes(), core(), counter.STANDOFF_TICKS
@@ -179,11 +179,6 @@ def test_admission_rejects_short_or_unsafe_or_not_overwhelming_force(case):
         friends = _friends(5)
     elif case == "reserve":
         friends, foes = _friends(7), _foes(1)
-    elif case == "too_many":
-        foes += [
-            unit(n, "RANGER", controlled=False, position=(8, n - 53))
-            for n in range(52, 55)
-        ]
     elif case in {"hp", "shield"}:
         c[case] = 4
     elif case == "moving":
@@ -207,7 +202,7 @@ def test_formation_assembles_safely_and_only_enters_when_every_member_is_ready()
     assert operation is not None and operation.entered is None
     assert len(operation.slots) == 6
     assert counter.paired_cells(tuple(s.firing for s in operation.slots.values()))
-    assert len({slot.stage for slot in operation.slots.values()}) == 6
+    assert max(Counter(slot.stage for slot in operation.slots.values()).values()) <= 2
     assert len(turn.rangers) - len(operation.slots) >= 4
     for member in turn.rangers:
         action = turn.plan.unit_actions.get(member.id)
@@ -288,9 +283,11 @@ def test_assembly_cancels_without_replacement_or_chasing(case):
     elif case == "invisible":
         objects = [o for o in objects if o.get("id") != object_id(50)]
     elif case == "reinforced":
+        # Reinforcements must be able to affect this assault, rather than
+        # merely increasing the count of enemies elsewhere around the Core.
+        firing = next(iter(operation.slots.values())).firing
         objects.extend(
-            unit(n, "RANGER", controlled=False, position=(6, n - 82))
-            for n in (80, 81, 82)
+            unit(n, "RANGER", controlled=False, position=firing) for n in (80, 81)
         )
     else:
         strategy.memory.incoming_damage[next(iter(operation.slots.values())).stage] = (
@@ -538,3 +535,161 @@ def test_foreign_respawn_and_duplicate_tick_do_not_reset_residence():
     )
     state.observe(turn)
     assert state.contacts[object_id(50)].since == before[object_id(50)].since
+
+
+def test_distant_contacts_do_not_veto_a_superior_local_counterattack():
+    distant = [
+        unit(n, "RANGER", controlled=False, position=(8, n - 53)) for n in range(52, 55)
+    ]
+    strategy, turn, context = _start(foes=[*_foes(), *distant])
+    operation = strategy.memory.counterattack.operation
+    assert operation is not None
+    assert set(operation.target_ids) == {object_id(50), object_id(51)}
+    assert len(operation.slots) == 6
+    assert context.counterattack_ids
+    assert (
+        counter.reachable_opposition(
+            tuple(slot.firing for slot in operation.slots.values()),
+            strategy._counterattack_enemies(turn),
+            set(),
+        )
+        == 2
+    )
+
+
+def test_more_than_four_actual_supporting_enemies_still_veto_ingress():
+    target = _views(_foes(1, (0, 0)))
+    supporters = _views(
+        [unit(n, "RANGER", controlled=False, position=(5, 1)) for n in (80, 81)]
+        + [unit(n, "RANGER", controlled=False, position=(1, 5)) for n in (82, 83)]
+    )
+    positions = {
+        UUID(int=i): (p, 2)
+        for i, p in enumerate(
+            [(2, 0)] * 2 + [(3, 0)] * 2 + [(0, 2)] * 2 + [(0, 3)] * 2, 2
+        )
+    }
+    assert all(
+        not counter.can_attack(enemy, cell, set())
+        for enemy in supporters
+        for cell, _ in positions.values()
+    )
+    assert (
+        counter.reachable_opposition(
+            tuple(cell for cell, _ in positions.values()), (*target, *supporters), set()
+        )
+        == 5
+    )
+    assert not counter.entry_viable(positions, target, (*target, *supporters), set())
+
+
+def _narrow_assembly():
+    friends = [
+        unit(n, "RANGER", position=p)
+        for n, p in enumerate(
+            [(3, 2), (4, 2), (4, 1), (5, 1), (6, 1), (5, 2), (6, 3), (7, 2)], 2
+        )
+    ]
+    rocks = {(-1, 0), (0, -1), (0, 1), (1, -1), (1, 1), (2, -1), (3, -1), (4, 0)}
+    return friends, rocks
+
+
+def test_shared_safe_stages_reach_a_real_volley_across_restart(tmp_path):
+    friends, rocks = _narrow_assembly()
+    encounter = Encounter(friends, _foes(1, (0, 0)), resources=0)
+    encounter.core = core(position=(6, 2))
+    strategy = _strategy({o["id"]: "defense" for o in friends})
+    _warm(strategy, encounter.turn())
+    entered = None
+    for offset in range(counter.ASSEMBLY_TICKS + 2):
+        turn = make_turn(
+            tick=encounter.tick,
+            objects=[
+                encounter.core,
+                *encounter.friends.values(),
+                *encounter.foes.values(),
+            ],
+            obstacles=rocks,
+        )
+        context = _context(strategy, turn)
+        strategy._prepare_counterattack(context)
+        operation = strategy.memory.counterattack.operation
+        assert operation is not None
+        assert Counter(slot.stage for slot in operation.slots.values()) == {
+            (2, 1): 2,
+            (3, 1): 2,
+        }
+        enemy_actions = {}
+        if operation.entered is not None:
+            entered = operation.entered
+            first = next(k for k in operation.slots if k in encounter.friends)
+            enemy_actions = {
+                object_id(50): {
+                    "type": "SHOOT",
+                    "target_id": first,
+                    "expected_cell": list(operation.slots[first].firing),
+                }
+            }
+        for member in turn.rangers:
+            action = turn.plan.unit_actions.get(member.id)
+            if action is not None and action.type == "MOVE":
+                cell = add(member.position, action.direction)
+                assert cell not in rocks
+                if entered is None:
+                    assert not line_of_fire((0, 0), cell, rocks)
+        encounter.settle(turn.plan, enemy_actions)
+        if offset == 1:
+            path = tmp_path / "shared-stage.json"
+            strategy.memory.save(path)
+            strategy.memory = WorldMemory.load(path)
+        if encounter.kills:
+            break
+    assert entered is not None
+    assert encounter.kills == 1
+    assert encounter.losses <= 1
+    assert encounter.core["hp"] == encounter.core["shield"] == 5
+
+
+def test_shared_stage_cannot_displace_an_unselected_occupant():
+    friends, rocks = _narrow_assembly()
+    turn = make_turn(
+        objects=[
+            core(position=(6, 2)),
+            *friends,
+            *_foes(1, (0, 0)),
+            unit(90, "WORKER", position=(2, 1)),
+        ],
+        obstacles=rocks,
+    )
+    strategy = _strategy()
+    _warm(strategy, turn)
+    strategy._prepare_counterattack(_context(strategy, turn))
+    operation = strategy.memory.counterattack.operation
+    if operation is not None:
+        occupancy = Counter(
+            ranger.position
+            for ranger in turn.units
+            if str(ranger.id) not in operation.slots
+        )
+        occupancy.update(slot.stage for slot in operation.slots.values())
+        assert max(occupancy.values()) <= 2
+        assert sum(slot.stage == (2, 1) for slot in operation.slots.values()) <= 1
+    assert UUID(int=90) not in turn.plan.unit_actions
+
+
+def test_army_ratio_counts_only_enemies_that_can_join_the_selected_fight():
+    targets = _views(_foes(1, (0, 0)))
+    supporters = _views(
+        [unit(n, "RANGER", controlled=False, position=(5, 1)) for n in (80, 81)]
+        + [unit(82, "RANGER", controlled=False, position=(1, 5))]
+    )
+    positions = {
+        UUID(int=i): (p, 2)
+        for i, p in enumerate([(2, 0)] * 2 + [(3, 0)] * 2 + [(0, 3)] * 2, 2)
+    }
+    assert not counter.entry_viable(
+        positions, targets, (*targets, *supporters), set(), army_size=11
+    )
+    assert counter.entry_viable(
+        positions, targets, (*targets, *supporters), set(), army_size=12
+    )

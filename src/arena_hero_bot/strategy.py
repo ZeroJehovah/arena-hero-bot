@@ -7601,11 +7601,10 @@ class AggressiveStrategy:
         # Once engaged, use the actual survivors/volley below. Reapplying the
         # full-health launch ratio after one wound would abort every exchange.
         if (operation is None or operation.entered is None) and (
-            not 1 <= len(local_enemies) <= counter.MAX_ENEMIES
-            or len(healthy) < counter.ARMY_RATIO * len(local_enemies)
+            not local_enemies or len(healthy) < counter.MIN_RESERVE + counter.MIN_PARTY
         ):
             if operation is not None:
-                state.finish(turn.tick, "local force ratio no longer sufficient")
+                state.finish(turn.tick, "healthy counterattack reserves insufficient")
             return
         dangerous = {
             cell
@@ -7652,7 +7651,14 @@ class AggressiveStrategy:
                 ):
                     continue
                 slots = counter.choose_formation(
-                    turn, available, targets, enemies, rocks, dangerous, max_party
+                    turn,
+                    available,
+                    targets,
+                    enemies,
+                    rocks,
+                    dangerous,
+                    max_party,
+                    army_size=len(healthy),
                 )
                 if slots:
                     operation = counter.Counterattack(
@@ -7665,6 +7671,7 @@ class AggressiveStrategy:
                     state.reason = "assembling paired counterattack"
                     break
             if operation is None:
+                state.reason = "no safe locally superior counterattack formation"
                 state.retry_after = turn.tick + counter.RETRY_TICKS
                 return
         visible = {str(enemy.id): enemy for enemy in turn.visible_enemies}
@@ -7729,6 +7736,7 @@ class AggressiveStrategy:
                 targets,
                 enemies,
                 rocks,
+                army_size=len(healthy),
             )
         ):
             state.finish(turn.tick, "assembly no longer safe or locally superior")
@@ -7769,8 +7777,7 @@ class AggressiveStrategy:
                     {
                         cell
                         for cell in adjacent_positions(member.position)
-                        if self._predicted_friendly_occupancy(cell, context)
-                        >= (1 if cell == slot.stage else 2)
+                        if self._predicted_friendly_occupancy(cell, context) >= 2
                     },
                 )
                 route = counter.safe_routes(
@@ -7785,9 +7792,7 @@ class AggressiveStrategy:
                             context,
                             reason="assemble safely for paired counterattack",
                             target=slot.stage,
-                            intent=_MoveIntent.STAND
-                            if route[0] == slot.stage
-                            else _MoveIntent.TRANSIT,
+                            intent=_MoveIntent.TRANSIT,
                         )
         for member in members:
             if not self._has_unit_action(member, context):
