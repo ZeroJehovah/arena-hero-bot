@@ -12,6 +12,7 @@ from arena_hero import CoreView, Position, Turn, UnitType, UnitView
 
 from .counterattack import CounterattackState
 from .exploration import ExplorationMap, ExplorationRoute, visible_cells
+from .skirmish import Skirmish
 
 SCHEMA_VERSION = 1
 POSITION_HISTORY_LIMIT = 8
@@ -125,6 +126,8 @@ class WorldMemory:
     # Each cell retains (last attack Tick, strongest observed damage) briefly.
     incoming_damage: dict[Position, tuple[int, int]] = field(default_factory=dict)
     counterattack: CounterattackState = field(default_factory=CounterattackState)
+    skirmish: Skirmish | None = None
+    skirmish_cooldown_until: int = -1
     resource_cells: dict[Position, int] = field(default_factory=dict)
     # Combat identities are durable: a live Unit keeps its assigned role when
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
@@ -779,6 +782,8 @@ class WorldMemory:
                 for position, (tick, damage) in sorted(self.incoming_damage.items())
             ],
             "counterattack": self.counterattack.to_dict(),
+            "skirmish": self.skirmish.to_dict() if self.skirmish else None,
+            "skirmish_cooldown_until": self.skirmish_cooldown_until,
             "resource_cells": [
                 {"position": list(position), "tick": seen_tick}
                 for position, seen_tick in sorted(self.resource_cells.items())
@@ -1002,6 +1007,10 @@ class WorldMemory:
                 for value in raw.get("incoming_damage", [])
             },
             counterattack=CounterattackState.from_dict(raw.get("counterattack", {})),
+            skirmish=Skirmish.from_dict(raw["skirmish"])
+            if raw.get("skirmish")
+            else None,
+            skirmish_cooldown_until=int(raw.get("skirmish_cooldown_until", -1)),
             resource_cells=resource_cells,
             unit_roles={
                 str(unit_id): str(role)

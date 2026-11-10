@@ -301,6 +301,8 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             for unit_id, position in sorted(memory.defense_posts.items())
         },
         "counterattack": memory.counterattack.to_dict(),
+        "skirmish": memory.skirmish.to_dict() if memory.skirmish else None,
+        "skirmish_cooldown_until": memory.skirmish_cooldown_until,
         "layered_defense": {
             "anchor": memory.layered_defense_anchor,
             "posts": memory.layered_defense_posts,

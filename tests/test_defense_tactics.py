@@ -367,6 +367,23 @@ def test_patrol_pursues_only_with_a_present_healthy_supporting_shooter():
     assert "local force advantage" in context.report.decisions[-1].reason
 
 
+def test_legal_patrol_advance_precedes_a_speculative_lead_and_post_move():
+    strategy, turn, context = _scenario(
+        [(2, (0, 9), 2), (3, (0, 11), 2)],
+        [(30, "RANGER", (0, 13), 2)],
+        roles={2: "patrol-1", 3: "patrol-1"},
+    )
+    # At distance four the old cover-shot branch consumed the move even
+    # though the second Ranger has a current, survivable covering shot.
+    context.layered_steps[turn.rangers[0].id] = (1, 9)
+
+    action = _decide(strategy, turn.rangers[0], context)
+
+    assert action.type == "MOVE"
+    assert add((0, 9), action.direction) == (0, 10)
+    assert "local force advantage" in context.report.decisions[-1].reason
+
+
 @pytest.mark.parametrize(
     "conditions",
     [

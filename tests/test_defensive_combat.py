@@ -17,6 +17,7 @@ from arena_hero_bot.strategy import (
 )
 
 from .factories import core, make_turn, object_id, unit
+from .test_layered_defense import Encounter
 
 
 def _strategy(memory: WorldMemory | None = None) -> AggressiveStrategy:
@@ -329,8 +330,10 @@ def test_massed_assault_fallback_is_inert_without_the_shared_picture() -> None:
     )
 
 
-def test_mutual_kill_is_allowed_even_when_both_hostile_shots_still_resolve() -> None:
-    # Both attacks resolve even when the one-HP target dies in this volley.
+def test_lone_full_ranger_escapes_instead_of_trading_for_a_wounded_target() -> None:
+    # An isolated full-health shooter has a safe escape and no Core pressure.
+    # Preserve it instead of automatically accepting two incoming arrows for
+    # a one-HP enemy, while coordinated equal trades remain legal elsewhere.
     turn = make_turn(
         objects=[
             core(position=(10, 10)),
@@ -344,10 +347,12 @@ def test_mutual_kill_is_allowed_even_when_both_hostile_shots_still_resolve() -> 
     report = strategy.decide(turn)
 
     action = turn.plan.unit_actions[UUID(int=2)]
-    assert action.type == "SHOOT"
-    assert action.expected_cell == (0, 2)
+    assert action.type == "MOVE"
+    assert not strategy._visible_attackers_at(
+        add((0, 0), action.direction), turn, set()
+    )
     assert len(strategy._visible_attackers_at((0, 0), turn, set())) == 2
-    assert "fire" in _decisions_by_number(report)[2]
+    assert "lethal" in _decisions_by_number(report)[2]
 
 
 def test_moving_shooters_are_future_risk_without_current_arrows() -> None:
@@ -379,6 +384,102 @@ def test_moving_shooters_are_future_risk_without_current_arrows() -> None:
         object_id(31),
     }
     assert not strategy._visible_attackers_at((0, 0), turn, {(0, 3)})
+
+
+def test_recent_lethal_damage_beats_a_speculative_lead_with_no_visible_ray() -> None:
+    memory = WorldMemory(
+        unit_roles={object_id(2): "defense"}, unit_roles_initialized=True
+    )
+    strategy = _strategy(memory)
+    previous = make_turn(
+        tick=99,
+        objects=[core(), unit(2, "RANGER", position=(0, -4))],
+    )
+    memory.observe(previous)
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            unit(2, "RANGER", position=(0, -4), hp=1),
+            unit(30, "RANGER", controlled=False, position=(0, -8)),
+        ],
+        events=[
+            {
+                "event_id": object_id(900),
+                "tick": 99,
+                "event_type": "UNIT_DAMAGED",
+                "reason_code": "ATTACK",
+                "target_id": object_id(2),
+                "position": [0, -4],
+                "values": {"damage": 1, "hp": 1},
+            }
+        ],
+    )
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert isinstance(action, MoveAction)
+    assert add((0, -4), action.direction) != (0, -4)
+
+
+@pytest.mark.parametrize("visible", [True, False])
+@pytest.mark.parametrize("previous_safe_cell", [False, True])
+def test_worker_escapes_two_diagonal_rays_before_maximizing_distance(
+    visible, previous_safe_cell
+):
+    friends = [unit(2, "WORKER", position=(0, 0))]
+    foes = [unit(n, "RANGER", controlled=False, position=(2, -3)) for n in (30, 31)]
+    strategy = _strategy()
+    strategy.memory.observe(
+        make_turn(tick=99, objects=[core(position=(-1, 7)), *friends, *foes])
+    )
+    if previous_safe_cell:
+        strategy.memory.position_history[object_id(2)] = [(0, 0), (1, 0), (0, 0)]
+    turn = make_turn(
+        objects=[core(position=(-1, 7)), *friends, *(foes if visible else [])],
+        obstacles=[(0, 1)],
+    )
+
+    strategy.decide(turn)
+
+    action = turn.plan.unit_actions[UUID(int=2)]
+    assert action.type == "MOVE"
+    destination = add((0, 0), action.direction)
+    assert destination == (1, 0)
+    # LEFT is farther from the enemy but both Rangers can hit its diagonal.
+    # Settle their aimed shots against the chosen escape independently.
+    encounter = Encounter(friends, foes, resources=0)
+    encounter.core = core(position=(-1, 7))
+    encounter.settle(
+        turn.plan,
+        {
+            foe["id"]: {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": list(destination),
+            }
+            for foe in foes
+        },
+    )
+    assert encounter.losses == 0
+    assert encounter.friends[object_id(2)]["hp"] == 2
+
+
+def test_lone_mutual_kill_is_kept_when_it_removes_a_direct_core_attacker() -> None:
+    turn = make_turn(
+        objects=[
+            core(position=(0, 5)),
+            unit(2, "RANGER"),
+            unit(30, "RANGER", controlled=False, position=(0, 2), hp=1),
+            unit(31, "RANGER", controlled=False, position=(0, 3)),
+        ]
+    )
+    strategy = _strategy()
+
+    strategy.decide(turn)
+
+    assert turn.plan.unit_actions[UUID(int=2)].type == "SHOOT"
 
 
 def test_defender_routes_around_an_unsafe_first_step() -> None:
