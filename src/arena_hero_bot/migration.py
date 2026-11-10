@@ -129,21 +129,19 @@ def resource_quota_outer_ring(target_quota: int) -> int | None:
 
 
 def campaign_stop_ring(target_quota: int) -> int | None:
-    """Return the outermost campaign ring allowed at one formation tier.
+    """Stop at the frontier for quotas 2/3, or on entry to higher tiers.
 
-    Tiers 2 and 3 approach the next quota boundary without crossing it:
-    quota 2 stops at ring 35 beside quota 3, and quota 3 stops at ring 25
-    beside quota 4.  The max formation may enter quota 4 and travels all the
-    way to the outer quota 8 ring.
+    Quota 4+ is crossed only when the next tier is affordable. Missing
+    natural quota values use the highest existing tier below the roster cap.
     """
 
-    if target_quota <= 2:
-        boundary = resource_quota_outer_ring(3)
+    if target_quota <= 3:
+        boundary = resource_quota_outer_ring(max(2, target_quota) + 1)
         return None if boundary is None else boundary + 1
-    if target_quota < 8:
-        boundary = resource_quota_outer_ring(target_quota + 1)
-        return None if boundary is None else boundary + 1
-    return resource_quota_outer_ring(target_quota)
+    entry = resource_quota_outer_ring(target_quota) or 0
+    while _resource_quota_at_ring(entry) > target_quota:
+        entry += 1
+    return resource_quota_outer_ring(_resource_quota_at_ring(entry))
 
 
 def cardinal_block_neighbors(block: Position) -> tuple[Position, ...]:

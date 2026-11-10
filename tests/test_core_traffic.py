@@ -117,7 +117,7 @@ def test_resting_core_worker_follows_its_task_through_a_full_queue(
         ],
         *[
             unit(100 + n, "RANGER", position=(21 + n % 7, 649 - n // 7))
-            for n in range(28)
+            for n in range(40)
         ],
     ]
     strategy = AggressiveStrategy(
@@ -125,7 +125,7 @@ def test_resting_core_worker_follows_its_task_through_a_full_queue(
             core_home_position=home,
             core_layout_version=CORE_LAYOUT_VERSION,
             campaign_phase=4,
-            campaign_target_quota=8,
+            campaign_target_quota=5,
             campaign_last_core_id=core()["id"],
             unit_roles_initialized=True,
             unit_roles={

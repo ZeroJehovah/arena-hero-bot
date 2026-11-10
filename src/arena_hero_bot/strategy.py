@@ -299,8 +299,8 @@ SYMMETRIC_RESOURCE_BLOCK_SIZE = 32
 SYMMETRIC_PATROL_RING_UNITS = 8
 SYMMETRIC_CORE_RADIUS = 13
 # Campaign posture replaces the old fixed 4V+24R roster with four explicit,
-# cumulative local formations.  It never trains Vanguards or new expeditions:
-# every Ranger beyond the max local formation is another patrol Ranger.
+# cumulative local formations. It never trains Vanguards or new expeditions;
+# all local Rangers split evenly between defense and patrol, with odd guards.
 CAMPAIGN_PHASE_NONE = 0
 CAMPAIGN_PHASE_STAGE1 = 1
 CAMPAIGN_PHASE_STAGE2 = 2
@@ -308,9 +308,9 @@ CAMPAIGN_PHASE_STAGE3 = 3
 CAMPAIGN_PHASE_STAGE4 = 4
 CAMPAIGN_STAGE1_WORKERS = 8
 CAMPAIGN_STAGE2_WORKERS = 16
-CAMPAIGN_STAGE2_DEFENSE_RANGERS = 8
-CAMPAIGN_STAGE3_DEFENSE_RANGERS = 20
-CAMPAIGN_MAX_PATROL_RANGERS = 8
+CAMPAIGN_STAGE2_RANGERS = 8
+CAMPAIGN_MAX_RANGERS = 20
+CAMPAIGN_RANGERS_PER_QUOTA = 10
 CAMPAIGN_DEFENSE_RADIUS = 8
 CAMPAIGN_DEFENSE_COMPRESSED_RADIUS = 4
 CAMPAIGN_DEFENSE_PRESSURE_ENEMIES = ALL_HANDS_DEFENSE_MIN_ENEMIES
@@ -9145,11 +9145,7 @@ class AggressiveStrategy:
 
     def _patrol_team_count(self) -> int:
         if self.config.campaign_mode:
-            return (
-                SYMMETRIC_PATROL_TEAM_COUNT
-                if self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE3
-                else 0
-            )
+            return SYMMETRIC_PATROL_TEAM_COUNT
         return (
             SYMMETRIC_PATROL_TEAM_COUNT
             if self._symmetric_posture()
@@ -9158,11 +9154,7 @@ class AggressiveStrategy:
 
     def _patrol_team_quota(self) -> tuple[int, int]:
         if self.config.campaign_mode:
-            return (
-                (0, PATROL_TEAM_RANGERS)
-                if self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE3
-                else (0, 0)
-            )
+            return 0, PATROL_TEAM_RANGERS
         return (
             0 if self._symmetric_posture() else PATROL_TEAM_VANGUARDS,
             PATROL_TEAM_RANGERS,
@@ -9170,19 +9162,7 @@ class AggressiveStrategy:
 
     def _formation_quota(self) -> tuple[int, int, int, int]:
         if self.config.campaign_mode:
-            if self.memory.campaign_phase <= CAMPAIGN_PHASE_STAGE3:
-                # Role assignment is cumulative rather than capped at the
-                # phase's minimum roster.  Otherwise a stage-two player that
-                # already owns more than eight Rangers would have the surplus
-                # demoted to staged before phase advancement could observe it,
-                # making the stage-three formation unreachable.
-                return (
-                    0,
-                    CAMPAIGN_STAGE3_DEFENSE_RANGERS,
-                    0,
-                    CAMPAIGN_STAGE3_DEFENSE_RANGERS,
-                )
-            return (0, 28, 0, 20)
+            return 0, CAMPAIGN_MAX_RANGERS, 0, CAMPAIGN_MAX_RANGERS // 2
         if self._symmetric_posture():
             return (
                 SYMMETRIC_FORMATION_VANGUARDS,
@@ -9203,11 +9183,11 @@ class AggressiveStrategy:
         return EXPEDITION_SQUAD_VANGUARDS, EXPEDITION_SQUAD_RANGERS
 
     def _reconcile_unit_roles(self, turn: Turn) -> None:
-        """Assign stable combat identities without reshuffling live units.
+        """Preserve combat identities while filling the active role quotas.
 
-        Roles are allocated only to previously unassigned UUIDs.  A new Unit
-        can fill a genuinely vacant slot, but it cannot displace a live
-        defender or patrol member merely because its UUID sorts earlier.
+        Campaign casualties may require the smallest possible role transfer
+        to restore the even split. Other modes only fill genuinely vacant
+        fixed slots with previously unassigned UUIDs.
         """
 
         live_units = {str(unit.id): unit for unit in (*turn.vanguards, *turn.rangers)}
@@ -9234,6 +9214,11 @@ class AggressiveStrategy:
                 if unit_id in live_ids:
                     roles[unit_id] = f"{EXPEDITION_ROLE_PREFIX}{serial}"
                     expedition_ids.add(unit_id)
+
+        if self.config.campaign_mode:
+            self._reconcile_campaign_roles(turn, roles, expedition_ids)
+            self._save_unit_roles(roles)
+            return
 
         migration_excluded_ids: set[str] = set()
         if legacy_migration and turn.core is not None:
@@ -9341,42 +9326,92 @@ class AggressiveStrategy:
             assign_available(UnitType.VANGUARD, role, patrol_vanguards)
             assign_available(UnitType.RANGER, role, patrol_rangers)
 
-        if (
-            self.config.campaign_mode
-            and self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE3
-        ):
-            # Once the max formation is complete every further Ranger is
-            # patrol rather than staged.  Keep two per logical team so stable
-            # UUIDs extend the existing four-team pattern without a cap.
-            surplus_rangers = sorted(
-                (
-                    unit_id
-                    for unit_id, unit in live_units.items()
-                    if unit.unit_type is UnitType.RANGER
-                    and (unit_id not in roles or roles.get(unit_id) == STAGED_ROLE)
-                    and unit_id not in expedition_ids
-                ),
-                key=lambda value: UUID(value).bytes,
-            )
-            counts: dict[int, int] = {}
-            for unit_id, role in roles.items():
-                team = self._patrol_team_from_role(role)
-                if (
-                    team is not None
-                    and live_units[unit_id].unit_type is UnitType.RANGER
-                ):
-                    counts[team] = counts.get(team, 0) + 1
-            team = SYMMETRIC_PATROL_TEAM_COUNT + 1
-            for unit_id in surplus_rangers:
-                while counts.get(team, 0) >= PATROL_TEAM_RANGERS:
-                    team += 1
-                roles[unit_id] = f"{PATROL_ROLE_PREFIX}{team}"
-                counts[team] = counts.get(team, 0) + 1
-
         for unit_id in sorted(
             live_ids - set(roles), key=lambda value: UUID(value).bytes
         ):
             roles[unit_id] = STAGED_ROLE
+        self._save_unit_roles(roles)
+
+    def _reconcile_campaign_roles(
+        self, turn: Turn, roles: dict[str, str], expedition_ids: set[str]
+    ) -> None:
+        """Split local Rangers evenly with the fewest existing role changes.
+
+        New UUIDs fill vacancies first. When a casualty makes a transfer
+        necessary, keep the nearest defenders and recall the nearest patrols.
+        Surviving patrol members retain their team numbers across restarts.
+        Legacy expeditions finish their recall before joining this roster.
+        """
+
+        rangers = {
+            str(unit.id): unit
+            for unit in turn.rangers
+            if str(unit.id) not in expedition_ids
+        }
+        defense_quota = (len(rangers) + 1) // 2
+
+        def nearby(unit_id: str) -> tuple[int, bytes]:
+            return (
+                manhattan(turn.core.position, rangers[unit_id].position)
+                if turn.core is not None
+                else 0,
+                UUID(unit_id).bytes,
+            )
+
+        defenders = sorted(
+            (uid for uid in rangers if roles.get(uid) == DEFENSE_ROLE), key=nearby
+        )
+        unassigned = sorted(
+            (
+                uid
+                for uid in rangers
+                if roles.get(uid) != DEFENSE_ROLE
+                and self._patrol_team_from_role(roles.get(uid)) is None
+            ),
+            key=nearby,
+        )
+        keep_defense = set(defenders[:defense_quota])
+        keep_defense.update(unassigned[: max(0, defense_quota - len(keep_defense))])
+        if len(keep_defense) < defense_quota:
+            patrols = sorted(
+                (
+                    uid
+                    for uid in rangers
+                    if self._patrol_team_from_role(roles.get(uid)) is not None
+                ),
+                key=nearby,
+            )
+            keep_defense.update(patrols[: defense_quota - len(keep_defense)])
+
+        for uid in keep_defense:
+            roles[uid] = DEFENSE_ROLE
+        counts: dict[int, int] = {}
+        for role in roles.values():
+            team = self._patrol_team_from_role(role)
+            if team is not None:
+                counts[team] = counts.get(team, 0) + 1
+        team = 1
+        for uid in sorted(rangers, key=lambda value: UUID(value).bytes):
+            if uid in keep_defense or self._patrol_team_from_role(roles.get(uid)):
+                continue
+            while counts.get(team, 0) >= PATROL_TEAM_RANGERS:
+                team += 1
+            roles[uid] = f"{PATROL_ROLE_PREFIX}{team}"
+            counts[team] = counts.get(team, 0) + 1
+        for unit in turn.vanguards:
+            uid = str(unit.id)
+            roles.setdefault(uid, STAGED_ROLE)
+            if roles[uid] == DEFENSE_ROLE:
+                roles[uid] = STAGED_ROLE
+        for uid, role in roles.items():
+            if self.memory.unit_roles.get(uid) != role:
+                self.memory.clear_goal(uid)
+                self.memory.defense_posts.pop(uid, None)
+                self.memory.patrol_ring_slots.pop(uid, None)
+
+    def _save_unit_roles(self, roles: dict[str, str]) -> None:
+        """Persist roles and discard posts belonging to former defenders."""
+
         self.memory.unit_roles = roles
         self.memory.defense_posts = {
             unit_id: position
@@ -9559,6 +9594,7 @@ class AggressiveStrategy:
                     self._campaign_patrol_role_for_returning_runner(str(member))
                 )
                 self.memory.clear_goal(str(member))
+            self._reconcile_unit_roles(turn)
         staged_vanguards = sorted(
             (
                 unit.id
@@ -11376,7 +11412,6 @@ class AggressiveStrategy:
         current_block = resource_block_index(origin)
         current_ring = resource_block_ring(current_block)
         current_quota = resource_block_quota(current_block)
-        movement_cap = self._campaign_movement_cap(turn)
         preferred_block = (
             resource_block_index(preferred_target)
             if preferred_target is not None
@@ -11405,11 +11440,7 @@ class AggressiveStrategy:
                 adjacent
                 and self.config.campaign_mode
                 and not emergency
-                and (
-                    movement_cap is None
-                    or current_quota > movement_cap
-                    or resource_block_quota(block) > movement_cap
-                )
+                and not self._campaign_cross_block_allowed(turn, block)
             ):
                 continue
             ring_delta = resource_block_ring(block) - current_ring
@@ -11551,11 +11582,7 @@ class AggressiveStrategy:
             adjacent_block = blocks_are_cardinally_adjacent(current_block, home_block)
             movement_cap = self._campaign_movement_cap(turn)
             current_quota = resource_block_quota(current_block)
-            adjacent_allowed = (
-                movement_cap is not None
-                and current_quota <= movement_cap
-                and resource_block_quota(home_block) <= movement_cap
-            )
+            adjacent_allowed = self._campaign_cross_block_allowed(turn, home_block)
             # A campaign rest only exists on a block center.  Older snapshots
             # could persist any clear cell as the destination, so a target
             # that is not one of its block's four center cells is rebuilt
@@ -11578,6 +11605,9 @@ class AggressiveStrategy:
                 ):
                     self._repair_unreachable_home_target(turn, core.position)
                 return
+            if adjacent_block and not adjacent_allowed:
+                self._cancel_campaign_migration(turn)
+                return
         target = self._reachable_home_target(
             turn,
             core.position,
@@ -11594,8 +11624,7 @@ class AggressiveStrategy:
         """Advance only on completed composition; casualties never demote."""
 
         workers = len(turn.workers)
-        defense_rangers = self._campaign_defense_rangers(turn)
-        patrol_rangers = self._campaign_patrol_rangers(turn)
+        rangers = self._campaign_rangers(turn)
         if (
             self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE1
             and workers >= CAMPAIGN_STAGE1_WORKERS
@@ -11605,23 +11634,25 @@ class AggressiveStrategy:
         if (
             self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE2
             and workers >= CAMPAIGN_STAGE2_WORKERS
-            and defense_rangers >= CAMPAIGN_STAGE2_DEFENSE_RANGERS
+            and rangers >= CAMPAIGN_STAGE2_RANGERS
         ):
             self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE3
             self.memory.campaign_target_quota = 4
         if (
             self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE3
             and workers >= CAMPAIGN_STAGE2_WORKERS
-            and defense_rangers >= CAMPAIGN_STAGE3_DEFENSE_RANGERS
-            and patrol_rangers >= CAMPAIGN_MAX_PATROL_RANGERS
+            and rangers >= CAMPAIGN_MAX_RANGERS
         ):
             self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE4
-            self.memory.campaign_target_quota = 8
         if self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE4:
-            # Persisted saves from the previous campaign version already had
-            # phase four with target four. Repair the durable goal even though
-            # no phase transition can fire on a restart.
-            self.memory.campaign_target_quota = 8
+            # The destination tier follows the surviving Ranger total;
+            # old fixed goals are repaired even without a phase transition.
+            cap = max(2, rangers // CAMPAIGN_RANGERS_PER_QUOTA + 1)
+            self.memory.campaign_target_quota = cap + 1 if cap < 4 else cap
+        elif self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE3:
+            self.memory.campaign_target_quota = 4
+        elif self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE2:
+            self.memory.campaign_target_quota = 3
         self._update_campaign_scout(turn)
         self._observe_campaign_rest(turn)
         self._continue_campaign_migration(turn)
@@ -11637,6 +11668,8 @@ class AggressiveStrategy:
         """
 
         if self._continue_emergency_migration(turn):
+            return
+        if self.memory.defense_compressed:
             return
         if self.memory.campaign_resting:
             return
@@ -11884,28 +11917,19 @@ class AggressiveStrategy:
     def _update_campaign_scout(self, turn: Turn) -> None:
         """Publish the held hop only after the target block is visibly clear."""
 
-        from .migration import (
-            resource_block_index,
-            resource_block_quota,
-        )
+        from .migration import resource_block_index
 
         target = self.memory.campaign_scout_target
         if target is None:
             return
         block = resource_block_index(target)
-        movement_cap = self._campaign_movement_cap(turn)
-        current_quota = resource_block_quota(
-            resource_block_index(turn.core.position) if turn.core is not None else block
-        )
-        if (
-            movement_cap is None
-            or current_quota > movement_cap
-            or resource_block_quota(block) > movement_cap
-        ):
+        if not self._campaign_cross_block_allowed(turn, block):
             # Casualties revoke the forward sweep immediately, even while
             # blind cells remain. Patrols resume their current-block route;
             # the durable campaign phase does not grant movement permission.
             self._clear_campaign_scout()
+            return
+        if self.memory.defense_compressed:
             return
         if (
             self.memory.campaign_scout_unobservable_target != target
@@ -11964,6 +11988,12 @@ class AggressiveStrategy:
         self.memory.core_home_position = target
         self.memory.core_layout_version = CORE_LAYOUT_VERSION
 
+    def _campaign_rangers(self, turn: Turn) -> int:
+        """Count surviving Rangers available to the local campaign roster."""
+
+        returning = self._expedition_member_ids(turn)
+        return sum(unit.id not in returning for unit in turn.rangers)
+
     def _campaign_defense_rangers(self, turn: Turn) -> int:
         return sum(
             self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
@@ -11999,8 +12029,7 @@ class AggressiveStrategy:
         return (
             self.config.campaign_mode
             and len(turn.workers) >= CAMPAIGN_STAGE2_WORKERS
-            and self._campaign_defense_rangers(turn) >= CAMPAIGN_STAGE3_DEFENSE_RANGERS
-            and self._campaign_patrol_rangers(turn) >= CAMPAIGN_MAX_PATROL_RANGERS
+            and self._campaign_rangers(turn) >= CAMPAIGN_MAX_RANGERS
         )
 
     def _campaign_defense_pressure(
@@ -12052,6 +12081,81 @@ class AggressiveStrategy:
             self.memory.defense_posts.clear()
             self._defensive_layout = None
             self._symmetric_defense_cache = None
+            if previous:
+                self._finish_campaign_battle(turn)
+
+    def _cancel_campaign_migration(self, turn: Turn) -> None:
+        """Discard the old journey and refit at a reachable current-block center."""
+
+        core = turn.core
+        if core is None:
+            return
+        target = self._current_block_home_candidate(
+            core.position,
+            self._rock_map(turn),
+            set(turn.resource_cells) | set(self.memory.resource_cells),
+            {unit.position for unit in turn.units},
+        )
+        old_home = self.memory.core_home_position
+        if (
+            old_home in _resource_block_center_cells(core.position)
+            and old_home is not None
+            and self._has_core_static_route(
+                core.position, old_home, self._rock_map(turn)
+            )
+        ):
+            target = old_home
+        self.memory.core_migration_start_position = None
+        self.memory.campaign_emergency_target = None
+        self.memory.campaign_emergency_started_tick = 0
+        self.memory.campaign_scout_rejections.clear()
+        self.memory.campaign_resting = False
+        self._commit_symmetric_home(target)
+
+    def _finish_campaign_battle(self, turn: Turn) -> None:
+        """Recheck the live roster after the persisted all-hands defense ends."""
+
+        from .migration import resource_block_index, resource_block_quota
+
+        core = turn.core
+        target = self.memory.campaign_scout_target or self.memory.core_home_position
+        if core is None or target is None or target == core.position:
+            return
+        block = resource_block_index(core.position)
+        # Finishing entry into a newly unlocked tier is legal with that
+        # tier's roster. Continuing from one of its centers needs the next
+        # tier, so evaluate the original hop even after crossing its boundary.
+        origin = self.memory.core_migration_start_position or core.position
+        origin_quota = resource_block_quota(resource_block_index(origin))
+        cap = self._campaign_movement_cap(turn)
+        if (
+            cap is None
+            or resource_block_quota(block) > cap
+            or (origin_quota >= 4 and cap <= origin_quota)
+            or (
+                resource_block_index(target) != block
+                and not self._campaign_cross_block_allowed(
+                    turn, resource_block_index(target)
+                )
+            )
+        ):
+            self._cancel_campaign_migration(turn)
+
+    def _campaign_cross_block_allowed(self, turn: Turn, block: Position) -> bool:
+        """Authorize entry and same-tier travel from the surviving formation."""
+
+        from .migration import resource_block_index, resource_block_quota
+
+        core = turn.core
+        cap = self._campaign_movement_cap(turn)
+        if core is None or cap is None:
+            return False
+        current = resource_block_quota(resource_block_index(core.position))
+        return (
+            current <= cap
+            and resource_block_quota(block) <= cap
+            and (current < 4 or current < cap)
+        )
 
     def _campaign_patrols_to_recall(
         self,
@@ -12102,33 +12206,20 @@ class AggressiveStrategy:
         if not self.config.campaign_mode:
             return None
         workers = len(turn.workers)
-        defense = self._campaign_defense_rangers(turn)
-        patrol = self._campaign_patrol_rangers(turn)
-        if (
-            workers >= CAMPAIGN_STAGE2_WORKERS
-            and defense >= CAMPAIGN_STAGE3_DEFENSE_RANGERS
-            and patrol >= CAMPAIGN_MAX_PATROL_RANGERS
-        ):
-            return 8
-        if (
-            workers >= CAMPAIGN_STAGE2_WORKERS
-            and defense >= CAMPAIGN_STAGE3_DEFENSE_RANGERS
-        ):
-            return 3
-        if (
-            workers >= CAMPAIGN_STAGE2_WORKERS
-            and defense >= CAMPAIGN_STAGE2_DEFENSE_RANGERS
-        ):
+        rangers = self._campaign_rangers(turn)
+        if workers < CAMPAIGN_STAGE2_WORKERS:
+            return None
+        if rangers >= CAMPAIGN_MAX_RANGERS:
+            return rangers // CAMPAIGN_RANGERS_PER_QUOTA + 1
+        if rangers >= CAMPAIGN_STAGE2_RANGERS:
             return 2
         return None
 
     def _campaign_quota_gate_complete(self, turn: Turn) -> bool:
         """Return whether the roster matches the quota of the current block.
 
-        The gate is the live formation's quota permission.  Stage 2 permits
-        quota-2 movement after 16W+8R(defense); stage 3 permits quota-3
-        movement after 16W+20R(defense); only the max formation permits the
-        quota-4-and-above approach to the quota-8 block.
+        With 16 Workers, eight Rangers permit quota 2 and twenty permit
+        quota 3. Every further ten Rangers unlock one more quota level.
         """
 
         return self._campaign_movement_cap(turn) is not None
@@ -12575,6 +12666,36 @@ class AggressiveStrategy:
                 )
                 coverage_radius = SYMMETRIC_DEFENSE_MAX_RADIUS
             if self.config.campaign_mode:
+                # The even split can outgrow the original twenty-post
+                # template. Supply unique nearby reserve posts, retaining
+                # surviving owners before introducing new cells.
+                radius = (
+                    CAMPAIGN_DEFENSE_COMPRESSED_RADIUS
+                    if self.memory.defense_compressed
+                    else CAMPAIGN_DEFENSE_RADIUS
+                )
+                extras = (
+                    {
+                        (core_position[0] + dx, core_position[1] + dy)
+                        for dx, dy in _manhattan_disk_offsets(radius)
+                        if dx or dy
+                    }
+                    - set(posts)
+                    - obstacles
+                    - set(context.turn.resource_cells)
+                )
+                retained = set(previous.values()) & extras
+                extra_count = max(len(retained), len(guards) - len(posts))
+                posts += tuple(
+                    sorted(
+                        extras,
+                        key=lambda cell: (
+                            cell not in retained,
+                            -manhattan(core_position, cell),
+                            cell,
+                        ),
+                    )[:extra_count]
+                )
                 assignments = _assign_fixed_defense_posts(guards, posts, previous)
             else:
                 split = SYMMETRIC_DEFENSE_VANGUARDS
@@ -15908,29 +16029,15 @@ class AggressiveStrategy:
         """Return the exact next stage slot, or ``None`` when fully staffed.
 
         Visible hostile fighters in the Core assault ring temporarily require
-        a Ranger. Otherwise the cumulative order is 8W, 16W, 8R(defense),
-        20R(defense), 8R(patrol), then patrol Rangers without a cap.
+        a Ranger. Otherwise finish sixteen Workers, then build Rangers
+        without encoding their eventual defense or patrol assignment.
         """
 
         if self._local_core_attackers(turn):
             return (UnitType.RANGER,)
         workers = len(turn.workers)
-        defense = self._campaign_defense_rangers(turn)
-        patrol = self._campaign_patrol_rangers(turn)
-        # This is one uninterrupted priority sequence, not one quota per
-        # persisted phase.  A phase advances as soon as its formation is
-        # complete, and the same Tick continues with the next lower-tier gap.
-        if workers < CAMPAIGN_STAGE1_WORKERS:
-            return (UnitType.WORKER,)
         if workers < CAMPAIGN_STAGE2_WORKERS:
             return (UnitType.WORKER,)
-        if defense < CAMPAIGN_STAGE2_DEFENSE_RANGERS:
-            return (UnitType.RANGER,)
-        if defense < CAMPAIGN_STAGE3_DEFENSE_RANGERS:
-            return (UnitType.RANGER,)
-        if patrol < CAMPAIGN_MAX_PATROL_RANGERS:
-            return (UnitType.RANGER,)
-        # At max formation all later production is patrol Ranger, forever.
         return (UnitType.RANGER,)
 
     def _expedition_need_candidates(self, turn: Turn) -> tuple[UnitType, ...]:

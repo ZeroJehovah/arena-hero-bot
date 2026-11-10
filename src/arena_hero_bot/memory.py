@@ -211,7 +211,7 @@ class WorldMemory:
     # a restart cannot turn it into a walk back toward the fighters.
     campaign_emergency_target: Position | None = None
     campaign_emergency_started_tick: int = 0
-    # The twenty defensive Rangers normally cover radius eight and fold into
+    # Defensive Rangers normally cover radius eight and fold into
     # a radius-four inner screen under sustained pressure.
     defense_compressed: bool = False
     defense_calm_since_tick: int | None = None

@@ -153,17 +153,18 @@ def _rangers(count: int, *, offset: int = 1000) -> list[dict[str, object]]:
     ]
 
 
-def _max_roster() -> tuple[
-    list[dict[str, object]], list[dict[str, object]], dict[str, str]
-]:
+def _roster(
+    count: int = 30,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, str]]:
     workers = _workers(16)
-    rangers = _rangers(28)
+    rangers = _rangers(count)
+    defense = (count + 1) // 2
     roles = {
         **{str(worker["id"]): "staged" for worker in workers},
-        **{str(ranger["id"]): "defense" for ranger in rangers[:20]},
+        **{str(ranger["id"]): "defense" for ranger in rangers[:defense]},
         **{
             str(ranger["id"]): f"patrol-{index // 2 + 1}"
-            for index, ranger in enumerate(rangers[20:])
+            for index, ranger in enumerate(rangers[defense:])
         },
     }
     return workers, rangers, roles
@@ -175,7 +176,7 @@ def test_campaign_replaces_a_rock_sealed_block_center() -> None:
     origin = (-1074, -17)
     sealed_center = (-1072, -17)
     core_object = core(9, position=origin)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         core_home_position=sealed_center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -224,7 +225,7 @@ def test_campaign_repairs_a_blocked_adjacent_center_in_the_same_block() -> None:
     origin = (-1033, -15)
     blocked_center = (-1008, -16)
     core_object = core(9, position=origin)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         core_home_position=blocked_center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -265,7 +266,7 @@ def test_campaign_revalidates_distant_centers_before_planning(
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
     }
     core_object = core(9, position=origin)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = (
         WorldMemory()
         if fresh_core
@@ -776,7 +777,7 @@ def test_stage_two_roster_advances_to_stage_three_and_asks_for_a_ranger() -> Non
     assert strategy._campaign_spawn_candidates(turn) == (UnitType.RANGER,)
 
 
-def test_completed_stage_three_reaches_max_and_targets_quota_eight() -> None:
+def test_completed_stage_three_reaches_max_and_targets_quota_four_boundary() -> None:
     core_object = core(position=(-2033, -2929))
     memory = WorldMemory(
         core_home_position=(-2033, -2929),
@@ -786,22 +787,19 @@ def test_completed_stage_three_reaches_max_and_targets_quota_eight() -> None:
         campaign_last_core_id=core_object["id"],
         unit_roles_initialized=True,
     )
-    rangers = _rangers(28)
-    for ranger in rangers[:20]:
-        memory.unit_roles[str(ranger["id"])] = "defense"
-    for index, ranger in enumerate(rangers[20:]):
-        memory.unit_roles[str(ranger["id"])] = f"patrol-{index // 2 + 1}"
-    turn = make_turn(objects=[core_object, *_workers(16), *rangers])
+    workers, rangers, roles = _roster(20)
+    memory.unit_roles = roles
+    turn = make_turn(objects=[core_object, *workers, *rangers])
     strategy = _strategy(memory)
 
     strategy._reconcile_unit_roles(turn)
-    assert strategy._campaign_defense_rangers(turn) == 20
-    assert strategy._campaign_patrol_rangers(turn) == 8
+    assert strategy._campaign_defense_rangers(turn) == 10
+    assert strategy._campaign_patrol_rangers(turn) == 10
     strategy._advance_campaign_phase(turn)
 
     assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE4
-    assert memory.campaign_target_quota == 8
-    assert strategy._formation_quota() == (0, 28, 0, 20)
+    assert memory.campaign_target_quota == 4
+    assert strategy._formation_quota() == (0, 20, 0, 10)
     assert strategy._expedition_squad_quota() == (0, 4)
     assert memory.core_home_position is not None
     assert blocks_are_cardinally_adjacent(
@@ -810,15 +808,15 @@ def test_completed_stage_three_reaches_max_and_targets_quota_eight() -> None:
     )
 
 
-def test_persisted_max_stage_repairs_the_old_quota_four_goal() -> None:
+def test_persisted_max_stage_replaces_the_old_fixed_quota_goal() -> None:
     center = (15, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
         campaign_phase=CAMPAIGN_PHASE_STAGE4,
-        campaign_target_quota=4,
+        campaign_target_quota=8,
         campaign_last_core_id=core_object["id"],
         unit_roles=roles,
         unit_roles_initialized=True,
@@ -828,7 +826,7 @@ def test_persisted_max_stage_repairs_the_old_quota_four_goal() -> None:
     _strategy(memory)._advance_campaign_phase(turn)
 
     assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE4
-    assert memory.campaign_target_quota == 8
+    assert memory.campaign_target_quota == 4
 
 
 def test_campaign_defense_covers_radius_eight_and_compresses_to_four() -> None:
@@ -1148,7 +1146,7 @@ def test_full_bank_mid_migration_does_not_skip_the_cleared_spawn_tick() -> None:
         campaign_target_quota=8,
         campaign_last_core_id=core_object["id"],
     )
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory.unit_roles = roles
     memory.unit_roles_initialized = True
     loaded = workers[0]
@@ -1489,7 +1487,7 @@ def test_pre_max_migration_spends_an_affordable_formation_gap() -> None:
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(20)
+    rangers = _rangers(19)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     turn = make_turn(
@@ -1510,7 +1508,7 @@ def test_max_formation_migration_does_not_spawn_below_a_full_bank() -> None:
 
     center = (-945, -945)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     # Keep the formation local so the spending assertion is independent of
     # thousands of cells of return-path search under coverage instrumentation.
     for index, actor in enumerate([*workers, *rangers]):
@@ -1636,7 +1634,7 @@ def test_quota_three_block_waits_for_the_stage_two_roster() -> None:
     assert turn.plan.core_action is None
 
 
-def test_stage_three_moves_only_inside_quota_three_toward_quota_four() -> None:
+def test_twenty_rangers_reach_max_and_approach_quota_four() -> None:
     center = (-529, -529)
     core_object = core(position=center)
     memory = WorldMemory(
@@ -1655,7 +1653,7 @@ def test_stage_three_moves_only_inside_quota_three_toward_quota_four() -> None:
 
     _strategy(memory).decide(turn)
 
-    assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE3
+    assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE4
     assert memory.campaign_target_quota == 4
     assert memory.campaign_resting is False
     assert memory.core_home_position is not None
@@ -1675,7 +1673,7 @@ def test_stage_three_moves_only_inside_quota_three_toward_quota_four() -> None:
 def test_quota_four_hop_waits_for_forward_scout_and_enemy_settle() -> None:
     center = (815, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -1733,7 +1731,7 @@ def test_campaign_scout_ignores_cells_sealed_inside_rocks() -> None:
 
     center = (815, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     sealed = (799, 0)
     seal = [(800, 0), (799, 1), (798, 0), (799, -1)]
     memory = WorldMemory(
@@ -1783,7 +1781,7 @@ def test_campaign_scout_refreshes_sealed_cells_after_new_rocks() -> None:
 
     center = (815, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     sealed = (799, 0)
     seal = [(800, 0), (799, 1), (798, 0), (799, -1)]
     memory = WorldMemory(
@@ -1847,7 +1845,7 @@ def test_campaign_scout_allows_one_unseen_cell_per_four_rangers() -> None:
     center = (815, 15)
     target = (784, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -1985,7 +1983,7 @@ def test_campaign_scout_prioritizes_unseen_gaps_over_aging_covered_cells(age):
 def test_campaign_rock_repair_cannot_sidestep_or_skip_forward_scout(phase):
     origin = (-818, 16)
     sealed_centers = [(-817, 15), (-817, 16), (-816, 15), (-816, 16)]
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     if phase == CAMPAIGN_PHASE_STAGE3:
         rangers = rangers[:20]
         roles = {
@@ -2021,7 +2019,7 @@ def test_scout_finishes_observable_blind_cells_beside_a_blocked_anchor(blocked_a
         for dy in range(-2, 3)
         if 0 < abs(dx) + abs(dy) <= 2
     }
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     scout = rangers[-1]
     scout["position"] = [776, 8]
     memory = WorldMemory(
@@ -2178,10 +2176,11 @@ def test_campaign_scouts_use_the_full_patrol_leash_before_cover_fire() -> None:
             "RANGER",
             position=(center[0] + index % 5, center[1] + 4 + index // 5),
         )
-        for index in range(20)
+        for index in range(15)
     ]
     patrol = [
-        unit(2000 + index, "RANGER", position=(-819 + index, -24)) for index in range(8)
+        unit(2000 + index, "RANGER", position=(-819 + index, -24))
+        for index in range(15)
     ]
     rangers = [*defense, *patrol]
     roles = {
@@ -2231,12 +2230,12 @@ def test_campaign_scout_stops_on_roster_loss_before_sweep_finishes(
     center = (815, 15)
     target = (784, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     for index, worker in enumerate(workers):
         worker["position"] = [806 + index, 24]
-    for index, ranger in enumerate(rangers[:20]):
+    for index, ranger in enumerate(rangers[:15]):
         ranger["position"] = [811 + index % 5, 8 + index // 5]
-    for index, ranger in enumerate(rangers[20:]):
+    for index, ranger in enumerate(rangers[15:]):
         ranger["position"] = [784 + index, 22]
     memory = WorldMemory(
         core_home_position=center,
@@ -2276,7 +2275,7 @@ def test_campaign_scout_stops_on_roster_loss_before_sweep_finishes(
         assert memory.campaign_scout_target is None
         assert memory.core_home_position == center
         assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE4
-        assert memory.campaign_target_quota == 8
+        assert memory.campaign_target_quota == 4
         assert (
             turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
         )
@@ -2295,11 +2294,12 @@ def test_campaign_scout_stops_on_roster_loss_before_sweep_finishes(
             and resource_block_index(decision.target) == resource_block_index(center)
             for decision in patrol_moves
         )
-        assert all(
-            memory.unit_roles[str(ranger["id"])] == roles[str(ranger["id"])]
+        changed = sum(
+            memory.unit_roles[str(ranger["id"])] != roles[str(ranger["id"])]
             for ranger in rangers
             if ranger["id"] != lost["id"]
         )
+        assert changed == (casualty == "defense")
         if restart:
             memory.save(memory_path)
             memory = WorldMemory.load(memory_path)
@@ -2313,7 +2313,7 @@ def test_campaign_scout_stops_on_roster_loss_before_sweep_finishes(
 
 def test_campaign_scout_waits_instead_of_failing_when_coverage_stalls() -> None:
     target = (-784, -17)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         campaign_phase=CAMPAIGN_PHASE_STAGE4,
         campaign_target_quota=8,
@@ -2367,7 +2367,7 @@ def test_campaign_reserve_starts_only_at_the_max_formation() -> None:
 def test_max_formation_builds_only_at_full_bank_and_keeps_spawning_rangers() -> None:
     center = (15, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster(20)
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -2379,7 +2379,7 @@ def test_max_formation_builds_only_at_full_bank_and_keeps_spawning_rangers() -> 
     )
     strategy = _strategy(memory)
     full = make_turn(
-        resources=core_resource_capacity(16 + 28),
+        resources=core_resource_capacity(16 + len(rangers)),
         objects=[core_object, *workers, *rangers],
     )
 
@@ -2390,10 +2390,10 @@ def test_max_formation_builds_only_at_full_bank_and_keeps_spawning_rangers() -> 
     assert full.plan.core_action.unit_type is UnitType.RANGER
 
 
-def test_max_formation_assigns_every_extra_ranger_to_patrol() -> None:
+def test_odd_ranger_recruit_fills_defense_without_moving_existing_patrols() -> None:
     center = (15, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     extra = unit(2000, "RANGER", position=(70, 20))
     extra_id = str(extra["id"])
     roles[extra_id] = "staged"
@@ -2411,7 +2411,7 @@ def test_max_formation_assigns_every_extra_ranger_to_patrol() -> None:
 
     strategy._reconcile_unit_roles(turn)
 
-    assert memory.unit_roles[extra_id].startswith("patrol-")
+    assert memory.unit_roles[extra_id] == "defense"
     assert strategy._campaign_spawn_candidates(turn) == (UnitType.RANGER,)
 
 
@@ -2420,7 +2420,7 @@ def test_max_formation_assigns_every_extra_ranger_to_patrol() -> None:
 def test_incremental_patrol_recruits_fill_stable_pairs(
     tmp_path: Path, batch_size: int, restart: bool
 ) -> None:
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     roles = {uid: role for uid, role in roles.items() if role != "staged"}
     memory = WorldMemory(
         campaign_phase=CAMPAIGN_PHASE_STAGE4,
@@ -2446,24 +2446,25 @@ def test_incremental_patrol_recruits_fill_stable_pairs(
 
     patrol_sizes = [
         sum(role == team for role in memory.unit_roles.values())
-        for team in ("patrol-5", "patrol-6", "patrol-7")
+        for team in ("patrol-8", "patrol-9")
     ]
-    assert patrol_sizes == [2, 2, 2]
+    assert patrol_sizes == [2, 2]
+    assert sum(role == "defense" for role in memory.unit_roles.values()) == 18
     assert all(memory.unit_roles[uid] == role for uid, role in roles.items())
 
 
 def test_surplus_patrol_recruit_fills_a_casualty_without_reshuffling() -> None:
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster(20)
     roles = {uid: role for uid, role in roles.items() if role != "staged"}
     extra = [
         unit(2000 + index, "RANGER", position=(20 + index, 10)) for index in range(4)
     ]
     roles.update(
         {
-            object_id(2000): "patrol-5",
-            object_id(2001): "patrol-5",
-            object_id(2002): "patrol-6",
-            object_id(2003): "patrol-6",
+            object_id(2000): "patrol-6",
+            object_id(2001): "patrol-6",
+            object_id(2002): "defense",
+            object_id(2003): "defense",
         }
     )
     memory = WorldMemory(
@@ -2486,14 +2487,14 @@ def test_surplus_patrol_recruit_fills_a_casualty_without_reshuffling() -> None:
 
     assert memory.unit_roles == {
         **{uid: role for uid, role in roles.items() if uid != object_id(2000)},
-        object_id(1999): "patrol-5",
+        object_id(1999): "patrol-6",
     }
 
 
 def test_forward_patrols_are_all_recalled_when_the_defense_ring_is_hit() -> None:
     center = (15, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -2526,7 +2527,7 @@ def test_forward_patrols_are_all_recalled_when_the_defense_ring_is_hit() -> None
             == "reinforce the threatened side from a stable defensive post"
             for decision in report.decisions
         )
-        == 8
+        == len(rangers) // 2
     )
     assert all(
         decision.target != center
@@ -2562,7 +2563,7 @@ def test_legacy_expedition_recall_keeps_fighting_before_it_returns() -> None:
 
 
 @pytest.mark.parametrize("unit_type", ["RANGER", "VANGUARD"])
-def test_returned_legacy_expedition_joins_the_patrol_roster(
+def test_returned_legacy_expedition_joins_the_balanced_roster(
     tmp_path: Path, unit_type: str
 ) -> None:
     center = (15, 15)
@@ -2585,7 +2586,11 @@ def test_returned_legacy_expedition_joins_the_patrol_roster(
 
     _strategy(memory).decide(turn)
 
-    assert memory.unit_roles[str(returned["id"])].startswith("patrol-")
+    assert (
+        memory.unit_roles[str(returned["id"])] == "defense"
+        if unit_type == "RANGER"
+        else memory.unit_roles[str(returned["id"])].startswith("patrol-")
+    )
     assert memory.expedition_squads == []
     role = memory.unit_roles[str(returned["id"])]
     path = tmp_path / "memory.json"
@@ -2594,7 +2599,7 @@ def test_returned_legacy_expedition_joins_the_patrol_roster(
     resumed.decide(make_turn(tick=101, objects=[core_object, *rangers, returned]))
     assert resumed.memory.unit_roles[str(returned["id"])] == role
     assert resumed.memory.expedition_squads == []
-    assert resumed._campaign_patrol_rangers(turn) == (unit_type == "RANGER")
+    assert resumed._campaign_patrol_rangers(turn) == 10
 
 
 CLEARANCE_HOME = (-497, 719)
@@ -2945,6 +2950,14 @@ def _core_hunt_reasons(report) -> list:
     ]
 
 
+def _hunter_memory(core_object, rangers):
+    """Keep the designated hunter defensive in a balanced three-Ranger roster."""
+
+    memory = _sealed_memory(core_object, rangers)
+    memory.unit_roles[str(rangers[1]["id"])] = "patrol-1"
+    return memory
+
+
 def test_enemy_core_in_the_block_detaches_one_defender() -> None:
     core_object = core(1, position=CLEARANCE_HOME)
     rangers = _clearance_rangers(4)
@@ -2988,7 +3001,7 @@ def test_core_hunter_ignores_bycatch_while_the_core_has_no_ray() -> None:
         unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
         hunter,
     ]
-    memory = _sealed_memory(core_object, rangers)
+    memory = _hunter_memory(core_object, rangers)
     # The Core is three cells away but on no legal eight-direction ray from
     # the hunter, while the enemy Worker sharing its cell does offer one.
     turn = make_turn(
@@ -3087,7 +3100,7 @@ def test_core_hunt_hunter_closes_and_destroys_the_core() -> None:
         unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
         hunter,
     ]
-    memory = _sealed_memory(core_object, rangers)
+    memory = _hunter_memory(core_object, rangers)
     strategy = _strategy(memory)
 
     approach = make_turn(objects=[core_object, *rangers, _rival_core()], tick=100)
@@ -3119,7 +3132,7 @@ def test_core_hunt_ends_when_the_last_seen_cell_is_empty() -> None:
         unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
         hunter,
     ]
-    memory = _sealed_memory(core_object, rangers)
+    memory = _hunter_memory(core_object, rangers)
     strategy = _strategy(memory)
 
     strategy.decide(make_turn(objects=[core_object, *rangers, _rival_core()], tick=100))
@@ -3141,7 +3154,7 @@ def test_core_hunt_does_not_restart_during_its_cooldown() -> None:
         unit(102, "RANGER", position=(CLEARANCE_HOME[0], CLEARANCE_HOME[1] - 3)),
         hunter,
     ]
-    memory = _sealed_memory(core_object, rangers)
+    memory = _hunter_memory(core_object, rangers)
     strategy = _strategy(memory)
 
     assert _core_hunt_reasons(

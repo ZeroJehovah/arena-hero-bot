@@ -68,14 +68,19 @@ For a long-running local instance that restarts after an unexpected process exit
 The supervisor uses the live defaults `--target-workers 16 --no-max-population
 --expedition-mode --campaign-mode` when no arguments are supplied. Pass normal CLI
 arguments to override them. Campaign mode follows one cumulative Ranger-only
-sequence: `8W -> 16W -> 8R(defense) -> 20R(defense) -> 8R(patrol) -> *R(patrol)`.
+sequence: `8W -> 16W -> 8R -> 20R -> *R`.
+Ranger production does not choose a role. After births or losses, the local
+Ranger roster splits evenly between defense and patrol, assigning an odd extra
+Ranger to defense. Recruits fill vacancies first; only the minimum necessary
+survivors change roles, and existing patrol team identities remain stable.
 While a visible hostile combat unit is inside the Core assault ring, the next
 production slot temporarily becomes a Ranger; the normal sequence resumes as
 soon as that local threat is gone.
-It spends every affordable resource below the max formation and keeps a stockpile
-only after that formation is complete. Every later Ranger remains a patrol unit.
+It spends every affordable resource below the `16W+20R` max formation, then
+builds further Rangers only at a full bank. Losses below that base roster
+restore immediate affordable replenishment, even if the durable phase is max.
 Legacy expedition squads are recalled, fight normally while returning, and join
-the patrol roster within eight cells of the Core; campaign mode creates no new
+the local roster within eight cells of the Core; campaign mode creates no new
 expeditions and no Vanguards.
 
 `--campaign-mode` enables the required formation management and uncapped growth
@@ -158,8 +163,16 @@ one. The Core moves for four Ticks; an arrival service Tick may spawn a unit,
 heal before depositing, or accept a delivery, keeping the hop to five Ticks. A
 new hop waits until affordable formation slots are built. The economy harvests
 across the source and destination chunks while defensive posts and patrols
-follow it. Formation tiers cap movement at quota 2, quota 3, and then the max
-formation's quota-8 goal. Before every hop into or within quota 4+,
+follow it. With sixteen Workers, eight Rangers permit quota 2 travel and twenty
+permit travel through quota 3 to the quota 4 boundary. Thirty Rangers permit
+entry into quota 4, stopping at the first block center. Forty permit travel
+through quota 4 and entry into quota 5; fifty permit travel through quota 5 and
+entry into quota 6, and so on. There is no fixed quota-8 destination. Casualties
+immediately revoke unauthorized hops and scouts. After a major defensive battle
+and the eight-Tick calm window, an insufficient roster cancels the old journey
+and refits at a reachable center in the Core's current block, including the old
+destination if the Core has already crossed into it.
+Before every hop into or within quota 4+,
 patrols must observe the destination block, confirm it is clear, and allow an
 eight-Tick enemy-clear settling window. The quota goal, current hop, scout
 coverage, and pause schedule are durable across restarts.

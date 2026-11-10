@@ -15,7 +15,7 @@ from arena_hero_bot.strategy import (
 )
 
 from .factories import core, make_turn, unit
-from .test_campaign import _max_roster
+from .test_campaign import _roster
 from .test_core_traffic import settled_positions
 
 
@@ -134,7 +134,7 @@ def test_queue_approaches_survive_restart_and_deliver_without_crossing(tmp_path)
 
 
 def production_strategy():
-    workers, rangers, roles = _max_roster()
+    workers, rangers, roles = _roster()
     memory = WorldMemory(
         core_home_position=(24, 16),
         core_layout_version=CORE_LAYOUT_VERSION,
