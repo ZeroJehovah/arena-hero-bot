@@ -5951,6 +5951,35 @@ def test_a_worker_keeps_the_cell_it_claimed_when_the_pairing_would_flip() -> Non
     assert claims[object_id(2)] == (12, 0)
 
 
+def _decide_resource_claim(strategy, turn, *, complete):
+    """Advance real claim assignment and Worker actions on every observed Tick.
+
+    Complete decisions at the start, progress changes and expiry boundaries
+    verify the surrounding planner. Other Ticks still observe, match, route
+    and update the claim without repeatedly planning unrelated Core/combat
+    work. Neither the production stall budget nor the clock is shortened.
+    """
+
+    if complete:
+        return strategy.decide(turn)
+    assert turn.core is not None
+    assert len(turn.workers) == 1
+    strategy.memory.observe(turn)
+    occupied = {turn.core.position, turn.workers[0].position}
+    context = _TurnContext(
+        turn=turn,
+        report=DecisionReport(tick=turn.tick),
+        occupied=occupied,
+        enemy_positions=set(),
+        friendly_occupancy=dict.fromkeys(occupied, 1),
+        resource_assignments=strategy._assign_resources(turn),
+        remaining_resources=turn.resources,
+        remaining_resource_space=turn.resource_space,
+    )
+    strategy._decide_worker(turn.workers[0], context)
+    return context.report
+
+
 def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
     """A held claim is bounded: a stalled Worker rejoins the greedy pass."""
 
@@ -5966,12 +5995,20 @@ def test_a_worker_that_stops_closing_in_releases_its_claim() -> None:
     for tick in range(101, 101 + CLAIM_STALL_BUDGET + 4):
         # The Worker is pinned at (3, 0) every Tick, so it never closes on the
         # cell it claimed - the stall the budget exists to bound.
-        report = strategy.decide(
+        report = _decide_resource_claim(
+            strategy,
             make_turn(
                 tick=tick,
                 objects=[core(), unit(2, "WORKER", position=(3, 0))],
                 resource_cells=[(4, 0), (12, 0)],
-            )
+            ),
+            complete=tick
+            in {
+                101,
+                100 + CLAIM_STALL_BUDGET,
+                101 + CLAIM_STALL_BUDGET,
+                104 + CLAIM_STALL_BUDGET,
+            },
         )
         targets.append(
             next(
@@ -6042,12 +6079,15 @@ def test_a_worker_releases_a_route_that_only_reaches_old_best_progress() -> None
     positions = [(3, 0), (4, 0), (5, 0)] + [(4, 0)] * (CLAIM_STALL_BUDGET + 1)
     targets = []
     for tick, position in enumerate(positions, start=101):
-        report = strategy.decide(
+        report = _decide_resource_claim(
+            strategy,
             make_turn(
                 tick=tick,
                 objects=[core(), unit(2, "WORKER", position=position)],
                 resource_cells=[(5, 0), (12, 0)],
-            )
+            ),
+            complete=tick
+            in {101, 102, 103, 103 + CLAIM_STALL_BUDGET, 104 + CLAIM_STALL_BUDGET},
         )
         targets.append(
             next(

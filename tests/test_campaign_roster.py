@@ -259,20 +259,14 @@ def test_quota_four_waits_for_forty_rangers_before_another_hop(count, may_travel
         assert memory.campaign_target_quota == 5
 
 
-@pytest.mark.parametrize("crossed", [False, True])
-@pytest.mark.parametrize("loss", ["none", "ranger", "worker"])
-@pytest.mark.parametrize("restart", [False, True])
-@pytest.mark.parametrize(
-    ("origin", "destination", "ranger_count"),
-    [
-        ((783, 15), (751, 15), 40),
-        ((815, 15), (783, 15), 30),
-        ((591, 15), (559, 15), 40),
-    ],
-)
-def test_major_battle_refits_in_current_block_when_journey_is_no_longer_authorized(
-    tmp_path, crossed, loss, restart, origin, destination, ranger_count
-):
+_BATTLE_ROUTES = [
+    ((783, 15), (751, 15), 40),
+    ((815, 15), (783, 15), 30),
+    ((591, 15), (559, 15), 40),
+]
+
+
+def _battle_migration_scenario(origin, destination, ranger_count, crossed):
     position = (origin[0] - (16 if crossed else 3), origin[1])
     workers, rangers, roles = _roster(ranger_count)
     for index, actor in enumerate([*workers, *rangers]):
@@ -287,7 +281,6 @@ def test_major_battle_refits_in_current_block_when_journey_is_no_longer_authoriz
         core_migration_start_position=origin,
         core_migration_last_position=position,
     )
-    strategy = _strategy(memory)
     enemies = [
         unit(
             3000 + i,
@@ -297,10 +290,114 @@ def test_major_battle_refits_in_current_block_when_journey_is_no_longer_authoriz
         )
         for i in range(3)
     ]
+    return _strategy(memory), position, workers, rangers, enemies
+
+
+def _assert_recovered_journey(memory, origin, destination, position, crossed, loss):
+    assert not memory.defense_compressed
+    assert memory.campaign_phase == 4
+    if loss == "none":
+        assert memory.core_home_position == destination
+        assert memory.core_migration_start_position == origin
+    else:
+        assert memory.core_home_position is not None
+        assert resource_block_index(memory.core_home_position) == resource_block_index(
+            position
+        )
+        if crossed:
+            assert memory.core_home_position == destination
+        assert memory.core_migration_start_position is None
+        assert memory.campaign_scout_target is None
+        assert memory.campaign_emergency_target is None
+
+
+@pytest.mark.parametrize("crossed", [False, True])
+@pytest.mark.parametrize("loss", ["none", "ranger", "worker"])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize(("origin", "destination", "ranger_count"), _BATTLE_ROUTES)
+def test_battle_recovery_rechecks_every_roster_and_route_combination(
+    tmp_path, crossed, loss, restart, origin, destination, ranger_count
+):
+    # All 36 recovery transitions run directly. The full decisions below
+    # separately cover pressure detection, call ordering and Core moves.
+    strategy, position, workers, rangers, enemies = _battle_migration_scenario(
+        origin, destination, ranger_count, crossed
+    )
+    memory = strategy.memory
     battle = make_turn(
         tick=100, objects=[core(position=position), *workers, *rangers, *enemies]
     )
-    strategy.decide(battle)
+    strategy._update_campaign_defense_posture(battle, under_pressure=True)
+    assert memory.defense_compressed
+    assert memory.core_home_position == destination
+    if loss == "ranger":
+        rangers.pop()
+    elif loss == "worker":
+        workers.pop()
+    # Pending tasks must actually be cleared, not merely remain None.
+    memory.campaign_scout_target = destination
+    memory.campaign_scout_started_tick = 90
+    memory.campaign_scout_seen_ticks = {destination: 99}
+    memory.campaign_emergency_target = destination
+    memory.campaign_emergency_started_tick = 90
+    memory.core_arrival_worker_id = str(workers[0]["id"])
+    memory.core_arrival_destination = (position[0] - 1, position[1])
+    memory.core_queue_targets = {str(workers[0]["id"]): destination}
+
+    for tick in (101, 108, 109):
+        turn = make_turn(
+            tick=tick, objects=[core(position=position), *workers, *rangers]
+        )
+        strategy._update_campaign_defense_posture(turn, under_pressure=False)
+        if tick < 109:
+            assert memory.defense_compressed
+            assert memory.defense_calm_since_tick == 101
+            assert memory.core_home_position == destination
+            assert memory.core_migration_start_position == origin
+        if tick == 101 and restart:
+            path = tmp_path / "memory.json"
+            memory.save(path)
+            memory = WorldMemory.load(path)
+            strategy = _strategy(memory)
+
+    _assert_recovered_journey(memory, origin, destination, position, crossed, loss)
+    if loss != "none":
+        assert memory.campaign_scout_started_tick == 0
+        assert not memory.campaign_scout_seen_ticks
+        assert memory.campaign_emergency_started_tick == 0
+        assert memory.core_arrival_worker_id is None
+        assert memory.core_arrival_destination is None
+        assert not memory.core_queue_targets
+    else:
+        assert memory.core_arrival_worker_id == str(workers[0]["id"])
+        assert memory.core_queue_targets
+
+
+@pytest.mark.parametrize(
+    ("route", "crossed", "loss", "restart"),
+    [
+        (0, False, "none", False),
+        (0, True, "ranger", True),
+        (1, False, "ranger", False),
+        (1, True, "worker", False),
+        (2, False, "worker", True),
+        (2, True, "none", True),
+    ],
+)
+def test_major_battle_refits_in_current_block_when_journey_is_no_longer_authorized(
+    tmp_path, route, crossed, loss, restart
+):
+    origin, destination, ranger_count = _BATTLE_ROUTES[route]
+    strategy, position, workers, rangers, enemies = _battle_migration_scenario(
+        origin, destination, ranger_count, crossed
+    )
+    memory = strategy.memory
+    path = tmp_path / "memory.json"
+    battle = make_turn(
+        tick=100, objects=[core(position=position), *workers, *rangers, *enemies]
+    )
+    report = strategy.decide(battle)
+    assert not any("planning time limit" in item.reason for item in report.decisions)
     assert memory.defense_compressed
     assert memory.core_home_position == destination
     if loss == "ranger":
@@ -308,7 +405,6 @@ def test_major_battle_refits_in_current_block_when_journey_is_no_longer_authoriz
     elif loss == "worker":
         workers.pop()
     if restart:
-        path = tmp_path / "memory.json"
         memory.save(path)
         memory = WorldMemory.load(path)
         strategy = _strategy(memory)
@@ -329,22 +425,22 @@ def test_major_battle_refits_in_current_block_when_journey_is_no_longer_authoriz
             if tick == 101
             else [],
         )
-        strategy.decide(turn)
-    assert not memory.defense_compressed
-    assert memory.campaign_phase == 4
-    if loss == "none":
-        assert memory.core_home_position == destination
-        assert memory.core_migration_start_position == origin
-    else:
-        assert memory.core_home_position is not None
-        assert resource_block_index(memory.core_home_position) == resource_block_index(
-            position
+        report = strategy.decide(turn)
+        assert not any(
+            "planning time limit" in item.reason for item in report.decisions
         )
-        if crossed:
-            assert memory.core_home_position == destination
-        assert memory.core_migration_start_position is None
-        assert memory.campaign_scout_target is None
-        assert memory.campaign_emergency_target is None
+        if tick == 101:
+            assert memory.defense_compressed
+            assert memory.defense_calm_since_tick == 101
+            # The roster gate may already revoke an illegal hop; the defense
+            # posture itself still waits for the full calm interval.
+            if restart:
+                memory.save(path)
+                memory = WorldMemory.load(path)
+                strategy = _strategy(memory)
+
+    _assert_recovered_journey(memory, origin, destination, position, crossed, loss)
+    if loss != "none":
         assert turn.plan.core_action is not None
         assert turn.plan.core_action.type == "START_MOVE"
 
