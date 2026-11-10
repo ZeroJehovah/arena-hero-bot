@@ -11892,6 +11892,21 @@ class AggressiveStrategy:
         target = self.memory.campaign_scout_target
         if target is None:
             return
+        block = resource_block_index(target)
+        movement_cap = self._campaign_movement_cap(turn)
+        current_quota = resource_block_quota(
+            resource_block_index(turn.core.position) if turn.core is not None else block
+        )
+        if (
+            movement_cap is None
+            or current_quota > movement_cap
+            or resource_block_quota(block) > movement_cap
+        ):
+            # Casualties revoke the forward sweep immediately, even while
+            # blind cells remain. Patrols resume their current-block route;
+            # the durable campaign phase does not grant movement permission.
+            self._clear_campaign_scout()
+            return
         if (
             self.memory.campaign_scout_unobservable_target != target
             or self.memory.campaign_scout_unobservable_obstacle_count
@@ -11904,7 +11919,6 @@ class AggressiveStrategy:
             # traversable ground.
             self._cache_campaign_scout_unobservable(turn, target)
         started = self.memory.campaign_scout_started_tick
-        block = resource_block_index(target)
         target_cells = {
             (x, y)
             for x in range(
@@ -11938,22 +11952,6 @@ class AggressiveStrategy:
             or turn.tick - last_enemy >= CAMPAIGN_SCOUT_SETTLE_TICKS
         )
         if safety_covered and enemy_cleared:
-            movement_cap = self._campaign_movement_cap(turn)
-            current_quota = resource_block_quota(
-                resource_block_index(turn.core.position)
-                if turn.core is not None
-                else block
-            )
-            if (
-                movement_cap is None
-                or current_quota > movement_cap
-                or resource_block_quota(block) > movement_cap
-            ):
-                # The formation may have lost members while the patrols were
-                # sweeping. Do not spend that old permission on a hop into a
-                # block the live roster may no longer enter.
-                self._clear_campaign_scout()
-                return
             self._set_campaign_hop_target(target)
             self._clear_campaign_scout()
             return

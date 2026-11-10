@@ -2223,17 +2223,112 @@ def test_campaign_scouts_use_the_full_patrol_leash_before_cover_fire() -> None:
     )
 
 
+@pytest.mark.parametrize("casualty", ["worker", "defense", "patrol"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_campaign_scout_stops_on_roster_loss_before_sweep_finishes(
+    tmp_path: Path, casualty: str, restart: bool
+) -> None:
+    center = (815, 15)
+    target = (784, 15)
+    core_object = core(position=center)
+    workers, rangers, roles = _max_roster()
+    for index, worker in enumerate(workers):
+        worker["position"] = [806 + index, 24]
+    for index, ranger in enumerate(rangers[:20]):
+        ranger["position"] = [811 + index % 5, 8 + index // 5]
+    for index, ranger in enumerate(rangers[20:]):
+        ranger["position"] = [784 + index, 22]
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=8,
+        campaign_last_core_id=core_object["id"],
+        campaign_scout_target=target,
+        campaign_scout_started_tick=100,
+        campaign_scout_last_gain_tick=100,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    report = strategy.decide(
+        make_turn(tick=100, objects=[core_object, *workers, *rangers])
+    )
+    assert memory.campaign_scout_target == target
+    assert any("scout the next" in decision.reason for decision in report.decisions)
+    lost = {
+        "worker": workers[-1],
+        "defense": rangers[0],
+        "patrol": rangers[-1],
+    }[casualty]
+    survivors = [item for item in [*workers, *rangers] if item["id"] != lost["id"]]
+    memory_path = tmp_path / "memory.json"
+    if restart:
+        memory.save(memory_path)
+        memory = WorldMemory.load(memory_path)
+        strategy = _strategy(memory)
+
+    for tick in (101, 102):
+        turn = make_turn(tick=tick, objects=[core_object, *survivors])
+        report = strategy.decide(turn)
+
+        assert memory.campaign_scout_target is None
+        assert memory.core_home_position == center
+        assert memory.campaign_phase == CAMPAIGN_PHASE_STAGE4
+        assert memory.campaign_target_quota == 8
+        assert (
+            turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
+        )
+        assert not any(
+            "scout the next" in decision.reason for decision in report.decisions
+        )
+        patrol_moves = [
+            decision
+            for decision in report.decisions
+            if roles.get(decision.actor_id, "").startswith("patrol-")
+            and decision.action == "MOVE"
+        ]
+        assert patrol_moves
+        assert all(
+            decision.target is not None
+            and resource_block_index(decision.target) == resource_block_index(center)
+            for decision in patrol_moves
+        )
+        assert all(
+            memory.unit_roles[str(ranger["id"])] == roles[str(ranger["id"])]
+            for ranger in rangers
+            if ranger["id"] != lost["id"]
+        )
+        if restart:
+            memory.save(memory_path)
+            memory = WorldMemory.load(memory_path)
+            strategy = _strategy(memory)
+
+    strategy.decide(make_turn(tick=103, objects=[core_object, *workers, *rangers]))
+    assert memory.campaign_scout_target is not None
+    assert memory.campaign_scout_started_tick == 103
+    assert memory.core_home_position == center
+
+
 def test_campaign_scout_waits_instead_of_failing_when_coverage_stalls() -> None:
     target = (-784, -17)
+    workers, rangers, roles = _max_roster()
     memory = WorldMemory(
         campaign_phase=CAMPAIGN_PHASE_STAGE4,
         campaign_target_quota=8,
         campaign_scout_target=target,
         campaign_scout_started_tick=100,
         campaign_scout_last_gain_tick=100,
+        unit_roles=roles,
     )
 
-    _strategy(memory)._update_campaign_scout(make_turn(tick=1000))
+    _strategy(memory)._update_campaign_scout(
+        make_turn(
+            tick=1000,
+            objects=[core(position=(-817, -16)), *workers, *rangers],
+        )
+    )
 
     assert memory.campaign_scout_target == target
     assert not memory.campaign_scout_rejections
