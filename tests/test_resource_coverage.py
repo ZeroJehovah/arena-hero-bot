@@ -96,17 +96,17 @@ def test_home_selection_chooses_the_least_blocked_nearby_chunk_center() -> None:
     assert home in {(-17, -17), (-16, -17), (-17, -16), (-16, -16)}
 
 
-def test_outer_ring_is_a_single_124_cell_clockwise_chunk_edge() -> None:
+def test_outer_ring_is_a_single_100_cell_clockwise_inset_route() -> None:
     route = _single_chunk_outer_ring(HOME, set())
 
-    assert len(route) == 124
-    assert len(set(route)) == 124
-    assert route[0] == (-416, 671)
-    assert route[31] == (-385, 671)
-    assert route[32] == (-385, 670)
-    assert route[62] == (-385, 640)
-    assert route[63] == (-386, 640)
-    assert route[-1] == (-416, 670)
+    assert len(route) == 100
+    assert len(set(route)) == 100
+    assert route[0] == (-413, 668)
+    assert route[25] == (-388, 668)
+    assert route[26] == (-388, 667)
+    assert route[50] == (-388, 643)
+    assert route[51] == (-389, 643)
+    assert route[-1] == (-413, 667)
 
 
 def test_worker_sectors_are_one_each_and_survive_replacements() -> None:
@@ -329,6 +329,10 @@ def test_chunk_patrol_can_retrace_a_safe_route_after_changing_targets(
     tmp_path, restart, history, target, first_direction, steps
 ):
     home = (16, 16)
+    # Keep these old detour shapes within the new three-cell inset. The
+    # separate boundary regressions cover returning from outside the block.
+    history = [(x, y + 3) for x, y in history]
+    target = target[0], target[1] + 3
     worker = unit(302, "WORKER", position=history[-1])
     # The two patrol sites are six cells apart, with a twelve-step route
     # around rocks inside the chunk. Penalizing the previous approach sends
@@ -354,6 +358,7 @@ def test_chunk_patrol_can_retrace_a_safe_route_after_changing_targets(
         (25, 3),
         (25, 4),
     }
+    rocks = {(x, y + 3) for x, y in rocks}
     memory = WorldMemory(
         core_home_position=home,
         position_history={worker["id"]: list(history)},
@@ -573,8 +578,8 @@ def test_ring_slots_are_eight_flagship_phases_and_move_clockwise_together() -> N
         (right - left) % len(route)
         for left, right in zip(indices, indices[1:] + indices[:1], strict=True)
     ]
-    assert min(gaps) == 15
-    assert max(gaps) == 16
+    assert min(gaps) == 12
+    assert max(gaps) == 13
 
     patrol_ids = strategy._patrol_ids(first)
     targets = {

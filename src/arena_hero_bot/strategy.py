@@ -81,6 +81,7 @@ LEGACY_WORKER_PATROL_PURPOSE = "worker-block-patrol-v1"
 COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 PATROL_RING_PURPOSE = "combat-ring-patrol-v1"
 PATROL_RING_LAYOUT_VERSION = 3
+PATROL_EDGE_INSET = 3
 CORE_LAYOUT_VERSION = 3
 RESOURCE_CLAIM_TTL = 4
 # A held claim is only released when its approach has stopped paying, not when
@@ -504,6 +505,7 @@ class _TurnContext:
     resource_assignments: dict[UUID, Position] = field(default_factory=dict)
     worker_patrol_roster: frozenset[UUID] = field(default_factory=frozenset)
     worker_patrol_owners: dict[Position, UUID] = field(default_factory=dict)
+    worker_patrol_inner_view: frozenset[Position] | None = None
     defensive_assignments: dict[UUID, Position] | None = None
     remaining_resources: int = 0
     remaining_resource_space: int = 0
@@ -589,6 +591,34 @@ class _ResourceBlock:
         return (
             self.min_x <= position[0] <= self.max_x
             and self.min_y <= position[1] <= self.max_y
+        )
+
+    def inset(self, distance: int) -> _ResourceBlock:
+        return _ResourceBlock(
+            self.index,
+            self.min_x + distance,
+            self.max_x - distance,
+            self.min_y + distance,
+            self.max_y - distance,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _OutsidePatrolArea:
+    """Bound a route, allowing an already displaced unit to return inside."""
+
+    area: _ResourceBlock
+    origin: Position
+    return_margin: int = 0
+
+    def __contains__(self, position: Position) -> bool:
+        return not (
+            min(self.area.min_x, self.origin[0] - self.return_margin)
+            <= position[0]
+            <= max(self.area.max_x, self.origin[0] + self.return_margin)
+            and min(self.area.min_y, self.origin[1] - self.return_margin)
+            <= position[1]
+            <= max(self.area.max_y, self.origin[1] + self.return_margin)
         )
 
 
@@ -6245,6 +6275,47 @@ class AggressiveStrategy:
             if wait_at_goal:
                 unit.wait()
         else:
+            patrol_area = self._patrol_area_for_goal(unit, goal, context.turn)
+            if patrol_area is not None:
+                if (
+                    isinstance(unit, Ranger)
+                    and avoid_new_threats
+                    and not allow_outside_combat_leash
+                    and not self._within_combat_leash(
+                        unit, goal, context, offensive=offensive
+                    )
+                ):
+                    self._record_wait(unit, context, f"outside patrol leash: {reason}")
+                    return
+                inner = patrol_area.inset(PATROL_EDGE_INSET)
+                # A displaced unit may need a short exterior detour around
+                # rocks or a locked service approach before it can reenter.
+                # Once inside the assigned area this allowance is zero.
+                return_margin = (
+                    0 if patrol_area.contains(unit.position) else PATROL_EDGE_INSET
+                )
+                # Prefer a complete interior route. Rocks can require the
+                # edge strip, but can never license a shortcut out of the
+                # assigned area. Ignore history on both attempts so safe
+                # retracing is not penalized.
+                areas = (inner, patrol_area) if inner.contains(goal) else (patrol_area,)
+                for area in areas:
+                    if self._move(
+                        unit,
+                        goal,
+                        context,
+                        reason=reason,
+                        intent=intent,
+                        extra_blockers=_OutsidePatrolArea(
+                            area, unit.position, return_margin
+                        ),
+                        require_path=True,
+                        avoid_recent=False,
+                        avoid_new_threats=avoid_new_threats,
+                    ):
+                        return
+                self._record_wait(unit, context, f"no safe patrol path for: {reason}")
+                return
             moved = (
                 self._move_within_leash(
                     unit,
@@ -6269,6 +6340,46 @@ class AggressiveStrategy:
             )
             if not moved:
                 self._record_wait(unit, context, f"no safe path for: {reason}")
+
+    def _patrol_area_for_goal(
+        self, unit: Unit, goal: Position, turn: Turn
+    ) -> _ResourceBlock | None:
+        """Constrain coverage tasks without restricting services or combat."""
+
+        current = self.memory.goal_for(str(unit.id))
+        if current is None or current.position != goal:
+            return None
+        scouting = current.purpose.startswith(f"{CAMPAIGN_SCOUT_PURPOSE}-")
+        if not (
+            _is_worker_patrol_goal(current)
+            or current.purpose == PATROL_RING_PURPOSE
+            or scouting
+        ):
+            return None
+        area = self._resource_chunk(turn)
+        if area is None or not scouting:
+            return area
+        target = self.memory.campaign_scout_target
+        if target is None:
+            return area
+        return self._campaign_scout_area(unit, target, turn)
+
+    def _campaign_scout_area(
+        self, unit: Unit, target: Position, turn: Turn
+    ) -> _ResourceBlock:
+        destination = _single_chunk_resource_block(target)
+        area = self._resource_chunk(turn)
+        if destination.contains(unit.position) or area is None:
+            return destination
+        # A published forward scout may cross from the source into its
+        # adjacent destination. Once there it stays within that block.
+        return _ResourceBlock(
+            0,
+            min(area.min_x, destination.min_x),
+            max(area.max_x, destination.max_x),
+            min(area.min_y, destination.min_y),
+            max(area.max_y, destination.max_y),
+        )
 
     def _retreat_worker(
         self,
@@ -6479,6 +6590,7 @@ class AggressiveStrategy:
         context: _TurnContext,
         *,
         allow_goal: bool = False,
+        extra_blockers: Container[Position] | None = None,
     ) -> bool:
         """Return whether ``goal`` is reachable ignoring our own traffic.
 
@@ -6492,6 +6604,10 @@ class AggressiveStrategy:
         if unit.position == goal:
             return True
         blocked = self._static_blockers(unit, context)
+        if extra_blockers is not None:
+            if goal in extra_blockers:
+                return False
+            blocked = overlay_blockers(blocked, extra_blockers)
         direction = next_step(
             unit.position,
             goal,
@@ -13689,10 +13805,15 @@ class AggressiveStrategy:
             return cached[2]
         obstacles = self._rock_map(turn)
         if migrating:
+            area = self._resource_chunk(turn)
+            if area is None:
+                return ()
+            inner = area.inset(PATROL_EDGE_INSET)
             route = tuple(
                 (center[0] + dx, center[1] + dy)
                 for dx, dy in _defensive_ring_offsets(CORE_MIGRATION_PATROL_RADIUS)
                 if (center[0] + dx, center[1] + dy) not in obstacles
+                and inner.contains((center[0] + dx, center[1] + dy))
             )
             if self.config.campaign_mode:
                 # A moving Core needs its patrol screen in front of the
@@ -13873,7 +13994,7 @@ class AggressiveStrategy:
         slots = self._reconcile_patrol_ring_slots(turn)
         slot = slots.get(unit.id)
         if not route or slot is None:
-            return unit.position, "hold while the chunk-edge patrol ring is unavailable"
+            return unit.position, "hold while the interior patrol ring is unavailable"
         slot_count = max(SYMMETRIC_PATROL_RING_UNITS, len(slots))
         self._advance_patrol_ring_phase(turn, route, slots, slot_count)
         route_index = (
@@ -13893,7 +14014,7 @@ class AggressiveStrategy:
             if turn.core is not None
             and self.memory.core_home_position is not None
             and turn.core.position != self.memory.core_home_position
-            else "follow the clockwise resource-chunk edge"
+            else "follow the clockwise resource-chunk interior"
         )
         return patrol_position, reason
 
@@ -13918,6 +14039,13 @@ class AggressiveStrategy:
         )
         obstacles = self._rock_map(turn)
         target_cells = block_cells - obstacles - self.memory.campaign_scout_unobservable
+        inner = _single_chunk_resource_block(target).inset(PATROL_EDGE_INSET)
+        patrol_area = self._campaign_scout_area(unit, target, turn)
+        route_bounds = _OutsidePatrolArea(
+            patrol_area,
+            unit.position,
+            0 if patrol_area.contains(unit.position) else PATROL_EDGE_INSET,
+        )
         unit_id = str(unit.id)
         purpose = f"{CAMPAIGN_SCOUT_PURPOSE}-{target[0]}-{target[1]}"
         current = self.memory.goal_for(unit_id)
@@ -13932,8 +14060,15 @@ class AggressiveStrategy:
             current is not None
             and current.purpose == purpose
             and current.position in target_cells
+            and inner.contains(current.position)
             and unit.position != current.position
             and turn.tick - current.assigned_tick <= 80
+            and (
+                context is None
+                or self._has_static_route(
+                    unit, current.position, context, extra_blockers=route_bounds
+                )
+            )
         ):
             return current.position
 
@@ -13991,6 +14126,7 @@ class AggressiveStrategy:
                         candidate,
                         context,
                         allow_goal=True,
+                        extra_blockers=route_bounds,
                     )
                 ):
                     continue
@@ -14006,26 +14142,36 @@ class AggressiveStrategy:
         # unseen cells, including those near a blocked or unreachable anchor;
         # a hypothetical view from that anchor is not observed coverage.
         for cell in self._campaign_scout_gaps(turn, target, obstacles, target_cells):
-            if cell in claimed:
+            if cell in reserved_views:
                 continue
-            if context is not None and (
-                self._predicted_friendly_occupancy(cell, context) >= 2
-                or not self._has_static_route(
-                    unit,
-                    cell,
-                    context,
-                    allow_goal=True,
-                )
-            ):
-                continue
-            goal = UnitGoal(
-                position=cell,
-                assigned_tick=turn.tick,
-                purpose=purpose,
-                last_progress_position=unit.position,
+            # Observe a blind cell from inside whenever possible. Walking
+            # onto the cell itself needlessly pulls scouts to the boundary.
+            viewpoints = sorted(
+                visible_cells(cell, RANGER_VISION_RADIUS, obstacles)
+                & target_cells - claimed,
+                key=lambda position: (
+                    not inner.contains(position),
+                    manhattan(unit.position, position),
+                    position,
+                ),
             )
-            self.memory.set_goal(unit_id, goal)
-            return cell
+            for position in viewpoints[:8]:
+                if context is not None and (
+                    position in context.enemy_positions
+                    or self._predicted_friendly_occupancy(position, context) >= 2
+                    or not self._has_static_route(
+                        unit, position, context, extra_blockers=route_bounds
+                    )
+                ):
+                    continue
+                goal = UnitGoal(
+                    position=position,
+                    assigned_tick=turn.tick,
+                    purpose=purpose,
+                    last_progress_position=unit.position,
+                )
+                self.memory.set_goal(unit_id, goal)
+                return position
         return unit.position
 
     def _campaign_scout_gaps(
@@ -16146,6 +16292,25 @@ class AggressiveStrategy:
         purpose = WORKER_PATROL_PURPOSE
         current = self.memory.goal_for(unit_id)
         block_cells = frozenset(_resource_block_cells(chunk)) - obstacles
+        inner = chunk.inset(PATROL_EDGE_INSET)
+        route_bounds = _OutsidePatrolArea(
+            chunk,
+            worker.position,
+            0 if chunk.contains(worker.position) else PATROL_EDGE_INSET,
+        )
+        if context.worker_patrol_inner_view is None:
+            # Border posts are useful only for real blind cells: Manhattan
+            # vision cannot cover every corner from an inset square, and
+            # rocks may hide other cells. Share this bounded calculation
+            # across all Workers in the Tick.
+            context.worker_patrol_inner_view = frozenset().union(
+                *(
+                    self._worker_patrol_view(position, block_cells, obstacles)
+                    for position in _resource_block_cells(inner)
+                    if position not in obstacles
+                )
+            )
+        blind_cells = block_cells - context.worker_patrol_inner_view
         sectors = _resource_area_patrol_sectors(chunk)
         patrol_workers = [
             other
@@ -16218,7 +16383,11 @@ class AggressiveStrategy:
             return min(WORKER_PATROL_AGE_CAP, max(0, turn.tick - seen_tick))
 
         def marginal_gain(position: Position) -> int:
-            view = self._worker_patrol_view(position, block_cells, obstacles)
+            view = self._worker_view_cache.get(position)
+            if view is None:
+                view = self._worker_patrol_view(position, block_cells, obstacles)
+            if not inner.contains(position):
+                view &= blind_cells
             return sum(age(cell) for cell in view if cell not in reserved_views)
 
         service_cells = (
@@ -16248,6 +16417,7 @@ class AggressiveStrategy:
                 and position not in claimed_positions
                 and position not in other_positions
                 and self._predicted_friendly_occupancy(position, context) < 2
+                and (inner.contains(position) or marginal_gain(position) > 0)
             )
 
         current_gain = (
@@ -16269,6 +16439,7 @@ class AggressiveStrategy:
                 current.position,
                 context,
                 allow_goal=True,
+                extra_blockers=route_bounds,
             )
         ):
             if current.last_progress_position is None:
@@ -16343,6 +16514,7 @@ class AggressiveStrategy:
                     candidate,
                     context,
                     allow_goal=True,
+                    extra_blockers=route_bounds,
                 ):
                     patrol_position = candidate
                     break
@@ -17244,20 +17416,20 @@ def _single_chunk_outer_ring(
     home: Position,
     obstacles: Container[Position],
 ) -> tuple[Position, ...]:
-    """Return the free cells on the clockwise edge of the 32x32 chunk.
+    """Return a clockwise patrol three cells inside the 32x32 chunk.
 
     Coordinates follow the game's integer grid with increasing y treated as
     north for direction naming.  The route is top-left to top-right, down the
     right edge, right-to-left along the bottom, then up the left edge.  Rocks
-    remove their own waypoint; the filtered order stays clockwise and the local
-    pathfinder detours through the adjacent interior cell.
+    remove their own waypoint; bounded routing prefers the interior and may
+    use the edge strip only when terrain requires it.
     """
 
     size = SYMMETRIC_RESOURCE_BLOCK_SIZE
-    min_x = (home[0] // size) * size
-    max_x = min_x + size - 1
-    min_y = (home[1] // size) * size
-    max_y = min_y + size - 1
+    min_x = (home[0] // size) * size + PATROL_EDGE_INSET
+    max_x = min_x + size - 1 - 2 * PATROL_EDGE_INSET
+    min_y = (home[1] // size) * size + PATROL_EDGE_INSET
+    max_y = min_y + size - 1 - 2 * PATROL_EDGE_INSET
     edge = (
         ((x, max_y) for x in range(min_x, max_x + 1)),
         ((max_x, y) for y in range(max_y - 1, min_y - 1, -1)),

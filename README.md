@@ -154,6 +154,13 @@ bounded to eight cells around the Core, twelve dependent moves and 1,024 search
 attempts per Tick. Migration lanes still keep one slot available for the moving
 Core.
 
+Idle Worker coverage and routine Ranger patrols keep their entire routes inside
+the assigned resource area. They prefer positions and paths three cells inside
+the boundary; rocks may require a detour through the edge strip. Workers and
+forward scouts approach the edge only to observe cells hidden from the interior.
+A unit already outside returns safely. Migration retains its authorized source
+and destination blocks, while resource service and combat retain their own rules.
+
 ## Long Core migration
 
 The bot can relocate the Core between resource chunks without stopping the

@@ -2002,7 +2002,11 @@ def test_campaign_scout_fills_the_gaps_between_anchor_discs() -> None:
         for ranger in patrol
         if decisions[str(ranger["id"])].action == "MOVE"
     ]
-    assert any(decision.target == gap for decision in moves)
+    assert any(
+        decision.target is not None
+        and gap in visible_cells(decision.target, RANGER_VISION_RADIUS, set())
+        for decision in moves
+    )
     assert memory.campaign_scout_target == target
 
 
@@ -2209,7 +2213,11 @@ def test_campaign_scout_reaches_a_far_corner_outside_the_combat_leash() -> None:
         for ranger in patrol
         if decisions[str(ranger["id"])].action == "MOVE"
     ]
-    assert any(decision.target == gap for decision in moves)
+    assert any(
+        decision.target is not None
+        and gap in visible_cells(decision.target, RANGER_VISION_RADIUS, obstacles)
+        for decision in moves
+    )
     assert memory.campaign_scout_target == target
 
 
