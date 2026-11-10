@@ -3593,9 +3593,14 @@ class AggressiveStrategy:
                             return
                 self.memory.clear_goal(str(worker.id))
 
+        avoid_recent = True
         if self._preserves_resources():
             chunk = self._resource_chunk(context.turn)
             if chunk is not None:
+                # Coverage goals can legitimately reverse the previous route.
+                # Penalizing that route can turn a short return into a long
+                # detour outside the resource chunk, and repeat on retargeting.
+                avoid_recent = False
                 if (
                     self._is_resource_scout(worker, context.turn)
                     and context.threat.level is ThreatLevel.NORMAL
@@ -3632,6 +3637,7 @@ class AggressiveStrategy:
             goal,
             context,
             reason=reason,
+            avoid_recent=avoid_recent,
         )
 
     @staticmethod
@@ -6166,6 +6172,7 @@ class AggressiveStrategy:
         allow_goal: bool = False,
         wait_at_goal: bool = False,
         intent: _MoveIntent = _MoveIntent.STAND,
+        avoid_recent: bool = True,
         avoid_new_threats: bool = False,
         offensive: bool = False,
         allow_outside_combat_leash: bool = False,
@@ -6194,6 +6201,7 @@ class AggressiveStrategy:
                     reason=reason,
                     allow_goal=allow_goal,
                     intent=intent,
+                    avoid_recent=avoid_recent,
                 )
             )
             if not moved:

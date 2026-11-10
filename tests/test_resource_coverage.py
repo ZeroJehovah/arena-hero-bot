@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from uuid import UUID
 
+import pytest
 from arena_hero import Direction
 
 from arena_hero_bot.exploration import visible_cells
-from arena_hero_bot.geometry import manhattan
+from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import WORKER_SECTOR_LAYOUT_VERSION, UnitGoal, WorldMemory
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
@@ -304,6 +305,96 @@ def test_visible_resource_interrupts_worker_block_patrol() -> None:
     assert claim is not None
     assert claim.purpose == RESOURCE_CLAIM_PURPOSE
     assert claim.position == resource
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize(
+    ("history", "target", "first_direction", "steps"),
+    [
+        (
+            [(22, 5), (23, 5), (23, 4), (23, 3), (23, 2)],
+            (17, 2),
+            Direction.DOWN,
+            12,
+        ),
+        (
+            [(24, -1), (24, -2), (23, -2), (22, -2), (21, -2)],
+            (23, 2),
+            Direction.RIGHT,
+            8,
+        ),
+    ],
+)
+def test_chunk_patrol_can_retrace_a_safe_route_after_changing_targets(
+    tmp_path, restart, history, target, first_direction, steps
+):
+    home = (16, 16)
+    worker = unit(302, "WORKER", position=history[-1])
+    # The two patrol sites are six cells apart, with a twelve-step route
+    # around rocks inside the chunk. Penalizing the previous approach sends
+    # the Worker on a longer loop through the neighboring chunk instead.
+    rocks = {
+        (16, 5),
+        (18, -2),
+        (18, -1),
+        (19, 0),
+        (20, 0),
+        (20, 1),
+        (20, 3),
+        (21, 0),
+        (21, 2),
+        (21, 3),
+        (22, -4),
+        (22, -1),
+        (22, 4),
+        (23, -1),
+        (23, 0),
+        (24, 4),
+        (25, 0),
+        (25, 3),
+        (25, 4),
+    }
+    memory = WorldMemory(
+        core_home_position=home,
+        position_history={worker["id"]: list(history)},
+        worker_sector_layout_version=WORKER_SECTOR_LAYOUT_VERSION,
+        worker_sector_count=16,
+        worker_sectors={worker["id"]: 2},
+    )
+    memory.set_goal(
+        worker["id"],
+        UnitGoal(target, 100, WORKER_PATROL_PURPOSE, history[-1]),
+    )
+    strategy = _strategy(memory)
+    chunk = _single_chunk_resource_block(home)
+    inside = chunk.contains(history[-1])
+    visited = {history[-1]}
+    for offset in range(steps):
+        if restart and offset in {0, 4}:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = _strategy(WorldMemory.load(path))
+        turn = make_turn(
+            tick=100 + offset,
+            objects=[core(position=home), worker],
+            obstacles=rocks,
+        )
+        report = strategy.decide(turn)
+        decision = next(d for d in report.decisions if d.actor_id == worker["id"])
+        assert decision.target == target
+        action = turn.plan.unit_actions[UUID(worker["id"])]
+        assert action.type == "MOVE"
+        if offset == 0:
+            assert action.direction is first_direction
+        position = add(turn.workers[0].position, action.direction)
+        assert position not in rocks
+        assert position not in visited
+        if inside:
+            assert chunk.contains(position)
+        inside = inside or chunk.contains(position)
+        visited.add(position)
+        worker["position"] = list(position)
+    assert tuple(worker["position"]) == target
 
 
 def test_empty_campaign_chunk_keeps_all_workers_refreshing_the_chunk() -> None:
