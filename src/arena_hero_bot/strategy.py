@@ -6048,7 +6048,6 @@ class AggressiveStrategy:
             position
             for position in adjacent_positions(ranger.position)
             if position not in blocked
-            and self._predicted_friendly_occupancy(position, context) < 2
             and (
                 position != core.position
                 or (
@@ -6057,6 +6056,35 @@ class AggressiveStrategy:
                     and not context.core_build_priority
                 )
             )
+        ]
+        current_attackers = self._visible_attackers_at(
+            ranger.position, context.turn, obstacles
+        )
+        if len(current_attackers) >= ranger.hp and not any(
+            self._predicted_friendly_occupancy(position, context) < 2
+            and len(self._visible_attackers_at(position, context.turn, obstacles))
+            < ranger.hp
+            for position in candidates
+        ):
+            # A necessary retreat is planned before ordinary formation moves.
+            # Execute an already selected safe departure first, so its real
+            # capacity is available to the endangered shooter on this Tick.
+            for position in candidates:
+                if (
+                    self._predicted_friendly_occupancy(position, context) >= 2
+                    and len(
+                        self._visible_attackers_at(position, context.turn, obstacles)
+                    )
+                    < ranger.hp
+                    and self.memory.incoming_damage.get(position, (-1, 0))[1]
+                    < ranger.hp
+                    and self._release_layered_retreat_exit(position, context)
+                ):
+                    break
+        candidates = [
+            position
+            for position in candidates
+            if self._predicted_friendly_occupancy(position, context) < 2
         ]
         if not candidates:
             return False
@@ -6075,9 +6103,6 @@ class AggressiveStrategy:
             if min(attack_distance(enemy, position) for enemy in threats)
             >= current_distance
         ]
-        current_attackers = self._visible_attackers_at(
-            ranger.position, context.turn, obstacles
-        )
         attackers_by_cell = {
             position: self._visible_attackers_at(position, context.turn, obstacles)
             for position in candidates
@@ -6128,6 +6153,44 @@ class AggressiveStrategy:
                 else _MoveIntent.TRANSIT
             ),
         )
+
+    def _release_layered_retreat_exit(
+        self, cell: Position, context: _TurnContext
+    ) -> bool:
+        """Advance one pending safe formation move before a blocked retreat."""
+        rocks = self._rock_map(context.turn)
+        for ally in context.turn.rangers:
+            direction = context.layered_steps.get(ally.id)
+            if (
+                ally.position != cell
+                or direction is None
+                or self._has_unit_action(ally, context)
+                or ally.id in (context.defensive_trade_shots or {})
+                or any(
+                    line_of_fire(cell, enemy.position, rocks)
+                    for enemy in context.turn.visible_enemies
+                )
+            ):
+                continue
+            destination = add(cell, direction)
+            if (
+                self._future_attackers_at(destination, context.turn, rocks)
+                or self.memory.incoming_damage.get(destination, (-1, 0))[1] >= ally.hp
+            ):
+                continue
+            goal = context.layered_assignments[ally.id]
+            if self._queue_move(
+                ally,
+                direction,
+                context,
+                reason="complete a safe formation departure before a covered retreat",
+                target=goal,
+                intent=(
+                    _MoveIntent.STAND if destination == goal else _MoveIntent.TRANSIT
+                ),
+            ):
+                return self._predicted_friendly_occupancy(cell, context) < 2
+        return False
 
     def _ranger_covering_allies(
         self,
@@ -7297,6 +7360,7 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return None
+        enemies = self._core_retreat_threats(context.turn, enemies)
         obstacles = self._rock_map(context.turn)
         blocked = set(obstacles)
         blocked.update(context.turn.resource_cells)
@@ -7322,6 +7386,38 @@ class AggressiveStrategy:
             (core.position,) * 3 + (add(core.position, direction),), fighters, obstacles
         )
         return direction if damage < core.hp + core.shield else None
+
+    def _core_retreat_threats(
+        self, turn: Turn, enemies: tuple[CoreView | UnitView, ...]
+    ) -> tuple[UnitView, ...]:
+        """Keep recently unseen fire sources in the four-Tick route budget."""
+        core = turn.core
+        if core is None:
+            return ()
+        radius = self.config.core_assault_radius + RANGER_VISION_RADIUS
+        known = {
+            UUID(enemy.object_id): UnitView(
+                kind="UNIT",
+                id=UUID(enemy.object_id),
+                controlled=False,
+                position=enemy.position,
+                hp=enemy.hp,
+                unit_type=UnitType(enemy.unit_type),
+            )
+            for enemy in self.memory.recent_enemies(
+                turn.tick, PATROL_CONTACT_RESET_TICKS
+            )
+            if enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
+            and manhattan(core.position, enemy.position) <= radius
+        }
+        known.update(
+            (enemy.id, enemy)
+            for enemy in (*enemies, *turn.visible_enemies)
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+            and manhattan(core.position, enemy.position) <= radius
+        )
+        return tuple(known[key] for key in sorted(known))
 
     def _combat_defense_required(
         self,
@@ -8434,7 +8530,11 @@ class AggressiveStrategy:
         if (
             len(allies) < 4
             and context.core_build_priority
-            and maximum_core_damage((core.position,) * 4, enemies, obstacles)
+            and maximum_core_damage(
+                (core.position,) * 4,
+                self._core_retreat_threats(context.turn, enemies),
+                obstacles,
+            )
             < core.hp + core.shield
         ):
             # An affordable emergency defender can end an early isolated
@@ -8556,6 +8656,7 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return None
+        enemies = self._core_retreat_threats(context.turn, enemies)
         rocks = self._rock_map(context.turn)
         stay_damage = maximum_core_damage((core.position,) * 4, enemies, rocks)
         choices: list[tuple[int, int, int, int, Direction]] = []
@@ -8864,26 +8965,48 @@ class AggressiveStrategy:
         )
         if not volley:
             return
+        isolated: set[UUID] = set()
+        if (
+            not context.threat.recent_core_attack
+            and not context.threat.projected_core_damage
+            and not any(
+                self._enemy_can_attack_position(enemy, core.position, obstacles)
+                for enemy in enemies
+            )
+        ):
+            for actor_id, target in volley.items():
+                position, hp = shooters[actor_id]
+                if hp != 2 or target.hp != 1:
+                    continue
+                opponents = tuple(
+                    enemy
+                    for enemy in enemies
+                    if line_of_fire(position, enemy.position, obstacles)
+                )
+                if sum(
+                    self._enemy_can_attack_position(enemy, position, obstacles)
+                    for enemy in enemies
+                ) >= hp and not any(
+                    other_id != actor_id
+                    and any(
+                        line_of_fire(other_position, enemy.position, obstacles)
+                        for enemy in opponents
+                    )
+                    for other_id, other_position in positions.items()
+                ):
+                    isolated.add(actor_id)
+        # Separate lone duels cannot justify each other's casualties. Leave
+        # these shooters free to retreat; the normal no-exit fallback still
+        # fires, and genuinely shared volleys keep their pooled arrow budget.
+        for actor_id in isolated:
+            volley.pop(actor_id)
+            shooters.pop(actor_id)
+            positions.pop(actor_id)
+        if not volley:
+            return
         losses = casualty_bound(shooters, enemies, obstacles)
         kills = len({target.id for target in volley.values()})
         if losses <= kills:
-            # A lone full-health shooter need not trade its life for a wounded
-            # target when a safe exit exists and the Core is not under fire.
-            # Keep coordinated/equal volleys and the no-escape fallback; this
-            # only removes the commitment that would suppress normal retreat.
-            if (
-                len(shooters) == 1
-                and losses == kills == 1
-                and next(iter(shooters.values()))[1] == 2
-                and next(iter(volley.values())).hp == 1
-                and not context.threat.recent_core_attack
-                and not context.threat.projected_core_damage
-                and not any(
-                    self._enemy_can_attack_position(enemy, core.position, obstacles)
-                    for enemy in enemies
-                )
-            ):
-                return
             context.defensive_trade_shots = volley
             assigned_damage: dict[UUID, int] = {}
             for target in volley.values():
