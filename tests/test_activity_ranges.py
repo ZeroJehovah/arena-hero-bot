@@ -273,6 +273,61 @@ def test_mining_can_take_a_small_edge_detour_but_cannot_search_arbitrarily_far(s
     assert any(x < 14 for x, _y in visited)
 
 
+@pytest.mark.parametrize("initially_visible", [False, True])
+def test_failed_patrol_route_does_not_hide_a_mine_with_a_bounded_mining_route(
+    initially_visible,
+):
+    mine, position = (14, 14), (14, 12)
+    rocks = {(x, 13) for x in range(14, 46)}
+    memory = WorldMemory(
+        core_home_position=(48, 16),
+        core_migration_start_position=(16, 16),
+        obstacles=rocks,
+        resource_cells={mine: 99},
+    )
+    strategy = strategy_for(memory)
+    patrol = make_turn(
+        tick=99,
+        objects=[core(position=(30, 16)), unit(2, "WORKER", position=position)],
+        obstacles=rocks,
+    )
+    memory.set_goal(object_id(2), UnitGoal(mine, patrol.tick, WORKER_PATROL_PURPOSE))
+    strategy._move_or_wait(
+        patrol.workers[0], mine, context_for(patrol), reason="refresh patrol coverage"
+    )
+    assert settled_positions(patrol)[patrol.workers[0].id] == position
+    strategy._unreachable_patrol_cells[mine] = patrol.tick
+
+    for tick in range(100, 105):
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(
+                    position=(30, 16),
+                    state="MOVING",
+                    destination=[31, 16],
+                    move_direction="RIGHT",
+                    move_progress=tick - 100,
+                    move_required_ticks=4,
+                )
+                if tick < 104
+                else core(position=(31, 16)),
+                unit(2, "WORKER", position=position),
+            ],
+            resource_cells=[mine] if initially_visible or tick > 100 else [],
+            obstacles=rocks,
+        )
+        strategy.decide(turn)
+        action = turn.plan.unit_actions[turn.workers[0].id]
+        if tick == 104:
+            assert position == mine
+            assert action.type == "HARVEST"
+        else:
+            assert action.type == "MOVE"
+            position = settled_positions(turn)[turn.workers[0].id]
+            assert 10 <= position[0] <= 49 and -4 <= position[1] <= 35
+
+
 def test_shorter_claim_swap_cannot_give_a_local_exception_to_a_distant_worker():
     memory = WorldMemory(core_home_position=(16, 16))
     strategy = strategy_for(memory)

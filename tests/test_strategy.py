@@ -4422,11 +4422,12 @@ def test_resource_patrol_replaces_a_static_unreachable_goal() -> None:
     assert second.plan.unit_actions[second.workers[0].id].type == "MOVE"
 
 
-def test_worker_retreats_from_recently_contested_area() -> None:
+def test_worker_harvests_beside_a_recently_contested_cell() -> None:
     memory = WorldMemory(contested_positions={(6, 0): 160})
     turn = make_turn(
         tick=161,
         objects=[core(position=(0, 0)), unit(2, "WORKER", position=(5, 0))],
+        resource_cells=[(5, 1)],
     )
 
     report = decide(
@@ -4437,8 +4438,17 @@ def test_worker_retreats_from_recently_contested_area() -> None:
 
     action = turn.plan.unit_actions[turn.workers[0].id]
     assert action.type == "MOVE"
-    assert action.direction is Direction.LEFT
-    assert any("retreat" in item.reason for item in report.decisions)
+    assert action.direction is Direction.DOWN
+    assert not any("retreat" in item.reason for item in report.decisions)
+    assert (6, 0) in memory.contested_positions
+
+    arrived = make_turn(
+        tick=162,
+        objects=[core(), unit(2, "WORKER", position=(5, 1))],
+        resource_cells=[(5, 1)],
+    )
+    decide(arrived, memory=memory, config=StrategyConfig(resource_target=95))
+    assert arrived.plan.unit_actions[arrived.workers[0].id].type == "HARVEST"
 
 
 def test_exploration_goal_remains_stable_across_turns() -> None:

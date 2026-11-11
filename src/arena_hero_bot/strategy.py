@@ -6569,13 +6569,9 @@ class AggressiveStrategy:
         worker: Worker,
         context: _TurnContext,
     ) -> tuple[Position, ...]:
-        combat_threats = self._worker_combat_threats(worker, context)
-        contested = [
-            position
-            for position in self.memory.contested_positions
-            if manhattan(worker.position, position) <= self.config.worker_threat_radius
-        ]
-        return tuple(dict.fromkeys((*combat_threats, *contested)))
+        # Movement contention reserves its exact cell in the route checks.
+        # Only observed hostile fighters create a surrounding danger disk.
+        return self._worker_combat_threats(worker, context)
 
     def _worker_combat_threats(
         self,
@@ -6874,6 +6870,10 @@ class AggressiveStrategy:
             destination in self.memory.obstacles
             or destination in context.turn.obstacle_cells
             or destination in context.defensive_firing_lanes
+            or (
+                isinstance(unit, Worker)
+                and destination in self.memory.contested_positions
+            )
         ):
             return False
         core = context.turn.core
@@ -14773,10 +14773,12 @@ class AggressiveStrategy:
             for cell, seen_tick in self._unreachable_patrol_cells.items()
             if turn.tick - seen_tick < UNREACHABLE_PATROL_COOLDOWN
         }
+        # Patrol paths stay inside the ordinary area; mining can use a
+        # bounded terrain detour. A failed patrol cannot exclude a mine.
         unreachable = (
             self._worker_threat_exclusion_cells(turn)
+            | set(self.memory.contested_positions)
             | set(self._unreachable_claims)
-            | set(self._unreachable_patrol_cells)
         ) - {worker.position for worker in workers.values()}
         hostile = {enemy.position for enemy in turn.visible_enemies}
         blocked_resources = self._rock_map(turn)
@@ -14910,9 +14912,8 @@ class AggressiveStrategy:
             for cell, seen_tick in self._unreachable_claims.items()
             if turn.tick - seen_tick < UNREACHABLE_CLAIM_COOLDOWN
         }
-        # A Worker-only exclusion disk sits around every remembered enemy Core
-        # and every recently seen hostile fighter, and ``_move`` refuses to
-        # route a Worker into one.  The pairing below only measured distance, so
+        # Exclude recent hostile fighter disks, exact contested cells, and
+        # resource routes that have failed. Pairing only measured distance, so
         # a cell inside a disk stayed the nearest candidate for the Workers
         # beside it and every claim on it became an orbit around the rim - one
         # that never arrives, so it never records the absence that would forget
@@ -14920,7 +14921,9 @@ class AggressiveStrategy:
         # the ones a route has just failed to reach.  A cell a Worker already
         # stands on stays in: arrival harvests it.
         unreachable = (
-            self._worker_threat_exclusion_cells(turn) | set(self._unreachable_claims)
+            self._worker_threat_exclusion_cells(turn)
+            | set(self.memory.contested_positions)
+            | set(self._unreachable_claims)
         ) - {worker.position for worker in workers.values()}
         hostile = {enemy.position for enemy in turn.visible_enemies}
         blocked_resources = self._rock_map(turn)
