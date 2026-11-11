@@ -20,7 +20,12 @@ from arena_hero_bot.defense import (
 from arena_hero_bot.geometry import add, line_of_fire
 from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.models import DecisionReport
-from arena_hero_bot.strategy import AggressiveStrategy, StrategyConfig, _TurnContext
+from arena_hero_bot.strategy import (
+    CORE_LAYOUT_VERSION,
+    AggressiveStrategy,
+    StrategyConfig,
+    _TurnContext,
+)
 
 from .factories import core, make_turn, object_id, unit
 
@@ -814,6 +819,73 @@ def test_sheltered_worker_deposits_and_wounded_worker_actually_heals():
     assert encounter.deposits >= 1
     assert encounter.heals >= 1
     assert encounter.friends[object_id(4)]["hp"] == 2
+
+
+@pytest.mark.parametrize("patient_role", ["defense", "patrol-1"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_paused_migration_heals_two_rangers_before_redeployment(
+    patient_role, restart, tmp_path
+):
+    friends = [
+        unit(2, "RANGER", position=(-2, 0), hp=1),
+        unit(3, "RANGER", position=(2, 0), hp=1),
+        unit(4, "RANGER", position=(-2, -3)),
+        unit(5, "RANGER", position=(-1, -4)),
+        unit(6, "RANGER", position=(1, -4)),
+        unit(7, "RANGER", position=(2, -3)),
+    ]
+    roles = {
+        object_id(2): patient_role,
+        object_id(3): "patrol-1" if patient_role == "defense" else "defense",
+        object_id(4): "defense",
+        object_id(5): "defense",
+        object_id(6): "patrol-1",
+        object_id(7): "patrol-2",
+    }
+    strategy = _strategy(roles)
+    strategy.memory.core_home_position = (16, 0)
+    strategy.memory.core_layout_version = CORE_LAYOUT_VERSION
+    strategy.memory.campaign_last_core_id = object_id(1)
+    strategy.memory.campaign_phase = 4
+    encounter = Encounter(
+        friends, [unit(50, "VANGUARD", controlled=False, position=(0, -8))], resources=2
+    )
+    healed = set()
+    for offset in range(8):
+        turn = encounter.turn()
+        report = strategy.decide(turn)
+        assert turn.plan.core_action is not None
+        assert turn.plan.core_action.type == "WAIT"
+        assert any(
+            decision.actor_kind == "CORE"
+            and decision.reason == "hold Core behind the two defensive firing ranks"
+            for decision in report.decisions
+        )
+        if offset == 0:
+            for ident, position in ((2, (-2, 0)), (3, (2, 0))):
+                action = turn.plan.unit_actions[UUID(int=ident)]
+                assert action.type == "MOVE"
+                assert add(position, action.direction) in {(-1, 0), (1, 0)}
+        healers = {
+            str(ident)
+            for ident, action in turn.plan.unit_actions.items()
+            if action.type == "HEAL"
+        }
+        assert len(healers) <= 1
+        healed.update(healers)
+        encounter.settle(turn.plan, {})
+        assert encounter.core["position"] == [0, 0]
+        assert (encounter.core["hp"], encounter.core["shield"]) == (5, 5)
+        if restart and offset == 1:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    assert healed == {object_id(2), object_id(3)}
+    assert encounter.heals == 2
+    assert encounter.resources == 0
+    for ident in healed:
+        assert encounter.friends[ident]["hp"] == 2
+        assert encounter.friends[ident]["position"] != encounter.core["position"]
 
 
 def test_critical_ranger_does_not_churn_while_healing_slot_is_occupied():

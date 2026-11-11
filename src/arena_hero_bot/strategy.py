@@ -4529,14 +4529,20 @@ class AggressiveStrategy:
         return None
 
     def _prepare_migration_healing(self, context: _TurnContext) -> None:
-        """Let wounded escorts catch up and reserve one actual arrival service."""
+        """Let escorts reach arrival service or a paused Core's healing slot."""
 
         core = context.turn.core
         arrival = context.core_migration_destination
         if (
             core is None
-            or arrival is None
             or (context.core_build_priority and core.view.state is CoreState.NORMAL)
+            or (
+                arrival is None
+                and not (
+                    self._stationary_core_traffic(context)
+                    and self._core_migration_in_progress(core.view)
+                )
+            )
         ):
             return
         patients = [
@@ -4549,15 +4555,17 @@ class AggressiveStrategy:
         ]
         context.core_migration_healing_ids = frozenset(r.id for r in patients)
         if (
-            context.core_build_priority
+            arrival is None
+            or context.core_build_priority
             or not patients
             or any(
                 worker.position == arrival and worker.cargo > 0
                 for worker in context.turn.workers
             )
         ):
-            # An already occupied cargo slot completes its service. Patients
-            # still approach during MOVING so they can take the next free slot.
+            # A defense hold has no arrival lane, but funded patients must
+            # still pass the migration approach lock to reach the parked Core.
+            # Occupied cargo slots keep their service while patients approach.
             return
         steps = (
             (core.view.move_required_ticks or 4) - (core.view.move_progress or 0)
