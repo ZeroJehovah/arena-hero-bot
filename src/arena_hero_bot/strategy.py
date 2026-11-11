@@ -82,6 +82,11 @@ COMBAT_PATROL_PURPOSE = "combat-patrol-v1"
 PATROL_RING_PURPOSE = "combat-ring-patrol-v1"
 PATROL_RING_LAYOUT_VERSION = 3
 PATROL_EDGE_INSET = 3
+WORKER_ACTIVITY_SIZE = 32
+ACTIVITY_EXCEPTION_MARGIN = 4
+RANGER_SOURCE_COVER_MARGIN = 4
+WORKER_LOCAL_RESOURCE_RADIUS = 6
+WORKER_LOCAL_RESOURCE_PATH_LIMIT = 8
 CORE_LAYOUT_VERSION = 3
 RESOURCE_CLAIM_TTL = 4
 # A held claim is only released when its approach has stopped paying, not when
@@ -358,9 +363,9 @@ SYMMETRIC_RANGER_OFFSETS: tuple[Position, ...] = (
 )
 CORE_QUEUE_RADIUS = 4
 CORE_TRAFFIC_RADIUS = 8
-# A campaign rest ends as soon as every Worker that was close enough to hand
-# cargo in has unloaded.  Cargo deeper in the block keeps walking with the Core
-# instead of parking the whole operation on the next hop.
+# Only nearby cargo holds service open. The next-hop rest also waits for all
+# live Workers and Rangers to enter the Core's current block; cargo deeper
+# within that block can keep walking with the Core on the following hop.
 CAMPAIGN_REST_RADIUS = CORE_QUEUE_RADIUS
 # A moving Core must not have its next completion cell occupied.  Keep the
 # four immediate neighbours available between steps, but do not push Workers
@@ -579,7 +584,7 @@ class _DefensiveLayout:
 
 @dataclass(frozen=True, slots=True)
 class _ResourceBlock:
-    """One fixed 16x16 quadrant of the selected resource chunk."""
+    """A rectangular resource or activity region with inclusive cell bounds."""
 
     index: int
     min_x: int
@@ -602,23 +607,65 @@ class _ResourceBlock:
             self.max_y - distance,
         )
 
+    def intersection(self, other: _ResourceBlock) -> _ResourceBlock | None:
+        result = _ResourceBlock(
+            self.index,
+            max(self.min_x, other.min_x),
+            min(self.max_x, other.max_x),
+            max(self.min_y, other.min_y),
+            min(self.max_y, other.max_y),
+        )
+        return (
+            result
+            if result.min_x <= result.max_x and result.min_y <= result.max_y
+            else None
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ActivityArea:
+    """A union of permitted rectangles, without filling its missing corners."""
+
+    regions: tuple[_ResourceBlock, ...]
+
+    def contains(self, position: Position) -> bool:
+        return any(region.contains(position) for region in self.regions)
+
+    def inset(self, distance: int) -> _ActivityArea:
+        regions = (region.inset(distance) for region in self.regions)
+        return _ActivityArea(
+            tuple(
+                region
+                for region in regions
+                if region.min_x <= region.max_x and region.min_y <= region.max_y
+            )
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _OutsidePatrolArea:
     """Bound a route, allowing an already displaced unit to return inside."""
 
-    area: _ResourceBlock
+    area: _ResourceBlock | _ActivityArea
     origin: Position
     return_margin: int = 0
 
     def __contains__(self, position: Position) -> bool:
-        return not (
-            min(self.area.min_x, self.origin[0] - self.return_margin)
+        if self.area.contains(position):
+            return False
+        if self.area.contains(self.origin):
+            return True
+        regions = (
+            self.area.regions if isinstance(self.area, _ActivityArea) else (self.area,)
+        )
+        return not any(
+            min(region.min_x, self.origin[0] - self.return_margin)
             <= position[0]
-            <= max(self.area.max_x, self.origin[0] + self.return_margin)
-            and min(self.area.min_y, self.origin[1] - self.return_margin)
+            <= max(region.max_x, self.origin[0] + self.return_margin)
+            and min(region.min_y, self.origin[1] - self.return_margin)
             <= position[1]
-            <= max(self.area.max_y, self.origin[1] + self.return_margin)
+            <= max(region.max_y, self.origin[1] + self.return_margin)
+            for region in regions
         )
 
 
@@ -677,6 +724,9 @@ class AggressiveStrategy:
         # chunk has only 1024 cells, and all sixteen Workers score the same
         # obstacle map, so caching these discs avoids rebuilding them per Unit.
         self._worker_view_cache: dict[Position, frozenset[Position]] = {}
+        self._worker_local_resource_cache: (
+            tuple[Turn, dict[UUID, dict[Position, int]]] | None
+        ) = None
         self._worker_safe_cells_cache: tuple[Turn, frozenset[Position]] | None = None
         # Set for the current Tick only by ``_assign_resources`` when a
         # Worker is deliberately left out of known-site pairing.  Keeping the
@@ -808,6 +858,7 @@ class AggressiveStrategy:
         self._record_sweep_results(turn)
         self.memory.observe(turn)
         self._worker_view_cache = {}
+        self._worker_local_resource_cache = None
         self._worker_safe_cells_cache = None
         if self.config.campaign_mode:
             self._observe_campaign_state(turn)
@@ -3496,11 +3547,16 @@ class AggressiveStrategy:
         if worker.position == assigned_resource:
             worker.harvest()
             self.memory.clear_goal(str(worker.id))
+            activity = self._worker_activity_area(context.turn)
             context.report.add(
                 actor_id=str(worker.id),
                 actor_kind="WORKER",
                 action="HARVEST",
-                reason="harvest current visible resource",
+                reason=(
+                    "harvest nearby live resource beyond the ordinary activity area"
+                    if activity is not None and not activity.contains(worker.position)
+                    else "harvest current visible resource"
+                ),
                 target=worker.position,
             )
             return
@@ -3525,12 +3581,11 @@ class AggressiveStrategy:
             self._release_unreachable_claim(worker, assigned_resource, context)
             assigned_resource = None
 
-        if assigned_resource is not None and self._move(
+        if assigned_resource is not None and self._move_worker_resource(
             worker,
             assigned_resource,
             context,
             reason="claim nearest unassigned known resource",
-            allow_goal=True,
         ):
             existing_goal = self.memory.goal_for(str(worker.id))
             if (
@@ -3572,7 +3627,12 @@ class AggressiveStrategy:
             and resource_goal is not None
             and resource_goal.purpose == RESOURCE_CLAIM_PURPOSE
         ):
-            if resource_goal.position in context.turn.resource_cells:
+            if (
+                not self._worker_resource_eligible(
+                    worker, resource_goal.position, context.turn
+                )
+                or resource_goal.position in context.turn.resource_cells
+            ):
                 self.memory.clear_goal(str(worker.id))
             elif not self._has_static_route(
                 worker,
@@ -3600,7 +3660,7 @@ class AggressiveStrategy:
                         self.memory.clear_goal(str(worker.id))
                         self._claim_stalls.pop(worker.id, None)
                     else:
-                        if self._move(
+                        if self._move_worker_resource(
                             worker,
                             resource_goal.position,
                             context,
@@ -3635,13 +3695,9 @@ class AggressiveStrategy:
                     self._is_resource_scout(worker, context.turn)
                     and context.threat.level is ThreatLevel.NORMAL
                 ):
-                    # The campaign economy is deliberately anchored to this
-                    # 32x32 chunk.  An outside resource cannot be claimed by
-                    # ``_assign_chunk_resources``, and following the old
-                    # inward exploration goal moved the refresh Worker farther
-                    # from home every time its route completed.  Keep the
-                    # refresh role visible in telemetry while sweeping the
-                    # cells that can actually replenish this economy.
+                    # Refresh the moving local window. Nearby visible mining
+                    # opportunities have already been considered above; an
+                    # idle refresh task does not authorize a distant search.
                     goal = self._worker_block_patrol_goal(worker, context)
                     reason = (
                         "refresh least-seen coverage in the resource chunk "
@@ -5784,16 +5840,17 @@ class AggressiveStrategy:
 
         if self._symmetric_posture() and at_home and self.memory.campaign_resting:
             # A campaign rest is a hold on a block center, never a step count:
-            # the Core stays put until the queue around it has delivered and
-            # this block's quota gate has its roster.  Production, healing and
-            # deposits above stay available for the whole hold.
+            # all Workers and Rangers must enter this block, the nearby queue
+            # must deliver, and the quota gate must have its roster. Production,
+            # healing and deposits above stay available for the whole hold.
             context.report.add(
                 actor_id=str(core.id),
                 actor_kind="CORE",
                 action="WAIT",
                 reason=(
-                    "hold the block center until deliveries, affordable builds, "
-                    "and the quota gate roster are complete"
+                    "hold the block center until all Workers and Rangers enter "
+                    "this block and deliveries, affordable builds, and the quota "
+                    "gate roster are complete"
                 ),
                 target=core.position,
             )
@@ -6299,6 +6356,9 @@ class AggressiveStrategy:
                 # assigned area. Ignore history on both attempts so safe
                 # retracing is not penalized.
                 areas = (inner, patrol_area) if inner.contains(goal) else (patrol_area,)
+                outer_bounds = _OutsidePatrolArea(
+                    patrol_area, unit.position, return_margin
+                )
                 for area in areas:
                     if self._move(
                         unit,
@@ -6306,8 +6366,9 @@ class AggressiveStrategy:
                         context,
                         reason=reason,
                         intent=intent,
-                        extra_blockers=_OutsidePatrolArea(
-                            area, unit.position, return_margin
+                        extra_blockers=overlay_blockers(
+                            outer_bounds,
+                            _OutsidePatrolArea(area, unit.position, return_margin),
                         ),
                         require_path=True,
                         avoid_recent=False,
@@ -6343,7 +6404,7 @@ class AggressiveStrategy:
 
     def _patrol_area_for_goal(
         self, unit: Unit, goal: Position, turn: Turn
-    ) -> _ResourceBlock | None:
+    ) -> _ResourceBlock | _ActivityArea | None:
         """Constrain coverage tasks without restricting services or combat."""
 
         current = self.memory.goal_for(str(unit.id))
@@ -6356,8 +6417,12 @@ class AggressiveStrategy:
             or scouting
         ):
             return None
-        area = self._resource_chunk(turn)
-        if area is None or not scouting:
+        area = (
+            self._worker_activity_area(turn)
+            if isinstance(unit, Worker)
+            else self._ranger_activity_area(turn)
+        )
+        if not scouting:
             return area
         target = self.memory.campaign_scout_target
         if target is None:
@@ -6366,20 +6431,14 @@ class AggressiveStrategy:
 
     def _campaign_scout_area(
         self, unit: Unit, target: Position, turn: Turn
-    ) -> _ResourceBlock:
+    ) -> _ResourceBlock | _ActivityArea:
         destination = _single_chunk_resource_block(target)
-        area = self._resource_chunk(turn)
+        area = self._ranger_activity_area(turn)
         if destination.contains(unit.position) or area is None:
             return destination
         # A published forward scout may cross from the source into its
         # adjacent destination. Once there it stays within that block.
-        return _ResourceBlock(
-            0,
-            min(area.min_x, destination.min_x),
-            max(area.max_x, destination.max_x),
-            min(area.min_y, destination.min_y),
-            max(area.max_y, destination.max_y),
-        )
+        return area
 
     def _retreat_worker(
         self,
@@ -12384,11 +12443,10 @@ class AggressiveStrategy:
     def _continue_campaign_migration(self, turn: Turn) -> None:
         """Publish the next hop after the reached block center has been served.
 
-        The rest gate is the only hold between hops.  While the Core still owes
-        a nearby delivery, an affordable formation build, or this block's
-        quota gate still owes roster, the published home stays where the Core
-        is standing, so the operation never leaves a center early and never
-        parks off one either.
+        The rest gate is the only hold between hops. While a Worker or Ranger
+        is outside this block, the Core owes a nearby delivery or affordable
+        build, or the quota gate owes roster, the published home stays at the
+        reached center. This gate also precedes a new forward scouting task.
         """
 
         if self._continue_emergency_migration(turn):
@@ -12964,14 +13022,23 @@ class AggressiveStrategy:
     def _campaign_rest_complete(self, turn: Turn) -> bool:
         """Return whether the Core may leave the block center it stands on.
 
-        Draining every Worker in the block is not the goal: cargo deeper in the
-        chunk keeps walking with the Core.  A rest ends only when the service
-        neighbourhood has no delivery left, every currently affordable campaign
-        formation slot has been produced, and this block's quota gate holds its
-        roster.  Starting a new hop with an owed build would strand the spend
-        for the whole leg.
+        Every live Worker and Ranger must already be in the Core's current
+        block. The nearby service queue must be drained, affordable formation
+        slots built, and the quota gate satisfied. Cargo deeper within this
+        block can keep walking with the Core on the next hop.
         """
 
+        from .migration import resource_block_index
+
+        core = turn.core
+        if core is None:
+            return False
+        block = resource_block_index(core.position)
+        if any(
+            resource_block_index(unit.position) != block
+            for unit in (*turn.workers, *turn.rangers)
+        ):
+            return False
         if self._campaign_pending_deliveries(turn):
             return False
         if self._campaign_spawn_ready(turn, turn.resources):
@@ -13805,7 +13872,7 @@ class AggressiveStrategy:
             return cached[2]
         obstacles = self._rock_map(turn)
         if migrating:
-            area = self._resource_chunk(turn)
+            area = self._ranger_activity_area(turn)
             if area is None:
                 return ()
             inner = area.inset(PATROL_EDGE_INSET)
@@ -14378,9 +14445,11 @@ class AggressiveStrategy:
         if not self._symmetric_posture():
             return None
         home = self.memory.core_home_position
-        if home is None:
-            return None
         core = turn.core if turn is not None else None
+        if home is None:
+            # A sealed center cancels migration, not the local activity area.
+            # Idle Workers must not fall back to a distant global search.
+            return _single_chunk_resource_block(core.position) if core else None
         size = SYMMETRIC_RESOURCE_BLOCK_SIZE
         home_block = (home[0] // size, home[1] // size)
         blocks = {home_block}
@@ -14402,6 +14471,203 @@ class AggressiveStrategy:
             min_y=min(block[1] for block in blocks),
             max_y=max(block[1] for block in blocks) + size - 1,
         )
+
+    def _core_activity_window(
+        self, turn: Turn, *, margin: int = 0
+    ) -> _ResourceBlock | None:
+        core = turn.core
+        if core is None:
+            return None
+        half = WORKER_ACTIVITY_SIZE // 2
+        return _ResourceBlock(
+            0,
+            core.position[0] - half - margin,
+            core.position[0] + half - 1 + margin,
+            core.position[1] - half - margin,
+            core.position[1] + half - 1 + margin,
+        )
+
+    def _activity_chunks(
+        self, turn: Turn, *, include_scout: bool = False
+    ) -> tuple[_ResourceBlock, ...]:
+        core = turn.core
+        if core is None or not self._symmetric_posture():
+            return ()
+        current = _single_chunk_resource_block(core.position)
+        scout = self.memory.campaign_scout_target if include_scout else None
+        target = scout or self.memory.core_home_position
+        if target is None or target == core.position:
+            return (current,)
+        source = _single_chunk_resource_block(
+            core.position
+            if scout is not None
+            else self.memory.core_migration_start_position or core.position
+        )
+        destination = _single_chunk_resource_block(target)
+        distance = (
+            abs(source.min_x - destination.min_x)
+            + abs(source.min_y - destination.min_y)
+        ) // SYMMETRIC_RESOURCE_BLOCK_SIZE
+        if distance > 1:
+            return (current,)
+        return (destination,) if source == destination else (source, destination)
+
+    def _worker_activity_area(self, turn: Turn) -> _ResourceBlock | None:
+        chunks = self._activity_chunks(turn)
+        window = self._core_activity_window(turn)
+        if not chunks or window is None:
+            return None
+        core = turn.core
+        if core is not None and core.position == self.memory.core_home_position:
+            # The four legal center cells already center the stationary 32x32
+            # chunk to within half a cell. Keep its existing boundary coverage.
+            return _single_chunk_resource_block(core.position)
+        area = _ResourceBlock(
+            0,
+            min(chunk.min_x for chunk in chunks),
+            max(chunk.max_x for chunk in chunks),
+            min(chunk.min_y for chunk in chunks),
+            max(chunk.max_y for chunk in chunks),
+        )
+        return area.intersection(window)
+
+    def _ranger_activity_area(self, turn: Turn) -> _ActivityArea | None:
+        chunks = self._activity_chunks(turn, include_scout=True)
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return _ActivityArea(chunks)
+        source, destination = chunks
+        window = self._core_activity_window(turn, margin=RANGER_SOURCE_COVER_MARGIN)
+        source = source.intersection(window) if window is not None else source
+        return _ActivityArea(
+            (source, destination) if source is not None else (destination,)
+        )
+
+    def _worker_resource_eligible(
+        self, worker: Worker, resource: Position, turn: Turn
+    ) -> bool:
+        area = self._worker_activity_area(turn)
+        if area is None or area.contains(resource):
+            return True
+        exception = self._core_activity_window(turn, margin=ACTIVITY_EXCEPTION_MARGIN)
+        distance = manhattan(worker.position, resource)
+        goal = self.memory.goal_for(str(worker.id))
+        continuing_detour = (
+            goal is not None
+            and goal.purpose == RESOURCE_CLAIM_PURPOSE
+            and goal.position == resource
+            and goal.last_progress_position is not None
+            and manhattan(goal.last_progress_position, resource)
+            <= WORKER_LOCAL_RESOURCE_RADIUS
+            and distance <= WORKER_LOCAL_RESOURCE_PATH_LIMIT
+        )
+        if (
+            exception is None
+            or worker.cargo > 0
+            or not exception.contains(resource)
+            or resource not in turn.resource_cells
+            or (distance > WORKER_LOCAL_RESOURCE_RADIUS and not continuing_detour)
+        ):
+            return False
+        cached = self._worker_local_resource_cache
+        if cached is None or cached[0] is not turn:
+            cached = (turn, {})
+            self._worker_local_resource_cache = cached
+        distances = cached[1].get(worker.id)
+        if distances is None:
+            distances = {worker.position: 0}
+            cached[1][worker.id] = distances
+            blockers = (
+                self._rock_map(turn)
+                | self._worker_threat_exclusion_cells(turn)
+                | {enemy.position for enemy in turn.visible_enemies}
+            )
+            blockers.discard(worker.position)
+            bounds = _OutsidePatrolArea(exception, worker.position, PATROL_EDGE_INSET)
+            frontier = deque([worker.position])
+            while frontier:
+                position = frontier.popleft()
+                if distances[position] >= WORKER_LOCAL_RESOURCE_PATH_LIMIT:
+                    continue
+                for neighbor in adjacent_positions(position):
+                    if (
+                        neighbor in distances
+                        or neighbor in blockers
+                        or neighbor in bounds
+                    ):
+                        continue
+                    distances[neighbor] = distances[position] + 1
+                    frontier.append(neighbor)
+        return resource in distances
+
+    def _move_worker_resource(
+        self,
+        worker: Worker,
+        resource: Position,
+        context: _TurnContext,
+        *,
+        reason: str,
+    ) -> bool:
+        area = self._worker_activity_area(context.turn)
+        if area is None:
+            return self._move(worker, resource, context, reason=reason, allow_goal=True)
+        if not self._worker_resource_eligible(worker, resource, context.turn):
+            return False
+        exception = self._core_activity_window(
+            context.turn, margin=ACTIVITY_EXCEPTION_MARGIN
+        )
+        local_exception = not area.contains(resource)
+        progress_distances = None
+        if local_exception and self._worker_local_resource_cache is not None:
+            reachable = self._worker_local_resource_cache[1][worker.id]
+            progress_distances = {resource: 0}
+            frontier = deque([resource])
+            while frontier:
+                position = frontier.popleft()
+                for neighbor in adjacent_positions(position):
+                    if neighbor in reachable and neighbor not in progress_distances:
+                        progress_distances[neighbor] = progress_distances[position] + 1
+                        frontier.append(neighbor)
+        areas = (exception,) if local_exception else (area, exception)
+        route_bounds = tuple(
+            _OutsidePatrolArea(
+                bounds,
+                worker.position,
+                0 if bounds.contains(worker.position) else PATROL_EDGE_INSET,
+            )
+            for bounds in areas
+            if bounds is not None
+        )
+        for index, bounds in enumerate(route_bounds):
+            if self._move(
+                worker,
+                resource,
+                context,
+                reason=(
+                    "claim nearby live resource beyond the ordinary activity area"
+                    if local_exception
+                    else f"take a bounded terrain detour to: {reason}"
+                    if index > 0
+                    else reason
+                ),
+                allow_goal=True,
+                require_path=True,
+                extra_blockers=bounds,
+                avoid_recent=not local_exception,
+                progress_distances=progress_distances,
+            ):
+                return True
+        if not any(
+            self._has_static_route(
+                worker, resource, context, allow_goal=True, extra_blockers=bounds
+            )
+            for bounds in route_bounds
+        ):
+            # An unlimited terrain route cannot keep a locally inaccessible
+            # claim alive forever. Temporary friendly congestion still waits.
+            self._release_unreachable_claim(worker, resource, context)
+        return False
 
     def _resource_patrol_sectors(
         self, turn: Turn | None = None
@@ -14490,7 +14756,7 @@ class AggressiveStrategy:
         return assignments
 
     def _assign_chunk_resources(self, turn: Turn) -> dict[UUID, Position]:
-        """Pair every empty Worker with the nearest resource in the live chunk."""
+        """Pair empty Workers with local mines and bounded live exceptions."""
 
         chunk = self._resource_chunk(turn)
         if chunk is None:
@@ -14517,27 +14783,32 @@ class AggressiveStrategy:
         visible_resources = {
             resource
             for resource in set(turn.resource_cells) - hostile - unreachable
-            if resource not in blocked_resources and chunk.contains(resource)
+            if resource not in blocked_resources
+            and any(
+                self._worker_resource_eligible(worker, resource, turn)
+                for worker in workers.values()
+            )
         }
+        activity = self._worker_activity_area(turn) or chunk
         remembered_resources = (
             {
                 resource
                 for resource in self.memory.remembered_resource_cells()
-                if chunk.contains(resource) and resource not in blocked_resources
+                if activity.contains(resource) and resource not in blocked_resources
             }
             - hostile
             - unreachable
             - visible_resources
         )
 
-        # Drop claims outside the active chunk.  Within the chunk every Worker
-        # is eligible regardless of its preferred patrol sector.
+        # Recheck moving-window claims and local visible exceptions each Turn.
+        # The larger economic map remains remembered for the running hop.
         for worker in workers.values():
             goal = self.memory.goal_for(str(worker.id))
             if (
                 goal is not None
                 and goal.purpose == RESOURCE_CLAIM_PURPOSE
-                and not chunk.contains(goal.position)
+                and not self._worker_resource_eligible(worker, goal.position, turn)
             ):
                 self.memory.clear_goal(str(worker.id))
                 self._claim_stalls.pop(worker.id, None)
@@ -14550,6 +14821,7 @@ class AggressiveStrategy:
             [visible_pool],
             assignments,
             clear_missing=False,
+            turn=turn,
         )
 
         if (
@@ -14570,21 +14842,28 @@ class AggressiveStrategy:
 
         for pool in (visible_pool, remembered_pool):
             while workers and pool:
-                _, _, worker_id, resource = min(
+                candidate = min(
                     (
-                        manhattan(worker.position, resource)
-                        + (
-                            manhattan(turn.core.position, resource)
-                            if turn.core is not None
-                            else 0
-                        ),
-                        manhattan(worker.position, resource),
-                        worker.id,
-                        resource,
-                    )
-                    for worker in workers.values()
-                    for resource in pool
+                        (
+                            manhattan(worker.position, resource)
+                            + (
+                                manhattan(turn.core.position, resource)
+                                if turn.core is not None
+                                else 0
+                            ),
+                            manhattan(worker.position, resource),
+                            worker.id,
+                            resource,
+                        )
+                        for worker in workers.values()
+                        for resource in pool
+                        if self._worker_resource_eligible(worker, resource, turn)
+                    ),
+                    default=None,
                 )
+                if candidate is None:
+                    break
+                _, _, worker_id, resource = candidate
                 assignments[worker_id] = resource
                 workers.pop(worker_id)
                 pool.remove(resource)
@@ -14798,7 +15077,12 @@ class AggressiveStrategy:
         }
         for resource in sorted(visible_resources):
             underfoot = sorted(
-                (worker for worker in workers.values() if worker.position == resource),
+                (
+                    worker
+                    for worker in workers.values()
+                    if worker.position == resource
+                    and self._worker_resource_eligible(worker, resource, turn)
+                ),
                 key=lambda worker: worker.id.bytes,
             )
             if not underfoot:
@@ -14835,11 +15119,18 @@ class AggressiveStrategy:
             if current_claim is None:
                 assignments[harvester.id] = resource
                 assignments.pop(owner)
-            else:
+            elif owner in workers and self._worker_resource_eligible(
+                workers[owner], current_claim, turn
+            ):
                 assignments[harvester.id], assignments[owner] = (
                     resource,
                     current_claim,
                 )
+            else:
+                # A nearby live exception belongs to this Worker, not to
+                # whichever distant Worker would inherit its previous claim.
+                assignments[harvester.id] = resource
+                assignments.pop(owner)
 
     def _release_unreachable_claim(
         self,
@@ -14876,7 +15167,8 @@ class AggressiveStrategy:
         so both approaches still terminate in an observation.
         """
 
-        positions = {worker.id: worker.position for worker in turn.workers}
+        workers = {worker.id: worker for worker in turn.workers}
+        positions = {worker.id: worker.position for worker in workers.values()}
         for _ in range(len(assignments)):
             improvement: tuple[int, UUID, UUID] | None = None
             claimed = sorted(assignments)
@@ -14887,7 +15179,14 @@ class AggressiveStrategy:
                     current = manhattan(start, goal) + manhattan(other, other_goal)
                     swapped = manhattan(start, other_goal) + manhattan(other, goal)
                     gain = current - swapped
-                    if gain > 0 and (improvement is None or gain > improvement[0]):
+                    if (
+                        gain > 0
+                        and (improvement is None or gain > improvement[0])
+                        and self._worker_resource_eligible(
+                            workers[first], other_goal, turn
+                        )
+                        and self._worker_resource_eligible(workers[second], goal, turn)
+                    ):
                         improvement = (gain, first, second)
             if improvement is None:
                 return
@@ -14904,6 +15203,7 @@ class AggressiveStrategy:
         assignments: dict[UUID, Position],
         *,
         clear_missing: bool = True,
+        turn: Turn | None = None,
     ) -> None:
         """Keep a Worker on the cell it already claimed while it closes in.
 
@@ -14944,6 +15244,10 @@ class AggressiveStrategy:
                 continue
             pool = next((item for item in pools if goal.position in item), None)
             if pool is None:
+                continue
+            if turn is not None and not self._worker_resource_eligible(
+                worker, goal.position, turn
+            ):
                 continue
             reference = goal.last_progress_position
             distance = manhattan(worker.position, goal.position)
@@ -16287,16 +16591,17 @@ class AggressiveStrategy:
         chunk = self._resource_chunk(context.turn)
         if chunk is None:
             return self._resource_patrol_goal(worker, turn, context)
+        area = self._worker_activity_area(turn) or chunk
         obstacles = self._rock_map(turn)
         unit_id = str(worker.id)
         purpose = WORKER_PATROL_PURPOSE
         current = self.memory.goal_for(unit_id)
-        block_cells = frozenset(_resource_block_cells(chunk)) - obstacles
-        inner = chunk.inset(PATROL_EDGE_INSET)
+        block_cells = frozenset(_resource_block_cells(area)) - obstacles
+        inner = area.inset(PATROL_EDGE_INSET)
         route_bounds = _OutsidePatrolArea(
-            chunk,
+            area,
             worker.position,
-            0 if chunk.contains(worker.position) else PATROL_EDGE_INSET,
+            0 if area.contains(worker.position) else PATROL_EDGE_INSET,
         )
         if context.worker_patrol_inner_view is None:
             # Border posts are useful only for real blind cells: Manhattan
@@ -16354,7 +16659,7 @@ class AggressiveStrategy:
             if other.id != worker.id
             if (goal := self.memory.goal_for(str(other.id))) is not None
             and _is_worker_patrol_goal(goal)
-            and chunk.contains(goal.position)
+            and area.contains(goal.position)
         ]
         claimed_positions = {goal.position for _other, goal in patrol_goals}
         other_positions = {
@@ -16412,7 +16717,7 @@ class AggressiveStrategy:
 
         def usable(position: Position) -> bool:
             return (
-                chunk.contains(position)
+                area.contains(position)
                 and all(position not in layer for layer in unavailable_layers)
                 and position not in claimed_positions
                 and position not in other_positions
@@ -16467,7 +16772,7 @@ class AggressiveStrategy:
 
         candidates = [
             position
-            for position in _resource_block_cells(chunk)
+            for position in _resource_block_cells(area)
             if position != worker.position and usable(position)
         ]
         preferred_sector = self.memory.worker_sectors.get(unit_id)
@@ -16484,6 +16789,10 @@ class AggressiveStrategy:
                 else 0
             )
             value = gain / (4 + distance)
+            if not area.contains(worker.position):
+                # A displaced idle Worker reenters promptly instead of walking
+                # along a shrinking exterior strip toward a remote blind cell.
+                value = 1 / (1 + distance)
             value /= 1 + WORKER_PATROL_SECTOR_PENALTY * load
             if sector_index == preferred_sector:
                 value *= WORKER_PATROL_PREFERRED_BONUS

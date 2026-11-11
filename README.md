@@ -168,10 +168,23 @@ local economy. Long campaigns publish one current-or-cardinal-neighbor chunk
 center at a time; after reaching that roughly 32-cell hop they publish the next
 one. The Core moves for four Ticks; an arrival service Tick may spawn a unit,
 heal before depositing, or accept a delivery, keeping the hop to five Ticks. A
-new hop waits until affordable formation slots are built. The economy harvests
-across the source and destination chunks while defensive posts and patrols
-follow it. With sixteen Workers, eight Rangers permit quota 2 travel and twenty
-permit travel through quota 3 to the quota 4 boundary. Thirty Rangers permit
+new hop, including its forward scout, waits until every live Worker and Ranger
+is in the Core's current 32x32 block and affordable formation slots are built.
+Nearby cargo must also be delivered and the current quota gate satisfied.
+Worker mining and idle patrols stay near the actual Core: during travel their
+ordinary area is the source/destination chunks intersected with a moving 32x32
+window. At rest the current block remains available. Rangers cover the source
+inside that window plus a four-cell margin, and may use the entire destination,
+including its preparatory scout. Patrol paths remain within the permitted area.
+An empty Worker may temporarily mine a live visible resource outside it when
+the resource is within six Manhattan steps, a safe route takes at most eight
+steps, and both stay inside the Core window plus four cells. Mining may also
+take bounded terrain detours inside that margin. An existing live near-mine
+claim may finish its short rock detour within the same eight-step route budget.
+Deliveries, healing, necessary combat, and the bounded enemy Core hunt retain
+their own rules.
+With sixteen Workers, eight Rangers permit quota 2 travel and twenty permit
+travel through quota 3 to the quota 4 boundary. Thirty Rangers permit
 entry into quota 4, stopping at the first block center. Forty permit travel
 through quota 4 and entry into quota 5; fifty permit travel through quota 5 and
 entry into quota 6, and so on. There is no fixed quota-8 destination. Casualties

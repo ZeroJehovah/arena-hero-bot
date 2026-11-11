@@ -30,6 +30,7 @@ from arena_hero_bot.strategy import (
 )
 
 from .factories import core, make_turn, object_id, unit
+from .test_core_traffic import settled_positions
 
 
 @pytest.fixture(autouse=True)
@@ -189,6 +190,181 @@ def _roster(
         },
     }
     return workers, rangers, roles
+
+
+def _gathered_roster(
+    count: int = 8, *, center: tuple[int, int] = (-945, -945)
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, str]]:
+    workers, rangers, roles = _roster(count, center=center)
+    for index, worker in enumerate(workers):
+        worker["position"] = [center[0] - 7 + index, center[1] + 6]
+    for index, ranger in enumerate(rangers):
+        ranger["position"] = [
+            center[0] - 7 + index % 16,
+            center[1] - 6 - index // 16,
+        ]
+    return workers, rangers, roles
+
+
+@pytest.mark.parametrize("unit_type", ["WORKER", "RANGER"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_campaign_next_hop_waits_for_every_unit_to_enter_the_core_block(
+    unit_type, restart, tmp_path
+):
+    center = (-945, -945)
+    core_object = core(position=center)
+    workers, rangers, roles = _gathered_roster(9, center=center)
+    # The complete minimum roster is already inside. Even a surplus member
+    # outside the block must hold the next hop, regardless of its role/cargo.
+    straggler = unit(500, "WORKER", cargo=1) if unit_type == "WORKER" else rangers[-1]
+    if unit_type == "WORKER":
+        workers.append(straggler)
+    block = resource_block_index(center)
+    straggler["position"] = [block[0] * 32 - 2, block[1] * 32 + 4]
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    roster = [*workers, *rangers]
+    for tick in range(100, 148):
+        if restart and tick == 101:
+            path = tmp_path / "memory.json"
+            memory.save(path)
+            memory = WorldMemory.load(path)
+            strategy = _strategy(memory)
+        turn = make_turn(tick=tick, objects=[core_object, *roster])
+        member = next(
+            member for member in turn.units if str(member.id) == straggler["id"]
+        )
+        outside = resource_block_index(member.position) != block
+
+        strategy.decide(turn)
+
+        if not outside:
+            assert memory.campaign_resting is False
+            assert memory.core_home_position != center
+            assert turn.plan.core_action is not None
+            assert turn.plan.core_action.type == "START_MOVE"
+            return
+        assert memory.campaign_resting is True
+        assert memory.core_home_position == center
+        assert memory.campaign_scout_target is None
+        assert turn.plan.core_action is None
+        positions = {
+            str(member_id): position
+            for member_id, position in settled_positions(turn).items()
+        }
+        for member in roster:
+            member["position"] = list(positions[str(member["id"])])
+    pytest.fail("the held campaign never resumed after its straggler returned")
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_campaign_waits_for_gathering_before_starting_a_forward_scout(
+    restart, tmp_path
+):
+    center = (815, 15)
+    core_object = core(position=center)
+    workers, rangers, roles = _gathered_roster(30, center=center)
+    # This Worker is already in the next inward block, not the Core's block.
+    straggler = workers[0]
+    straggler["position"] = [798, 4]
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    for tick in (100, 101):
+        turn = make_turn(tick=tick, objects=[core_object, *workers, *rangers])
+
+        strategy.decide(turn)
+
+        assert memory.campaign_resting is True
+        assert memory.core_home_position == center
+        assert memory.campaign_scout_target is None
+        assert turn.plan.core_action is None
+        if restart:
+            path = tmp_path / "memory.json"
+            memory.save(path)
+            memory = WorldMemory.load(path)
+            strategy = _strategy(memory)
+
+    straggler["position"] = [800, 4]
+    gathered = make_turn(tick=102, objects=[core_object, *workers, *rangers])
+    strategy.decide(gathered)
+
+    target = memory.campaign_scout_target
+    assert target is not None
+    assert resource_block_index(target) != resource_block_index(center)
+    assert memory.core_home_position == center
+    assert gathered.plan.core_action is None
+    # A started scout may leave the Core block and subsequently publish its
+    # cleared destination. Gathering is a gate on starting the next task.
+    rangers[-1]["position"] = list(target)
+    target_block = resource_block_index(target)
+    memory.campaign_scout_seen_ticks.update(
+        {
+            (x, y): gathered.tick
+            for x in range(target_block[0] * 32, (target_block[0] + 1) * 32)
+            for y in range(target_block[1] * 32, (target_block[1] + 1) * 32)
+        }
+    )
+    cleared = make_turn(tick=103, objects=[core_object, *workers, *rangers])
+    strategy.decide(cleared)
+
+    assert memory.core_home_position == target
+    assert memory.campaign_scout_target is None
+    assert cleared.plan.core_action is not None
+    assert cleared.plan.core_action.type == "START_MOVE"
+
+
+def test_campaign_gathering_accepts_block_edges_and_distant_cargo():
+    center = (-945, -945)
+    core_object = core(position=center)
+    workers, rangers, roles = _gathered_roster(center=center)
+    workers[0]["position"] = [-960, -960]
+    workers[0]["cargo"] = 1
+    rangers[-1]["position"] = [-929, -929]
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(
+        objects=[
+            core_object,
+            *workers,
+            *rangers,
+            unit(900, "WORKER", controlled=False, position=(-1100, -1100)),
+            unit(901, "RANGER", controlled=False, position=(-1101, -1100)),
+            unit(902, "VANGUARD", position=(-962, -958)),
+        ]
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.campaign_resting is False
+    assert memory.core_home_position != center
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
 
 
 def test_campaign_replaces_a_rock_sealed_block_center() -> None:
@@ -523,15 +699,13 @@ def test_stage_two_publishes_only_one_adjacent_hop() -> None:
         campaign_last_core_id=current_core["id"],
         core_migration_last_position=current_center,
     )
-    rangers = _rangers(8, center=current_center)
+    workers, rangers, _roles = _gathered_roster(8, center=current_center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     planned = plan_resource_quota(memory, 3, current_position=current_center)
     assert planned is not None
     memory.campaign_scout_rejections = {planned.target_block: 100}
-    turn = make_turn(
-        tick=100, objects=[current_core, *_workers(16, center=current_center), *rangers]
-    )
+    turn = make_turn(tick=100, objects=[current_core, *workers, *rangers])
 
     _strategy(memory).decide(turn)
 
@@ -819,7 +993,7 @@ def test_completed_stage_three_reaches_max_and_targets_quota_four_boundary() -> 
         campaign_last_core_id=core_object["id"],
         unit_roles_initialized=True,
     )
-    workers, rangers, roles = _roster(20, center=core_object["position"])
+    workers, rangers, roles = _gathered_roster(20, center=core_object["position"])
     memory.unit_roles = roles
     turn = make_turn(objects=[core_object, *workers, *rangers])
     strategy = _strategy(memory)
@@ -1306,12 +1480,10 @@ def test_quota_two_block_departs_after_the_full_stage_two_formation() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8, center=center)
+    workers, rangers, _roles = _gathered_roster(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(
-        tick=100, objects=[core_object, *_workers(16, center=center), *rangers]
-    )
+    turn = make_turn(tick=100, objects=[core_object, *workers, *rangers])
 
     _strategy(memory).decide(turn)
 
@@ -1340,13 +1512,11 @@ def test_campaign_rest_holds_the_center_until_nearby_cargo_lands() -> None:
         campaign_target_quota=3,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(8, center=center)
+    workers, rangers, _roles = _gathered_roster(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     loaded = unit(500, "WORKER", position=(-943, -945), cargo=1)
-    turn = make_turn(
-        tick=100, objects=[core_object, *_workers(16, center=center), loaded, *rangers]
-    )
+    turn = make_turn(tick=100, objects=[core_object, *workers, loaded, *rangers])
 
     report = _strategy(memory).decide(turn)
 
@@ -1359,7 +1529,7 @@ def test_campaign_rest_holds_the_center_until_nearby_cargo_lands() -> None:
         tick=101,
         objects=[
             core_object,
-            *_workers(16, center=center),
+            *workers,
             unit(500, "WORKER", position=(-944, -945)),
             *rangers,
         ],
@@ -1595,13 +1765,13 @@ def test_campaign_center_holds_for_an_affordable_build_before_the_next_hop() -> 
         campaign_target_quota=4,
         campaign_last_core_id=core_object["id"],
     )
-    rangers = _rangers(18, center=center)
+    workers, rangers, _roles = _gathered_roster(18, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
     turn = make_turn(
         tick=100,
         resources=unit_cost(UnitType.RANGER, 16 + len(rangers)),
-        objects=[core_object, *_workers(16, center=center), *rangers],
+        objects=[core_object, *workers, *rangers],
     )
     strategy = _strategy(memory)
 
@@ -1615,7 +1785,7 @@ def test_campaign_center_holds_for_an_affordable_build_before_the_next_hop() -> 
 
     depleted = make_turn(
         tick=101,
-        objects=[core_object, *_workers(16, center=center), *rangers],
+        objects=[core_object, *workers, *rangers],
     )
     strategy.decide(depleted)
 
@@ -1695,12 +1865,10 @@ def test_twenty_rangers_reach_max_and_approach_quota_four() -> None:
         campaign_last_core_id=core_object["id"],
         unit_roles_initialized=True,
     )
-    rangers = _rangers(20, center=center)
+    workers, rangers, _roles = _gathered_roster(20, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    turn = make_turn(
-        tick=100, objects=[core_object, *_workers(16, center=center), *rangers]
-    )
+    turn = make_turn(tick=100, objects=[core_object, *workers, *rangers])
 
     _strategy(memory).decide(turn)
 
@@ -1724,7 +1892,7 @@ def test_twenty_rangers_reach_max_and_approach_quota_four() -> None:
 def test_quota_four_hop_waits_for_forward_scout_and_enemy_settle() -> None:
     center = (815, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _roster(center=center)
+    workers, rangers, roles = _gathered_roster(30, center=center)
     memory = WorldMemory(
         core_home_position=center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -1782,7 +1950,7 @@ def test_campaign_scout_ignores_cells_sealed_inside_rocks() -> None:
 
     center = (815, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _gathered_roster(30, center=center)
     sealed = (799, 0)
     seal = [(800, 0), (799, 1), (798, 0), (799, -1)]
     memory = WorldMemory(
@@ -1832,7 +2000,7 @@ def test_campaign_scout_refreshes_sealed_cells_after_new_rocks() -> None:
 
     center = (815, 15)
     core_object = core(position=center)
-    workers, rangers, roles = _roster()
+    workers, rangers, roles = _gathered_roster(30, center=center)
     sealed = (799, 0)
     seal = [(800, 0), (799, 1), (798, 0), (799, -1)]
     memory = WorldMemory(
@@ -2365,8 +2533,14 @@ def test_campaign_scout_stops_on_roster_loss_before_sweep_finishes(
             strategy = _strategy(memory)
 
     strategy.decide(make_turn(tick=103, objects=[core_object, *workers, *rangers]))
+    assert memory.campaign_scout_target is None
+    assert memory.campaign_resting is True
+    assert memory.core_home_position == center
+    for index, ranger in enumerate(rangers[15:]):
+        ranger["position"] = [806 + index, 22]
+    strategy.decide(make_turn(tick=104, objects=[core_object, *workers, *rangers]))
     assert memory.campaign_scout_target is not None
-    assert memory.campaign_scout_started_tick == 103
+    assert memory.campaign_scout_started_tick == 104
     assert memory.core_home_position == center
 
 
