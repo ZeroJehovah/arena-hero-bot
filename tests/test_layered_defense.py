@@ -484,7 +484,7 @@ def test_core_does_not_start_a_fatal_four_tick_move():
 class Encounter:
     """Small independent movement/combat/healing settlement for regression."""
 
-    def __init__(self, friends, foes, *, resources=1):
+    def __init__(self, friends, foes, *, resources=1, rocks=()):
         self.friends = {o["id"]: deepcopy(o) for o in friends}
         self.foes = {o["id"]: deepcopy(o) for o in foes}
         self.core = core()
@@ -496,6 +496,7 @@ class Encounter:
         self.losses = 0
         self.deposits = 0
         self.heals = 0
+        self.rocks = frozenset(rocks)
 
     def turn(self):
         c = deepcopy(self.core)
@@ -512,6 +513,7 @@ class Encounter:
             tick=self.tick,
             resources=self.resources,
             objects=[c, *self.friends.values(), *self.foes.values()],
+            obstacles=self.rocks,
         )
 
     def settle(self, plan, enemy_actions):
@@ -550,11 +552,20 @@ class Encounter:
             (self.foes, {**self.friends, self.core["id"]: self.core}, enemy_actions),
         ):
             for actor_id, action in commands.items():
-                if actor_id not in fleet or action["type"] != "SHOOT":
+                if actor_id not in fleet:
                     continue
                 origin = tuple(fleet[actor_id]["position"])
+                if action["type"] == "SWEEP":
+                    assert fleet[actor_id]["unit_type"] == "VANGUARD"
+                    cell = add(origin, Direction(action["direction"]))
+                    for target in victims.values():
+                        if tuple(target["position"]) == cell:
+                            damage[target["id"]] += 1
+                    continue
+                if action["type"] != "SHOOT":
+                    continue
                 cell = tuple(action["expected_cell"])
-                if not line_of_fire(origin, cell, set()):
+                if not line_of_fire(origin, cell, self.rocks):
                     continue
                 candidates = [
                     o for o in victims.values() if tuple(o["position"]) == cell

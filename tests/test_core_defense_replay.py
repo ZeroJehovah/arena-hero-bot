@@ -17,6 +17,7 @@ from arena_hero_bot.strategy import (
 )
 
 from .factories import core, make_turn, object_id, unit
+from .test_layered_defense import Encounter
 
 
 def _strategy(
@@ -119,7 +120,7 @@ def test_core_assault_prefers_a_current_enemy_cell_over_a_one_cell_lead() -> Non
 
 def test_defender_repositions_before_firing_only_a_predicted_cell() -> None:
     memory = WorldMemory(
-        unit_roles={object_id(2): DEFENSE_ROLE},
+        unit_roles={object_id(2): DEFENSE_ROLE, object_id(3): DEFENSE_ROLE},
         unit_roles_initialized=True,
     )
     memory.enemy_position_history[object_id(30)] = [
@@ -127,17 +128,24 @@ def test_defender_repositions_before_firing_only_a_predicted_cell() -> None:
         (99, (1, 4)),
         (100, (1, 3)),
     ]
-    turn = make_turn(
-        objects=[
-            core(),
-            unit(2, "RANGER", position=(0, 1)),
-            unit(30, "RANGER", controlled=False, position=(1, 3)),
-        ]
+    encounter = Encounter(
+        [unit(2, "RANGER", position=(0, 1)), unit(3, "RANGER", position=(2, 2))],
+        [unit(30, "RANGER", controlled=False, position=(1, 3))],
+        resources=0,
     )
+    turn = encounter.turn()
     strategy = _strategy(memory)
     memory.observe(turn)
     context = _combat_context(strategy, turn)
 
+    # Moving cannot fire: the ally must really take the first arrow off the
+    # target, rather than leave this defender in a losing 1HP-v-2HP reply.
+    strategy._decide_ranger(
+        turn.rangers[1], context, strategy.memory.recent_enemies(turn.tick, 32)
+    )
+    ally_action = turn.plan.unit_actions[UUID(int=3)]
+    assert isinstance(ally_action, ShootAction)
+    assert ally_action.target_id == UUID(int=30)
     strategy._decide_ranger(
         turn.rangers[0],
         context,
@@ -148,6 +156,37 @@ def test_defender_repositions_before_firing_only_a_predicted_cell() -> None:
     assert isinstance(action, MoveAction)
     assert add((0, 1), action.direction) == (1, 1)
     assert "clear firing lane" in context.report.decisions[-1].reason
+
+    encounter.settle(
+        turn.plan,
+        {
+            object_id(30): {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": [1, 1],
+            }
+        },
+    )
+    assert encounter.friends[object_id(2)]["hp"] == 1
+    assert encounter.foes[object_id(30)]["hp"] == 1
+    reply = encounter.turn()
+    memory.observe(reply)
+    reply_context = _combat_context(strategy, reply)
+    for ranger in reply.rangers:
+        strategy._decide_ranger(
+            ranger, reply_context, memory.recent_enemies(reply.tick, 32)
+        )
+    encounter.settle(
+        reply.plan,
+        {
+            object_id(30): {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": [1, 1],
+            }
+        },
+    )
+    assert (encounter.kills, encounter.losses) == (1, 0)
 
 
 def test_overlapping_defenders_keep_their_direct_shots_during_combat() -> None:

@@ -2191,11 +2191,17 @@ def test_ranger_disengages_from_an_adjacent_vanguard() -> None:
         ],
     )
 
-    report = decide(turn)
+    decide(turn)
 
     action = turn.plan.unit_actions[turn.rangers[0].id]
     assert action.type == "MOVE"
-    assert any("max-range firing line" in item.reason for item in report.decisions)
+    assert (
+        manhattan(
+            add(turn.rangers[0].position, action.direction),
+            turn.visible_enemies[0].position,
+        )
+        > 1
+    )
 
 
 def test_ranger_fires_instead_of_stepping_back_from_an_enemy_ranger() -> None:

@@ -146,6 +146,55 @@ def casualty_bound(
     return losses
 
 
+def fire_groups(
+    positions: Mapping[UUID, Position],
+    enemies: Sequence[UnitView],
+    rocks: Container[Position],
+    *,
+    shots: Mapping[UUID, UnitView] | None = None,
+) -> tuple[tuple[frozenset[UUID], tuple[UnitView, ...]], ...]:
+    """Connect shared hostile attacks and arrows assigned to a real volley.
+
+    A Vanguard that cannot sweep either duel does not connect their losses
+    just because both Rangers could shoot it. Required ranged support for a
+    Vanguard kill still belongs with the allies exposed to its sweep.
+    """
+    opponents: dict[UUID, list[UnitView]] = {actor_id: [] for actor_id in positions}
+    shooters: dict[UUID, set[UUID]] = {}
+    for enemy in enemies:
+        linked = {
+            actor_id
+            for actor_id, position in positions.items()
+            if can_attack(enemy, position, rocks)
+        }
+        linked.update(
+            actor_id
+            for actor_id, target in (shots or {}).items()
+            if target.id == enemy.id
+        )
+        shooters[enemy.id] = linked
+        for actor_id in linked:
+            opponents[actor_id].append(enemy)
+    remaining = set(positions)
+    groups = []
+    while remaining:
+        pending = [min(remaining)]
+        members: set[UUID] = set()
+        contacts: dict[UUID, UnitView] = {}
+        while pending:
+            actor_id = pending.pop()
+            if actor_id in members:
+                continue
+            members.add(actor_id)
+            remaining.discard(actor_id)
+            for enemy in opponents[actor_id]:
+                if enemy.id not in contacts:
+                    contacts[enemy.id] = enemy
+                    pending.extend(shooters[enemy.id] - members)
+        groups.append((frozenset(members), tuple(contacts.values())))
+    return tuple(groups)
+
+
 def maximum_core_damage(
     core_positions: Sequence[Position],
     enemies: Sequence[UnitView],
