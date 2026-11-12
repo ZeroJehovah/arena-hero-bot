@@ -93,6 +93,63 @@ class PatrolContact:
     target_id: str
 
 
+@dataclass(slots=True)
+class WorkerAreaProtection:
+    """One bounded patrol response to fighters restricting the Worker area."""
+
+    core_id: str
+    started: int
+    deadline: int
+    assembly_deadline: int
+    target_ids: tuple[str, ...]
+    target_origins: dict[str, Position]
+    member_ids: tuple[str, ...]
+    member_roles: dict[str, str] = field(default_factory=dict)
+    last_seen: int = 0
+    entered: int | None = None
+    reason: str = "protecting the Worker activity area"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "core_id": self.core_id,
+            "started": self.started,
+            "deadline": self.deadline,
+            "assembly_deadline": self.assembly_deadline,
+            "target_ids": list(self.target_ids),
+            "target_origins": {
+                enemy_id: list(position)
+                for enemy_id, position in sorted(self.target_origins.items())
+            },
+            "member_ids": list(self.member_ids),
+            "member_roles": dict(sorted(self.member_roles.items())),
+            "last_seen": self.last_seen,
+            "entered": self.entered,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> WorkerAreaProtection:
+        return cls(
+            core_id=str(raw["core_id"]),
+            started=int(raw["started"]),
+            deadline=int(raw["deadline"]),
+            assembly_deadline=int(raw["assembly_deadline"]),
+            target_ids=tuple(str(value) for value in raw.get("target_ids", ())),
+            target_origins={
+                str(enemy_id): tuple(position)
+                for enemy_id, position in raw.get("target_origins", {}).items()
+            },
+            member_ids=tuple(str(value) for value in raw.get("member_ids", ())),
+            member_roles={
+                str(unit_id): str(role)
+                for unit_id, role in raw.get("member_roles", {}).items()
+            },
+            last_seen=int(raw.get("last_seen", raw.get("started", 0))),
+            entered=(int(raw["entered"]) if raw.get("entered") is not None else None),
+            reason=str(raw.get("reason", "protecting the Worker activity area")),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ExpeditionSquad:
     """A persisted expedition membership, current heading and shared route."""
@@ -134,6 +191,13 @@ class WorldMemory:
     # ``patrol-1`` .. ``patrol-4``, ``staged`` or ``expedition-N``.
     unit_roles: dict[str, str] = field(default_factory=dict)
     patrol_contacts: dict[str, PatrolContact] = field(default_factory=dict)
+    # Active activity-area protection survives a restart so its membership and
+    # absolute budgets cannot be renewed by reconnecting.  Units returning
+    # from an aborted mission are kept outside the shared patrol-ring arrival
+    # gate until they are back in the Core neighbourhood.
+    worker_area_protection: WorkerAreaProtection | None = None
+    worker_area_protection_cooldowns: dict[str, int] = field(default_factory=dict)
+    worker_area_protection_returns: dict[str, int] = field(default_factory=dict)
     # Exact defensive posts, independent of temporary combat/healing goals.
     # The anchor lets the strategy translate every post together if the Core
     # moves, without reallocating surviving Units to different slots.
@@ -345,6 +409,11 @@ class WorldMemory:
         self.patrol_ring_slots = {
             unit_id: slot
             for unit_id, slot in self.patrol_ring_slots.items()
+            if unit_id in live_combat_ids
+        }
+        self.worker_area_protection_returns = {
+            unit_id: tick
+            for unit_id, tick in self.worker_area_protection_returns.items()
             if unit_id in live_combat_ids
         }
 
@@ -793,6 +862,17 @@ class WorldMemory:
                 role: asdict(contact)
                 for role, contact in sorted(self.patrol_contacts.items())
             },
+            "worker_area_protection": (
+                self.worker_area_protection.to_dict()
+                if self.worker_area_protection is not None
+                else None
+            ),
+            "worker_area_protection_cooldowns": dict(
+                sorted(self.worker_area_protection_cooldowns.items())
+            ),
+            "worker_area_protection_returns": dict(
+                sorted(self.worker_area_protection_returns.items())
+            ),
             "defense_posts": {
                 unit_id: list(position)
                 for unit_id, position in sorted(self.defense_posts.items())
@@ -1024,6 +1104,23 @@ class WorldMemory:
                     target_id=str(value["target_id"]),
                 )
                 for role, value in raw.get("patrol_contacts", {}).items()
+            },
+            worker_area_protection=(
+                WorkerAreaProtection.from_dict(raw["worker_area_protection"])
+                if raw.get("worker_area_protection")
+                else None
+            ),
+            worker_area_protection_cooldowns={
+                str(enemy_id): int(tick)
+                for enemy_id, tick in raw.get(
+                    "worker_area_protection_cooldowns", {}
+                ).items()
+            },
+            worker_area_protection_returns={
+                str(unit_id): int(tick)
+                for unit_id, tick in raw.get(
+                    "worker_area_protection_returns", {}
+                ).items()
             },
             defense_posts={
                 str(unit_id): _position(position)

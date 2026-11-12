@@ -70,6 +70,7 @@ from .memory import (
     ExpeditionSquad,
     PatrolContact,
     UnitGoal,
+    WorkerAreaProtection,
     WorldMemory,
 )
 from .models import DecisionReport
@@ -88,6 +89,16 @@ ACTIVITY_EXCEPTION_MARGIN = 4
 RANGER_SOURCE_COVER_MARGIN = 4
 WORKER_LOCAL_RESOURCE_RADIUS = 6
 WORKER_LOCAL_RESOURCE_PATH_LIMIT = 8
+WORKER_AREA_PROTECTION_MAX_PARTY = 6
+WORKER_AREA_PROTECTION_MAX_TARGETS = 2
+WORKER_AREA_PROTECTION_MAX_TICKS = 32
+WORKER_AREA_PROTECTION_ASSEMBLY_TICKS = 24
+WORKER_AREA_PROTECTION_FIRE_TICKS = 4
+WORKER_AREA_PROTECTION_RETURN_TICKS = 24
+WORKER_AREA_PROTECTION_COOLDOWN_TICKS = 32
+WORKER_AREA_PROTECTION_TARGET_RADIUS = 4
+WORKER_AREA_PROTECTION_MIN_RESERVE = 2
+WORKER_AREA_PROTECTION_COOLDOWN_LIMIT = 128
 CORE_LAYOUT_VERSION = 3
 RESOURCE_CLAIM_TTL = 4
 # A held claim is only released when its approach has stopped paying, not when
@@ -546,6 +557,10 @@ class _TurnContext:
     garrison_ids: frozenset[UUID] = field(default_factory=frozenset)
     raid_ids: frozenset[UUID] = field(default_factory=frozenset)
     clearance_ids: frozenset[UUID] = field(default_factory=frozenset)
+    worker_area_protection_ids: frozenset[UUID] = field(default_factory=frozenset)
+    worker_area_protection_return_ids: frozenset[UUID] = field(
+        default_factory=frozenset
+    )
     counterattack_ids: frozenset[UUID] = field(default_factory=frozenset)
     counterattack_reserved: frozenset[Position] = field(default_factory=frozenset)
     core_hunt_ids: frozenset[UUID] = field(default_factory=frozenset)
@@ -647,6 +662,21 @@ class _ActivityArea:
 
 
 @dataclass(frozen=True, slots=True)
+class _WorkerAreaProtectionCandidate:
+    """A local fighter group whose danger disks restrict the Worker area."""
+
+    target_ids: tuple[str, ...]
+    objective: Position
+    positions: tuple[Position, ...]
+    target_hp: tuple[int, ...]
+    objective_cell: Position
+    blocked_cells: frozenset[Position]
+    worker_overlap: int
+    resource_overlap: int
+    risk_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _OutsidePatrolArea:
     """Bound a route, allowing an already displaced unit to return inside."""
 
@@ -732,7 +762,9 @@ class AggressiveStrategy:
         self._worker_local_resource_cache: (
             tuple[Turn, dict[UUID, dict[Position, int]]] | None
         ) = None
-        self._worker_safe_cells_cache: tuple[Turn, frozenset[Position]] | None = None
+        self._worker_safe_cells_cache: (
+            tuple[Turn, frozenset[UUID], frozenset[Position]] | None
+        ) = None
         # Set for the current Tick only by ``_assign_resources`` when a
         # Worker is deliberately left out of known-site pairing.  Keeping the
         # identity here lets the selected Worker be non-minimal without
@@ -767,14 +799,25 @@ class AggressiveStrategy:
         self._raid_target: Position | None = None
         self._raid_until_tick: int = -1
         self._raid_cooldown_until: int = -1
-        # A block whose natural quota is fully discovered but whose every node
-        # is sealed by hostile fighters has no safe income.  Campaign mode has
-        # no expeditions to answer that, so the standing defenders themselves
-        # become the clearance detachment.  Kept off ``WorldMemory`` for the
-        # same reason as the raid: a restart sends them home.
+        # Campaign patrol members can be detached to protect usable cells in
+        # the live Worker area. Their full state is durable; this set is the
+        # current Tick's fast ownership view and is rebuilt from that state at
+        # startup.
         self._clearance_ids: frozenset[UUID] = frozenset()
         self._clearance_target: Position | None = None
-        self._clearance_until_tick: int = -1
+        if self.config.campaign_mode and self.memory.worker_area_protection:
+            protection = self.memory.worker_area_protection
+            try:
+                self._clearance_ids = frozenset(
+                    UUID(unit_id) for unit_id in protection.member_ids
+                )
+            except (TypeError, ValueError):
+                self.memory.worker_area_protection = None
+            else:
+                if len(protection.target_ids) == 1:
+                    self._clearance_target = protection.target_origins.get(
+                        protection.target_ids[0]
+                    )
         # An enemy Core parked in or beside the resource area is not a threat
         # (it cannot attack), but it sits on top of the local economy and can
         # be destroyed for free while no hostile fighter is around.  One home
@@ -978,6 +1021,14 @@ class AggressiveStrategy:
             raid_ids=raid_ids,
             clearance_ids=(
                 self._clearance_ids if self.config.campaign_mode else frozenset()
+            ),
+            worker_area_protection_ids=(
+                self._clearance_ids if self.config.campaign_mode else frozenset()
+            ),
+            worker_area_protection_return_ids=(
+                self._worker_area_protection_return_ids(turn)
+                if self.config.campaign_mode
+                else frozenset()
             ),
             core_hunt_ids=core_hunt_ids,
             campaign_patrol_recall_ids=campaign_patrol_recall_ids,
@@ -1374,6 +1425,23 @@ class AggressiveStrategy:
                 self._decide_core_hunt_ranger(ranger, context)
                 return
             shootable = core_shots
+        if (
+            ranger.id in context.worker_area_protection_ids
+            and self.memory.worker_area_protection is not None
+        ):
+            # A detached protection member spends movement and arrows on the
+            # fixed mission target only. Nearby bycatch remains a route and
+            # return-fire risk, not a reason to extend this task's budget.
+            mission_targets = set(self.memory.worker_area_protection.target_ids)
+            mission_shots = [
+                (enemy, cells)
+                for enemy, cells in shootable
+                if str(enemy.id) in mission_targets
+            ]
+            if not mission_shots:
+                self._decide_clearance_ranger(ranger, context, visible_enemies)
+                return
+            shootable = mission_shots
         direct_shootable = [
             (enemy, (enemy.position,))
             for enemy, shot_cells in shootable
@@ -1698,6 +1766,8 @@ class AggressiveStrategy:
                     target,
                     shot_cells,
                 )
+                if ranger.id in context.clearance_ids:
+                    self._record_worker_area_protection_fire(target, context)
                 ranger.shoot(target, expected_cell=shot_cell)
                 if local_formation or trade_target is not None:
                     self._reserve_ranger_firing_lane(
@@ -1982,7 +2052,18 @@ class AggressiveStrategy:
         guard between posts.
         """
 
-        target = self._preferred_target(context.focus_target, fighters)
+        mission = self.memory.worker_area_protection
+        mission_targets = set(mission.target_ids) if mission is not None else set()
+        target = next(
+            (
+                enemy
+                for enemy in fighters
+                if isinstance(enemy, UnitView) and str(enemy.id) in mission_targets
+            ),
+            None,
+        )
+        if target is None:
+            target = self._preferred_target(context.focus_target, fighters)
         if target is None and fighters:
             target = self._best_visible_target(
                 ranger.position,
@@ -2002,23 +2083,50 @@ class AggressiveStrategy:
                 context,
                 offensive=True,
                 reason=(
-                    "close a firing angle on the fighter sealing this "
-                    "block's resource quota"
+                    "close a firing angle on the fighter restricting the "
+                    "Worker activity area"
                 ),
                 avoid_new_threats=True,
             ):
                 return True
         anchor = self._clearance_target
-        if anchor is None or anchor == ranger.position:
-            return False
-        return self._move_within_leash(
-            ranger,
-            anchor,
-            context,
-            offensive=True,
-            reason="advance on the last seen fighter sealing this block",
-            avoid_new_threats=True,
-        )
+        if (
+            anchor is not None
+            and anchor != ranger.position
+            and self._move_within_leash(
+                ranger,
+                anchor,
+                context,
+                offensive=True,
+                reason="advance on the last seen Worker-area restricting fighter",
+                avoid_new_threats=True,
+            )
+        ):
+            return True
+        if mission is not None:
+            self._hold_defensive_ranger(
+                ranger,
+                context,
+                reason="hold for a safe firing angle on the Worker-area threat",
+            )
+            return True
+        return False
+
+    def _record_worker_area_protection_fire(
+        self,
+        target: CoreView | UnitView,
+        context: _TurnContext,
+    ) -> None:
+        """Start the four-Tick engagement clock on the first mission shot."""
+
+        mission = self.memory.worker_area_protection
+        if (
+            mission is not None
+            and mission.entered is None
+            and isinstance(target, UnitView)
+            and str(target.id) in mission.target_ids
+        ):
+            mission.entered = context.turn.tick
 
     def _try_patrol_pursuit(self, ranger: Ranger, context: _TurnContext) -> bool:
         """Evaluate authorised pursuit before speculative cover or post moves."""
@@ -2089,6 +2197,23 @@ class AggressiveStrategy:
         ) >= ranger.hp and self._move_ranger_toward_core(
             ranger, context, reason="leave a lethal multi-source firing line"
         ):
+            return
+        if ranger.id in context.worker_area_protection_return_ids:
+            goal = self._patrol_recall_goal(ranger, context.turn)
+            if goal != ranger.position and self._move_within_leash(
+                ranger,
+                goal,
+                context,
+                offensive=False,
+                reason="return from Worker-area protection to the patrol ring",
+                avoid_new_threats=True,
+            ):
+                return
+            self._hold_defensive_ranger(
+                ranger,
+                context,
+                reason="wait for a safe patrol-ring return",
+            )
             return
         if ranger.id in context.clearance_ids and self._decide_clearance_ranger(
             ranger,
@@ -6779,7 +6904,10 @@ class AggressiveStrategy:
         # and an enemy Worker cannot attack, so neither may freeze the local
         # economy or force a retreat: a Core parked beside the only nodes in a
         # low-quota block would otherwise make the whole block unharvestable.
-        if worker.position in self._worker_safe_defense_cells(context.turn):
+        if worker.position in self._worker_safe_defense_cells(
+            context.turn,
+            excluded_ids=frozenset(self._clearance_ids),
+        ):
             return ()
         visible = [
             enemy.position
@@ -8109,7 +8237,11 @@ class AggressiveStrategy:
 
     def _prepare_counterattack(self, context: _TurnContext) -> None:
         """Own a fixed group through safe assembly, atomic ingress and a volley."""
-        if not self.config.campaign_mode or self.memory.skirmish is not None:
+        if (
+            not self.config.campaign_mode
+            or self.memory.skirmish is not None
+            or self.memory.worker_area_protection is not None
+        ):
             return
         turn = context.turn
         core = turn.core
@@ -8464,7 +8596,10 @@ class AggressiveStrategy:
 
     def _prepare_skirmish(self, context: _TurnContext) -> None:
         """Clear a nearby small contact with a fixed, time-bounded group."""
-        if not self.config.campaign_mode:
+        if (
+            not self.config.campaign_mode
+            or self.memory.worker_area_protection is not None
+        ):
             return
         turn = context.turn
         core = turn.core
@@ -12500,6 +12635,13 @@ class AggressiveStrategy:
         self.memory.campaign_scout_rejections.clear()
         self.memory.campaign_emergency_target = None
         self.memory.campaign_emergency_started_tick = 0
+        self._abort_resource_clearance(
+            turn,
+            reason="Core identity changed",
+            cooldown=False,
+        )
+        self.memory.worker_area_protection_cooldowns.clear()
+        self.memory.worker_area_protection_returns.clear()
         self._abort_core_hunt()
         self._core_hunt_cooldown_until = -1
         self.memory.defense_compressed = False
@@ -14423,6 +14565,50 @@ class AggressiveStrategy:
         }
         return slots
 
+    def _worker_area_protection_return_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Return live patrol members that still owe a safe trip back to the ring."""
+
+        if not self.config.campaign_mode:
+            return frozenset()
+        live = {unit.id for unit in turn.rangers}
+        active: set[UUID] = set()
+        core = turn.core
+        for unit_id, until in list(self.memory.worker_area_protection_returns.items()):
+            try:
+                parsed = UUID(unit_id)
+            except (TypeError, ValueError):
+                self.memory.worker_area_protection_returns.pop(unit_id, None)
+                continue
+            if parsed not in live:
+                self.memory.worker_area_protection_returns.pop(unit_id, None)
+                continue
+            unit = next(ranger for ranger in turn.rangers if ranger.id == parsed)
+            if core is not None and manhattan(unit.position, core.position) <= (
+                SYMMETRIC_PATROL_RECALL_RADIUS
+            ):
+                self.memory.worker_area_protection_returns.pop(unit_id, None)
+                continue
+            if until >= turn.tick:
+                active.add(parsed)
+        return frozenset(active)
+
+    def _patrol_ring_exempt_ids(self, turn: Turn) -> frozenset[UUID]:
+        """Exclude detached/returning members from the shared arrival gate."""
+
+        active = frozenset(
+            ranger.id for ranger in turn.rangers if ranger.id in self._clearance_ids
+        )
+        live_ids = {str(ranger.id) for ranger in turn.rangers}
+        returning: set[UUID] = set()
+        for unit_id in self.memory.worker_area_protection_returns:
+            if unit_id not in live_ids:
+                continue
+            try:
+                returning.add(UUID(unit_id))
+            except (TypeError, ValueError):
+                continue
+        return active | returning
+
     def _advance_patrol_ring_phase(
         self,
         turn: Turn,
@@ -14435,9 +14621,12 @@ class AggressiveStrategy:
         if self._patrol_ring_phase_tick == turn.tick or not route or not slots:
             return
         live = {unit.id: unit for unit in (*turn.vanguards, *turn.rangers)}
+        exempt = self._patrol_ring_exempt_ids(turn)
         phase = self.memory.patrol_ring_phase % len(route)
         live_slots = [
-            (unit_id, slot) for unit_id, slot in slots.items() if unit_id in live
+            (unit_id, slot)
+            for unit_id, slot in slots.items()
+            if unit_id in live and unit_id not in exempt
         ]
         if live_slots and all(
             live[unit_id].position
@@ -16091,80 +16280,446 @@ class AggressiveStrategy:
             return True
         return threat.should_evacuate_core or core.hp < 5 or core.shield < 5
 
+    def _worker_area_protection_candidates(
+        self,
+        turn: Turn,
+        *,
+        additional_excluded_ids: frozenset[UUID] = frozenset(),
+    ) -> tuple[_WorkerAreaProtectionCandidate, ...]:
+        """Return hostile groups whose danger disks cover the Worker area."""
+
+        area = self._worker_activity_area(turn)
+        core = turn.core
+        if area is None or core is None or not self.config.campaign_mode:
+            return ()
+        obstacles = self._rock_map(turn)
+        mission = self.memory.worker_area_protection
+        excluded: set[UUID] = set()
+        excluded.update(additional_excluded_ids)
+        if mission is not None:
+            for unit_id in mission.member_ids:
+                try:
+                    excluded.add(UUID(unit_id))
+                except (TypeError, ValueError):
+                    continue
+        sheltered = self._worker_safe_defense_cells(
+            turn,
+            excluded_ids=frozenset(excluded),
+        )
+        sealed = self.memory.campaign_scout_unobservable
+        usable = {
+            (x, y)
+            for x in range(area.min_x, area.max_x + 1)
+            for y in range(area.min_y, area.max_y + 1)
+            if (x, y) not in obstacles and (x, y) not in sealed
+        }
+        if not usable:
+            return ()
+        fighters = tuple(
+            enemy
+            for enemy in self.memory.recent_enemies(
+                turn.tick,
+                self.config.worker_threat_memory_ttl,
+            )
+            if enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
+            and turn.tick - enemy.tick <= self.config.worker_threat_memory_ttl
+        )
+        if not fighters:
+            return ()
+        visible_workers = {worker.position for worker in turn.workers}
+        known_resources = set(turn.resource_cells) | set(self.memory.resource_cells)
+        radius = self.config.worker_threat_radius
+        candidates: list[_WorkerAreaProtectionCandidate] = []
+        for primary in fighters:
+            blocked = {
+                cell
+                for cell in usable
+                if cell not in sheltered and manhattan(cell, primary.position) <= radius
+            }
+            if not blocked:
+                continue
+            risk = tuple(
+                sorted(
+                    (
+                        enemy
+                        for enemy in fighters
+                        if manhattan(enemy.position, primary.position)
+                        <= RAID_ABORT_SCAN_RADIUS
+                    ),
+                    key=lambda enemy: (
+                        manhattan(core.position, enemy.position),
+                        enemy.object_id,
+                    ),
+                )
+            )
+            if len(risk) > WORKER_AREA_PROTECTION_MAX_TARGETS:
+                # The mission is capped at six Rangers and two fixed targets.
+                # A larger local group already requires the dedicated
+                # counterattack/skirmish policies instead of consuming a patrol
+                # squad it cannot safely clear.
+                continue
+            group = risk[:WORKER_AREA_PROTECTION_MAX_TARGETS]
+            group_blocked = {
+                cell
+                for cell in usable
+                if cell not in sheltered
+                and any(manhattan(cell, enemy.position) <= radius for enemy in group)
+            }
+            if not group_blocked:
+                continue
+            objective_cell = min(
+                group_blocked,
+                key=lambda cell: (
+                    min(manhattan(cell, enemy.position) for enemy in group),
+                    manhattan(core.position, cell),
+                    cell,
+                ),
+            )
+            candidates.append(
+                _WorkerAreaProtectionCandidate(
+                    target_ids=tuple(enemy.object_id for enemy in group),
+                    objective=primary.position,
+                    positions=tuple(enemy.position for enemy in group),
+                    target_hp=tuple(enemy.hp for enemy in group),
+                    objective_cell=objective_cell,
+                    blocked_cells=frozenset(group_blocked),
+                    worker_overlap=sum(
+                        manhattan(worker, primary.position) <= radius
+                        for worker in visible_workers
+                    ),
+                    resource_overlap=sum(
+                        manhattan(resource, primary.position) <= radius
+                        for resource in known_resources
+                    ),
+                    risk_ids=tuple(enemy.object_id for enemy in risk),
+                )
+            )
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (
+                -candidate.worker_overlap,
+                -candidate.resource_overlap,
+                manhattan(core.position, candidate.objective),
+                -len(candidate.blocked_cells),
+                candidate.target_ids,
+            ),
+        )
+        unique: list[_WorkerAreaProtectionCandidate] = []
+        seen: set[tuple[str, ...]] = set()
+        for candidate in ordered:
+            if candidate.target_ids in seen:
+                continue
+            seen.add(candidate.target_ids)
+            unique.append(candidate)
+        return tuple(unique)
+
+    def _worker_area_protection_squad(
+        self,
+        turn: Turn,
+        objective: Position,
+        required_size: int,
+    ) -> tuple[Ranger, ...]:
+        """Pick a small healthy patrol group while retaining the global reserve."""
+
+        self._ensure_unit_roles(turn)
+        core = turn.core
+        if core is None:
+            return ()
+        local = tuple(
+            ranger
+            for ranger in turn.rangers
+            if ranger.hp > 1 and not self._is_expedition_member(ranger, turn)
+        )
+        if not local:
+            return ()
+        reserve = max(
+            WORKER_AREA_PROTECTION_MIN_RESERVE,
+            (len(local) + 2) // 3,
+        )
+        # The layered Core defense needs four healthy Rangers to form two
+        # actual firing ranks. A nearby fighter is already handled by that
+        # higher-priority formation, so do not turn a proactive economy task
+        # into the reason the second rank disappears.
+        layered_contact_radius = self.config.core_assault_radius + RANGER_VISION_RADIUS
+        local_contact = any(
+            isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+            and manhattan(core.position, enemy.position) <= layered_contact_radius
+            for enemy in turn.visible_enemies
+        ) or any(
+            enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.RANGER.value, UnitType.VANGUARD.value}
+            and turn.tick - enemy.tick <= 8
+            and manhattan(core.position, enemy.position) <= layered_contact_radius
+            for enemy in self.memory.recent_enemies(turn.tick, 8)
+        )
+        if local_contact:
+            reserve = max(reserve, min(len(local), 4))
+        patrol = tuple(
+            ranger for ranger in local if ranger.id in self._patrol_ids(turn)
+        )
+        available = min(
+            WORKER_AREA_PROTECTION_MAX_PARTY,
+            max(0, len(local) - reserve),
+            len(patrol),
+        )
+        required = min(
+            WORKER_AREA_PROTECTION_MAX_PARTY,
+            max(2, required_size),
+        )
+        if available < required:
+            return ()
+        ordered = sorted(
+            patrol,
+            key=lambda ranger: (
+                manhattan(ranger.position, objective),
+                ranger.id.bytes,
+            ),
+        )
+        selected: list[Ranger] = [ordered[0]]
+        first_team = self._patrol_team_from_role(
+            self.memory.unit_roles.get(str(ordered[0].id))
+        )
+        remaining = ordered[1:]
+        remaining.sort(
+            key=lambda ranger: (
+                self._patrol_team_from_role(self.memory.unit_roles.get(str(ranger.id)))
+                != first_team,
+                manhattan(ranger.position, objective),
+                ranger.id.bytes,
+            )
+        )
+        return tuple((selected + remaining)[:required])
+
     def _update_resource_clearance(
         self,
         turn: Turn,
         threat: ThreatAssessment,
     ) -> frozenset[UUID]:
-        """Send standing defenders against fighters sealing this block.
+        """Dispatch patrol Rangers to any fighter restricting the economy area.
 
-        The rule is deliberately narrow: the block's natural quota is fully
-        discovered, every discovered node is covered by hostile fighters, and
-        there is no safe site left to harvest.  With income at zero the economy
-        cannot fund its own way out, so the defenders that would only wait on
-        the ring become the detachment that clears the block.
-
-        The squad is bounded exactly like the ordinary raid: it needs a local
-        numeric advantage, it aborts when a fighter turns towards the Core, it
-        disengages when the objective is held by more fighters than it brought,
-        and it is recalled by the same tick budget.  Campaign defence keeps one
-        guard on station whenever the roster has more than one combat unit.
+        Eligibility no longer waits for the natural resource quota to be fully
+        discovered or for every known node to be sealed.  Resource can refresh
+        in any currently empty cell, so a hostile danger disk overlapping any
+        usable cell of the live Worker area is already an economic restriction.
+        The selected patrol group, absolute budgets and cooldown persist across
+        restarts.  The narrow full-quota decision remains separately owned by
+        emergency Core migration.
         """
 
         live = frozenset(unit.id for unit in (*turn.rangers, *turn.vanguards))
+        live_ids = frozenset(str(unit_id) for unit_id in live)
         self._clearance_ids &= live
         core = turn.core
-        decision = self._resource_block_clearance(turn)
-        if core is None or decision is None:
-            self._abort_resource_clearance(turn)
+        if core is None:
+            self._abort_resource_clearance(turn, reason="Core unavailable")
             return frozenset()
-        objective, covering, _cells = decision
-        if self._clearance_ids:
-            if (
-                turn.tick > self._clearance_until_tick
-                or self._clearance_recall_needed(turn, threat)
-                or self._clearance_outmatched(turn, covering)
-            ):
-                self._abort_resource_clearance(turn)
+        self.memory.worker_area_protection_cooldowns = {
+            enemy_id: until
+            for enemy_id, until in (
+                self.memory.worker_area_protection_cooldowns.items()
+            )
+            if until >= turn.tick
+        }
+        if (
+            len(self.memory.worker_area_protection_cooldowns)
+            > WORKER_AREA_PROTECTION_COOLDOWN_LIMIT
+        ):
+            self.memory.worker_area_protection_cooldowns = dict(
+                sorted(
+                    self.memory.worker_area_protection_cooldowns.items(),
+                    key=lambda item: (item[1], item[0]),
+                )[-WORKER_AREA_PROTECTION_COOLDOWN_LIMIT:]
+            )
+        self.memory.worker_area_protection_returns = {
+            unit_id: until
+            for unit_id, until in (self.memory.worker_area_protection_returns.items())
+            if unit_id in live_ids
+        }
+        candidates = self._worker_area_protection_candidates(turn)
+        mission = self.memory.worker_area_protection
+        if mission is not None and mission.core_id != str(core.id):
+            self._abort_resource_clearance(
+                turn,
+                reason="Core identity changed",
+            )
+            mission = None
+        if mission is not None:
+            mission_targets = set(mission.target_ids)
+            selected = tuple(
+                candidate
+                for candidate in candidates
+                if set(candidate.target_ids) <= mission_targets
+                and set(candidate.target_ids) & mission_targets
+            )
+            if not selected:
+                self._abort_resource_clearance(
+                    turn,
+                    reason="target no longer restricts the Worker area",
+                    cooldown=any(
+                        enemy_id in self.memory.enemies
+                        for enemy_id in mission.target_ids
+                    ),
+                )
                 return frozenset()
-            self._clearance_target = objective
+            decision = selected[0]
+            visible_target_ids = {
+                str(enemy.id)
+                for enemy in turn.visible_enemies
+                if str(enemy.id) in mission_targets
+            }
+            if visible_target_ids & set(decision.target_ids):
+                mission.last_seen = turn.tick
+            live_members = tuple(
+                ranger
+                for ranger in turn.rangers
+                if str(ranger.id) in mission.member_ids and ranger.hp > 1
+            )
+            role_changed = any(
+                expected != self.memory.unit_roles.get(str(ranger.id))
+                for ranger in live_members
+                if (expected := mission.member_roles.get(str(ranger.id))) is not None
+            )
+            displaced = any(
+                manhattan(position, mission.target_origins[enemy_id])
+                > WORKER_AREA_PROTECTION_TARGET_RADIUS
+                for enemy_id, position in zip(
+                    decision.target_ids,
+                    decision.positions,
+                    strict=False,
+                )
+                if enemy_id in mission.target_origins
+            )
+            if (
+                len(live_members) != len(mission.member_ids)
+                or turn.tick >= mission.deadline
+                or (mission.entered is None and turn.tick >= mission.assembly_deadline)
+                or (
+                    mission.entered is not None
+                    and turn.tick - mission.entered >= WORKER_AREA_PROTECTION_FIRE_TICKS
+                )
+                or displaced
+                or turn.tick - mission.last_seen > 8
+                or role_changed
+                or self._clearance_recall_needed(turn, threat)
+                or self.memory.campaign_scout_target is not None
+                or self.memory.counterattack.operation is not None
+                or self.memory.skirmish is not None
+                or len(decision.risk_ids) > WORKER_AREA_PROTECTION_MAX_TARGETS
+                or self._clearance_outmatched(turn, decision.positions)
+            ):
+                self._abort_resource_clearance(
+                    turn,
+                    reason="active protection budget or safety gate closed",
+                )
+                return frozenset()
+            self._clearance_ids = frozenset(ranger.id for ranger in live_members)
+            mission.target_ids = decision.target_ids
+            mission.target_origins = {
+                enemy_id: mission.target_origins.get(enemy_id, position)
+                for enemy_id, position in zip(
+                    decision.target_ids,
+                    decision.positions,
+                    strict=True,
+                )
+            }
+            self._clearance_target = decision.objective
             return self._clearance_ids
-        if self._clearance_recall_needed(turn, threat):
-            return frozenset()
-        if self._core_hunt_ranger_id is not None:
-            # The standing ring is already one Ranger short; do not open a
-            # second front on the same Tick.
-            return frozenset()
-        squad = self._clearance_squad(turn, objective)
-        if len(squad) <= len(covering):
-            return frozenset()
-        self._clearance_ids = frozenset(unit.id for unit in squad)
-        if self._clearance_outmatched(turn, covering):
-            self._abort_resource_clearance(turn)
-            return frozenset()
-        self._clearance_target = objective
-        self._clearance_until_tick = turn.tick + self.config.raid_max_ticks
-        return self._clearance_ids
 
-    def _clearance_squad(
-        self,
-        turn: Turn,
-        objective: Position,
-    ) -> tuple[Ranger | Vanguard, ...]:
-        """Pick the closest fighters, keeping one guard when possible."""
-
-        combat = self._clearing_combat_units(turn)
-        keep_home = 1 if len(combat) > 1 else 0
-        available = max(1, min(len(combat) - keep_home, self.config.raid_squad_size))
-        ordered = sorted(
-            combat,
-            key=lambda unit: (
-                unit.hp <= 1,
-                manhattan(unit.position, objective),
-                unit.id.bytes,
+        if (
+            self._clearance_recall_needed(turn, threat)
+            or not self._offensive_patrol_enabled(turn)
+            or self.memory.campaign_scout_target is not None
+            or self.memory.counterattack.operation is not None
+            or self.memory.skirmish is not None
+            or self._core_hunt_ranger_id is not None
+        ):
+            return frozenset()
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if all(
+                    turn.tick
+                    >= self.memory.worker_area_protection_cooldowns.get(
+                        enemy_id,
+                        -1,
+                    )
+                    for enemy_id in item.target_ids
+                )
+            ),
+            None,
+        )
+        if candidate is None:
+            return frozenset()
+        # Require enough healthy patrol arrows for one simultaneous volley.
+        # This is deliberately conservative for Vanguards: a four-HP sweep
+        # unit cannot be approached by a two-Ranger task that would need a
+        # second exchange after it has already closed the distance.
+        required = max(
+            2 if len(candidate.target_ids) == 1 else 4,
+            min(
+                WORKER_AREA_PROTECTION_MAX_PARTY,
+                sum(candidate.target_hp),
             ),
         )
-        return tuple(ordered[:available])
+        squad = self._worker_area_protection_squad(
+            turn,
+            candidate.objective,
+            required,
+        )
+        if len(squad) < required or len(squad) <= len(candidate.risk_ids):
+            return frozenset()
+        post_departure = next(
+            (
+                item
+                for item in self._worker_area_protection_candidates(
+                    turn,
+                    additional_excluded_ids=frozenset(ranger.id for ranger in squad),
+                )
+                if item.target_ids == candidate.target_ids
+            ),
+            None,
+        )
+        if post_departure is None:
+            return frozenset()
+        candidate = post_departure
+        self._clearance_ids = frozenset(ranger.id for ranger in squad)
+        if self._clearance_outmatched(turn, candidate.positions):
+            self._abort_resource_clearance(
+                turn,
+                reason="local fighter group is not safely inferior",
+            )
+            return frozenset()
+        origins = dict(zip(candidate.target_ids, candidate.positions, strict=True))
+        target_last_seen = {
+            enemy.object_id: enemy.tick
+            for enemy in self.memory.recent_enemies(
+                turn.tick,
+                self.config.worker_threat_memory_ttl,
+            )
+            if enemy.object_id in candidate.target_ids
+        }
+        self.memory.worker_area_protection = WorkerAreaProtection(
+            core_id=str(core.id),
+            started=turn.tick,
+            deadline=turn.tick + WORKER_AREA_PROTECTION_MAX_TICKS,
+            assembly_deadline=(turn.tick + WORKER_AREA_PROTECTION_ASSEMBLY_TICKS),
+            target_ids=candidate.target_ids,
+            target_origins=origins,
+            member_ids=tuple(str(ranger.id) for ranger in squad),
+            member_roles={
+                str(ranger.id): self.memory.unit_roles.get(str(ranger.id), "")
+                for ranger in squad
+            },
+            last_seen=max(target_last_seen.values(), default=turn.tick),
+            reason=("clear hostile fighters restricting the Worker activity area"),
+        )
+        for ranger in squad:
+            self.memory.worker_area_protection_returns.pop(str(ranger.id), None)
+        self._clearance_target = candidate.objective
+        return self._clearance_ids
 
     def _clearance_outmatched(
         self,
@@ -16211,12 +16766,37 @@ class AggressiveStrategy:
         )
         return len(fighters) >= len(members) or len(covering) > len(members)
 
-    def _abort_resource_clearance(self, turn: Turn) -> None:
-        """Release the clearance detachment back to its defence posts."""
+    def _abort_resource_clearance(
+        self,
+        turn: Turn,
+        *,
+        reason: str = "protection mission superseded",
+        cooldown: bool = True,
+    ) -> None:
+        """Release a patrol protection squad and preserve bounded return state."""
 
+        mission = self.memory.worker_area_protection
+        if mission is not None:
+            if cooldown:
+                until = turn.tick + WORKER_AREA_PROTECTION_COOLDOWN_TICKS
+                for enemy_id in mission.target_ids:
+                    self.memory.worker_area_protection_cooldowns[enemy_id] = max(
+                        self.memory.worker_area_protection_cooldowns.get(
+                            enemy_id,
+                            -1,
+                        ),
+                        until,
+                    )
+            return_until = turn.tick + WORKER_AREA_PROTECTION_RETURN_TICKS
+            for unit_id in mission.member_ids:
+                self.memory.worker_area_protection_returns[unit_id] = max(
+                    self.memory.worker_area_protection_returns.get(unit_id, -1),
+                    return_until,
+                )
+            mission.reason = reason
+        self.memory.worker_area_protection = None
         self._clearance_ids = frozenset()
         self._clearance_target = None
-        self._clearance_until_tick = -1
 
     def _update_core_hunt(
         self,
@@ -17264,7 +17844,10 @@ class AggressiveStrategy:
         position: Position,
         turn: Turn,
     ) -> bool:
-        if position in self._worker_safe_defense_cells(turn):
+        if position in self._worker_safe_defense_cells(
+            turn,
+            excluded_ids=frozenset(self._clearance_ids),
+        ):
             return False
         return any(
             manhattan(position, enemy) <= self.config.worker_threat_radius
@@ -17295,9 +17878,17 @@ class AggressiveStrategy:
 
         return self._worker_threat_disks(
             self._worker_combat_threat_positions(turn)
-        ) - self._worker_safe_defense_cells(turn)
+        ) - self._worker_safe_defense_cells(
+            turn,
+            excluded_ids=frozenset(self._clearance_ids),
+        )
 
-    def _worker_safe_defense_cells(self, turn: Turn) -> frozenset[Position]:
+    def _worker_safe_defense_cells(
+        self,
+        turn: Turn,
+        *,
+        excluded_ids: frozenset[UUID] = frozenset(),
+    ) -> frozenset[Position]:
         """Open sheltered economy cells without erasing unseen enemy danger.
 
         The six-cell warning disks are useful outside our formation. Inside
@@ -17305,15 +17896,17 @@ class AggressiveStrategy:
         harvesting, healing or the one-at-a-time Core service pipeline.
         """
         cached = self._worker_safe_cells_cache
-        if cached is not None and cached[0] is turn:
-            return cached[1]
+        if cached is not None and cached[0] is turn and cached[1] == excluded_ids:
+            return cached[2]
         core = turn.core
         safe: set[Position] = set()
         if core is not None:
             cover = [
                 ally
                 for ally in turn.rangers
-                if ally.hp > 1 and not self._is_expedition_member(ally, turn)
+                if ally.hp > 1
+                and ally.id not in excluded_ids
+                and not self._is_expedition_member(ally, turn)
             ]
             visible_ids = {str(enemy.id) for enemy in turn.visible_enemies}
             hidden = [
@@ -17348,7 +17941,7 @@ class AggressiveStrategy:
                         continue
                     safe.add(cell)
         result = frozenset(safe)
-        self._worker_safe_cells_cache = turn, result
+        self._worker_safe_cells_cache = turn, excluded_ids, result
         return result
 
     def _worker_threat_disks(self, centers: tuple[Position, ...]) -> set[Position]:

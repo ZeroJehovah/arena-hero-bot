@@ -9,7 +9,12 @@ import pytest
 from arena_hero import APIError, ArenaHeroError, Turn
 
 from arena_hero_bot import cli, runtime
-from arena_hero_bot.memory import ExpeditionSquad, PatrolContact, WorldMemory
+from arena_hero_bot.memory import (
+    ExpeditionSquad,
+    PatrolContact,
+    WorkerAreaProtection,
+    WorldMemory,
+)
 from arena_hero_bot.migration import write_migration_request
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.runtime import RuntimeConfig
@@ -161,6 +166,19 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
         defense_posts={"u1": (3, -8)},
         defense_anchor=(3, 0),
         patrol_contacts={"patrol-1": PatrolContact((3, 6), 95, 100, "enemy")},
+        worker_area_protection=WorkerAreaProtection(
+            core_id=object_id(1),
+            started=99,
+            deadline=131,
+            assembly_deadline=123,
+            target_ids=("enemy",),
+            target_origins={"enemy": (4, 5)},
+            member_ids=("u1",),
+            member_roles={"u1": "patrol-1"},
+            last_seen=99,
+        ),
+        worker_area_protection_cooldowns={"enemy": 140},
+        worker_area_protection_returns={"u1": 125},
         core_home_position=(16, 16),
         campaign_last_core_id=object_id(1),
         campaign_phase=2,
@@ -187,6 +205,9 @@ def test_turn_record_contains_state_plan_and_no_credential() -> None:
     assert record["identity"]["defense_anchor"] == [3, 0]
     assert record["identity"]["patrol_contacts"]["patrol-1"]["origin"] == [3, 6]
     assert record["identity"]["patrol_contacts"]["patrol-1"]["started_tick"] == 95
+    assert record["identity"]["worker_area_protection"]["target_ids"] == ["enemy"]
+    assert record["identity"]["worker_area_protection_cooldowns"]["enemy"] == 140
+    assert record["identity"]["worker_area_protection_returns"]["u1"] == 125
     assert record["identity"]["campaign"]["home_position"] == [16, 16]
     assert record["identity"]["campaign"]["phase"] == 2
     assert record["identity"]["campaign"]["target_quota"] == 3

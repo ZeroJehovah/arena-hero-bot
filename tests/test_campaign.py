@@ -2841,7 +2841,16 @@ CLEARANCE_FIGHTER = (-490, 719)
 
 
 def _clearance_rangers(count: int) -> list[dict[str, object]]:
-    offsets = [(0, 3), (0, -3), (3, 0), (-3, 0), (5, 5), (-5, 5)]
+    offsets = [
+        (0, 3),
+        (0, -3),
+        (3, 0),
+        (-3, 0),
+        (5, 5),
+        (-5, 5),
+        (7, 0),
+        (-7, 0),
+    ]
     return [
         unit(
             100 + index,
@@ -2876,7 +2885,10 @@ def _sealed_memory(
         campaign_phase=CAMPAIGN_PHASE_STAGE2,
         campaign_target_quota=3,
         campaign_last_core_id=str(core_object["id"]),
-        unit_roles={str(ranger["id"]): "defense" for ranger in rangers},
+        unit_roles={
+            str(ranger["id"]): f"patrol-{index // 2 + 2}"
+            for index, ranger in enumerate(rangers)
+        },
         unit_roles_initialized=True,
     )
 
@@ -2891,7 +2903,7 @@ def _sealed_fighters(count: int) -> list[dict[str, object]]:
 
 def test_sealed_block_sends_defenders_to_clear_the_fighters() -> None:
     core_object = core(1, position=CLEARANCE_HOME)
-    rangers = _clearance_rangers(4)
+    rangers = _clearance_rangers(8)
     memory = _sealed_memory(core_object, rangers)
     turn = make_turn(
         objects=[core_object, *rangers, *_sealed_fighters(1)],
@@ -2900,13 +2912,10 @@ def test_sealed_block_sends_defenders_to_clear_the_fighters() -> None:
 
     report = _strategy(memory).decide(turn)
 
-    clearing = [
-        decision
-        for decision in report.decisions
-        if "sealing this block" in decision.reason
-    ]
-    assert clearing
-    assert len({decision.actor_id for decision in clearing}) < len(rangers)
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert len(mission.member_ids) < len(rangers)
+    assert any(decision.actor_id in mission.member_ids for decision in report.decisions)
     assert memory.core_home_position == CLEARANCE_HOME
     assert memory.campaign_emergency_target is None
 
@@ -2954,7 +2963,7 @@ def test_clearance_counts_stacked_enemies_before_launching():
 
 def test_clearance_recalls_for_unseen_reinforcements_until_confirmed_destroyed():
     core_object = core(position=CLEARANCE_HOME)
-    rangers = _clearance_rangers(4)
+    rangers = _clearance_rangers(8)
     strategy = _strategy(_sealed_memory(core_object, rangers))
     pair = [
         unit(200, "RANGER", controlled=False, position=CLEARANCE_FIGHTER),
@@ -2993,10 +3002,13 @@ def test_clearance_recalls_for_unseen_reinforcements_until_confirmed_destroyed()
         threat = strategy._combat_policy.assess(turn, set())
         return strategy._update_resource_clearance(turn, threat)
 
-    assert len(update(100)) == 3
+    assert len(update(100)) == 4
     assert not update(101, reinforcement=True)
     assert not update(102)
-    assert len(update(103, destroyed=True)) == 3
+    # Aborts preserve a bounded per-target cooldown.  A confirmed destruction
+    # removes the reinforcement immediately, but the pair waits for its window.
+    assert not update(132, destroyed=True)
+    assert len(update(133, destroyed=True)) == 4
 
 
 def test_sealed_block_with_combat_units_does_not_abandon_the_core() -> None:
@@ -3123,21 +3135,387 @@ def test_emergency_migration_repairs_its_own_target_or_releases_it(
         assert resumed.memory.core_home_position == memory.core_home_position
 
 
-def test_partially_discovered_block_does_not_trigger_a_clearance() -> None:
+def test_partially_discovered_block_still_protects_potential_worker_cells() -> None:
     core_object = core(1, position=CLEARANCE_HOME)
-    rangers = _clearance_rangers(4)
+    rangers = _clearance_rangers(8)
     memory = _sealed_memory(core_object, rangers)
     turn = make_turn(
         objects=[core_object, *rangers, *_sealed_fighters(1)],
         resource_cells=[CLEARANCE_NODES[0]],
     )
 
-    report = _strategy(memory).decide(turn)
+    _strategy(memory).decide(turn)
 
-    assert not any(
-        "sealing this block" in decision.reason for decision in report.decisions
-    )
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert mission.target_ids == (str(turn.visible_enemies[0].id),)
     assert memory.campaign_emergency_target is None
+
+
+def test_zero_or_safe_known_resources_do_not_delay_worker_area_protection() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    for resource_cells in ([], [(-493, 719)]):
+        memory = _sealed_memory(core_object, rangers)
+        turn = make_turn(
+            objects=[core_object, *rangers, *_sealed_fighters(1)],
+            resource_cells=resource_cells,
+        )
+
+        _strategy(memory).decide(turn)
+
+        mission = memory.worker_area_protection
+        assert mission is not None
+        assert mission.target_ids == (str(turn.visible_enemies[0].id),)
+        assert memory.campaign_emergency_target is None
+
+
+def test_worker_area_protection_uses_shared_worker_sighting() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    worker = unit(400, "WORKER", position=(CLEARANCE_HOME[0] + 1, CLEARANCE_HOME[1]))
+    fighter = unit(
+        200,
+        "RANGER",
+        controlled=False,
+        position=(CLEARANCE_HOME[0] + 17, CLEARANCE_HOME[1]),
+    )
+    memory = _sealed_memory(core_object, rangers)
+    memory.observe(
+        make_turn(tick=100, objects=[core_object, *rangers, worker, fighter])
+    )
+    strategy = _strategy(memory)
+
+    decision_turn = make_turn(
+        tick=101,
+        objects=[core_object, *rangers, worker],
+    )
+    report = strategy.decide(decision_turn)
+
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert mission.target_ids == (str(fighter["id"]),)
+    assert mission.last_seen == 100
+    assert any(
+        decision.actor_id in mission.member_ids
+        and decision.action == "MOVE"
+        and "Worker-area" in decision.reason
+        for decision in report.decisions
+    )
+
+
+def test_fighters_outside_every_worker_area_cell_do_not_create_a_task() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[
+            core_object,
+            *rangers,
+            unit(200, "RANGER", controlled=False, position=(-450, 680)),
+        ]
+    )
+
+    _strategy(memory).decide(turn)
+
+    assert memory.worker_area_protection is None
+
+
+@pytest.mark.parametrize("enemy_type", ["WORKER", "CORE"])
+def test_noncombat_enemy_occupancy_does_not_create_a_protection_task(
+    enemy_type: str,
+) -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    enemy = (
+        unit(200, "WORKER", controlled=False, position=CLEARANCE_FIGHTER)
+        if enemy_type == "WORKER"
+        else core(
+            200,
+            controlled=False,
+            owner_username="rival",
+            position=CLEARANCE_FIGHTER,
+        )
+    )
+    turn = make_turn(objects=[core_object, *rangers, enemy])
+
+    _strategy(memory).decide(turn)
+
+    assert memory.worker_area_protection is None
+
+
+def test_worker_area_protection_persists_members_targets_and_budget(
+    tmp_path: Path,
+) -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    turn = make_turn(
+        objects=[core_object, *rangers, *_sealed_fighters(1)],
+    )
+    strategy = _strategy(memory)
+    strategy.decide(turn)
+    mission = memory.worker_area_protection
+    assert mission is not None
+
+    path = tmp_path / "memory.json"
+    memory.save(path)
+    loaded = WorldMemory.load(path)
+
+    assert loaded.worker_area_protection == mission
+    assert loaded.worker_area_protection.member_ids == mission.member_ids
+    assert loaded.worker_area_protection.deadline == 132
+
+
+def test_worker_area_protection_aborts_after_eight_ticks_without_sight() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    fighter = unit(
+        200,
+        "RANGER",
+        controlled=False,
+        position=(CLEARANCE_HOME[0] + 17, CLEARANCE_HOME[1]),
+    )
+    strategy = _strategy(memory)
+
+    strategy.decide(
+        make_turn(
+            tick=100,
+            objects=[core_object, *rangers, fighter],
+        )
+    )
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert mission.entered is None
+
+    for tick in range(101, 109):
+        strategy.decide(make_turn(tick=tick, objects=[core_object, *rangers]))
+        assert memory.worker_area_protection is not None
+
+    strategy.decide(make_turn(tick=109, objects=[core_object, *rangers]))
+
+    assert memory.worker_area_protection is None
+    assert memory.worker_area_protection_cooldowns[str(fighter["id"])] == 141
+    # Mission cancellation is not a kill or an early Worker-safety reset.
+    assert strategy._worker_combat_threat_positions(
+        make_turn(tick=124, objects=[core_object, *rangers])
+    )
+    assert not strategy._worker_combat_threat_positions(
+        make_turn(tick=125, objects=[core_object, *rangers])
+    )
+
+
+def test_worker_area_protection_aborts_after_target_moves_five_cells() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    fighter = unit(
+        200,
+        "RANGER",
+        controlled=False,
+        position=(-480, CLEARANCE_HOME[1]),
+    )
+    strategy = _strategy(memory)
+
+    strategy.decide(make_turn(tick=100, objects=[core_object, *rangers, fighter]))
+    assert memory.worker_area_protection is not None
+    assert memory.worker_area_protection.entered is None
+
+    for tick, x in ((101, -479), (102, -478), (103, -477), (104, -476)):
+        fighter["position"] = [x, CLEARANCE_HOME[1]]
+        strategy.decide(make_turn(tick=tick, objects=[core_object, *rangers, fighter]))
+        assert memory.worker_area_protection is not None
+
+    fighter["position"] = [-475, CLEARANCE_HOME[1]]
+    strategy.decide(make_turn(tick=105, objects=[core_object, *rangers, fighter]))
+
+    assert memory.worker_area_protection is None
+    assert memory.worker_area_protection_cooldowns[str(fighter["id"])] == 137
+
+
+def test_confirmed_protection_kill_does_not_trigger_failure_cooldown() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    fighter = _sealed_fighters(1)[0]
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+
+    strategy.decide(make_turn(tick=100, objects=[core_object, *rangers, fighter]))
+    assert memory.worker_area_protection is not None
+
+    strategy.decide(
+        make_turn(
+            tick=101,
+            objects=[core_object, *rangers],
+            events=[
+                {
+                    "event_id": object_id(900),
+                    "tick": 100,
+                    "event_type": "DESTRUCTION_PARTICIPATION",
+                    "reason_code": "UNIT",
+                    "target_id": fighter["id"],
+                }
+            ],
+        )
+    )
+
+    assert memory.worker_area_protection is None
+    assert str(fighter["id"]) not in memory.worker_area_protection_cooldowns
+    assert str(fighter["id"]) not in memory.enemies
+
+
+def test_protection_members_return_marker_clears_only_on_safe_rejoin() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    fighter = _sealed_fighters(1)[0]
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+
+    strategy.decide(make_turn(tick=100, objects=[core_object, *rangers, fighter]))
+    mission = memory.worker_area_protection
+    assert mission is not None
+    members = [
+        next(ranger for ranger in rangers if str(ranger["id"]) == member_id)
+        for member_id in mission.member_ids
+    ]
+    for index, ranger in enumerate(members):
+        ranger["position"] = [
+            CLEARANCE_HOME[0] + 20,
+            CLEARANCE_HOME[1] + index,
+        ]
+
+    strategy.decide(
+        make_turn(
+            tick=101,
+            objects=[core_object, *rangers],
+            events=[
+                {
+                    "event_id": object_id(900),
+                    "tick": 100,
+                    "event_type": "DESTRUCTION_PARTICIPATION",
+                    "reason_code": "UNIT",
+                    "target_id": fighter["id"],
+                }
+            ],
+        )
+    )
+
+    assert set(mission.member_ids) <= set(memory.worker_area_protection_returns)
+    safe_member_id = mission.member_ids[0]
+    safe_ranger = next(
+        ranger for ranger in rangers if str(ranger["id"]) == safe_member_id
+    )
+    safe_ranger["position"] = [CLEARANCE_HOME[0] + 10, CLEARANCE_HOME[1]]
+
+    strategy.decide(make_turn(tick=102, objects=[core_object, *rangers]))
+
+    assert safe_member_id not in memory.worker_area_protection_returns
+    assert mission.member_ids[1] in memory.worker_area_protection_returns
+
+
+def test_active_protection_does_not_expand_to_a_new_nearby_target() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    original = _sealed_fighters(1)[0]
+    original["position"] = [-480, CLEARANCE_HOME[1]]
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+
+    strategy.decide(make_turn(tick=100, objects=[core_object, *rangers, original]))
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert mission.target_ids == (str(original["id"]),)
+
+    reinforcement = unit(
+        201,
+        "RANGER",
+        controlled=False,
+        position=(-479, CLEARANCE_HOME[1]),
+    )
+    strategy.decide(
+        make_turn(
+            tick=101,
+            objects=[core_object, *rangers, original, reinforcement],
+        )
+    )
+
+    assert memory.worker_area_protection is None
+    assert memory.worker_area_protection_cooldowns[str(original["id"])] == 133
+
+
+def test_worker_area_protection_cooldowns_are_bounded() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    memory.worker_area_protection_cooldowns = {
+        object_id(1000 + index): 200 for index in range(129)
+    }
+
+    _strategy(memory).decide(make_turn(tick=100, objects=[core_object, *rangers]))
+
+    assert len(memory.worker_area_protection_cooldowns) == 128
+
+
+def test_protection_uses_a_full_volley_against_a_vanguard() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    vanguard = unit(
+        200,
+        "VANGUARD",
+        controlled=False,
+        position=(CLEARANCE_HOME[0] + 17, CLEARANCE_HOME[1]),
+    )
+
+    _strategy(memory).decide(
+        make_turn(tick=100, objects=[core_object, *rangers, vanguard])
+    )
+
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert len(mission.member_ids) == 4
+    assert mission.target_ids == (str(vanguard["id"]),)
+
+
+def test_protection_does_not_commit_two_vanguards_beyond_one_volley() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    vanguards = [
+        unit(
+            200 + index,
+            "VANGUARD",
+            controlled=False,
+            position=(CLEARANCE_HOME[0] + 16 + index, CLEARANCE_HOME[1]),
+        )
+        for index in range(2)
+    ]
+
+    _strategy(memory).decide(
+        make_turn(tick=100, objects=[core_object, *rangers, *vanguards])
+    )
+
+    assert memory.worker_area_protection is None
+
+
+def test_detached_protection_member_does_not_hold_the_shared_patrol_phase() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    strategy = _strategy(memory)
+    turn = make_turn(objects=[core_object, *rangers])
+    active, detached = turn.rangers[:2]
+    route = (active.position, detached.position)
+    slots = {active.id: 0, detached.id: 1}
+    memory.patrol_ring_phase = 0
+    strategy._patrol_ring_phase_tick = -1
+    strategy._clearance_ids = frozenset({detached.id})
+
+    strategy._advance_patrol_ring_phase(turn, route, slots, 2)
+
+    assert memory.patrol_ring_phase == 1
 
 
 def test_enemy_cores_do_not_seal_a_resource_block() -> None:
@@ -3187,7 +3565,9 @@ def _hunter_memory(core_object, rangers):
     """Keep the designated hunter defensive in a balanced three-Ranger roster."""
 
     memory = _sealed_memory(core_object, rangers)
+    memory.unit_roles[str(rangers[0]["id"])] = "defense"
     memory.unit_roles[str(rangers[1]["id"])] = "patrol-1"
+    memory.unit_roles[str(rangers[2]["id"])] = "defense"
     return memory
 
 

@@ -303,6 +303,17 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
         "counterattack": memory.counterattack.to_dict(),
         "skirmish": memory.skirmish.to_dict() if memory.skirmish else None,
         "skirmish_cooldown_until": memory.skirmish_cooldown_until,
+        "worker_area_protection": (
+            memory.worker_area_protection.to_dict()
+            if memory.worker_area_protection
+            else None
+        ),
+        "worker_area_protection_cooldowns": dict(
+            sorted(memory.worker_area_protection_cooldowns.items())
+        ),
+        "worker_area_protection_returns": dict(
+            sorted(memory.worker_area_protection_returns.items())
+        ),
         "layered_defense": {
             "anchor": memory.layered_defense_anchor,
             "posts": memory.layered_defense_posts,
