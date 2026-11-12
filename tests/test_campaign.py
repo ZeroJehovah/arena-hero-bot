@@ -2850,6 +2850,12 @@ def _clearance_rangers(count: int) -> list[dict[str, object]]:
         (-5, 5),
         (7, 0),
         (-7, 0),
+        (9, 0),
+        (-9, 0),
+        (9, 5),
+        (-9, 5),
+        (9, -5),
+        (-9, -5),
     ]
     return [
         unit(
@@ -3477,6 +3483,54 @@ def test_protection_uses_a_full_volley_against_a_vanguard() -> None:
     assert mission is not None
     assert len(mission.member_ids) == 4
     assert mission.target_ids == (str(vanguard["id"]),)
+
+
+def test_protection_rounds_a_damaged_vanguard_up_to_four_rangers() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    memory = _sealed_memory(core_object, rangers)
+    vanguard = unit(
+        200,
+        "VANGUARD",
+        controlled=False,
+        position=(CLEARANCE_HOME[0] + 17, CLEARANCE_HOME[1]),
+        hp=3,
+    )
+
+    _strategy(memory).decide(
+        make_turn(tick=100, objects=[core_object, *rangers, vanguard])
+    )
+
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert len(mission.member_ids) == 4
+
+
+def test_protection_rounds_mixed_damaged_targets_up_to_six_rangers() -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(14)
+    memory = _sealed_memory(core_object, rangers)
+    ranger = unit(
+        200,
+        "RANGER",
+        controlled=False,
+        position=(CLEARANCE_HOME[0] + 17, CLEARANCE_HOME[1]),
+    )
+    vanguard = unit(
+        201,
+        "VANGUARD",
+        controlled=False,
+        position=(CLEARANCE_HOME[0] + 18, CLEARANCE_HOME[1]),
+        hp=3,
+    )
+
+    _strategy(memory).decide(
+        make_turn(tick=100, objects=[core_object, *rangers, ranger, vanguard])
+    )
+
+    mission = memory.worker_area_protection
+    assert mission is not None
+    assert len(mission.member_ids) == 6
 
 
 def test_protection_does_not_commit_two_vanguards_beyond_one_volley() -> None:

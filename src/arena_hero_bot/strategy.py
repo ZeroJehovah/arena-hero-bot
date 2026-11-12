@@ -16657,12 +16657,17 @@ class AggressiveStrategy:
         # This is deliberately conservative for Vanguards: a four-HP sweep
         # unit cannot be approached by a two-Ranger task that would need a
         # second exchange after it has already closed the distance.
-        required = max(
+        required_arrows = max(
             2 if len(candidate.target_ids) == 1 else 4,
             min(
                 WORKER_AREA_PROTECTION_MAX_PARTY,
                 sum(candidate.target_hp),
             ),
+        )
+        required = min(
+            size
+            for size in (2, 4, WORKER_AREA_PROTECTION_MAX_PARTY)
+            if size >= required_arrows
         )
         squad = self._worker_area_protection_squad(
             turn,
