@@ -66,6 +66,7 @@ from .memory import (
     RESOURCE_CLAIM_PURPOSE,
     RESOURCE_MEMORY_LIMIT,
     WORKER_SECTOR_LAYOUT_VERSION,
+    CoreHunt,
     EnemySighting,
     ExpeditionSquad,
     PatrolContact,
@@ -564,6 +565,7 @@ class _TurnContext:
     counterattack_ids: frozenset[UUID] = field(default_factory=frozenset)
     counterattack_reserved: frozenset[Position] = field(default_factory=frozenset)
     core_hunt_ids: frozenset[UUID] = field(default_factory=frozenset)
+    core_hunt_return_ids: frozenset[UUID] = field(default_factory=frozenset)
     campaign_patrol_recall_ids: frozenset[UUID] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
@@ -818,18 +820,12 @@ class AggressiveStrategy:
                     self._clearance_target = protection.target_origins.get(
                         protection.target_ids[0]
                     )
-        # An enemy Core parked in or beside the resource area is not a threat
-        # (it cannot attack), but it sits on top of the local economy and can
-        # be destroyed for free while no hostile fighter is around.  One home
-        # defender is detached for that job and returns when it is done, when
-        # a fighter appears, or when the trip budget runs out.  Ephemeral for
-        # the same restart-safety reason as the raid: a restart sends it home.
-        self._core_hunt_ranger_id: UUID | None = None
-        self._core_hunt_enemy_id: str | None = None
-        self._core_hunt_target: Position | None = None
-        self._core_hunt_until_tick: int = -1
-        self._core_hunt_last_seen_tick: int = -1
-        self._core_hunt_cooldown_until: int = -1
+        # A discovered Core owns one local Ranger until destruction, loss of
+        # its trail or a higher-priority safety task. Role and patrol slot stay
+        # intact; target, handoffs and the pursuit budget live in WorldMemory.
+        self._core_hunt_route_cache: (
+            tuple[Turn, Position, dict[Position, tuple[int, Position]]] | None
+        ) = None
         self._local_fireline_target_id: str | None = None
         self._local_fireline_ranger_ids: frozenset[UUID] = frozenset()
         self._local_fireline_goals: dict[UUID, Position] = {}
@@ -1031,6 +1027,7 @@ class AggressiveStrategy:
                 else frozenset()
             ),
             core_hunt_ids=core_hunt_ids,
+            core_hunt_return_ids=self._core_hunt_return_ids(turn),
             campaign_patrol_recall_ids=campaign_patrol_recall_ids,
         )
         context.core_build_priority = self._campaign_build_priority(context)
@@ -1377,7 +1374,7 @@ class AggressiveStrategy:
             # The detached hunter was sent out on a fleet sighting, so its own
             # five-cell vision may not hold the Core yet.  Hand it the target
             # Core explicitly; every other target still obeys the local-vision
-            # rule, and the hunt aborts as soon as a fighter appears.
+            # rule, and nearby escorts or home pressure abort the hunt.
             hunted = self._core_hunt_core_view(context.turn)
             if hunted is not None and all(
                 str(enemy.id) != str(hunted.id) for enemy in visible_enemies
@@ -1394,6 +1391,19 @@ class AggressiveStrategy:
             visible_enemies,
             offensive=offensive,
         )
+        yield_noncombat_shots = ranger.id in context.core_hunt_return_ids or (
+            local_formation
+            and self._clearance_recall_needed(context.turn, context.threat)
+        )
+        if yield_noncombat_shots:
+            # A recalled hunter keeps real defensive shots, while non-combat
+            # opportunities yield to the threatened Core and return route.
+            firing_pool = tuple(
+                enemy
+                for enemy in firing_pool
+                if isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+            )
         shootable = [
             (enemy, shot_cells)
             for enemy in firing_pool
@@ -1479,6 +1489,8 @@ class AggressiveStrategy:
             direct_shootable = shootable
         if (
             local_formation
+            and ranger.id not in context.core_hunt_ids
+            and not yield_noncombat_shots
             and not any(
                 isinstance(enemy, CoreView)
                 or (
@@ -2197,6 +2209,15 @@ class AggressiveStrategy:
         ) >= ranger.hp and self._move_ranger_toward_core(
             ranger, context, reason="leave a lethal multi-source firing line"
         ):
+            return
+        if ranger.id in context.core_hunt_return_ids:
+            if self._move_ranger_toward_core(
+                ranger, context, reason="return from Core pursuit to home cover"
+            ):
+                return
+            self._hold_defensive_ranger(
+                ranger, context, reason="wait for a safe Core pursuit return"
+            )
             return
         if ranger.id in context.worker_area_protection_return_ids:
             goal = self._patrol_recall_goal(ranger, context.turn)
@@ -10173,6 +10194,16 @@ class AggressiveStrategy:
         next, so a volley can hedge instead of stacking every arrow on the
         same prediction (``_volley_aim_cell``).
         """
+        if isinstance(enemy, CoreView):
+            aim = self._core_hunt_aim_position(enemy)
+            return (
+                (aim,)
+                if self._line_of_fire_clear(
+                    ranger.position, aim, obstacles, friendly_positions
+                )
+                and self._aim_cell_has_enemy_opportunity(aim, turn)
+                else ()
+            )
         enemy_id = str(enemy.id)
         stationary = isinstance(enemy, UnitView) and self.memory.enemy_is_stationary(
             enemy_id, turn.tick
@@ -12643,7 +12674,8 @@ class AggressiveStrategy:
         self.memory.worker_area_protection_cooldowns.clear()
         self.memory.worker_area_protection_returns.clear()
         self._abort_core_hunt()
-        self._core_hunt_cooldown_until = -1
+        self.memory.core_hunt_cooldown_until = -1
+        self.memory.core_hunt_returns.clear()
         self.memory.defense_compressed = False
         self.memory.defense_calm_since_tick = None
         self._commit_symmetric_home(target)
@@ -14607,6 +14639,14 @@ class AggressiveStrategy:
                 returning.add(UUID(unit_id))
             except (TypeError, ValueError):
                 continue
+        hunt = self.memory.core_hunt
+        if hunt is not None and hunt.ranger_id in live_ids:
+            returning.add(UUID(hunt.ranger_id))
+        returning.update(
+            UUID(unit_id)
+            for unit_id in self.memory.core_hunt_returns
+            if unit_id in live_ids
+        )
         return active | returning
 
     def _advance_patrol_ring_phase(
@@ -16010,8 +16050,14 @@ class AggressiveStrategy:
             # so every legal shooting cell around it stays reachable.
             reach = self.config.core_hunt_radius
             core = context.turn.core
-            if core is not None and self._core_hunt_target is not None:
-                reach = max(reach, manhattan(core.position, self._core_hunt_target))
+            hunt = self.memory.core_hunt
+            if core is not None and hunt is not None:
+                reach = max(
+                    reach,
+                    manhattan(core.position, hunt.position)
+                    + max(0, context.turn.tick - hunt.last_seen) // 4
+                    + 1,
+                )
             return reach + RANGER_STANDOFF_RANGE
         if offensive:
             return self.config.offensive_patrol_radius
@@ -16633,7 +16679,7 @@ class AggressiveStrategy:
             or self.memory.campaign_scout_target is not None
             or self.memory.counterattack.operation is not None
             or self.memory.skirmish is not None
-            or self._core_hunt_ranger_id is not None
+            or self.memory.core_hunt is not None
         ):
             return frozenset()
         candidate = next(
@@ -16809,29 +16855,12 @@ class AggressiveStrategy:
         threat: ThreatAssessment,
         raid_ids: frozenset[UUID],
     ) -> frozenset[UUID]:
-        """Detach one home defender to destroy a Core squatting on the block.
+        """Assign the closest safe local Ranger to one durable Core target.
 
-        An enemy Core cannot attack, so it never belongs in the danger model:
-        a Core parked in the resource chunk blocks no node by itself, but it
-        keeps the block contested, harvests the same 32x32 quota, and every
-        node it happens to sit beside becomes a race.  When no hostile fighter
-        is visible anywhere near our Core or the target, a single standing
-        defender can walk out, break ten points of HP and shield, and come
-        back.  The trip is deliberately narrow:
-
-        * only one ``DEFENSE_ROLE`` Ranger leaves, and only while at least
-          two other healthy combat units stay on station;
-        * it launches only when no hostile fighter is visible, nor remembered
-          around our Core, hunter or target within the worker threat window;
-        * it aborts on any fighter that comes into view, on Core damage or
-          evacuation pressure, when the Ranger itself is wounded, or after
-          ``core_hunt_max_ticks``;
-        * the hunter walks to the last seen cell while the Core flickers out
-          of vision.  Finding that cell empty in plain sight ends the trip,
-          which is exactly what a destroyed Core looks like: it respawns at
-          once 20-30 cells away with a fresh shield under a new UUID, so the
-          replacement must never be chased.  ``core_hunt_lost_ticks`` is only
-          the backstop for a hunter that stops making progress.
+        Patrol is interrupted by a real target. A nearer Ranger can take
+        over the same hunt without changing either role or the deadline;
+        unrelated remote fighters do not cancel the task. Core pressure,
+        local escorts, wounds and insufficient home reserves take priority.
         """
 
         if not self.config.campaign_mode:
@@ -16839,47 +16868,61 @@ class AggressiveStrategy:
             return frozenset()
 
         core = turn.core
-        live_rangers = {unit.id: unit for unit in turn.rangers}
-        ranger = live_rangers.get(self._core_hunt_ranger_id)
+        self._core_hunt_return_ids(turn)
+        hunt = self.memory.core_hunt
         target = self._core_hunt_core_view(turn)
-        if target is not None:
-            self._core_hunt_target = target.position
-            self._core_hunt_last_seen_tick = turn.tick
-        if self._core_hunt_ranger_id is not None:
-            arrived = (
-                target is None
-                and ranger is not None
-                and self._core_hunt_target is not None
-                and manhattan(ranger.position, self._core_hunt_target)
-                <= RANGER_VISION_RADIUS
-                # Rocks can leave a dark cell inside the nominal radius, so
-                # require a real friendly sighting of an empty target cell
-                # before calling the Core gone.
-                and self._core_hunt_target in self._fleet_visible_cells(turn)
+        if hunt is not None:
+            ranger = next(
+                (unit for unit in turn.rangers if str(unit.id) == hunt.ranger_id),
+                None,
+            )
+            if target is not None:
+                self._observe_hunted_core(hunt, target, turn.tick)
+            destroyed = any(
+                str(event.target_id) == hunt.target_id
+                and event.event_type in {"DESTRUCTION_PARTICIPATION", "CORE_DESTROYED"}
+                for event in turn.events
             )
             if (
                 core is None
+                or hunt.core_id != str(core.id)
                 or ranger is None
                 or ranger.hp < 2
-                or turn.tick > self._core_hunt_until_tick
-                # The last known cell is standing empty in plain sight: the
-                # Core was destroyed (it respawns elsewhere with a new id) or
-                # walked away.  Either way the trip is over.
-                or arrived
-                or turn.tick - self._core_hunt_last_seen_tick
-                > self.config.core_hunt_lost_ticks
+                or destroyed
+                or turn.tick > hunt.deadline
+                or turn.tick - hunt.last_seen > self.config.core_hunt_lost_ticks
                 or self._clearance_recall_needed(turn, threat)
+                or raid_ids
+                or self._clearance_ids
+                or self.memory.counterattack.operation is not None
+                or self.memory.skirmish is not None
+                or not self._core_hunt_has_reserves(turn, ranger.id)
                 or self._core_hunt_contested(turn, ranger, target)
+                or (target is None and not self._core_hunt_search_cells(turn))
             ):
                 self._abort_core_hunt(turn)
                 return frozenset()
-            return frozenset({self._core_hunt_ranger_id})
+            if target is not None:
+                candidate = self._core_hunt_candidate(turn, target=target)
+                if candidate is not None and candidate[1].id != ranger.id:
+                    # Only a strictly shorter safe route replaces the hunter.
+                    # Equal routes keep ownership and cannot bounce the task.
+                    aim = self._core_hunt_aim_position(target)
+                    routes = self._core_hunt_routes(turn, aim)
+                    old_cost = routes.get(ranger.position, (2**63 - 1, aim))[0]
+                    new_cost = routes[candidate[1].position][0]
+                    if new_cost < old_cost:
+                        self._mark_core_hunt_return(ranger.id, turn)
+                        hunt.ranger_id = str(candidate[1].id)
+            return frozenset({UUID(hunt.ranger_id)})
 
         if (
             core is None
             or raid_ids
             or self._clearance_ids
-            or turn.tick < self._core_hunt_cooldown_until
+            or self.memory.counterattack.operation is not None
+            or self.memory.skirmish is not None
+            or turn.tick < self.memory.core_hunt_cooldown_until
             or self._clearance_recall_needed(turn, threat)
         ):
             return frozenset()
@@ -16887,35 +16930,99 @@ class AggressiveStrategy:
         if candidate is None:
             return frozenset()
         enemy, hunter = candidate
-        if self._core_hunt_contested(turn, hunter, enemy):
-            return frozenset()
-        self._core_hunt_ranger_id = hunter.id
-        self._core_hunt_enemy_id = str(enemy.id)
-        self._core_hunt_target = enemy.position
-        self._core_hunt_until_tick = turn.tick + self.config.core_hunt_max_ticks
-        self._core_hunt_last_seen_tick = turn.tick
+        self.memory.core_hunt = CoreHunt(
+            core_id=str(core.id),
+            target_id=str(enemy.id),
+            ranger_id=str(hunter.id),
+            started=turn.tick,
+            deadline=turn.tick + self.config.core_hunt_max_ticks,
+            position=enemy.position,
+            last_seen=turn.tick,
+        )
+        self._observe_hunted_core(self.memory.core_hunt, enemy, turn.tick)
         return frozenset({hunter.id})
 
     def _core_hunt_core_view(self, turn: Turn) -> CoreView | None:
         """Return this Tick's sighting of the hunted enemy Core, if any."""
 
-        enemy_id = self._core_hunt_enemy_id
-        if enemy_id is None:
+        hunt = self.memory.core_hunt
+        if hunt is None:
             return None
         return next(
             (
                 enemy
                 for enemy in turn.visible_enemies
-                if isinstance(enemy, CoreView) and str(enemy.id) == enemy_id
+                if isinstance(enemy, CoreView) and str(enemy.id) == hunt.target_id
             ),
             None,
+        )
+
+    @staticmethod
+    def _core_hunt_aim_position(target: CoreView) -> Position:
+        """Use the arrival cell only when the public Core move completes."""
+        if (
+            target.state is CoreState.MOVING
+            and target.destination is not None
+            and target.move_progress is not None
+            and target.move_required_ticks is not None
+            and target.move_progress + 1 >= target.move_required_ticks
+        ):
+            return target.destination
+        return target.position
+
+    @staticmethod
+    def _observe_hunted_core(hunt: CoreHunt, target: CoreView, tick: int) -> None:
+        if target.state is CoreState.MOVING and target.move_direction is not None:
+            hunt.direction = target.move_direction.delta
+        elif target.position != hunt.position:
+            dx = target.position[0] - hunt.position[0]
+            dy = target.position[1] - hunt.position[1]
+            hunt.direction = (
+                (0 if dx == 0 else (1 if dx > 0 else -1)),
+                (0 if dy == 0 else (1 if dy > 0 else -1)),
+            )
+        hunt.position = target.position
+        hunt.last_seen = tick
+        hunt.destination = (
+            target.destination if target.state is CoreState.MOVING else None
+        )
+        hunt.arrival_tick = (
+            tick + target.move_required_ticks - target.move_progress
+            if target.state is CoreState.MOVING
+            and target.move_required_ticks is not None
+            and target.move_progress is not None
+            else None
+        )
+
+    def _core_hunt_has_reserves(self, turn: Turn, hunter_id: UUID) -> bool:
+        core = turn.core
+        if core is None:
+            return False
+        return (
+            sum(
+                unit.id != hunter_id
+                and unit.hp > 1
+                and not self._is_expedition_member(unit, turn)
+                and str(unit.id) not in self.memory.core_hunt_returns
+                and (
+                    self.memory.core_hunt is None
+                    or str(unit.id) != self.memory.core_hunt.ranger_id
+                )
+                and unit.id not in self._clearance_ids | self._raid_ids
+                and manhattan(unit.position, core.position)
+                <= self.config.combat_pursuit_radius
+                for unit in (*turn.rangers, *turn.vanguards)
+            )
+            >= 2
         )
 
     def _core_hunt_candidate(
         self,
         turn: Turn,
+        *,
+        target: CoreView | None = None,
     ) -> tuple[CoreView, Ranger] | None:
-        """Pick a defenceless enemy Core and the defender that will crack it."""
+        """Rank healthy guards and patrols by the real route to a firing cell."""
 
         from .migration import resource_block_index
 
@@ -16923,8 +17030,26 @@ class AggressiveStrategy:
         if core is None:
             return None
         block = resource_block_index(core.position)
-        enemies = sorted(
-            (
+        hunters = tuple(
+            unit
+            for unit in turn.rangers
+            if unit.hp > 1
+            and (
+                self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
+                or self._patrol_team_from_role(self.memory.unit_roles.get(str(unit.id)))
+                is not None
+            )
+            and str(unit.id) not in self.memory.core_hunt_returns
+            and not self._is_expedition_member(unit, turn)
+            and self._core_hunt_has_reserves(turn, unit.id)
+        )
+        if not hunters:
+            return None
+        discovery_area = self._ranger_activity_area(turn)
+        enemies = (
+            (target,)
+            if target is not None
+            else tuple(
                 enemy
                 for enemy in turn.visible_enemies
                 if isinstance(enemy, CoreView)
@@ -16932,40 +17057,140 @@ class AggressiveStrategy:
                     resource_block_index(enemy.position) == block
                     or manhattan(core.position, enemy.position)
                     <= self.config.core_hunt_radius
+                    or any(
+                        discovery_area is not None
+                        and discovery_area.contains(hunter.position)
+                        and manhattan(hunter.position, enemy.position)
+                        <= RANGER_VISION_RADIUS
+                        for hunter in hunters
+                    )
                 )
-            ),
-            key=lambda enemy: (
-                manhattan(core.position, enemy.position),
-                enemy.position,
-                str(enemy.id),
-            ),
+            )
         )
-        if not enemies:
+        rocks = self._rock_map(turn)
+        choices = []
+        for enemy in enemies:
+            aim = self._core_hunt_aim_position(enemy)
+            routes = self._core_hunt_routes(turn, aim)
+            for hunter in hunters:
+                route = routes.get(hunter.position)
+                if (
+                    route is None
+                    or self._core_hunt_contested(turn, hunter, enemy)
+                    or any(
+                        line_of_fire(hunter.position, fighter.position, rocks)
+                        for fighter in self._ranger_threats(turn)
+                    )
+                ):
+                    continue
+                choices.append(
+                    (
+                        route[0],
+                        manhattan(hunter.position, enemy.position),
+                        manhattan(core.position, enemy.position),
+                        str(enemy.id),
+                        hunter.id.bytes,
+                        enemy,
+                        hunter,
+                    )
+                )
+        if not choices:
             return None
-        healthy = [
-            unit
-            for unit in (*turn.rangers, *turn.vanguards)
-            if unit.hp > 1 and not self._is_expedition_member(unit, turn)
-        ]
-        if len(healthy) < 3:
-            # One defender may leave only while the ring still has a pair.
-            return None
-        hunters = sorted(
+        selected = min(choices, key=lambda choice: choice[:5])
+        return selected[-2], selected[-1]
+
+    def _core_hunt_routes(
+        self, turn: Turn, aim: Position
+    ) -> dict[Position, tuple[int, Position]]:
+        """Share a bounded safe terrain map; capacity is checked on each step."""
+        cached = self._core_hunt_route_cache
+        if cached is not None and cached[0] is turn and cached[1] == aim:
+            return cached[2]
+        core = turn.core
+        if core is None:
+            return {}
+        rocks = self._rock_map(turn)
+        danger: set[Position] = set()
+        for enemy in self._ranger_threats(turn):
+            for origin in (enemy.position, *adjacent_positions(enemy.position)):
+                if origin in rocks:
+                    continue
+                if enemy.unit_type is UnitType.VANGUARD:
+                    danger.update(adjacent_positions(origin))
+                else:
+                    danger.update(
+                        cell
+                        for cell in firing_positions(origin)
+                        if line_of_fire(origin, cell, rocks)
+                    )
+        blocked = overlay_blockers(
+            rocks,
+            {enemy.position for enemy in turn.visible_enemies},
+            {core.position},
+            danger,
+            self.memory.contested_positions,
+            {
+                cell
+                for cell, (_tick, damage) in self.memory.incoming_damage.items()
+                if damage >= 2
+            },
+        )
+        reach = max(self.config.core_hunt_radius, manhattan(core.position, aim)) + 3
+        goals = sorted(
             (
-                unit
-                for unit in turn.rangers
-                if unit.hp > 1
-                and self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
-                and not self._is_expedition_member(unit, turn)
+                cell
+                for cell in firing_positions(aim)
+                if cell not in blocked
+                and manhattan(cell, aim) <= RANGER_VISION_RADIUS
+                and self._line_of_fire_clear(cell, aim, rocks)
+                and manhattan(core.position, cell) <= reach
             ),
-            key=lambda unit: (
-                manhattan(unit.position, enemies[0].position),
-                unit.id.bytes,
-            ),
+            key=lambda cell: (-self._ranger_range(cell, aim), cell),
         )
-        if not hunters:
-            return None
-        return enemies[0], hunters[0]
+        routes = {cell: (0, cell) for cell in goals}
+        frontier = deque(goals)
+        while frontier and len(routes) < 4096:
+            cell = frontier.popleft()
+            cost, goal = routes[cell]
+            if cost >= self.config.core_hunt_max_ticks:
+                continue
+            for neighbor in adjacent_positions(cell):
+                if (
+                    neighbor in routes
+                    or neighbor in blocked
+                    or manhattan(core.position, neighbor) > reach
+                ):
+                    continue
+                routes[neighbor] = (cost + 1, goal)
+                frontier.append(neighbor)
+                if len(routes) >= 4096:
+                    break
+        self._core_hunt_route_cache = (turn, aim, routes)
+        return routes
+
+    def _core_hunt_search_cells(self, turn: Turn) -> tuple[Position, ...]:
+        """Search only cells the same four-Tick Core could have reached."""
+        hunt = self.memory.core_hunt
+        if hunt is None:
+            return ()
+        center = hunt.position
+        radius = max(0, turn.tick - hunt.last_seen) // 4
+        if hunt.destination is not None and hunt.arrival_tick is not None:
+            if turn.tick < hunt.arrival_tick:
+                radius = 0
+            else:
+                center = hunt.destination
+                radius = (turn.tick - hunt.arrival_tick) // 4
+        visible = self._fleet_visible_cells(turn)
+        rocks = self._rock_map(turn)
+        return tuple(
+            (center[0] + dx, center[1] + dy)
+            for dx in range(-radius, radius + 1)
+            for dy in range(-radius, radius + 1)
+            if abs(dx) + abs(dy) <= radius
+            and (center[0] + dx, center[1] + dy) not in visible
+            and (center[0] + dx, center[1] + dy) not in rocks
+        )
 
     def _core_hunt_contested(
         self,
@@ -16973,126 +17198,121 @@ class AggressiveStrategy:
         hunter: Ranger,
         target: CoreView | None,
     ) -> bool:
-        """Whether a hostile fighter makes a one-Ranger hunt unsafe.
-
-        A Ranger has two HP.  Any Vanguard that reaches it kills it, and any
-        Ranger it cannot outrange trades one-for-one, so a hunt only runs
-        while fighters are absent from our Core ring, the approach corridor
-        around the hunter, and the target itself.  Recent sightings guard the
-        same cells for one memory window, because vision flickers and the
-        Core is stationary: waiting a few Ticks costs nothing.
-        """
-
-        core = turn.core
-        anchor = target.position if target is not None else self._core_hunt_target
-
-        def near(position: Position) -> bool:
-            return (
-                (
-                    core is not None
-                    and manhattan(position, core.position)
-                    <= self.config.combat_pursuit_radius
-                )
-                or (
-                    anchor is not None
-                    and manhattan(position, anchor) <= RAID_ABORT_SCAN_RADIUS
-                )
-                or manhattan(position, hunter.position) <= RAID_ABORT_SCAN_RADIUS + 2
-            )
-
-        if any(
-            isinstance(enemy, UnitView)
-            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-            for enemy in turn.visible_enemies
-        ):
-            return True
-        return any(
-            sighting.kind == "UNIT"
-            and sighting.unit_type in {UnitType.VANGUARD.value, UnitType.RANGER.value}
-            and turn.tick - sighting.tick <= self.config.worker_threat_memory_ttl
-            and near(sighting.position)
-            for sighting in self.memory.recent_enemies(
-                turn.tick,
-                self.config.worker_threat_memory_ttl,
+        """Screen the target's escort and hunter, not unrelated battle fronts."""
+        hunt = self.memory.core_hunt
+        anchors = (
+            (target.position, self._core_hunt_aim_position(target))
+            if target is not None
+            else (
+                (hunt.position, hunt.destination or hunt.position)
+                if hunt is not None
+                else ()
             )
         )
+        return any(
+            any(
+                manhattan(enemy.position, anchor) <= RAID_ABORT_SCAN_RADIUS
+                for anchor in anchors
+            )
+            or self._enemy_can_attack_position(
+                enemy, hunter.position, self._rock_map(turn)
+            )
+            for enemy in self._ranger_threats(turn)
+        )
+
+    def _mark_core_hunt_return(self, ranger_id: UUID, turn: Turn) -> None:
+        self.memory.core_hunt_returns[str(ranger_id)] = turn.tick
+
+    def _core_hunt_return_ids(self, turn: Turn) -> frozenset[UUID]:
+        core = turn.core
+        live = {str(unit.id): unit for unit in turn.rangers}
+        for unit_id in tuple(self.memory.core_hunt_returns):
+            unit = live.get(unit_id)
+            if (
+                unit is None
+                or core is None
+                or manhattan(unit.position, core.position)
+                <= (SYMMETRIC_PATROL_RECALL_RADIUS)
+            ):
+                self.memory.core_hunt_returns.pop(unit_id, None)
+        return frozenset(UUID(unit_id) for unit_id in self.memory.core_hunt_returns)
 
     def _abort_core_hunt(self, turn: Turn | None = None) -> None:
-        """Send the detached defender home and start the re-hunt cooldown.
+        """Send the detached Ranger home and start the re-hunt cooldown.
 
         Every abort starts the cooldown, including an expired trip: a Core
         that outlives the budget must not be re-targeted on the very next
-        Tick, or one distant Core would occupy a defender forever.
+        Tick, or one distant Core would occupy a Ranger forever.
         """
 
-        if turn is not None:
-            self._core_hunt_cooldown_until = (
+        hunt = self.memory.core_hunt
+        if turn is not None and hunt is not None:
+            self.memory.core_hunt_cooldown_until = (
                 turn.tick + self.config.core_hunt_cooldown_ticks
             )
-        self._core_hunt_ranger_id = None
-        self._core_hunt_enemy_id = None
-        self._core_hunt_target = None
-        self._core_hunt_until_tick = -1
-        self._core_hunt_last_seen_tick = -1
+            self._mark_core_hunt_return(UUID(hunt.ranger_id), turn)
+        self.memory.core_hunt = None
 
     def _decide_core_hunt_ranger(
         self,
         ranger: Ranger,
         context: _TurnContext,
     ) -> None:
-        """Walk the detached defender onto the enemy Core and keep firing.
-
-        Shooting is already resolved in ``_decide_ranger``; this only picks
-        the approach.  A visible Core is approached through the ordinary safe
-        firing-position search, and a dark Tick walks to the last seen cell
-        so flickering vision cannot bounce the hunter home.  The Tick is
-        always consumed: while the hunt is active this Ranger is not a
-        defensive post, and returning ``False`` would send it back into the
-        ring while the Core it was sent for is still standing.
-        """
-
-        target = self._core_hunt_core_view(context.turn)
-        if target is not None and self._core_hunt_target != target.position:
-            self._core_hunt_target = target.position
-        if target is not None:
-            goal = self._ranger_approach_goal(
-                ranger,
-                target,
-                context,
-                friendly_positions=self._predicted_friendly_positions(context),
-            )
-            if (
-                goal is not None
-                and goal != ranger.position
-                and self._move_within_leash(
-                    ranger,
-                    goal,
-                    context,
-                    offensive=True,
-                    reason="close a firing angle on the enemy Core in this block",
-                    avoid_new_threats=True,
-                )
-            ):
-                return
-        anchor = self._core_hunt_target
-        if (
-            anchor is not None
-            and anchor != ranger.position
-            and self._move_within_leash(
-                ranger,
-                anchor,
-                context,
-                offensive=True,
-                reason="advance on the last seen enemy Core in the resource area",
-                avoid_new_threats=True,
-            )
-        ):
+        """Approach or search for the fixed Core without yielding to patrol."""
+        hunt = self.memory.core_hunt
+        if hunt is None:
             return
-        self._hold_defensive_ranger(
-            ranger,
-            context,
-            reason="wait for a firing angle on the enemy Core",
+        target = self._core_hunt_core_view(context.turn)
+        aims = (
+            (self._core_hunt_aim_position(target),)
+            if target is not None
+            else tuple(
+                sorted(
+                    self._core_hunt_search_cells(context.turn),
+                    key=lambda cell: (
+                        manhattan(ranger.position, cell),
+                        -(
+                            (cell[0] - hunt.position[0]) * hunt.direction[0]
+                            + (cell[1] - hunt.position[1]) * hunt.direction[1]
+                        ),
+                        cell,
+                    ),
+                )[:12]
+            )
         )
+        for aim in aims:
+            routes = self._core_hunt_routes(context.turn, aim)
+            route = routes.get(ranger.position)
+            if route is None or route[0] == 0:
+                continue
+            cost, goal = route
+            steps = sorted(
+                (
+                    cell
+                    for cell in adjacent_positions(ranger.position)
+                    if cell in routes and routes[cell][0] == cost - 1
+                ),
+                key=lambda cell: (routes[cell][1] != goal, manhattan(cell, goal), cell),
+            )
+            for cell in steps:
+                direction = direction_between(ranger.position, cell)
+                if direction is not None and self._queue_move(
+                    ranger,
+                    direction,
+                    context,
+                    reason=(
+                        "close a firing angle on the enemy Core in this block"
+                        if target is not None
+                        else "search the fleeing enemy Core's last known direction"
+                    ),
+                    target=goal,
+                ):
+                    return
+            # Capacity is temporary. Keep this shortest safe route instead
+            # of trying an unrelated search cell to manufacture a detour.
+            break
+        self._record_wait(ranger, context, "wait for a safe enemy Core firing route")
+        ranger.wait()
 
     def _raid_recall_needed(self, turn: Turn, threat: ThreatAssessment) -> bool:
         """Whether the Core itself needs the detachment back at home.

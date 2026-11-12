@@ -296,6 +296,9 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             }
             for role, contact in sorted(memory.patrol_contacts.items())
         },
+        "core_hunt": memory.core_hunt.to_dict() if memory.core_hunt else None,
+        "core_hunt_cooldown_until": memory.core_hunt_cooldown_until,
+        "core_hunt_returns": dict(sorted(memory.core_hunt_returns.items())),
         "defense_posts": {
             unit_id: list(position)
             for unit_id, position in sorted(memory.defense_posts.items())

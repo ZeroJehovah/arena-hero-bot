@@ -94,6 +94,40 @@ class PatrolContact:
 
 
 @dataclass(slots=True)
+class CoreHunt:
+    """One Core target with a durable hunter and an absolute pursuit budget."""
+
+    core_id: str
+    target_id: str
+    ranger_id: str
+    started: int
+    deadline: int
+    position: Position
+    last_seen: int
+    direction: Position = (0, 0)
+    destination: Position | None = None
+    arrival_tick: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> CoreHunt:
+        return cls(
+            core_id=str(raw["core_id"]),
+            target_id=str(raw["target_id"]),
+            ranger_id=str(raw["ranger_id"]),
+            started=int(raw["started"]),
+            deadline=int(raw["deadline"]),
+            position=_position(raw["position"]),
+            last_seen=int(raw["last_seen"]),
+            direction=_position(raw.get("direction", (0, 0))),
+            destination=_optional_position(raw.get("destination")),
+            arrival_tick=_optional_integer(raw.get("arrival_tick")),
+        )
+
+
+@dataclass(slots=True)
 class WorkerAreaProtection:
     """One bounded patrol response to fighters restricting the Worker area."""
 
@@ -191,6 +225,10 @@ class WorldMemory:
     # ``patrol-1`` .. ``patrol-4``, ``staged`` or ``expedition-N``.
     unit_roles: dict[str, str] = field(default_factory=dict)
     patrol_contacts: dict[str, PatrolContact] = field(default_factory=dict)
+    core_hunt: CoreHunt | None = None
+    core_hunt_cooldown_until: int = -1
+    # Return start Tick; detached patrols rejoin only after reaching home.
+    core_hunt_returns: dict[str, int] = field(default_factory=dict)
     # Active activity-area protection survives a restart so its membership and
     # absolute budgets cannot be renewed by reconnecting.  Units returning
     # from an aborted mission are kept outside the shared patrol-ring arrival
@@ -862,6 +900,9 @@ class WorldMemory:
                 role: asdict(contact)
                 for role, contact in sorted(self.patrol_contacts.items())
             },
+            "core_hunt": self.core_hunt.to_dict() if self.core_hunt else None,
+            "core_hunt_cooldown_until": self.core_hunt_cooldown_until,
+            "core_hunt_returns": dict(sorted(self.core_hunt_returns.items())),
             "worker_area_protection": (
                 self.worker_area_protection.to_dict()
                 if self.worker_area_protection is not None
@@ -1104,6 +1145,14 @@ class WorldMemory:
                     target_id=str(value["target_id"]),
                 )
                 for role, value in raw.get("patrol_contacts", {}).items()
+            },
+            core_hunt=(
+                CoreHunt.from_dict(raw["core_hunt"]) if raw.get("core_hunt") else None
+            ),
+            core_hunt_cooldown_until=int(raw.get("core_hunt_cooldown_until", -1)),
+            core_hunt_returns={
+                str(unit_id): int(tick)
+                for unit_id, tick in raw.get("core_hunt_returns", {}).items()
             },
             worker_area_protection=(
                 WorkerAreaProtection.from_dict(raw["worker_area_protection"])

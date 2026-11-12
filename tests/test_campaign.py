@@ -3733,8 +3733,12 @@ def test_enemy_core_outside_the_hunt_radius_is_left_alone() -> None:
     assert not _core_hunt_reasons(report)
 
 
-@pytest.mark.parametrize("enemy_position", [(-494, 719), (-394, 719)])
-def test_enemy_core_hunt_aborts_when_a_fighter_appears(enemy_position) -> None:
+@pytest.mark.parametrize(
+    "enemy_position,should_recall", [((-494, 719), True), ((-394, 719), False)]
+)
+def test_enemy_core_hunt_recalls_only_for_a_relevant_fighter(
+    enemy_position, should_recall
+) -> None:
     core_object = core(1, position=CLEARANCE_HOME)
     rangers = _clearance_rangers(4)
     memory = _sealed_memory(core_object, rangers)
@@ -3754,7 +3758,8 @@ def test_enemy_core_hunt_aborts_when_a_fighter_appears(enemy_position) -> None:
         ],
     )
 
-    assert not _core_hunt_reasons(strategy.decide(second))
+    report = strategy.decide(second)
+    assert bool(_core_hunt_reasons(report)) is not should_recall
 
 
 def test_core_hunt_hunter_closes_and_destroys_the_core() -> None:
