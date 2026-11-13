@@ -260,6 +260,12 @@ def _turn_record(
         "decision": report.to_dict(),
         "plan": turn.plan.model_dump(mode="json"),
         "submission": submission,
+        "control": {
+            "submission_source": submission.get("source"),
+            "manual_override": submission.get("source") not in {"AGENT", "unknown"}
+            if submission.get("source") is not None
+            else None,
+        },
         "identity": identity_snapshot or {},
     }
 
@@ -306,6 +312,17 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
         "counterattack": memory.counterattack.to_dict(),
         "skirmish": memory.skirmish.to_dict() if memory.skirmish else None,
         "skirmish_cooldown_until": memory.skirmish_cooldown_until,
+        "skirmish_retry_after": memory.skirmish_retry_after,
+        "flank": {
+            "operation": (
+                memory.flank.operation.summary(memory.last_tick)
+                if memory.flank.operation is not None
+                else None
+            ),
+            "last_result": memory.flank.last_result,
+            "returns": dict(sorted(memory.flank.returns.items())),
+            "contacts": len(memory.flank.contacts),
+        },
         "worker_area_protection": (
             memory.worker_area_protection.to_dict()
             if memory.worker_area_protection

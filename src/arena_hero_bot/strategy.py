@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from collections.abc import Container, Iterable
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import lru_cache
@@ -31,7 +32,7 @@ from arena_hero import (
 )
 
 from . import counterattack as counter
-from . import skirmish
+from . import flank, skirmish
 from .combat_policy import (
     CombatPolicy,
     CombatTargetLedger,
@@ -460,6 +461,7 @@ class StrategyConfig:
     planning_soft_budget: float = 3.5
     expedition_mode: bool = False
     campaign_mode: bool = False
+    blind_flank: bool = True
 
     def __post_init__(self) -> None:
         if self.campaign_mode:
@@ -567,6 +569,10 @@ class _TurnContext:
     core_hunt_ids: frozenset[UUID] = field(default_factory=frozenset)
     core_hunt_return_ids: frozenset[UUID] = field(default_factory=frozenset)
     campaign_patrol_recall_ids: frozenset[UUID] = field(default_factory=frozenset)
+    flank_ids: frozenset[UUID] = field(default_factory=frozenset)
+    flank_front_ids: frozenset[UUID] = field(default_factory=frozenset)
+    flank_return_ids: frozenset[UUID] = field(default_factory=frozenset)
+    flank_entry_permit: flank.EntryPermit | None = None
 
     def __post_init__(self) -> None:
         """Seed the friendly occupancy ledger for hand-built test contexts."""
@@ -830,6 +836,21 @@ class AggressiveStrategy:
         self._local_fireline_ranger_ids: frozenset[UUID] = frozenset()
         self._local_fireline_goals: dict[UUID, Position] = {}
         self._local_fireline_until_tick: int = -1
+        self._flank_search: flank.SearchBudget | None = None
+        operation = self.memory.flank.operation
+        if (
+            operation is not None
+            and operation.parent.kind is flank.Kind.FIRELINE
+            and self.memory.flank_fireline_parent_id == operation.parent.task_id
+        ):
+            self._local_fireline_target_id = operation.target_ids[0]
+            self._local_fireline_ranger_ids = frozenset(
+                UUID(key) for key in operation.member_ids
+            )
+            self._local_fireline_goals = {
+                UUID(key): slot.firing for key, slot in operation.slots.items()
+            }
+            self._local_fireline_until_tick = operation.parent.deadline
         # Expedition posture state.  Surplus combat units are staged at the
         # defensive ring edge until a full expedition can depart.  Each
         # expedition keeps its membership, pursuit and shared exploration
@@ -917,6 +938,7 @@ class AggressiveStrategy:
             self._refresh_expedition_navigation(turn)
         if self._symmetric_posture():
             self._observe_core_migration(turn)
+        self._observe_flank_contacts(turn)
         obstacles = self._rock_map(turn)
         threat = self._combat_policy.assess(turn, obstacles)
         recent_enemies = self.memory.recent_enemies(
@@ -1029,6 +1051,7 @@ class AggressiveStrategy:
             core_hunt_ids=core_hunt_ids,
             core_hunt_return_ids=self._core_hunt_return_ids(turn),
             campaign_patrol_recall_ids=campaign_patrol_recall_ids,
+            flank_return_ids=frozenset(UUID(key) for key in self.memory.flank.returns),
         )
         context.core_build_priority = self._campaign_build_priority(context)
         static_blockers = context.static_blockers
@@ -1111,8 +1134,11 @@ class AggressiveStrategy:
         planning_started = monotonic()
         self._planning_deadline = planning_started + self.config.planning_time_limit
         self._simplify_planning = False
+        self._flank_search = None
+        self._validate_flank_parent(context)
         self._prepare_counterattack(context)
         self._prepare_skirmish(context)
+        self._prepare_worker_flank(context)
         self._prepare_layered_defense(context)
 
         def within_budget() -> bool:
@@ -1267,6 +1293,7 @@ class AggressiveStrategy:
                 self._decide_worker(worker, context)
 
         self._resolve_core_traffic(context)
+        self._execute_flank(context)
         if deadlined:
             self._wait_unplanned_units(context, turn)
         else:
@@ -1274,6 +1301,7 @@ class AggressiveStrategy:
         if self.config.expedition_mode:
             self._persist_expedition_pursuits()
         report.planned_damage = dict(context.damage_ledger.planned_damage)
+        self._flank_report(context)
         return report
 
     def _rock_map(self, turn: Turn) -> set[Position]:
@@ -1343,6 +1371,10 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
+        if ranger.id in context.flank_ids:
+            # The complete group is resolved after ordinary combat and Core
+            # traffic, against their actual actions and service reservations.
+            return
         expedition_member = self._is_expedition_member(ranger, context.turn)
         if expedition_member:
             if self._decide_expedition_ranger(ranger, context):
@@ -1391,9 +1423,13 @@ class AggressiveStrategy:
             visible_enemies,
             offensive=offensive,
         )
-        yield_noncombat_shots = ranger.id in context.core_hunt_return_ids or (
-            local_formation
-            and self._clearance_recall_needed(context.turn, context.threat)
+        yield_noncombat_shots = (
+            ranger.id in context.core_hunt_return_ids
+            or ranger.id in context.flank_return_ids
+            or (
+                local_formation
+                and self._clearance_recall_needed(context.turn, context.threat)
+            )
         )
         if yield_noncombat_shots:
             # A recalled hunter keeps real defensive shots, while non-combat
@@ -1510,6 +1546,18 @@ class AggressiveStrategy:
                 action="SHOOT",
                 reason="keep the recent Core firing angle before post changes",
                 target=core_cell,
+            )
+            return
+        if (
+            not direct_shootable
+            and ranger.id in context.flank_front_ids
+            and not self._ranger_attackers_at(ranger.position, context.turn, obstacles)
+            and self.memory.incoming_damage.get(ranger.position, (-1, 0))[1] < ranger.hp
+        ):
+            self._hold_defensive_ranger(
+                ranger,
+                context,
+                reason="maintain safe mutual observation for the active local flank",
             )
             return
         if not direct_shootable and self._try_patrol_pursuit(ranger, context):
@@ -2219,6 +2267,17 @@ class AggressiveStrategy:
                 ranger, context, reason="wait for a safe Core pursuit return"
             )
             return
+        if ranger.id in context.flank_return_ids:
+            if self._move_ranger_toward_core(
+                ranger,
+                context,
+                reason="return from the bounded local flank to home cover",
+            ):
+                return
+            self._hold_defensive_ranger(
+                ranger, context, reason="wait for a safe local flank return"
+            )
+            return
         if ranger.id in context.worker_area_protection_return_ids:
             goal = self._patrol_recall_goal(ranger, context.turn)
             if goal != ranger.position and self._move_within_leash(
@@ -2366,6 +2425,1006 @@ class AggressiveStrategy:
         self._local_fireline_goals = {}
         self._local_fireline_until_tick = -1
 
+    def _observe_flank_contacts(self, turn: Turn) -> None:
+        """Count actual mutual observations without starting or renewing a task."""
+        groups: list[tuple[flank.Kind, tuple[UnitView, ...]]] = []
+        by_cell: dict[Position, list[UnitView]] = {}
+        core = turn.core
+        if self.config.campaign_mode and core is not None:
+            for enemy in turn.visible_enemies:
+                if (
+                    isinstance(enemy, UnitView)
+                    and enemy.unit_type is UnitType.RANGER
+                    and manhattan(core.position, enemy.position) <= 14
+                ):
+                    by_cell.setdefault(enemy.position, []).append(enemy)
+            mission = self.memory.worker_area_protection
+            if mission is not None:
+                targets = tuple(
+                    enemy
+                    for enemy in turn.visible_enemies
+                    if isinstance(enemy, UnitView)
+                    and str(enemy.id) in mission.target_ids
+                )
+                if len(targets) == len(mission.target_ids):
+                    groups.append((flank.Kind.PROTECTION, targets))
+            for cell in sorted(
+                by_cell,
+                key=lambda cell: (
+                    len(by_cell[cell]) > 2,
+                    manhattan(core.position, cell),
+                    cell,
+                ),
+            ):
+                for kind in (
+                    flank.Kind.COUNTERATTACK,
+                    flank.Kind.SKIRMISH,
+                    flank.Kind.PROTECTION,
+                    flank.Kind.FIRELINE,
+                ):
+                    group = (kind, tuple(by_cell[cell]))
+                    if group not in groups:
+                        groups.append(group)
+                if len(groups) >= flank.GROUP_LIMIT:
+                    break
+        self.memory.flank.observe(
+            turn,
+            groups,
+            tuple(
+                ranger
+                for ranger in turn.rangers
+                if not self._is_expedition_member(ranger, turn)
+                and (
+                    self.memory.core_hunt is None
+                    or str(ranger.id) != self.memory.core_hunt.ranger_id
+                )
+            ),
+            self._rock_map(turn),
+        )
+
+    @staticmethod
+    def _flank_task_id(
+        kind: flank.Kind, started: int, target_ids: Iterable[str]
+    ) -> str:
+        return f"{kind.value}:{started}:" + ",".join(sorted(target_ids))
+
+    def _flank_parent_valid(self, operation: flank.Operation) -> bool:
+        parent = operation.parent
+        if parent.kind is flank.Kind.SKIRMISH:
+            mission = self.memory.skirmish
+            return (
+                mission is not None
+                and self._flank_task_id(
+                    parent.kind, mission.started, mission.target_ids
+                )
+                == parent.task_id
+                and mission.slots == operation.slots
+                and mission.origins == operation.origins
+                and mission.core_id == operation.core_id
+                and mission.core_position == operation.core_position
+                and parent.deadline == mission.started + skirmish.MAX_TICKS
+            )
+        if parent.kind is flank.Kind.COUNTERATTACK:
+            assault = self.memory.counterattack.operation
+            return (
+                assault is not None
+                and self._flank_task_id(
+                    parent.kind, assault.started, assault.target_ids
+                )
+                == parent.task_id
+                and assault.slots == operation.slots
+                and parent.deadline
+                == assault.started + counter.ASSEMBLY_TICKS + counter.FIRE_TICKS
+            )
+        if parent.kind is flank.Kind.PROTECTION:
+            protection = self.memory.worker_area_protection
+            return (
+                protection is not None
+                and self._flank_task_id(
+                    parent.kind, protection.started, operation.target_ids
+                )
+                == parent.task_id
+                and set(protection.member_ids) == set(operation.member_ids)
+                and set(protection.target_ids) <= set(operation.target_ids)
+                and protection.core_id == operation.core_id
+                and protection.deadline == parent.deadline
+                and protection.assembly_deadline == parent.assembly_deadline
+            )
+        return (
+            self.memory.flank_fireline_parent_id == parent.task_id
+            and self._local_fireline_target_id in operation.target_ids
+            and self._local_fireline_until_tick == parent.deadline
+            and self._local_fireline_goals
+            == {UUID(key): slot.firing for key, slot in operation.slots.items()}
+        )
+
+    def _validate_flank_parent(self, context: _TurnContext) -> None:
+        operation = self.memory.flank.operation
+        if operation is not None and not self._flank_parent_valid(operation):
+            self.memory.flank.finish(context.turn.tick, "orphaned_parent")
+            context.flank_return_ids = frozenset(
+                UUID(key) for key in self.memory.flank.returns
+            )
+            # An orphan cannot create a replacement mission with a fresh
+            # deadline on this Tick or evade its mother's failure cooldown.
+            if operation.parent.kind is flank.Kind.SKIRMISH:
+                self.memory.skirmish_cooldown_until = max(
+                    self.memory.skirmish_cooldown_until,
+                    context.turn.tick + skirmish.COOLDOWN_TICKS,
+                )
+            elif operation.parent.kind is flank.Kind.COUNTERATTACK:
+                self.memory.counterattack.cooldown_until = max(
+                    self.memory.counterattack.cooldown_until,
+                    context.turn.tick + counter.COOLDOWN_TICKS,
+                )
+            elif operation.parent.kind is flank.Kind.FIRELINE:
+                self.memory.flank_fireline_parent_id = None
+                self._clear_local_fireline()
+
+    def _reserve_flank(self, context: _TurnContext, kind: flank.Kind) -> bool:
+        operation = self.memory.flank.operation
+        if (
+            operation is None
+            or operation.parent.kind is not kind
+            or not self._flank_parent_valid(operation)
+        ):
+            return False
+        context.flank_ids = frozenset(UUID(key) for key in operation.member_ids)
+        context.flank_front_ids = frozenset(UUID(key) for key in operation.front_ids)
+        context.counterattack_ids |= context.flank_ids
+        context.counterattack_reserved |= frozenset(
+            cell
+            for slot in operation.slots.values()
+            for cell in (slot.stage, slot.firing)
+        )
+        return True
+
+    def _flank_cell_allowed(
+        self,
+        ranger: Ranger,
+        cell: Position,
+        parent: flank.Parent,
+        context: _TurnContext,
+        origin: Position,
+    ) -> bool:
+        core = context.turn.core
+        if core is None or manhattan(origin, cell) > parent.max_steps:
+            return False
+        if parent.kind is flank.Kind.FIRELINE:
+            post = self.memory.defense_posts.get(str(ranger.id), origin)
+            return manhattan(
+                post, cell
+            ) <= DEFENSIVE_POST_SUPPORT_DISTANCE and self._within_combat_leash(
+                ranger, cell, context, offensive=False
+            )
+        if parent.kind is flank.Kind.PROTECTION:
+            return self._within_combat_leash(ranger, cell, context, offensive=True)
+        return manhattan(core.position, cell) <= counter.CONTACT_RADIUS + 4
+
+    def _flank_observers(self, turn: Turn) -> tuple[CoreView | UnitView, ...]:
+        """Known observers are a conservative union, without invented owners."""
+        current = {str(enemy.id): enemy for enemy in turn.visible_enemies}
+        visible = self._fleet_visible_cells(turn)
+        for sighting in self.memory.recent_enemies(turn.tick, flank.CONTACT_TTL):
+            if sighting.object_id in current or sighting.position in visible:
+                continue
+            if sighting.kind == "CORE":
+                current[sighting.object_id] = CoreView(
+                    kind="CORE",
+                    id=UUID(sighting.object_id),
+                    controlled=False,
+                    position=sighting.position,
+                    hp=sighting.hp,
+                    shield=sighting.shield or 0,
+                    state=CoreState.NORMAL,
+                    owner_username=sighting.owner_username or "unknown",
+                )
+            elif sighting.unit_type is not None:
+                current[sighting.object_id] = UnitView(
+                    kind="UNIT",
+                    id=UUID(sighting.object_id),
+                    controlled=False,
+                    position=sighting.position,
+                    hp=sighting.hp,
+                    unit_type=UnitType(sighting.unit_type),
+                )
+        return tuple(current.values())
+
+    def _choose_flank(
+        self,
+        context: _TurnContext,
+        parent: flank.Parent,
+        available: tuple[Ranger, ...],
+        targets: tuple[UnitView, ...],
+        *,
+        army_size: int = 0,
+    ) -> flank.Operation | None:
+        if (
+            not self.config.blind_flank
+            or self.memory.flank.operation is not None
+            or not parent.party_sizes
+            or self.memory.campaign_scout_target is not None
+        ):
+            return None
+        excluded = (
+            context.core_hunt_ids
+            | context.core_hunt_return_ids
+            | context.worker_area_protection_return_ids
+            | context.flank_return_ids
+            | context.campaign_patrol_recall_ids
+            | context.counterattack_ids
+        )
+        if parent.kind is not flank.Kind.PROTECTION:
+            excluded |= context.clearance_ids | context.raid_ids
+        available = tuple(
+            ranger
+            for ranger in available
+            if ranger.id not in excluded and not self._has_unit_action(ranger, context)
+        )
+        if self._flank_search is None:
+            now = monotonic()
+            soft_deadline = (
+                self._planning_deadline
+                - self.config.planning_time_limit
+                + self.config.planning_soft_budget
+                if self._planning_deadline > now
+                else now + flank.SEARCH_SECONDS
+            )
+            self._flank_search = flank.SearchBudget(
+                min(now + flank.SEARCH_SECONDS, soft_deadline)
+            )
+        risks = self._ranger_threats(context.turn)
+        rocks = self._rock_map(context.turn)
+        dangerous = {
+            cell
+            for cell, (_tick, damage) in self.memory.incoming_damage.items()
+            if damage >= 2
+        }
+        blocked = overlay_blockers(
+            rocks,
+            dangerous,
+            context.enemy_positions,
+            context.turn.resource_cells,
+            context.counterattack_reserved,
+            {context.turn.core.position} if context.turn.core else set(),
+        )
+        front = tuple(
+            ranger
+            for ranger in context.turn.rangers
+            if ranger.hp == 2
+            and not self._is_expedition_member(ranger, context.turn)
+            and ranger.id not in context.core_hunt_ids
+            and ranger.id not in context.core_hunt_return_ids
+            and ranger.id not in context.counterattack_ids
+            and ranger.id not in context.campaign_patrol_recall_ids
+            and ranger.id not in context.flank_return_ids
+            and ranger.id not in context.worker_area_protection_return_ids
+            and (
+                parent.kind is flank.Kind.PROTECTION
+                or ranger.id not in context.clearance_ids
+            )
+        )
+        origins = {ranger.id: ranger.position for ranger in available}
+        search_started = monotonic()
+        self._flank_search.deadline = min(
+            search_started + max(0.0, flank.SEARCH_SECONDS - self._flank_search.spent),
+            self._planning_deadline
+            - self.config.planning_time_limit
+            + self.config.planning_soft_budget
+            if self._planning_deadline > search_started
+            else search_started + flank.SEARCH_SECONDS,
+        )
+        proposal = flank.choose(
+            context.turn,
+            self.memory.flank,
+            parent,
+            available,
+            front,
+            targets,
+            risks,
+            self._flank_observers(context.turn),
+            rocks,
+            blocked,
+            self._flank_search,
+            allowed=lambda ranger, cell: self._flank_cell_allowed(
+                ranger, cell, parent, context, origins[ranger.id]
+            ),
+            known=self.memory.exploration.seen,
+        )
+        self._flank_search.spent += monotonic() - search_started
+        if proposal is not None and parent.kind is flank.Kind.COUNTERATTACK:
+            opposition = counter.reachable_opposition(
+                tuple(slot.firing for slot in proposal.slots.values()), risks, rocks
+            )
+            if (
+                opposition > counter.MAX_ENEMIES
+                or army_size < counter.ARMY_RATIO * opposition
+            ):
+                self._flank_search.reject("local_army_ratio")
+                return None
+        return proposal
+
+    def _prepare_worker_flank(self, context: _TurnContext) -> None:
+        mission = self.memory.worker_area_protection
+        if mission is None or self._reserve_flank(context, flank.Kind.PROTECTION):
+            return
+        visible = {
+            str(enemy.id): enemy
+            for enemy in context.turn.visible_enemies
+            if isinstance(enemy, UnitView)
+        }
+        targets = tuple(visible[key] for key in mission.target_ids if key in visible)
+        members = tuple(
+            ranger
+            for ranger in context.turn.rangers
+            if str(ranger.id) in mission.member_ids
+            and not self._has_unit_action(ranger, context)
+        )
+        if (
+            len(targets) != len(mission.target_ids)
+            or len(members) != len(mission.member_ids)
+            or mission.entered is not None
+        ):
+            return
+        parent = flank.Parent(
+            flank.Kind.PROTECTION,
+            self._flank_task_id(
+                flank.Kind.PROTECTION, mission.started, mission.target_ids
+            ),
+            mission.started,
+            mission.deadline,
+            mission.assembly_deadline,
+            WORKER_AREA_PROTECTION_FIRE_TICKS,
+            min(
+                24,
+                mission.deadline
+                - context.turn.tick
+                - WORKER_AREA_PROTECTION_FIRE_TICKS,
+            ),
+            (len(members),),
+            kill_all=True,
+            fixed_ids=frozenset(ranger.id for ranger in members),
+        )
+        proposal = self._choose_flank(context, parent, members, targets)
+        if proposal is not None:
+            self.memory.flank.operation = proposal
+            self._reserve_flank(context, flank.Kind.PROTECTION)
+
+    def _flank_entry_allowed(
+        self, actor_id: UUID, cell: Position, context: _TurnContext
+    ) -> bool:
+        permit = context.flank_entry_permit
+        operation = self.memory.flank.operation
+        if (
+            permit is None
+            or not permit.allows(context.turn.tick, operation, actor_id, cell)
+            or operation is None
+            or not self._flank_parent_valid(operation)
+            or context.turn.tick >= operation.parent.assembly_deadline
+        ):
+            return False
+        members = {
+            str(ranger.id): ranger
+            for ranger in context.turn.rangers
+            if str(ranger.id) in operation.member_ids
+        }
+        if set(members) != set(operation.member_ids) or any(
+            ranger.hp != 2 or ranger.position != operation.slots[key].stage
+            for key, ranger in members.items()
+        ):
+            return False
+        targets = tuple(
+            enemy
+            for enemy in context.turn.visible_enemies
+            if isinstance(enemy, UnitView) and str(enemy.id) in operation.target_ids
+        )
+        contact = self.memory.flank.contacts.get(
+            flank.group_key(operation.parent.kind, targets)
+        )
+        if (
+            len(targets) != len(operation.target_ids)
+            or any(
+                enemy.position != operation.target_positions[str(enemy.id)]
+                for enemy in targets
+            )
+            or contact is None
+            or contact.seen != context.turn.tick
+            or contact.ticks < flank.STABLE_TICKS
+        ):
+            return False
+        rocks = self._rock_map(context.turn)
+        fronts = flank.mutual_front(
+            targets,
+            tuple(
+                ranger
+                for ranger in context.turn.rangers
+                if str(ranger.id) in operation.front_ids
+            ),
+            rocks,
+        )
+        actions = context.turn._builder.unit_actions
+        planned_front = {
+            ranger.id: add(ranger.position, action.direction)
+            for ranger in fronts
+            if (action := actions.get(ranger.id)) is not None and action.type == "MOVE"
+        }
+        risks = self._ranger_threats(context.turn)
+        if not fronts or not all(
+            any(
+                flank.can_see(
+                    planned_front.get(ranger.id, ranger.position),
+                    target.position,
+                    5,
+                    rocks,
+                )
+                and flank.can_see(
+                    target.position,
+                    planned_front.get(ranger.id, ranger.position),
+                    5,
+                    rocks,
+                )
+                for ranger in fronts
+            )
+            for target in targets
+        ):
+            return False
+        if not self._flank_cell_allowed(
+            members[str(actor_id)],
+            cell,
+            operation.parent,
+            context,
+            operation.origins[str(actor_id)],
+        ):
+            return False
+        return (
+            bool(fronts)
+            and flank.cell_rejection(
+                cell,
+                targets,
+                self._flank_observers(context.turn),
+                risks,
+                rocks,
+                flank.prefire_cells(targets, fronts, rocks, planned_front)
+                | self.memory.flank.prefire_cells.keys(),
+            )
+            is None
+        )
+
+    def _flank_atomic_moves(
+        self,
+        context: _TurnContext,
+        members: tuple[Ranger, ...],
+        destinations: dict[UUID, Position],
+    ) -> bool:
+        """Commit real two-entity swaps/chains, or restore the entire transaction."""
+        actions = context.turn._builder.unit_actions
+        old_actions = actions.copy()
+        old_targets = self.memory.pending_move_targets.copy()
+        ledgers = {
+            name: getattr(context, name).copy()
+            for name in (
+                "arrival_counts",
+                "departure_counts",
+                "reserved",
+                "standing_reserved",
+                "planned_ids",
+                "core_traffic_moves",
+                "defensive_fire_cells",
+                "defensive_firing_lanes",
+            )
+        }
+        ledgers["volley_aims"] = {
+            key: cells.copy() for key, cells in context.volley_aims.items()
+        }
+        old_diagnostics = deepcopy(context.report.flank)
+        old_ownership = (
+            context.counterattack_ids,
+            context.counterattack_reserved,
+            context.flank_ids,
+            context.flank_front_ids,
+        )
+        old_damage = context.damage_ledger.planned_damage.copy()
+        old_inbound = context.core_inbound_id
+        decisions = len(context.report.decisions)
+        departures = Counter(member.position for member in members)
+        arrivals = Counter(destinations[member.id] for member in members)
+        if any(
+            self._has_unit_action(member, context)
+            or direction_between(member.position, destinations[member.id]) is None
+            for member in members
+        ) or any(
+            self._predicted_friendly_occupancy(cell, context)
+            - departures[cell]
+            + arrivals[cell]
+            > 2
+            for cell in arrivals
+        ):
+            return False
+        for cell, count in departures.items():
+            context.departure_counts[cell] = (
+                context.departure_counts.get(cell, 0) + count
+            )
+        successful = True
+        for member in members:
+            # The whole transaction promises these departures. Removing this
+            # actor's provisional departure lets _queue_move record it once.
+            context.departure_counts[member.position] -= 1
+            destination = destinations[member.id]
+            direction = direction_between(member.position, destination)
+            if (
+                direction is None
+                or destination in context.enemy_positions
+                or destination in context.turn.resource_cells
+                or not self._queue_move(
+                    member,
+                    direction,
+                    context,
+                    reason="synchronized qualified blind flank entry",
+                    target=destination,
+                )
+            ):
+                successful = False
+                break
+            action = actions.get(member.id)
+            if (
+                action is None
+                or action.type != "MOVE"
+                or add(member.position, action.direction) != destination
+            ):
+                # A collected traffic promise is not an executed departure.
+                successful = False
+                break
+        if successful:
+            return True
+        actions.clear()
+        actions.update(old_actions)
+        self.memory.pending_move_targets = old_targets
+        for name, value in ledgers.items():
+            setattr(context, name, value)
+        context.damage_ledger.planned_damage = old_damage
+        context.core_inbound_id = old_inbound
+        context.report.flank = old_diagnostics
+        (
+            context.counterattack_ids,
+            context.counterattack_reserved,
+            context.flank_ids,
+            context.flank_front_ids,
+        ) = old_ownership
+        del context.report.decisions[decisions:]
+        return False
+
+    def _end_flank(self, context: _TurnContext, reason: str) -> None:
+        operation = self.memory.flank.operation
+        if operation is None:
+            return
+        valid_parent = self._flank_parent_valid(operation)
+        self.memory.flank.finish(context.turn.tick, reason)
+        context.counterattack_ids -= context.flank_ids
+        context.flank_ids = frozenset()
+        context.flank_front_ids = frozenset()
+        context.flank_entry_permit = None
+        context.counterattack_reserved = frozenset()
+        context.flank_return_ids = frozenset(
+            UUID(key) for key in self.memory.flank.returns
+        )
+        if valid_parent:
+            if operation.parent.kind is flank.Kind.SKIRMISH:
+                self._finish_skirmish(context.turn.tick)
+            elif operation.parent.kind is flank.Kind.COUNTERATTACK:
+                self.memory.counterattack.finish(context.turn.tick, reason)
+            elif operation.parent.kind is flank.Kind.PROTECTION:
+                self._abort_resource_clearance(
+                    context.turn, reason=reason, cooldown=bool(operation.remaining_ids)
+                )
+                context.clearance_ids = frozenset()
+                context.worker_area_protection_ids = frozenset()
+                context.raid_ids = frozenset()
+            else:
+                self._clear_local_fireline()
+                self.memory.flank_fireline_parent_id = None
+        for ranger in context.turn.rangers:
+            if str(ranger.id) in operation.member_ids and not self._has_unit_action(
+                ranger, context
+            ):
+                self._decide_ranger(
+                    ranger,
+                    context,
+                    self.memory.recent_enemies(
+                        context.turn.tick, self.config.enemy_memory_ttl
+                    ),
+                )
+
+    def _execute_flank(self, context: _TurnContext) -> None:
+        """Validate against ordinary actions before moving or firing the group."""
+        operation = self.memory.flank.operation
+        if operation is None:
+            return
+        turn, parent = context.turn, operation.parent
+        core, rocks = turn.core, self._rock_map(turn)
+        risks = self._ranger_threats(turn)
+        if not self._flank_parent_valid(operation):
+            self._end_flank(context, "orphaned_parent")
+            return
+        if (
+            core is None
+            or str(core.id) != operation.core_id
+            or core.position != operation.core_position
+            or core.view.state is not CoreState.NORMAL
+            or core.hp < 5
+            or core.shield < 5
+            or context.core_escape_direction is not None
+            or context.threat.recent_core_attack
+            or context.threat.projected_core_damage
+            or any(counter.can_attack(enemy, core.position, rocks) for enemy in risks)
+            or self.memory.campaign_scout_target is not None
+        ):
+            self._end_flank(context, "core_pressure")
+            return
+        if turn.tick >= parent.deadline:
+            self._end_flank(context, "budget_exhausted")
+            return
+        if not operation.remaining_ids:
+            self._end_flank(context, "confirmed_targets_destroyed")
+            return
+        visible = {
+            str(enemy.id): enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+        }
+        targets = tuple(
+            visible[key] for key in operation.remaining_ids if key in visible
+        )
+        if len(targets) != len(operation.remaining_ids):
+            self._end_flank(context, "observer_lost")
+            return
+        if any(
+            target.position != operation.target_positions[str(target.id)]
+            for target in targets
+        ):
+            self._end_flank(context, "target_moved")
+            return
+        operation.last_seen = turn.tick
+        members = tuple(
+            ranger for ranger in turn.rangers if str(ranger.id) in operation.member_ids
+        )
+        if any(
+            self._has_unit_action(member, context)
+            or member.id in context.core_hunt_ids
+            or member.id in context.core_hunt_return_ids
+            or member.id in context.campaign_patrol_recall_ids
+            for member in members
+        ):
+            self._end_flank(context, "reserved_by_other_task")
+            return
+        if operation.phase is flank.Phase.ASSEMBLE:
+            contact = self.memory.flank.contacts.get(
+                flank.group_key(parent.kind, targets)
+            )
+            if (
+                contact is None
+                or contact.seen != turn.tick
+                or contact.ticks < flank.STABLE_TICKS
+                or contact.since > operation.stable_since
+            ):
+                self._end_flank(context, "contact_unstable")
+                return
+            if len(members) != len(operation.member_ids) or any(
+                member.hp < 2 for member in members
+            ):
+                self._end_flank(context, "member_unavailable")
+                return
+            fronts = flank.mutual_front(
+                targets,
+                tuple(
+                    ranger
+                    for ranger in turn.rangers
+                    if ranger.id not in context.flank_ids
+                    and ranger.id not in context.counterattack_ids
+                    and ranger.id not in context.core_hunt_ids
+                    and ranger.id not in context.core_hunt_return_ids
+                    and ranger.id not in context.flank_return_ids
+                    and ranger.id not in context.worker_area_protection_return_ids
+                    and ranger.id not in context.campaign_patrol_recall_ids
+                    and (
+                        parent.kind is flank.Kind.PROTECTION
+                        or ranger.id not in context.clearance_ids
+                    )
+                    and not self._is_expedition_member(ranger, turn)
+                    and ranger.hp > 1
+                ),
+                rocks,
+            )
+            actions = turn._builder.unit_actions
+            planned_front = {
+                ranger.id: add(ranger.position, action.direction)
+                for ranger in fronts
+                if (action := actions.get(ranger.id)) is not None
+                and action.type == "MOVE"
+            }
+            stable_front = fronts
+            if not all(
+                any(
+                    flank.can_see(
+                        planned_front.get(ranger.id, ranger.position),
+                        target.position,
+                        5,
+                        rocks,
+                    )
+                    and flank.can_see(
+                        target.position,
+                        planned_front.get(ranger.id, ranger.position),
+                        5,
+                        rocks,
+                    )
+                    for ranger in fronts
+                )
+                for target in targets
+            ):
+                self._end_flank(context, "observer_lost")
+                return
+            operation.front_ids = tuple(str(ranger.id) for ranger in stable_front)
+            prefire = (
+                flank.prefire_cells(targets, fronts, rocks, planned_front)
+                | self.memory.flank.prefire_cells.keys()
+            )
+            observers = self._flank_observers(turn)
+            for member in members:
+                slot = operation.slots[str(member.id)]
+                reason = flank.cell_rejection(
+                    slot.firing, targets, observers, risks, rocks, prefire
+                )
+                if (
+                    reason is not None
+                    or slot.firing in context.enemy_positions
+                    or slot.firing in turn.resource_cells
+                    or slot.stage in turn.resource_cells
+                    or slot.stage in rocks
+                    or not self.memory.exploration.seen(slot.firing)
+                    or not self.memory.exploration.seen(slot.stage)
+                    or not self._flank_cell_allowed(
+                        member,
+                        slot.firing,
+                        parent,
+                        context,
+                        operation.origins[str(member.id)],
+                    )
+                    or any(
+                        counter.can_attack(enemy, slot.stage, rocks)
+                        or (
+                            enemy.unit_type is UnitType.VANGUARD
+                            and manhattan(enemy.position, slot.stage) <= 2
+                        )
+                        for enemy in risks
+                    )
+                    or self.memory.incoming_damage.get(slot.firing, (-1, 0))[1]
+                    >= member.hp
+                ):
+                    self._end_flank(context, reason or "terrain_blocked")
+                    return
+            if (
+                turn.tick >= parent.assembly_deadline
+                or turn.tick + 1 + parent.fire_ticks > parent.deadline
+            ):
+                self._end_flank(context, "budget_exhausted")
+                return
+            ready = all(
+                member.position == operation.slots[str(member.id)].stage
+                for member in members
+            )
+            if ready:
+                destinations = {
+                    member.id: operation.slots[str(member.id)].firing
+                    for member in members
+                }
+                context.flank_entry_permit = flank.EntryPermit(
+                    turn.tick, parent.task_id, destinations
+                )
+                if self._flank_atomic_moves(context, members, destinations):
+                    operation.entry_tick = turn.tick
+                    operation.phase = flank.Phase.ENTER
+                else:
+                    context.flank_entry_permit = None
+                    context.report.flank["reason"] = "capacity_failed"
+                    for member in members:
+                        member.wait()
+                        context.planned_ids.add(member.id)
+                        self._record_wait(
+                            member,
+                            context,
+                            "wait for complete blind flank entry capacity",
+                        )
+                return
+            assembly_routes: dict[UUID, tuple[Position, ...]] = {}
+            for member in members:
+                slot = operation.slots[str(member.id)]
+                route = operation.routes[str(member.id)]
+                if member.position in route:
+                    route = route[route.index(member.position) + 1 :]
+                if member.position != slot.stage and (
+                    not route
+                    or direction_between(member.position, route[0]) is None
+                    or any(
+                        cell in rocks
+                        or not self.memory.exploration.seen(cell)
+                        or cell in prefire
+                        or cell in context.enemy_positions
+                        or not self._flank_cell_allowed(
+                            member,
+                            cell,
+                            parent,
+                            context,
+                            operation.origins[str(member.id)],
+                        )
+                        or any(
+                            counter.can_attack(enemy, cell, rocks) for enemy in risks
+                        )
+                        or self.memory.incoming_damage.get(cell, (-1, 0))[1]
+                        >= member.hp
+                        for cell in route
+                    )
+                ):
+                    self._end_flank(context, "route_invalidated")
+                    return
+                assembly_routes[member.id] = route
+            operation.route_validated_tick = turn.tick
+            for member in members:
+                slot = operation.slots[str(member.id)]
+                route = assembly_routes[member.id]
+                if member.position != slot.stage:
+                    direction = direction_between(member.position, route[0])
+                    if direction is not None:
+                        self._queue_move(
+                            member,
+                            direction,
+                            context,
+                            reason="assemble safely before joint blind flank entry",
+                            target=slot.stage,
+                        )
+                if not self._has_unit_action(member, context):
+                    member.wait()
+                    context.planned_ids.add(member.id)
+                    self._record_wait(
+                        member, context, "wait at safe blind flank assembly position"
+                    )
+            return
+        if operation.phase is flank.Phase.ENTER:
+            if operation.entry_tick == turn.tick:
+                return
+            if len(members) != len(operation.member_ids) or any(
+                member.position != operation.slots[str(member.id)].firing
+                for member in members
+            ):
+                self._end_flank(context, "arrival_incomplete")
+                return
+            operation.actual_arrivals = tuple(str(member.id) for member in members)
+            operation.actual_hp = {str(member.id): member.hp for member in members}
+            operation.phase = flank.Phase.OPENING
+        if operation.first_shot is not None:
+            operation.phase = flank.Phase.FINISH
+        ready_members = tuple(
+            member
+            for member in members
+            if member.position == operation.slots[str(member.id)].firing
+        )
+        positions, health = (
+            {member.id: member.position for member in ready_members},
+            {member.id: member.hp for member in ready_members},
+        )
+        if not positions or any(
+            enemy.unit_type is UnitType.VANGUARD
+            and counter.reachable_opposition(tuple(positions.values()), (enemy,), rocks)
+            for enemy in risks
+        ):
+            self._end_flank(context, "exchange_unfavorable")
+            return
+        rounds = min(
+            parent.fire_ticks,
+            parent.deadline - turn.tick,
+            parent.fire_ticks - (turn.tick - operation.first_shot)
+            if operation.first_shot is not None
+            else parent.fire_ticks,
+        )
+        own_allocation = flank.allocate_fire(positions, health, targets, rocks)
+        hits = Counter(target.id for target in own_allocation.values())
+        if operation.first_shot is None and (
+            len(own_allocation) < len(operation.target_ids)
+            or not any(hits[target.id] >= target.hp for target in targets)
+        ):
+            self._end_flank(context, "no_opening_kill")
+            return
+        fronts = {
+            ranger.id: (ranger.position, ranger.hp)
+            for ranger in turn.rangers
+            if str(ranger.id) in operation.front_ids and ranger.id not in positions
+        }
+        evaluation = flank.exchange(
+            positions,
+            health,
+            targets,
+            risks,
+            rocks,
+            rounds,
+            front=fronts,
+            confirmed_kills=len(operation.confirmed_destroyed),
+            confirmed_losses=len(operation.flank_losses) + len(operation.front_losses),
+            committed=context.damage_ledger.planned_damage,
+        )
+        if not evaluation.viable:
+            self._end_flank(context, evaluation.reason or "exchange_unfavorable")
+            return
+        allocation = flank.allocate_fire(
+            positions, health, targets, rocks, context.damage_ledger.planned_damage
+        )
+        context.report.flank["shooters"] = len(allocation)
+        if operation.first_shot is None and allocation:
+            operation.first_shot = turn.tick
+            operation.opening_allocation = {
+                str(key): str(target.id) for key, target in allocation.items()
+            }
+            if parent.kind is flank.Kind.SKIRMISH and self.memory.skirmish is not None:
+                self.memory.skirmish.entered = turn.tick
+            elif (
+                parent.kind is flank.Kind.COUNTERATTACK
+                and self.memory.counterattack.operation is not None
+            ):
+                self.memory.counterattack.operation.entered = turn.tick
+            elif (
+                parent.kind is flank.Kind.PROTECTION
+                and self.memory.worker_area_protection is not None
+            ):
+                self.memory.worker_area_protection.entered = turn.tick
+        for member in ready_members:
+            target = allocation.get(member.id)
+            if target is not None:
+                member.shoot(target, expected_cell=target.position)
+                context.planned_ids.add(member.id)
+                context.damage_ledger.record(target)
+                self._reserve_ranger_firing_lane(
+                    member.position, target.position, context
+                )
+                context.report.add(
+                    actor_id=str(member.id),
+                    actor_kind="RANGER",
+                    action="SHOOT",
+                    reason="precise opening blind flank volley"
+                    if operation.phase is flank.Phase.OPENING
+                    else "finish original flank targets with actual surviving shooters",
+                    target=target.position,
+                )
+            else:
+                if member.hp == 1 and self._move_ranger_toward_core(
+                    member, context, reason="withdraw a surplus wounded flank shooter"
+                ):
+                    continue
+                member.wait()
+                context.planned_ids.add(member.id)
+                self._record_wait(
+                    member,
+                    context,
+                    "hold after already allocated local flank target arrows",
+                )
+
+    def _flank_report(self, context: _TurnContext) -> None:
+        operation, budget = self.memory.flank.operation, self._flank_search
+        context.report.flank.update(
+            {
+                "operation": operation.summary(context.turn.tick)
+                if operation
+                else None,
+                "last_result": self.memory.flank.last_result,
+                "contacts": len(self.memory.flank.contacts),
+                "search": {
+                    "groups": budget.groups,
+                    "extensions": budget.extensions,
+                    "paths": budget.paths,
+                    "elapsed_ms": round(budget.spent * 1000, 3),
+                    "rejections": dict(budget.reasons),
+                }
+                if budget
+                else None,
+            }
+        )
+
     def _prepare_local_fireline(self, context: _TurnContext) -> None:
         """Assign a bounded response to a wounded fighter in a small contact.
 
@@ -2393,6 +3452,8 @@ class AggressiveStrategy:
             or context.threat.projected_core_damage > 0
         ):
             self._clear_local_fireline()
+            return
+        if self._reserve_flank(context, flank.Kind.FIRELINE):
             return
         fighters = tuple(
             enemy
@@ -2503,6 +3564,38 @@ class AggressiveStrategy:
                 continue
             if any(ranger not in available for ranger in all_ready):
                 continue
+            if (
+                not all_ready
+                and self.memory.counterattack.operation is None
+                and self.memory.skirmish is None
+                and self.memory.worker_area_protection is None
+            ):
+                parent = flank.Parent(
+                    flank.Kind.FIRELINE,
+                    self._flank_task_id(
+                        flank.Kind.FIRELINE, context.turn.tick, (str(target.id),)
+                    ),
+                    context.turn.tick,
+                    context.turn.tick + LOCAL_FIRELINE_MAX_TICKS,
+                    context.turn.tick + LOCAL_FIRELINE_MAX_TICKS - 3,
+                    3,
+                    LOCAL_FIRELINE_MAX_STEPS,
+                    (required,),
+                )
+                proposal = self._choose_flank(context, parent, available, (target,))
+                if proposal is not None:
+                    self.memory.flank.operation = proposal
+                    self.memory.flank_fireline_parent_id = parent.task_id
+                    self._local_fireline_target_id = str(target.id)
+                    self._local_fireline_ranger_ids = frozenset(
+                        UUID(key) for key in proposal.member_ids
+                    )
+                    self._local_fireline_goals = {
+                        UUID(key): slot.firing for key, slot in proposal.slots.items()
+                    }
+                    self._local_fireline_until_tick = parent.deadline
+                    self._reserve_flank(context, flank.Kind.FIRELINE)
+                    return
             selected: list[tuple[Ranger, Position]] = [
                 (ranger, ranger.position) for ranger in all_ready
             ]
@@ -7241,15 +8334,20 @@ class AggressiveStrategy:
         if (
             isinstance(unit, Ranger)
             and not self._is_expedition_member(unit, context.turn)
-            and unit.id not in context.counterattack_ids
+            and (
+                unit.id not in context.counterattack_ids or unit.id in context.flank_ids
+            )
             and unit.id not in context.coordinated_ranger_moves
             and (
-                len(
-                    self._ranger_attackers_at(
-                        destination, context.turn, self._rock_map(context.turn)
+                (
+                    not self._flank_entry_allowed(unit.id, destination, context)
+                    and len(
+                        self._ranger_attackers_at(
+                            destination, context.turn, self._rock_map(context.turn)
+                        )
                     )
+                    >= unit.hp
                 )
-                >= unit.hp
                 or self.memory.incoming_damage.get(destination, (-1, 0))[1] >= unit.hp
                 or (
                     (
@@ -8283,6 +9381,8 @@ class AggressiveStrategy:
             if state.operation is not None:
                 state.finish(turn.tick, "Core safety takes priority")
             return
+        if self._reserve_flank(context, flank.Kind.COUNTERATTACK):
+            return
         healthy = tuple(
             ranger
             for ranger in turn.rangers
@@ -8357,6 +9457,37 @@ class AggressiveStrategy:
                     for target in targets
                 ):
                     continue
+                parent = flank.Parent(
+                    flank.Kind.COUNTERATTACK,
+                    self._flank_task_id(
+                        flank.Kind.COUNTERATTACK,
+                        turn.tick,
+                        (str(target.id) for target in targets),
+                    ),
+                    turn.tick,
+                    turn.tick + counter.ASSEMBLY_TICKS + counter.FIRE_TICKS,
+                    turn.tick + counter.ASSEMBLY_TICKS,
+                    counter.FIRE_TICKS,
+                    counter.MAX_ROUTE,
+                    tuple(size for size in (4, 6, 8) if size <= max_party),
+                    paired=True,
+                    kill_all=True,
+                )
+                proposal = self._choose_flank(
+                    context, parent, available, tuple(targets), army_size=len(healthy)
+                )
+                if proposal is not None:
+                    operation = counter.Counterattack(
+                        tuple(str(target.id) for target in targets),
+                        cell,
+                        turn.tick,
+                        proposal.slots.copy(),
+                    )
+                    state.operation = operation
+                    state.reason = "assembling a qualified paired blind flank"
+                    self.memory.flank.operation = proposal
+                    self._reserve_flank(context, flank.Kind.COUNTERATTACK)
+                    return
                 slots = counter.choose_formation(
                     turn,
                     available,
@@ -8648,6 +9779,8 @@ class AggressiveStrategy:
         ):
             self._finish_skirmish(turn.tick)
             return
+        if self._reserve_flank(context, flank.Kind.SKIRMISH):
+            return
         healthy = tuple(
             ranger
             for ranger in turn.rangers
@@ -8671,6 +9804,25 @@ class AggressiveStrategy:
         )
         if operation is None:
             if turn.tick < self.memory.skirmish_cooldown_until:
+                return
+            stable_contact_ready = self.config.blind_flank and any(
+                contact.kind is flank.Kind.SKIRMISH
+                and contact.seen == turn.tick
+                and contact.ticks >= flank.STABLE_TICKS
+                for contact in self.memory.flank.contacts.values()
+            )
+            if (
+                turn.tick < self.memory.skirmish_retry_after
+                and not stable_contact_ready
+                and not any(
+                    isinstance(enemy, UnitView)
+                    and enemy.unit_type is UnitType.RANGER
+                    and enemy.hp == 1
+                    and manhattan(core.position, enemy.position)
+                    <= skirmish.CONTACT_RADIUS
+                    for enemy in turn.visible_enemies
+                )
+            ):
                 return
             reserve = max(2, (len(healthy) + 2) // 3)
             available = tuple(
@@ -8704,14 +9856,63 @@ class AggressiveStrategy:
             ):
                 if len(targets) > 2:
                     continue
-                if sum(target.hp for target in targets) > 1 and not all(
-                    (contact := self.memory.counterattack.contacts.get(str(target.id)))
-                    is not None
-                    and turn.tick - contact.since >= 8
-                    and contact.still >= 3
-                    for target in targets
+                stable = self.memory.flank.contacts.get(
+                    flank.group_key(flank.Kind.SKIRMISH, targets)
+                )
+                qualified_contact = (
+                    self.config.blind_flank
+                    and stable is not None
+                    and stable.seen == turn.tick
+                    and stable.ticks >= flank.STABLE_TICKS
+                )
+                if (
+                    sum(target.hp for target in targets) > 1
+                    and not qualified_contact
+                    and not all(
+                        (
+                            contact := self.memory.counterattack.contacts.get(
+                                str(target.id)
+                            )
+                        )
+                        is not None
+                        and turn.tick - contact.since >= 8
+                        and contact.still >= 3
+                        for target in targets
+                    )
                 ):
                     continue
+                parent = flank.Parent(
+                    flank.Kind.SKIRMISH,
+                    self._flank_task_id(
+                        flank.Kind.SKIRMISH,
+                        turn.tick,
+                        (str(target.id) for target in targets),
+                    ),
+                    turn.tick,
+                    turn.tick + skirmish.MAX_TICKS,
+                    turn.tick + skirmish.MAX_TICKS - 3,
+                    3,
+                    skirmish.MAX_STEPS,
+                    tuple(size for size in (2, 4, 6) if size <= max_party),
+                )
+                proposal = self._choose_flank(
+                    context, parent, available, tuple(targets)
+                )
+                if proposal is not None:
+                    operation = skirmish.Skirmish(
+                        str(core.id),
+                        core.position,
+                        proposal.target_ids,
+                        cell,
+                        turn.tick,
+                        turn.tick,
+                        proposal.slots.copy(),
+                        proposal.origins.copy(),
+                    )
+                    self.memory.skirmish = operation
+                    self.memory.flank.operation = proposal
+                    self._reserve_flank(context, flank.Kind.SKIRMISH)
+                    return
                 slots = skirmish.choose_slots(
                     turn, available, targets, enemies, rocks, blocked, max_party
                 )
@@ -8735,7 +9936,7 @@ class AggressiveStrategy:
             if operation is None:
                 # Formation search is bounded, but repeated impossible searches
                 # must not consume the planning budget on every Tick.
-                self.memory.skirmish_cooldown_until = turn.tick + 4
+                self.memory.skirmish_retry_after = turn.tick + 4
                 return
         members = tuple(
             ranger for ranger in turn.rangers if str(ranger.id) in operation.slots
@@ -9555,6 +10756,7 @@ class AggressiveStrategy:
             # counting its arrow towards a defensive exchange would commit the
             # rest of the formation to a volley it never fires.
             and ally.id not in context.core_hunt_ids
+            and ally.id not in context.flank_ids
             and not self._has_unit_action(ally, context)
             and any(
                 line_of_fire(ally.position, enemy.position, obstacles)
@@ -10086,6 +11288,8 @@ class AggressiveStrategy:
         self, ranger: Ranger, destination: Position, context: _TurnContext
     ) -> bool:
         """Do not pay an ingress arrow before an unsupported losing duel."""
+        if self._flank_entry_allowed(ranger.id, destination, context):
+            return True
         rocks = self._rock_map(context.turn)
         attackers = self._ranger_attackers_at(destination, context.turn, rocks)
         if not attackers:
@@ -10322,6 +11526,21 @@ class AggressiveStrategy:
         target: Position,
         turn: Turn | None = None,
     ) -> bool:
+        operation = self.memory.flank.operation
+        if (
+            turn is not None
+            and operation is not None
+            and str(unit.id) in operation.member_ids
+            and turn.tick < operation.parent.deadline
+            and turn.core is not None
+            and str(turn.core.id) == operation.core_id
+            and any(
+                str(enemy.id) in operation.remaining_ids and enemy.position == target
+                for enemy in turn.visible_enemies
+            )
+            and line_of_fire(unit.position, target, self._rock_map(turn))
+        ):
+            return True
         if manhattan(unit.position, target) <= _combat_vision_radius(unit):
             return True
         if (
@@ -14647,6 +15866,16 @@ class AggressiveStrategy:
             for unit_id in self.memory.core_hunt_returns
             if unit_id in live_ids
         )
+        returning.update(
+            UUID(unit_id)
+            for unit_id in self.memory.flank.returns
+            if unit_id in live_ids
+        )
+        operation = self.memory.flank.operation
+        if operation is not None:
+            returning.update(
+                UUID(unit_id) for unit_id in operation.member_ids if unit_id in live_ids
+            )
         return active | returning
 
     def _advance_patrol_ring_phase(
@@ -14942,6 +16171,13 @@ class AggressiveStrategy:
         *,
         friendly_positions: Container[Position] = (),
     ) -> Position | None:
+        operation = self.memory.flank.operation
+        if (
+            operation is not None
+            and ranger.id in context.flank_ids
+            and str(target.id) in operation.remaining_ids
+        ):
+            return operation.slots[str(ranger.id)].firing
         obstacles = self._rock_map(context.turn)
         defensive = not self._is_expedition_member(ranger, context.turn)
         target_position = target.position
@@ -16592,6 +17828,22 @@ class AggressiveStrategy:
             )
             mission = None
         if mission is not None:
+            flank_operation = self.memory.flank.operation
+            flanking = (
+                flank_operation is not None
+                and flank_operation.parent.kind is flank.Kind.PROTECTION
+                and self._flank_parent_valid(flank_operation)
+            )
+            if (
+                flanking
+                and flank_operation is not None
+                and not flank_operation.remaining_ids
+            ):
+                self.memory.flank.finish(turn.tick, "confirmed_targets_destroyed")
+                self._abort_resource_clearance(
+                    turn, reason="confirmed_targets_destroyed", cooldown=False
+                )
+                return frozenset()
             mission_targets = set(mission.target_ids)
             selected = tuple(
                 candidate
@@ -16620,7 +17872,7 @@ class AggressiveStrategy:
             live_members = tuple(
                 ranger
                 for ranger in turn.rangers
-                if str(ranger.id) in mission.member_ids and ranger.hp > 1
+                if str(ranger.id) in mission.member_ids and (ranger.hp > 1 or flanking)
             )
             role_changed = any(
                 expected != self.memory.unit_roles.get(str(ranger.id))
@@ -16638,7 +17890,14 @@ class AggressiveStrategy:
                 if enemy_id in mission.target_origins
             )
             if (
-                len(live_members) != len(mission.member_ids)
+                (
+                    len(live_members) != len(mission.member_ids)
+                    and not (
+                        flanking
+                        and flank_operation is not None
+                        and flank_operation.first_shot is not None
+                    )
+                )
                 or turn.tick >= mission.deadline
                 or (mission.entered is None and turn.tick >= mission.assembly_deadline)
                 or (
@@ -16653,7 +17912,10 @@ class AggressiveStrategy:
                 or self.memory.counterattack.operation is not None
                 or self.memory.skirmish is not None
                 or len(decision.risk_ids) > WORKER_AREA_PROTECTION_MAX_TARGETS
-                or self._clearance_outmatched(turn, decision.positions)
+                or (
+                    not flanking
+                    and self._clearance_outmatched(turn, decision.positions)
+                )
             ):
                 self._abort_resource_clearance(
                     turn,
@@ -16661,15 +17923,16 @@ class AggressiveStrategy:
                 )
                 return frozenset()
             self._clearance_ids = frozenset(ranger.id for ranger in live_members)
-            mission.target_ids = decision.target_ids
-            mission.target_origins = {
-                enemy_id: mission.target_origins.get(enemy_id, position)
-                for enemy_id, position in zip(
-                    decision.target_ids,
-                    decision.positions,
-                    strict=True,
-                )
-            }
+            if not flanking:
+                mission.target_ids = decision.target_ids
+                mission.target_origins = {
+                    enemy_id: mission.target_origins.get(enemy_id, position)
+                    for enemy_id, position in zip(
+                        decision.target_ids,
+                        decision.positions,
+                        strict=True,
+                    )
+                }
             self._clearance_target = decision.objective
             return self._clearance_ids
 

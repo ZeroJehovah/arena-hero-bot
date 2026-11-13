@@ -12,6 +12,7 @@ from arena_hero import CoreView, Position, Turn, UnitType, UnitView
 
 from .counterattack import CounterattackState
 from .exploration import ExplorationMap, ExplorationRoute, visible_cells
+from .flank import State as FlankState
 from .skirmish import Skirmish
 
 SCHEMA_VERSION = 1
@@ -219,6 +220,9 @@ class WorldMemory:
     counterattack: CounterattackState = field(default_factory=CounterattackState)
     skirmish: Skirmish | None = None
     skirmish_cooldown_until: int = -1
+    skirmish_retry_after: int = -1
+    flank: FlankState = field(default_factory=FlankState)
+    flank_fireline_parent_id: str | None = None
     resource_cells: dict[Position, int] = field(default_factory=dict)
     # Combat identities are durable: a live Unit keeps its assigned role when
     # a newly spawned UUID sorts ahead of it.  Values are ``defense``,
@@ -891,6 +895,9 @@ class WorldMemory:
             "counterattack": self.counterattack.to_dict(),
             "skirmish": self.skirmish.to_dict() if self.skirmish else None,
             "skirmish_cooldown_until": self.skirmish_cooldown_until,
+            "skirmish_retry_after": self.skirmish_retry_after,
+            "flank": self.flank.to_dict(),
+            "flank_fireline_parent_id": self.flank_fireline_parent_id,
             "resource_cells": [
                 {"position": list(position), "tick": seen_tick}
                 for position, seen_tick in sorted(self.resource_cells.items())
@@ -1132,6 +1139,11 @@ class WorldMemory:
             if raw.get("skirmish")
             else None,
             skirmish_cooldown_until=int(raw.get("skirmish_cooldown_until", -1)),
+            skirmish_retry_after=int(raw.get("skirmish_retry_after", -1)),
+            flank=FlankState.from_dict(raw.get("flank", {})),
+            flank_fireline_parent_id=_optional_string(
+                raw.get("flank_fireline_parent_id")
+            ),
             resource_cells=resource_cells,
             unit_roles={
                 str(unit_id): str(role)

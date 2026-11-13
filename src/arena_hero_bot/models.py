@@ -37,6 +37,7 @@ class DecisionReport:
     minimum_ticks_to_range: int | None = None
     projected_core_damage: int = 0
     planned_damage: dict[str, int] = field(default_factory=dict)
+    flank: dict[str, Any] = field(default_factory=dict)
 
     def add(
         self,
@@ -71,5 +72,6 @@ class DecisionReport:
             "minimum_ticks_to_range": self.minimum_ticks_to_range,
             "projected_core_damage": self.projected_core_damage,
             "planned_damage": dict(sorted(self.planned_damage.items())),
+            "flank": self.flank,
             "decisions": [decision.to_dict() for decision in self.decisions],
         }

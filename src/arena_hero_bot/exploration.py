@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Container
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from math import hypot
@@ -24,6 +25,7 @@ MAX_COOLDOWNS = 8
 MIN_INFORMATION_GAIN = 4
 
 
+@lru_cache(maxsize=256)
 def _supercover(dx: int, dy: int) -> tuple[Position, ...]:
     """Cells crossed before the endpoint, including both sides of a corner."""
 
@@ -68,8 +70,22 @@ def _vision_layout(
     return offsets, rays
 
 
+def can_see(
+    origin: Position,
+    target: Position,
+    radius: int,
+    obstacles: Container[Position],
+) -> bool:
+    """Test one observer's sight without constructing its whole vision disk."""
+
+    return manhattan(origin, target) <= radius and all(
+        (origin[0] + dx, origin[1] + dy) not in obstacles
+        for dx, dy in _supercover(target[0] - origin[0], target[1] - origin[1])
+    )
+
+
 def visible_cells(
-    origin: Position, radius: int, obstacles: set[Position]
+    origin: Position, radius: int, obstacles: Container[Position]
 ) -> frozenset[Position]:
     """Match Manhattan vision and the server's integer supercover occlusion.
 

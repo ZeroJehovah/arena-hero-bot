@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--websocket-url", help="override the game WebSocket URL")
     parser.add_argument(
+        "--no-blind-flank",
+        action="store_true",
+        help="disable new blind flank proposals while resolving existing missions",
+    )
+    parser.add_argument(
         "--target-workers",
         type=_non_negative_integer,
         default=16,
@@ -147,6 +152,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         resource_target=args.resource_target,
         expedition_mode=args.expedition_mode,
         campaign_mode=args.campaign_mode,
+        blind_flank=not args.no_blind_flank,
     )
     try:
         run_bot(runtime, strategy_config=strategy)
