@@ -245,6 +245,10 @@ class WorldMemory:
     # moves, without reallocating surviving Units to different slots.
     defense_posts: dict[str, Position] = field(default_factory=dict)
     defense_anchor: Position | None = None
+    defense_spread_version: int = 0
+    defense_coverage_radius: int = 0
+    defense_visible_radius: int = 0
+    defense_established_radius: int = 0
     # Legacy memory files predate durable role assignment.  The strategy uses
     # this marker to run one spatial sanity pass, then never reclassifies live
     # UUIDs merely because their positions change.
@@ -928,6 +932,10 @@ class WorldMemory:
             "defense_anchor": (
                 list(self.defense_anchor) if self.defense_anchor is not None else None
             ),
+            "defense_spread_version": self.defense_spread_version,
+            "defense_coverage_radius": self.defense_coverage_radius,
+            "defense_visible_radius": self.defense_visible_radius,
+            "defense_established_radius": self.defense_established_radius,
             "unit_roles_initialized": self.unit_roles_initialized,
             "expedition_squads": [
                 {
@@ -1188,6 +1196,10 @@ class WorldMemory:
                 for unit_id, position in raw.get("defense_posts", {}).items()
             },
             defense_anchor=_optional_position(raw.get("defense_anchor")),
+            defense_spread_version=int(raw.get("defense_spread_version", 0)),
+            defense_coverage_radius=int(raw.get("defense_coverage_radius", 0)),
+            defense_visible_radius=int(raw.get("defense_visible_radius", 0)),
+            defense_established_radius=int(raw.get("defense_established_radius", 0)),
             unit_roles_initialized=bool(raw.get("unit_roles_initialized", False)),
             expedition_squads=[
                 ExpeditionSquad(

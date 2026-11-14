@@ -1298,6 +1298,13 @@ def choose(
     by_id = {ranger.id: ranger for ranger in candidates}
     best_proposal: Operation | None = None
     best_score: tuple[int, ...] | None = None
+    # Different staging routes can yield the same actors on the same firing
+    # cells. Their HP, front, targets and risks are fixed for this search, so
+    # their exchanges are identical. Keep this cache local to the proposal;
+    # no result survives a new Tick or a different mother task.
+    projections_by_positions: dict[
+        tuple[tuple[UUID, Position], ...], tuple[Exchange, ...]
+    ] = {}
     for size in range(1, max(parent.party_sizes, default=0) + 1):
         extended = set()
         for group in beam:
@@ -1340,6 +1347,8 @@ def choose(
         if size not in parent.party_sizes or size < len(targets):
             continue
         for group in beam:
+            if budget.exhausted():
+                break
             positions = {actor_id: cell for _, actor_id, _, cell in group}
             health = {key: by_id[key].hp for key in positions}
             if parent.fixed_ids and positions.keys() != parent.fixed_ids:
@@ -1356,20 +1365,29 @@ def choose(
             ):
                 budget.reject("no_complete_volley")
                 continue
-            projections = [
-                exchange(
-                    positions,
-                    health,
-                    targets,
-                    enemies,
-                    rocks,
-                    parent.fire_ticks,
-                    front={ranger.id: (ranger.position, ranger.hp) for ranger in front},
-                    first_on_front=expected,
-                    deadline=budget.deadline,
+            signature = tuple(sorted(positions.items()))
+            projections = projections_by_positions.get(signature)
+            if projections is None:
+                projections = tuple(
+                    exchange(
+                        positions,
+                        health,
+                        targets,
+                        enemies,
+                        rocks,
+                        parent.fire_ticks,
+                        front={
+                            ranger.id: (ranger.position, ranger.hp) for ranger in front
+                        },
+                        first_on_front=expected,
+                        deadline=budget.deadline,
+                    )
+                    for expected in (True, False)
                 )
-                for expected in (True, False)
-            ]
+                if not any(
+                    result.reason == "search_budget_exhausted" for result in projections
+                ):
+                    projections_by_positions[signature] = projections
             if not all(result.viable for result in projections):
                 budget.reject(projections[-1].reason or "exchange_unfavorable")
                 continue

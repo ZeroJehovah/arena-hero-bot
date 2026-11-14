@@ -32,7 +32,7 @@ from arena_hero import (
 )
 
 from . import counterattack as counter
-from . import flank, skirmish
+from . import defense_layout, flank, skirmish
 from .combat_policy import (
     CombatPolicy,
     CombatTargetLedger,
@@ -529,6 +529,7 @@ class _TurnContext:
     worker_patrol_owners: dict[Position, UUID] = field(default_factory=dict)
     worker_patrol_inner_view: frozenset[Position] | None = None
     defensive_assignments: dict[UUID, Position] | None = None
+    stationary_defense_radius: int | None = None
     remaining_resources: int = 0
     remaining_resource_space: int = 0
     beacon_claimed: bool = False
@@ -8164,6 +8165,22 @@ class AggressiveStrategy:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
+        if (
+            isinstance(unit, Ranger)
+            and context.stationary_defense_radius is not None
+            and context.turn.core is not None
+            and reason == "hold a defensive perimeter around the resource Core"
+        ):
+            avoid_recent = False
+            require_path = True
+            blocked = overlay_blockers(
+                blocked,
+                self._stationary_defense_step_blockers(unit, context),
+                _OutsidePatrolArea(
+                    _single_chunk_resource_block(context.turn.core.position),
+                    unit.position,
+                ),
+            )
         if context.defensive_firing_lanes:
             blocked = overlay_blockers(blocked, context.defensive_firing_lanes)
         core_resource_clearance = (
@@ -15042,6 +15059,10 @@ class AggressiveStrategy:
         self._reset_core_migration_progress()
         self.memory.defense_posts.clear()
         self.memory.defense_anchor = None
+        self.memory.defense_spread_version = 0
+        self.memory.defense_coverage_radius = 0
+        self.memory.defense_visible_radius = 0
+        self.memory.defense_established_radius = 0
         self.memory.worker_sectors.clear()
         self.memory.worker_sector_layout_version = 0
         self.memory.worker_seen_ticks.clear()
@@ -15192,6 +15213,10 @@ class AggressiveStrategy:
                 self.memory.defense_posts.clear()
                 self.memory.defense_anchor = None
                 self._defensive_layout = None
+            self.memory.defense_spread_version = 0
+            self.memory.defense_coverage_radius = 0
+            self.memory.defense_visible_radius = 0
+            self.memory.defense_established_radius = 0
             return {}
         core_position = core.position
         guards = tuple(
@@ -15216,8 +15241,33 @@ class AggressiveStrategy:
             if self._symmetric_posture():
                 self.memory.defense_posts.clear()
                 self.memory.defense_anchor = core_position
+            self.memory.defense_spread_version = 0
+            self.memory.defense_coverage_radius = 0
+            self.memory.defense_visible_radius = 0
+            self.memory.defense_established_radius = 0
             return {}
         ordered_guard_ids = tuple(unit.id for unit in guards)
+
+        if (
+            self.config.campaign_mode
+            and core.view.state is CoreState.NORMAL
+            and self.memory.core_home_position in {None, core_position}
+            and self.memory.campaign_scout_target is None
+            and not self.memory.defense_compressed
+            and (
+                self.memory.defense_spread_version == defense_layout.LAYOUT_VERSION
+                or not any(
+                    manhattan(core_position, enemy.position)
+                    <= defense_layout.MAX_RADIUS + RANGER_VISION_RADIUS
+                    for enemy in self._ranger_threats(context.turn)
+                )
+            )
+        ):
+            return self._stationary_defense_assignments(guards, context)
+        self.memory.defense_spread_version = 0
+        self.memory.defense_coverage_radius = 0
+        self.memory.defense_visible_radius = 0
+        self.memory.defense_established_radius = 0
 
         if self._symmetric_posture():
             # Posts belong to persistent UUIDs, not to each Tick's sorted
@@ -15524,6 +15574,135 @@ class AggressiveStrategy:
         else:
             self._defensive_layout = None
         return dict(best)
+
+    def _stationary_defense_assignments(
+        self,
+        guards: tuple[Ranger | Vanguard, ...],
+        context: _TurnContext,
+    ) -> dict[UUID, Position]:
+        """Spread the actual stationary roster while retaining complete vision."""
+
+        core = context.turn.core
+        if core is None:
+            return {}
+        center = core.position
+        rocks = self._rock_map(context.turn)
+        block = _single_chunk_resource_block(center)
+        previous = {
+            str(guard.id): post
+            for guard in guards
+            if (post := self.memory.defense_posts.get(str(guard.id))) is not None
+        }
+        retained = (
+            tuple(previous.values())
+            if self.memory.defense_anchor == center
+            and self.memory.defense_spread_version == defense_layout.LAYOUT_VERSION
+            else ()
+        )
+        radius = self.memory.defense_coverage_radius
+        established = (
+            self.memory.defense_established_radius
+            if retained
+            else CAMPAIGN_DEFENSE_RADIUS
+        )
+        if not (
+            len(retained) == len(guards)
+            and len(set(retained)) == len(retained)
+            and radius > 0
+            and all(p not in rocks and block.contains(p) for p in retained)
+            and defense_layout.covered_radius(
+                center,
+                tuple((p, RANGER_VISION_RADIUS) for p in retained),
+                rocks,
+                radius,
+            )
+            == radius
+        ):
+            local_rocks = tuple(
+                sorted(
+                    (center[0] + dx, center[1] + dy)
+                    for dx in range(-32, 33)
+                    for dy in range(-32, 33)
+                    if (center[0] + dx, center[1] + dy) in rocks
+                )
+            )
+            posts, radius = defense_layout.plan_posts(
+                center,
+                len(guards),
+                local_rocks,
+                (block.min_x, block.max_x, block.min_y, block.max_y),
+                retained,
+            )
+        else:
+            posts = retained
+        assignments = _assign_fixed_defense_posts(guards, posts, previous)
+        self.memory.defense_posts = {
+            str(uid): post for uid, post in assignments.items()
+        }
+        self.memory.defense_anchor = center
+        self.memory.defense_spread_version = defense_layout.LAYOUT_VERSION
+        self.memory.defense_coverage_radius = radius
+        # A planned arrival is not current vision. Report the actual guard/Core
+        # disk separately, without relying on passing Workers or patrols.
+        self.memory.defense_visible_radius = defense_layout.covered_radius(
+            center,
+            tuple((guard.position, _combat_vision_radius(guard)) for guard in guards),
+            rocks,
+            radius,
+        )
+        if assignments and all(assignments.get(g.id) == g.position for g in guards):
+            established = radius
+        self.memory.defense_established_radius = min(
+            established, self.memory.defense_visible_radius, radius
+        )
+        context.stationary_defense_radius = self.memory.defense_established_radius
+        self._defensive_layout = _DefensiveLayout(
+            core_id=core.id,
+            core_position=center,
+            guard_ids=tuple(guard.id for guard in guards),
+            radius=radius,
+            assignments=assignments,
+        )
+        return assignments
+
+    def _stationary_defense_step_blockers(
+        self, ranger: Ranger, context: _TurnContext
+    ) -> set[Position]:
+        """Do not open a new interior blind cell merely to spread an idle guard."""
+
+        core = context.turn.core
+        radius = context.stationary_defense_radius
+        if core is None or radius is None:
+            return set()
+        rocks = self._rock_map(context.turn)
+        remaining = (
+            {
+                (core.position[0] + dx, core.position[1] + dy)
+                for dx, dy in _manhattan_disk_offsets(radius)
+            }
+            - rocks
+            - set(visible_cells(core.position, RANGER_VISION_RADIUS, rocks))
+        )
+        for ally in context.turn.rangers:
+            if ally.id == ranger.id or str(ally.id) not in self.memory.defense_posts:
+                continue
+            action = context.turn.plan.unit_actions.get(ally.id)
+            position = (
+                add(ally.position, action.direction)
+                if action is not None and action.type == "MOVE"
+                else ally.position
+            )
+            remaining.difference_update(
+                visible_cells(position, RANGER_VISION_RADIUS, rocks)
+            )
+        protected = remaining & visible_cells(
+            ranger.position, RANGER_VISION_RADIUS, rocks
+        )
+        return {
+            cell
+            for cell in adjacent_positions(ranger.position)
+            if not protected <= visible_cells(cell, RANGER_VISION_RADIUS, rocks)
+        }
 
     def _combat_patrol_goal(
         self,
@@ -19131,6 +19310,7 @@ class AggressiveStrategy:
             if (goal := self.memory.goal_for(str(other.id))) is not None
             and _is_worker_patrol_goal(goal)
             and area.contains(goal.position)
+            and goal.position not in obstacles
         ]
         claimed_positions = {goal.position for _other, goal in patrol_goals}
         other_positions = {

@@ -309,6 +309,12 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             unit_id: list(position)
             for unit_id, position in sorted(memory.defense_posts.items())
         },
+        "defense_coverage": {
+            "version": memory.defense_spread_version,
+            "planned_radius": memory.defense_coverage_radius,
+            "visible_radius": memory.defense_visible_radius,
+            "established_radius": memory.defense_established_radius,
+        },
         "counterattack": memory.counterattack.to_dict(),
         "skirmish": memory.skirmish.to_dict() if memory.skirmish else None,
         "skirmish_cooldown_until": memory.skirmish_cooldown_until,
