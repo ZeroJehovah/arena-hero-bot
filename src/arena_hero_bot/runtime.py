@@ -106,7 +106,9 @@ def run_bot(
                     migration_request_signature = request_signature
                     if request_signature is not None:
                         try:
-                            request = load_migration_request(migration_request_path)
+                            request = load_migration_request(
+                                migration_request_path, memory=memory
+                            )
                             if request is not None:
                                 request_id = sha256(
                                     json.dumps(asdict(request), sort_keys=True).encode()

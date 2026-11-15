@@ -373,7 +373,9 @@ def test_campaign_replaces_a_rock_sealed_block_center() -> None:
     origin = (-1074, -17)
     sealed_center = (-1072, -17)
     core_object = core(9, position=origin)
-    workers, rangers, roles = _roster(center=origin)
+    # The reachable current-block center is the Core's actual cell. Complete
+    # gathering there permits the next ordinary hop after terrain repair.
+    workers, rangers, roles = _gathered_roster(30, center=origin)
     memory = WorldMemory(
         core_home_position=sealed_center,
         core_layout_version=CORE_LAYOUT_VERSION,
@@ -584,7 +586,9 @@ def test_new_core_keeps_its_own_chunk_when_every_center_is_temporarily_busy() ->
 
 
 @pytest.mark.parametrize("layout_version", [0, CORE_LAYOUT_VERSION])
-def test_new_core_releases_migration_when_all_spawn_centers_are_sealed(layout_version):
+def test_new_core_rebuilds_spawn_center_and_releases_old_migration_state(
+    layout_version,
+):
     origin = (-1740, -1900)
     centers = {(-1745, -1905), (-1744, -1905), (-1745, -1904), (-1744, -1904)}
     rocks = {
@@ -605,12 +609,20 @@ def test_new_core_releases_migration_when_all_spawn_centers_are_sealed(layout_ve
 
     _strategy(memory).decide(turn)
 
-    assert memory.core_home_position is None
+    assert memory.core_home_position in {
+        (-1746, -1906),
+        (-1746, -1903),
+        (-1743, -1906),
+        (-1743, -1903),
+    }
     assert memory.core_layout_version == CORE_LAYOUT_VERSION
     assert memory.core_migration_start_position is None
-    assert memory.core_arrival_destination is None
     assert memory.core_arrival_worker_id is None
-    assert turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+    assert memory.core_arrival_destination == add(
+        origin, turn.plan.core_action.direction
+    )
 
 
 def test_core_respawn_event_resets_even_with_replayed_uuid() -> None:
@@ -2203,9 +2215,11 @@ def test_campaign_scout_prioritizes_unseen_gaps_over_aging_covered_cells(age):
 
 
 @pytest.mark.parametrize("phase", [CAMPAIGN_PHASE_STAGE3, CAMPAIGN_PHASE_STAGE4])
-def test_campaign_rock_repair_cannot_sidestep_or_skip_forward_scout(phase):
-    origin = (-818, 16)
-    sealed_centers = [(-817, 15), (-817, 16), (-816, 15), (-816, 16)]
+def test_campaign_rock_repair_keeps_the_nearest_center_without_skipping_scout(phase):
+    origin = (-819, 16)
+    # The next two central rings are rock, but the Core's own cell is still
+    # a closest reachable center in this block. Terrain cannot authorize a hop.
+    sealed_centers = [(x, y) for x in range(-818, -814) for y in range(14, 18)]
     workers, rangers, roles = _roster()
     if phase == CAMPAIGN_PHASE_STAGE3:
         rangers = rangers[:20]
@@ -2227,9 +2241,10 @@ def test_campaign_rock_repair_cannot_sidestep_or_skip_forward_scout(phase):
 
     replacement = strategy._repair_unreachable_home_target(turn, origin)
 
-    assert replacement is None
-    assert memory.core_home_position is None
-    assert memory.core_migration_start_position is None
+    assert replacement == origin
+    assert memory.core_home_position == origin
+    assert memory.core_migration_start_position == origin
+    assert memory.campaign_scout_target is None
 
 
 @pytest.mark.parametrize("blocked_anchor", [False, True])
@@ -3057,10 +3072,8 @@ def test_sealed_block_without_combat_units_migrates_away_from_the_danger() -> No
     assert turn.plan.core_action.type == "START_MOVE"
 
 
-@pytest.mark.parametrize("all_centers_sealed", [False, True])
-def test_emergency_migration_repairs_its_own_target_or_releases_it(
-    tmp_path, all_centers_sealed
-):
+@pytest.mark.parametrize("terrain", ["single-rock", "sealed-centers", "sealed-block"])
+def test_emergency_migration_repairs_its_own_target_or_releases_it(tmp_path, terrain):
     core_object = core(position=CLEARANCE_HOME)
     workers = _clearance_workers(16)
     enemies = _sealed_fighters(1)
@@ -3080,16 +3093,18 @@ def test_emergency_migration_repairs_its_own_target_or_releases_it(
     centers = {
         (block[0] * 32 + x, block[1] * 32 + y) for x in (15, 16) for y in (15, 16)
     }
-    rocks = (
-        {
+    if terrain == "sealed-block":
+        rocks = {
+            (block[0] * 32 + x, block[1] * 32 + y) for x in range(32) for y in range(32)
+        }
+    elif terrain == "sealed-centers":
+        rocks = {
             (x + dx, y + dy)
             for x, y in centers
             for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
-        }
-        - centers
-        if all_centers_sealed
-        else {target}
-    )
+        } - centers
+    else:
+        rocks = {target}
     # The old escape remains committed even after the fighters are destroyed;
     # only new permanent terrain can require replacement or cancellation.
     changed = make_turn(
@@ -3108,7 +3123,7 @@ def test_emergency_migration_repairs_its_own_target_or_releases_it(
     )
     strategy.decide(changed)
 
-    if all_centers_sealed:
+    if terrain == "sealed-block":
         assert memory.campaign_emergency_target is None
         assert memory.campaign_emergency_started_tick == 0
         assert memory.core_home_position is None
@@ -3118,6 +3133,8 @@ def test_emergency_migration_repairs_its_own_target_or_releases_it(
         assert replacement is not None and replacement != target
         assert replacement == memory.core_home_position
         assert resource_block_index(replacement) == block
+        if terrain == "sealed-centers":
+            assert replacement not in centers
         assert memory.campaign_emergency_started_tick == 100
         assert memory.core_migration_start_position == CLEARANCE_HOME
         assert (
@@ -3137,7 +3154,7 @@ def test_emergency_migration_repairs_its_own_target_or_releases_it(
         make_turn(tick=105, objects=[core_object, *workers], obstacles=rocks)
     )
     assert resumed.memory.campaign_emergency_target == memory.campaign_emergency_target
-    if not all_centers_sealed:
+    if terrain != "sealed-block":
         assert resumed.memory.core_home_position == memory.core_home_position
 
 

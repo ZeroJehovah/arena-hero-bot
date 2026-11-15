@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="request the cleanest nearby block at the next quota tier",
     )
     next_tier.add_argument("--note", default="next natural-resource tier")
-    request = commands.add_parser("request", help="request an explicit center cell")
+    request = commands.add_parser("request", help="request a reachable block center")
     request.add_argument("x", type=int)
     request.add_argument("y", type=int)
     request.add_argument("--note", default="operator migration request")
@@ -83,7 +83,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
         plan = None
     else:
-        request = load_migration_request(request_path)
+        request = load_migration_request(request_path, memory=memory)
         progress = memory.core_migration_last_position or memory.core_home_position
         destination = (
             request.target if request is not None else memory.core_home_position
@@ -125,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     block = resource_block_index(target)
-    request = write_migration_request(request_path, target, note=note)
+    request = write_migration_request(request_path, target, note=note, memory=memory)
     result: dict[str, object] = {
         "request_file": str(request_path),
         "target": list(request.target),

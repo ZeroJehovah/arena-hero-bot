@@ -166,7 +166,12 @@ and destination blocks, while resource service and combat retain their own rules
 The bot can relocate the Core between resource chunks without stopping the
 local economy. Long campaigns publish one current-or-cardinal-neighbor chunk
 center at a time; after reaching that roughly 32-cell hop they publish the next
-one. The Core moves for four Ticks; an arrival service Tick may spawn a unit,
+one. A chunk center is the reachable cell, or tied cells, closest in Euclidean
+distance to its physical midpoint. Permanent rocks can move the center away
+from the usual four central cells; the search considers the entire chunk and
+excludes sealed pockets. Terrain and the actual Core position are rechecked
+each Turn, while resources and friendly traffic retain their service rules.
+The Core moves for four Ticks; an arrival service Tick may spawn a unit,
 heal before depositing, or accept a delivery, keeping the hop to five Ticks. A
 new hop, including its forward scout, waits until every live Worker and Ranger
 is in the Core's current 32x32 block and affordable formation slots are built.
@@ -211,8 +216,8 @@ uv run arena-core-migration --data-dir var request-next-tier
 
 An explicit chunk-center cell can be supplied with `request X Y`; it must stay
 in the current chunk or a cardinal-neighbor chunk. `status` shows the persisted
-home and pending request. Requests are validated against chunk-center geometry
-and remembered obstacles before the running bot picks them up on its next Turn.
+home and pending request. The CLI and runtime validate the center using the
+remembered terrain and Core position before applying the request on the next Turn.
 `CORE_RESPAWNED`, Core UUID changes, non-cardinal position jumps, and per-Turn
 block adjacency checks prevent a new Core from inheriting an old destination.
 

@@ -19,7 +19,7 @@ from .strategy import (
     SYMMETRIC_RANGER_OFFSETS,
     SYMMETRIC_RESOURCE_BLOCK_SIZE,
     SYMMETRIC_VANGUARD_OFFSETS,
-    _resource_block_center_cells,
+    _resource_block_home_cells,
 )
 
 MIGRATION_REQUEST_VERSION = 1
@@ -272,11 +272,13 @@ def plan_resource_cap(
             if ring >= current_ring:
                 continue
             block_rocks = sum(cell in memory.obstacles for cell in _block_cells(block))
-            for target in _resource_block_center_cells(
+            for target in _resource_block_home_cells(
                 (
                     block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
                     block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
-                )
+                ),
+                origin=origin,
+                obstacles=memory.obstacles,
             ):
                 if target in memory.obstacles:
                     continue
@@ -370,11 +372,13 @@ def _plan_adjacent_block(
         if ring >= current_ring:
             continue
         block_rocks = sum(cell in memory.obstacles for cell in _block_cells(block))
-        for target in _resource_block_center_cells(
+        for target in _resource_block_home_cells(
             (
                 block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
                 block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
-            )
+            ),
+            origin=origin,
+            obstacles=memory.obstacles,
         ):
             if target in memory.obstacles:
                 continue
@@ -447,7 +451,9 @@ def _plan_adjacent_block(
     )
 
 
-def load_migration_request(path: Path) -> MigrationRequest | None:
+def load_migration_request(
+    path: Path, *, memory: WorldMemory | None = None
+) -> MigrationRequest | None:
     """Load and validate an optional hot migration request."""
 
     if not path.exists():
@@ -462,8 +468,7 @@ def load_migration_request(path: Path) -> MigrationRequest | None:
     if not isinstance(target_raw, list) or len(target_raw) != 2:
         raise ValueError("migration request target must contain [x, y]")
     target = int(target_raw[0]), int(target_raw[1])
-    if target not in _resource_block_center_cells(target):
-        raise ValueError("migration target must be one of a chunk's center cells")
+    _validate_migration_center(target, memory)
     return MigrationRequest(
         target=target,
         requested_at=str(raw.get("requested_at", "")),
@@ -477,11 +482,11 @@ def write_migration_request(
     target: Position,
     *,
     note: str = "",
+    memory: WorldMemory | None = None,
 ) -> MigrationRequest:
     """Atomically publish a validated migration request."""
 
-    if target not in _resource_block_center_cells(target):
-        raise ValueError("migration target must be one of a chunk's center cells")
+    _validate_migration_center(target, memory)
     request = MigrationRequest(
         target=target,
         requested_at=datetime.now(UTC).isoformat(),
@@ -511,3 +516,19 @@ def write_migration_request(
         Path(temporary).unlink(missing_ok=True)
         raise
     return request
+
+
+def _validate_migration_center(target: Position, memory: WorldMemory | None) -> None:
+    origin = (
+        memory.core_migration_last_position or memory.core_home_position
+        if memory is not None
+        else None
+    )
+    if target not in _resource_block_home_cells(
+        target,
+        origin=origin,
+        obstacles=memory.obstacles if memory is not None else None,
+    ):
+        raise ValueError(
+            "migration target must be one of its chunk's reachable center cells"
+        )

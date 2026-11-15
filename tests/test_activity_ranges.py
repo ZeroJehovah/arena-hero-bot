@@ -131,7 +131,7 @@ def test_displaced_idle_worker_replaces_its_old_goal_and_returns(tmp_path, resta
     assert following[0] > turn.workers[0].position[0]
 
 
-def test_cancelled_home_with_sealed_centers_does_not_restore_global_worker_search():
+def test_terrain_adjusted_home_does_not_restore_global_worker_search():
     memory = WorldMemory(
         campaign_last_core_id=object_id(1),
         campaign_phase=1,
@@ -142,7 +142,16 @@ def test_cancelled_home_with_sealed_centers_does_not_restore_global_worker_searc
     )
     strategy_for(memory, campaign=True).decide(turn)
 
-    assert memory.core_home_position is None
+    assert memory.core_home_position in {
+        (14, 15),
+        (14, 16),
+        (17, 15),
+        (17, 16),
+        (15, 14),
+        (16, 14),
+        (15, 17),
+        (16, 17),
+    }
     goal = memory.goal_for(object_id(2))
     assert goal is not None and goal.purpose == WORKER_PATROL_PURPOSE
     assert 0 <= goal.position[0] <= 15 and 0 <= goal.position[1] <= 15

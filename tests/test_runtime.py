@@ -332,9 +332,22 @@ def test_run_bot_persists_memory_and_turn_telemetry(tmp_path, monkeypatch) -> No
     assert "test-key" not in _written_telemetry(tmp_path).read_text()
 
 
-def test_run_bot_applies_hot_core_migration_request(tmp_path, monkeypatch) -> None:
-    turn = make_turn(objects=[core(), unit(2, "WORKER", position=(1, 0))])
-    write_migration_request(tmp_path / "core-migration.json", (16, 16))
+@pytest.mark.parametrize(
+    "target,obstacles",
+    [
+        ((16, 16), set()),
+        ((14, 15), {(15, 15), (16, 15), (15, 16), (16, 16)}),
+    ],
+)
+def test_run_bot_applies_hot_core_migration_request(
+    tmp_path, monkeypatch, target, obstacles
+) -> None:
+    turn = make_turn(
+        objects=[core(), unit(2, "WORKER", position=(1, 0))], obstacles=obstacles
+    )
+    memory = WorldMemory(obstacles=obstacles)
+    memory.save(tmp_path / "memory.json")
+    write_migration_request(tmp_path / "core-migration.json", target, memory=memory)
 
     class FakeClient:
         def __init__(self, **_kwargs) -> None:
@@ -359,7 +372,7 @@ def test_run_bot_applies_hot_core_migration_request(tmp_path, monkeypatch) -> No
         )
     )
 
-    assert WorldMemory.load(tmp_path / "memory.json").core_home_position == (16, 16)
+    assert WorldMemory.load(tmp_path / "memory.json").core_home_position == target
 
 
 def test_run_bot_skips_replayed_tick_after_restart(tmp_path, monkeypatch) -> None:

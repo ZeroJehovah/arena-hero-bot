@@ -13931,10 +13931,10 @@ class AggressiveStrategy:
         resources: set[Position],
         occupied: set[Position],
     ) -> Position | None:
-        """Return a reachable center in ``position``'s block, never an old home."""
+        """Return the nearest reachable center of ``position``'s block."""
 
         centers = sorted(
-            _resource_block_center_cells(position),
+            _resource_block_home_cells(position, origin=position, obstacles=obstacles),
             key=lambda cell: (
                 cell in obstacles,
                 cell in resources,
@@ -14073,11 +14073,13 @@ class AggressiveStrategy:
                     manhattan(origin, cell),
                     cell,
                 )
-                for cell in _resource_block_center_cells(
+                for cell in _resource_block_home_cells(
                     (
                         block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
                         block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
-                    )
+                    ),
+                    origin=origin,
+                    obstacles=obstacles,
                 )
             )
         return next(
@@ -14154,15 +14156,14 @@ class AggressiveStrategy:
                 # map.
                 current_block = resource_block_index(core.position)
                 home_block = resource_block_index(home)
-                if home in _resource_block_center_cells(home) and (
-                    current_block == home_block
-                    or (
-                        blocks_are_cardinally_adjacent(current_block, home_block)
-                        and resource_block_quota(home_block)
-                        <= resource_block_quota(current_block)
-                    )
+                if current_block == home_block or (
+                    blocks_are_cardinally_adjacent(current_block, home_block)
+                    and resource_block_quota(home_block)
+                    <= resource_block_quota(current_block)
                 ):
-                    if not self._has_core_static_route(
+                    if home not in _resource_block_home_cells(
+                        home, origin=core.position, obstacles=self._rock_map(turn)
+                    ) or not self._has_core_static_route(
                         core.position, home, self._rock_map(turn)
                     ):
                         self._repair_unreachable_home_target(turn, core.position)
@@ -14176,15 +14177,14 @@ class AggressiveStrategy:
             movement_cap = self._campaign_movement_cap(turn)
             current_quota = resource_block_quota(current_block)
             adjacent_allowed = self._campaign_cross_block_allowed(turn, home_block)
-            # A campaign rest only exists on a block center.  Older snapshots
-            # could persist any clear cell as the destination, so a target
-            # that is not one of its block's four center cells is rebuilt
-            # instead of being treated as a legal stopping point.
+            # The center is the closest reachable ground to the block's
+            # physical midpoint. Revalidate it against newly discovered rocks,
+            # including after arrival or restart.
             valid = (
                 same_block
                 if movement_cap is None or current_quota > movement_cap
                 else (same_block or (adjacent_block and adjacent_allowed))
-            ) and home in _resource_block_center_cells(home)
+            )
             block_changed = (
                 jumped
                 and previous is not None
@@ -14193,7 +14193,9 @@ class AggressiveStrategy:
             if valid and not block_changed:
                 # A partial A* route can still point toward a distant sealed
                 # center. Validate before combat/service can skip movement.
-                if not self._has_core_static_route(
+                if home not in _resource_block_home_cells(
+                    home, origin=core.position, obstacles=self._rock_map(turn)
+                ) or not self._has_core_static_route(
                     core.position, home, self._rock_map(turn)
                 ):
                     self._repair_unreachable_home_target(turn, core.position)
@@ -14346,11 +14348,13 @@ class AggressiveStrategy:
         for block in cardinal_block_neighbors(current_block):
             if resource_block_quota(block) > current_quota:
                 continue
-            for cell in _resource_block_center_cells(
+            for cell in _resource_block_home_cells(
                 (
                     block[0] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
                     block[1] * SYMMETRIC_RESOURCE_BLOCK_SIZE,
-                )
+                ),
+                origin=origin,
+                obstacles=obstacles,
             ):
                 distance = manhattan(cell, danger)
                 if distance <= current_distance:
@@ -14521,6 +14525,30 @@ class AggressiveStrategy:
             # the durable campaign phase does not grant movement permission.
             self._clear_campaign_scout()
             return
+        core = turn.core
+        if core is None:
+            return
+        centers = _resource_block_home_cells(
+            target, origin=core.position, obstacles=self._rock_map(turn)
+        )
+        if target not in centers:
+            if not centers:
+                self._clear_campaign_scout()
+                return
+            resources = set(turn.resource_cells) | set(self.memory.resource_cells)
+            occupied = {unit.position for unit in turn.units}
+            target = min(
+                centers,
+                key=lambda cell: (
+                    cell in resources,
+                    cell in occupied,
+                    manhattan(core.position, cell),
+                    cell,
+                ),
+            )
+            # The block and scout budget are unchanged. New rocks only repair
+            # the eventual stop; retain the coverage already earned here.
+            self.memory.campaign_scout_target = target
         if self.memory.defense_compressed:
             return
         if (
@@ -14690,8 +14718,11 @@ class AggressiveStrategy:
         )
         old_home = self.memory.core_home_position
         if (
-            old_home in _resource_block_center_cells(core.position)
-            and old_home is not None
+            old_home is not None
+            and old_home
+            in _resource_block_home_cells(
+                core.position, origin=core.position, obstacles=self._rock_map(turn)
+            )
             and self._has_core_static_route(
                 core.position, old_home, self._rock_map(turn)
             )
@@ -15016,11 +15047,8 @@ class AggressiveStrategy:
         min_y = chunk_y * size
         vanguards, rangers = self._symmetric_defense_layout_offsets()
         offsets = (*vanguards, *rangers)
-        center_cells = (
-            (min_x + size // 2 - 1, min_y + size // 2 - 1),
-            (min_x + size // 2, min_y + size // 2 - 1),
-            (min_x + size // 2 - 1, min_y + size // 2),
-            (min_x + size // 2, min_y + size // 2),
+        center_cells = _resource_block_home_cells(
+            (min_x, min_y), origin=core_position, obstacles=obstacles
         )
         radius = SYMMETRIC_HOME_CLEAR_RADIUS
         candidates: list[tuple[int, int, int, Position]] = []
@@ -15079,19 +15107,23 @@ class AggressiveStrategy:
         self._patrol_ring_phase_tick = -1
 
     def request_core_migration(self, target: Position) -> bool:
-        """Persist a new chunk-center migration requested by the operator."""
+        """Persist an operator request to a reachable chunk center."""
 
         from .migration import blocks_are_cardinally_adjacent, resource_block_index
 
         if target == self.memory.core_home_position:
             return False
-        if target not in _resource_block_center_cells(target):
-            raise ValueError("migration target must be one of a chunk's center cells")
         if target in self.memory.obstacles:
             raise ValueError("migration target is a remembered obstacle")
         source = (
             self.memory.core_migration_last_position or self.memory.core_home_position
         )
+        if target not in _resource_block_home_cells(
+            target, origin=source, obstacles=self.memory.obstacles
+        ):
+            raise ValueError(
+                "migration target must be one of its chunk's reachable center cells"
+            )
         if source is not None:
             source_block = resource_block_index(source)
             target_block = resource_block_index(target)
@@ -16563,8 +16595,8 @@ class AggressiveStrategy:
             return None
         core = turn.core
         if core is not None and core.position == self.memory.core_home_position:
-            # The four legal center cells already center the stationary 32x32
-            # chunk to within half a cell. Keep its existing boundary coverage.
+            # A reached terrain-adjusted center serves the whole block;
+            # its offset must not trim stationary boundary coverage.
             return _single_chunk_resource_block(core.position)
         area = _ResourceBlock(
             0,
@@ -20294,6 +20326,75 @@ def _resource_block_center_cells(position: Position) -> tuple[Position, ...]:
         (min_x + half - 1, min_y + half),
         (min_x + half, min_y + half),
     )
+
+
+def _resource_block_home_cells(
+    position: Position,
+    *,
+    origin: Position | None = None,
+    obstacles: Container[Position] | None = None,
+) -> tuple[Position, ...]:
+    """Return the reachable cells closest to this block's physical midpoint.
+
+    Only permanent rocks affect the center. Resources and friendly traffic
+    remain temporary route/service constraints. Search the whole 32x32 block,
+    grouping its free ground into connected components: an interior component
+    is unreachable unless it contains the Core, while components with boundary
+    exits use the existing bounded terrain route check. This avoids repeating a
+    full failed path search for every cell of a sealed central pocket.
+    """
+
+    if obstacles is None or not obstacles:
+        return _resource_block_center_cells(position)
+    origin = position if origin is None else origin
+    size = SYMMETRIC_RESOURCE_BLOCK_SIZE
+    min_x, min_y = (coordinate // size * size for coordinate in position)
+    max_x, max_y = min_x + size - 1, min_y + size - 1
+    center_x, center_y = min_x + max_x, min_y + max_y
+    remaining = {
+        (x, y)
+        for y in range(min_y, max_y + 1)
+        for x in range(min_x, max_x + 1)
+        if (x, y) not in obstacles
+    }
+    components: list[tuple[int, tuple[Position, ...], bool]] = []
+    while remaining:
+        frontier = [remaining.pop()]
+        contains_origin = False
+        boundary_exit = False
+        closest: list[Position] = []
+        distance: int | None = None
+        while frontier:
+            cell = frontier.pop()
+            contains_origin |= cell == origin
+            boundary_exit |= cell[0] in (min_x, max_x) or cell[1] in (min_y, max_y)
+            squared_distance = (2 * cell[0] - center_x) ** 2 + (
+                2 * cell[1] - center_y
+            ) ** 2
+            if distance is None or squared_distance < distance:
+                distance = squared_distance
+                closest = [cell]
+            elif squared_distance == distance:
+                closest.append(cell)
+            for neighbor in adjacent_positions(cell):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    frontier.append(neighbor)
+        if distance is not None and (contains_origin or boundary_exit):
+            components.append((distance, tuple(sorted(closest)), contains_origin))
+
+    centers: list[Position] = []
+    best_distance: int | None = None
+    for distance, cells, contains_origin in sorted(components):
+        if best_distance is not None and distance > best_distance:
+            break
+        if contains_origin or any(
+            next_step(origin, cell, blocked=obstacles, require_path=True) is not None
+            for cell in cells
+        ):
+            best_distance = distance
+            centers.extend(cells)
+    return tuple(sorted(centers, key=lambda cell: (cell[1], cell[0])))
 
 
 def _single_chunk_patrol_sectors(home: Position) -> tuple[_ResourceBlock, ...]:
