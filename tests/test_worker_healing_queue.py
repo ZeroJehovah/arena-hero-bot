@@ -14,6 +14,8 @@ from arena_hero_bot.strategy import (
 from .factories import core, make_turn, object_id, unit
 from .test_core_traffic import settled_positions
 from .test_layered_defense import Encounter
+from .test_layered_defense import _strategy as layered_strategy
+from .test_migration_cargo import migration_context, moving_core
 from .test_shared_movement import context_for
 
 
@@ -146,3 +148,90 @@ def test_wounded_loaded_worker_delivers_before_waiting_for_healing():
             break
     assert encounter.deposits == encounter.heals == 1
     assert encounter.friends[object_id(2)]["hp"] == 2
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_paused_migration_heals_workers_without_leaving_defense(tmp_path, restart):
+    guards = [
+        unit(4, "RANGER", position=(-2, -3)),
+        unit(5, "RANGER", position=(-1, -4)),
+        unit(6, "RANGER", position=(1, -4)),
+        unit(7, "RANGER", position=(2, -3)),
+    ]
+    strategy = layered_strategy(
+        {
+            guard["id"]: "defense" if i < 2 else "patrol-1"
+            for i, guard in enumerate(guards)
+        }
+    )
+    strategy.memory.core_home_position = (16, 0)
+    strategy.memory.core_layout_version = CORE_LAYOUT_VERSION
+    strategy.memory.campaign_last_core_id = object_id(1)
+    strategy.memory.campaign_phase = 4
+    encounter = Encounter(
+        [
+            unit(2, "WORKER", position=(-2, 0), hp=1),
+            unit(3, "WORKER", position=(2, 0), hp=1),
+            *guards,
+        ],
+        [unit(50, "VANGUARD", controlled=False, position=(0, -8))],
+        resources=2,
+    )
+    healed = set()
+    for offset in range(10):
+        turn = encounter.turn()
+        strategy.decide(turn)
+        assert turn.plan.core_action is not None
+        assert turn.plan.core_action.type == "WAIT"
+        if offset == 0:
+            positions = settled_positions(turn)
+            assert positions[UUID(int=2)] == (-1, 0)
+            assert positions[UUID(int=3)] == (1, 0)
+        healers = {
+            str(ident)
+            for ident, action in turn.plan.unit_actions.items()
+            if action.type == "HEAL"
+        }
+        assert len(healers) <= 1
+        healed.update(healers)
+        settled_positions(turn)
+        encounter.settle(turn.plan, {})
+        assert encounter.core["position"] == [0, 0]
+        assert (encounter.core["hp"], encounter.core["shield"]) == (5, 5)
+        if restart and offset == 1:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    assert healed == {object_id(2), object_id(3)}
+    assert encounter.heals == 2
+    assert encounter.resources == 0
+    assert encounter.losses == 0
+    for ident in healed:
+        assert encounter.friends[ident]["hp"] == 2
+        assert encounter.friends[ident]["position"] != encounter.core["position"]
+
+
+@pytest.mark.parametrize("barrier", ["funds", "build", "fire", "damage", "travel"])
+def test_paused_worker_healing_keeps_approach_safety_and_service_limits(barrier):
+    strategy = layered_strategy()
+    strategy.memory.core_home_position = (16, 0)
+    turn = make_turn(
+        resources=0 if barrier == "funds" else 1,
+        objects=[
+            moving_core() if barrier == "travel" else core(),
+            unit(2, "WORKER", position=(2, 0), hp=1),
+            *(
+                [unit(50, "RANGER", controlled=False, position=(1, -3))]
+                if barrier == "fire"
+                else []
+            ),
+        ],
+    )
+    strategy.memory.observe(turn)
+    if barrier == "damage":
+        strategy.memory.incoming_damage[(1, 0)] = (turn.tick, 1)
+    context = migration_context(turn) if barrier == "travel" else context_for(turn)
+    context.core_build_priority = barrier == "build"
+    strategy._prepare_migration_healing(context)
+    strategy._decide_worker(turn.workers[0], context)
+    assert settled_positions(turn)[UUID(int=2)] != (1, 0)

@@ -6028,7 +6028,7 @@ class AggressiveStrategy:
         return None
 
     def _prepare_migration_healing(self, context: _TurnContext) -> None:
-        """Let escorts reach arrival service or a paused Core's healing slot."""
+        """Let escorts reach arrival service and patients reach a paused Core."""
 
         core = context.turn.core
         arrival = context.core_migration_destination
@@ -6053,17 +6053,25 @@ class AggressiveStrategy:
             )
         ]
         context.core_migration_healing_ids = frozenset(r.id for r in patients)
+        if arrival is None:
+            # A defense hold has no arrival lane. Funded empty Workers need
+            # the same approach exemption as Rangers to reach the parked Core;
+            # actual entry still checks service ownership, safety and capacity.
+            context.core_migration_healing_ids |= frozenset(
+                worker.id
+                for worker in context.turn.workers
+                if worker.cargo == 0
+                and self._heal_available(worker, maximum_hp=2, context=context)
+            )
+            return
         if (
-            arrival is None
-            or context.core_build_priority
+            context.core_build_priority
             or not patients
             or any(
                 worker.position == arrival and worker.cargo > 0
                 for worker in context.turn.workers
             )
         ):
-            # A defense hold has no arrival lane, but funded patients must
-            # still pass the migration approach lock to reach the parked Core.
             # Occupied cargo slots keep their service while patients approach.
             return
         steps = (
