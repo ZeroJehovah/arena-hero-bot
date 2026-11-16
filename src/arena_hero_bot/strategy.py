@@ -8186,7 +8186,9 @@ class AggressiveStrategy:
                 layers.append(context.turn.obstacle_cells)
             blocked = overlay_blockers(*layers)
         if isinstance(unit, Worker):
-            threat_exclusion = self._worker_threat_exclusion_cells(context.turn)
+            threat_exclusion = self._worker_threat_exclusion_cells(
+                context.turn
+            ) | self._worker_lethal_cells(unit.hp)
             if threat_exclusion:
                 blocked = overlay_blockers(blocked, threat_exclusion)
         return blocked
@@ -8207,7 +8209,14 @@ class AggressiveStrategy:
         approaching a permanently sealed site without ever harvesting it.
         """
 
-        if goal in self.memory.obstacles or goal in context.turn.obstacle_cells:
+        if (
+            goal in self.memory.obstacles
+            or goal in context.turn.obstacle_cells
+            or (
+                isinstance(unit, Worker)
+                and self.memory.incoming_damage.get(goal, (-1, 0))[1] >= unit.hp
+            )
+        ):
             return False
         if unit.position == goal:
             return True
@@ -8276,6 +8285,14 @@ class AggressiveStrategy:
             blocked = self._static_blockers(unit, context)
             if context.enemy_positions:
                 blocked = overlay_blockers(blocked, context.enemy_positions)
+        if isinstance(unit, Worker):
+            # Shared Worker maps assume full health. A wounded Worker must
+            # also route around evidence that is fatal at its actual HP.
+            lethal_cells = self._worker_lethal_cells(unit.hp)
+            if goal in lethal_cells:
+                return False
+            if lethal_cells:
+                blocked = overlay_blockers(blocked, lethal_cells)
         if extra_blockers:
             blocked = overlay_blockers(blocked, extra_blockers)
         if (
@@ -8442,7 +8459,11 @@ class AggressiveStrategy:
             or destination in context.defensive_firing_lanes
             or (
                 isinstance(unit, Worker)
-                and destination in self.memory.contested_positions
+                and (
+                    destination in self.memory.contested_positions
+                    or self.memory.incoming_damage.get(destination, (-1, 0))[1]
+                    >= unit.hp
+                )
             )
         ):
             return False
@@ -17015,6 +17036,8 @@ class AggressiveStrategy:
     def _worker_resource_eligible(
         self, worker: Worker, resource: Position, turn: Turn
     ) -> bool:
+        if self.memory.incoming_damage.get(resource, (-1, 0))[1] >= worker.hp:
+            return False
         area = self._worker_activity_area(turn)
         if area is None or area.contains(resource):
             return True
@@ -17049,6 +17072,7 @@ class AggressiveStrategy:
             blockers = (
                 self._rock_map(turn)
                 | self._worker_threat_exclusion_cells(turn)
+                | self._worker_lethal_cells(worker.hp)
                 | {enemy.position for enemy in turn.visible_enemies}
             )
             blockers.discard(worker.position)
@@ -19739,6 +19763,7 @@ class AggressiveStrategy:
             and _is_worker_patrol_goal(goal)
             and area.contains(goal.position)
             and goal.position not in obstacles
+            and self.memory.incoming_damage.get(goal.position, (-1, 0))[1] < other.hp
         ]
         claimed_positions = {goal.position for _other, goal in patrol_goals}
         other_positions = {
@@ -19791,6 +19816,7 @@ class AggressiveStrategy:
             defense_cells,
             context.enemy_positions,
             self._worker_threat_exclusion_cells(turn),
+            self._worker_lethal_cells(worker.hp),
             self._unreachable_patrol_cells,
         )
 
@@ -19951,9 +19977,21 @@ class AggressiveStrategy:
         )
 
     def _worker_threat_exclusion_cells(self, turn: Turn) -> set[Position]:
-        """Return danger cells for Workers: hostile fighters only."""
+        """Exclude fighter danger disks and exact cells with fatal fire."""
 
-        return self._worker_combat_threat_exclusion_cells(turn)
+        return self._worker_combat_threat_exclusion_cells(
+            turn
+        ) | self._worker_lethal_cells(2)
+
+    def _worker_lethal_cells(self, hp: int) -> set[Position]:
+        # Memory expires these observations after its existing short TTL.
+        # Unknown shooters justify avoiding the proven cell, not inventing
+        # a hostile position and a six-cell warning disk around it.
+        return {
+            cell
+            for cell, (_tick, damage) in self.memory.incoming_damage.items()
+            if damage >= hp
+        }
 
     def _worker_combat_threat_positions(self, turn: Turn) -> tuple[Position, ...]:
         """Return recently remembered hostile combat Units."""

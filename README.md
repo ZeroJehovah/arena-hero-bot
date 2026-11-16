@@ -169,6 +169,10 @@ the boundary; rocks may require a detour through the edge strip. Workers and
 forward scouts approach the edge only to observe cells hidden from the interior.
 A unit already outside returns safely. Migration retains its authorized source
 and destination blocks, while resource service and combat retain their own rules.
+Workers also avoid cells where recent confirmed attack damage would kill them at
+their current health, including during mining, service and simultaneous traffic.
+This evidence expires after sixteen Ticks and blocks only the proven cell; nearby
+friendly cover does not erase it or turn it into a wider enemy danger zone.
 
 ## Long Core migration
 
