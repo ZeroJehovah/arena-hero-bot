@@ -1827,7 +1827,7 @@ def test_campaign_build_priority_preempts_beacon_at_the_center() -> None:
         tick=100,
         resources=unit_cost(UnitType.RANGER, 16 + len(rangers)),
         objects=[core_object, *_workers(16, center=center), *rangers],
-        beacon={"position": list(center)},
+        beacon={"position": list(center), "status": "GROUND"},
     )
 
     _strategy(memory).decide(turn)

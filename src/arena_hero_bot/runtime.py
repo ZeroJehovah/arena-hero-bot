@@ -356,6 +356,11 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
             "core_id": memory.campaign_last_core_id,
             "phase": memory.campaign_phase,
             "target_quota": memory.campaign_target_quota,
+            "beacon_target": (
+                list(memory.campaign_beacon_target)
+                if memory.campaign_beacon_target is not None
+                else None
+            ),
             "home_position": (
                 list(memory.core_home_position)
                 if memory.core_home_position is not None

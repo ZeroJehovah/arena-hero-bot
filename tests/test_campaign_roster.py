@@ -273,7 +273,11 @@ def test_sixty_rangers_scout_before_releasing_a_high_quota_hop(tmp_path, ring, r
         memory.save(path)
         memory = WorldMemory.load(path)
     strategy = _strategy(memory)
-    turn = make_turn(tick=100, objects=[core(position=center), *workers, *rangers])
+    turn = make_turn(
+        tick=100,
+        objects=[core(position=center), *workers, *rangers],
+        beacon={"position": [10000, 10000]},
+    )
 
     report = strategy.decide(turn)
 
@@ -295,7 +299,11 @@ def test_sixty_rangers_scout_before_releasing_a_high_quota_hop(tmp_path, ring, r
         memory.save(path)
         memory = WorldMemory.load(path)
         strategy = _strategy(memory)
-    ready = make_turn(tick=101, objects=[core(position=center), *workers, *rangers])
+    ready = make_turn(
+        tick=101,
+        objects=[core(position=center), *workers, *rangers],
+        beacon={"position": [10000, 10000]},
+    )
 
     report = strategy.decide(ready)
 

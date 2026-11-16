@@ -336,6 +336,7 @@ CAMPAIGN_MAX_RANGERS = 20
 CAMPAIGN_RANGERS_PER_QUOTA = 10
 CAMPAIGN_FULL_MIGRATION_RANGERS = 60
 CAMPAIGN_MAX_RESOURCE_QUOTA = 16
+CAMPAIGN_BEACON_MIN_QUOTA = 7
 CAMPAIGN_DEFENSE_RADIUS = 8
 CAMPAIGN_DEFENSE_COMPRESSED_RADIUS = 4
 CAMPAIGN_DEFENSE_PRESSURE_ENEMIES = ALL_HANDS_DEFENSE_MIN_ENEMIES
@@ -1888,6 +1889,8 @@ class AggressiveStrategy:
         ):
             return
 
+        if self._pickup_beacon(ranger, context):
+            return
         if local_formation:
             if ranger.id in context.layered_assignments and ranger.hp > 1:
                 self._move_layered_ranger(ranger, context)
@@ -1901,8 +1904,6 @@ class AggressiveStrategy:
             )
             return
 
-        if self._pickup_beacon(ranger, context):
-            return
         if not expedition_member:
             approach_enemies = tuple(
                 enemy
@@ -4274,6 +4275,8 @@ class AggressiveStrategy:
                 vanguard, maximum_hp=4, critical_hp=3, context=context
             ):
                 return
+            if self._pickup_beacon(vanguard, context):
+                return
             if any(
                 isinstance(enemy, UnitView)
                 and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
@@ -4978,6 +4981,8 @@ class AggressiveStrategy:
                 )
             return
 
+        if self._pickup_beacon(worker, context):
+            return
         if worker.position == assigned_resource:
             worker.harvest()
             self.memory.clear_goal(str(worker.id))
@@ -4995,8 +5000,6 @@ class AggressiveStrategy:
             )
             return
 
-        if self._pickup_beacon(worker, context):
-            return
         if self._recover_if_critical(worker, maximum_hp=2, context=context):
             return
 
@@ -7012,6 +7015,7 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return
+        shield_limit = self._core_shield_limit(context.turn)
         if core.view.state is CoreState.MOVING:
             context.report.add(
                 actor_id=str(core.id),
@@ -7086,6 +7090,14 @@ class AggressiveStrategy:
             (nearby_enemy or (self._unbounded_growth() and context.emergency))
             and (
                 core.shield < 5
+                or (
+                    core.shield < shield_limit
+                    and (
+                        nearby_combat_enemy
+                        or projected_damage > 0
+                        or context.threat.recent_core_attack
+                    )
+                )
                 or (projected_damage > 0 and not context.core_build_priority)
             )
             and context.remaining_resources > 0
@@ -7105,6 +7117,25 @@ class AggressiveStrategy:
             or self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE2
         )
         if self._campaign_priority_spawn(context):
+            return
+        if self._pickup_beacon(core, context):
+            return
+        if (
+            shield_limit > 5
+            and core.shield < shield_limit
+            and context.remaining_resources > 0
+        ):
+            # The Beacon raises capacity without restoring shields. Funded
+            # campaign production still owns the service Tick; spare actions
+            # fill the bonus shield before an ordinary move or defensive WAIT.
+            core.repair_shield()
+            context.report.add(
+                actor_id=str(core.id),
+                actor_kind="CORE",
+                action="REPAIR_SHIELD",
+                reason="fill the Champion Beacon shield capacity",
+                target=core.position,
+            )
             return
         if context.layered_assignments or context.counterattack_ids:
             core.wait()
@@ -7174,22 +7205,6 @@ class AggressiveStrategy:
                     reason="wait for a clear Core migration step",
                     target=core.position,
                 )
-            return
-
-        if (
-            not context.beacon_claimed
-            and core.position == context.turn.beacon.position
-            and context.turn.beacon.status is BeaconStatus.GROUND
-        ):
-            core.pickup_beacon()
-            context.beacon_claimed = True
-            context.report.add(
-                actor_id=str(core.id),
-                actor_kind="CORE",
-                action="PICKUP_BEACON",
-                reason="secure Champion Beacon with Core",
-                target=core.position,
-            )
             return
 
         if self._core_can_spawn(context):
@@ -7267,7 +7282,7 @@ class AggressiveStrategy:
             return
         if (
             not preserving_resources
-            and core.shield < 5
+            and core.shield < shield_limit
             and context.remaining_resources > 0
         ):
             core.repair_shield()
@@ -7319,18 +7334,53 @@ class AggressiveStrategy:
                     target=add(core.position, direction),
                 )
 
-    def _pickup_beacon(self, unit: Unit, context: _TurnContext) -> bool:
+    @staticmethod
+    def _core_shield_limit(turn: Turn) -> int:
+        """Use current ownership, including a friendly Unit carrying the Beacon."""
+
+        carrier = turn.beacon.carrier_id
+        if turn.beacon.status is BeaconStatus.CARRIED and (
+            (turn.core is not None and turn.core.id == carrier)
+            or any(unit.id == carrier for unit in turn.units)
+        ):
+            return 10
+        return 5
+
+    def _pickup_beacon(self, unit: Unit | Core, context: _TurnContext) -> bool:
         if (
             context.beacon_claimed
             or unit.position != context.turn.beacon.position
             or context.turn.beacon.status is not BeaconStatus.GROUND
         ):
             return False
+        if isinstance(unit, Core):
+            if (
+                unit.view.state is not CoreState.NORMAL
+                or context.core_service_action in {"DEPOSIT", "HEAL"}
+            ):
+                return False
+        elif (
+            context.core_escape_direction is not None
+            or unit.id in context.squad_return_ids
+            or unit.id in context.core_hunt_return_ids
+            or unit.id in context.flank_return_ids
+            or unit.id in context.worker_area_protection_return_ids
+            or unit.id in context.campaign_patrol_recall_ids
+            or context.layered_steps.get(unit.id) is not None
+            or (
+                isinstance(unit, Ranger)
+                and self._ranger_firing_damage(
+                    unit, context.turn, self._rock_map(context.turn)
+                )
+                >= unit.hp
+            )
+        ):
+            return False
         unit.pickup_beacon()
         context.beacon_claimed = True
         context.report.add(
             actor_id=str(unit.id),
-            actor_kind=unit.unit_type.value,
+            actor_kind="CORE" if isinstance(unit, Core) else unit.unit_type.value,
             action="PICKUP_BEACON",
             reason="secure Champion Beacon",
             target=unit.position,
@@ -13898,6 +13948,7 @@ class AggressiveStrategy:
         self._staged_ids = frozenset()
         self.memory.campaign_last_core_id = core_id
         self.memory.campaign_phase = CAMPAIGN_PHASE_STAGE1
+        self.memory.campaign_beacon_target = None
         self.memory.campaign_resting = False
         self.memory.core_migration_start_position = None
         self._clear_campaign_scout()
@@ -14250,6 +14301,7 @@ class AggressiveStrategy:
             self.memory.campaign_target_quota = 4
         elif self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE2:
             self.memory.campaign_target_quota = 3
+        self.memory.campaign_beacon_target = self._campaign_beacon_goal(turn)
         self._update_campaign_scout(turn)
         self._observe_campaign_rest(turn)
         self._continue_campaign_migration(turn)
@@ -14410,6 +14462,7 @@ class AggressiveStrategy:
             target_quota=movement_cap,
             stop_ring=stop_ring,
             current_position=core.position,
+            beacon_position=self._campaign_beacon_goal(turn),
         )
         if plan is not None:
             self.memory.campaign_target_quota = target_quota
@@ -14821,8 +14874,25 @@ class AggressiveStrategy:
         block = resource_block_index(core.position)
         if resource_block_quota(block) > movement_cap:
             return False
+        beacon = self._campaign_beacon_goal(turn)
+        if beacon is not None:
+            return block != resource_block_index(beacon)
         stop_ring = campaign_stop_ring(movement_cap)
         return stop_ring is not None and resource_block_ring(block) > stop_ring
+
+    def _campaign_beacon_goal(self, turn: Turn) -> Position | None:
+        """Approach the public Beacon block with a full migration formation."""
+
+        from .migration import resource_block_index, resource_block_quota
+
+        if self._campaign_movement_cap(turn) != CAMPAIGN_MAX_RESOURCE_QUOTA:
+            return None
+        if (
+            resource_block_quota(resource_block_index(turn.beacon.position))
+            < CAMPAIGN_BEACON_MIN_QUOTA
+        ):
+            return None
+        return turn.beacon.position
 
     @staticmethod
     def _campaign_ranger_quota_cap(rangers: int) -> int:

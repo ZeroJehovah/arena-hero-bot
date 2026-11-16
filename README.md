@@ -195,6 +195,18 @@ through quota 4 and entry into quota 5; fifty permit travel through quota 5 and
 entry into quota 6. Sixty local Rangers form a complete migration roster and
 permit travel through quota 6 and every higher natural quota, up to quota 16
 at the world center. Further quota levels do not require additional Rangers.
+With a full migration roster, a Champion Beacon in a quota-seven-or-higher
+block changes the next-hop direction toward its public block instead of the
+world center. A Beacon below quota seven retains the centerward route. Beacon
+hops reduce block distance, stay inward below quota seven, and remain inside
+the high-quota region after entry. Each hop still stops at a reachable block
+center and requires gathering, service and the normal forward safety scout;
+an ongoing hop or scout finishes before the latest Beacon coordinate selects
+the next hop. On reaching the Beacon block, the Core holds its block center.
+Local guards and patrols can pick up a ground Beacon on their own cell after
+necessary combat and service. A friendly Core or Unit carrying it raises the
+Core shield limit to ten; spare funded Core actions repair the bonus shield
+after campaign production. Pickup itself does not restore shields.
 This migration threshold retains the `16W+20R` production baseline and full-bank
 growth policy. Casualties immediately revoke unauthorized hops and scouts.
 After a major defensive battle

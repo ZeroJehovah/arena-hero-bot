@@ -294,6 +294,9 @@ class WorldMemory:
     # only when the Core itself is replaced.
     campaign_phase: int = 0
     campaign_target_quota: int = 0
+    # Recompute the public Beacon goal each Turn. The current hop and its
+    # scout retain their own durable targets until the next center is reached.
+    campaign_beacon_target: Position | None = None
     campaign_last_core_id: str | None = None
     # A rest exists only while the Core stands on its published block center.
     # The flag is recomputed every Turn from the live stance, so it can never
@@ -998,6 +1001,11 @@ class WorldMemory:
             },
             "campaign_phase": self.campaign_phase,
             "campaign_target_quota": self.campaign_target_quota,
+            "campaign_beacon_target": (
+                list(self.campaign_beacon_target)
+                if self.campaign_beacon_target is not None
+                else None
+            ),
             "campaign_last_core_id": self.campaign_last_core_id,
             "campaign_resting": self.campaign_resting,
             "campaign_scout_target": (
@@ -1273,6 +1281,9 @@ class WorldMemory:
             },
             campaign_phase=int(raw.get("campaign_phase", 0)),
             campaign_target_quota=int(raw.get("campaign_target_quota", 0)),
+            campaign_beacon_target=_optional_position(
+                raw.get("campaign_beacon_target")
+            ),
             campaign_last_core_id=(
                 str(raw["campaign_last_core_id"])
                 if raw.get("campaign_last_core_id") is not None

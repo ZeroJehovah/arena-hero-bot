@@ -15,6 +15,7 @@ from arena_hero import Position
 from .geometry import manhattan, next_step
 from .memory import WorldMemory
 from .strategy import (
+    CAMPAIGN_BEACON_MIN_QUOTA,
     SYMMETRIC_HOME_CLEAR_RADIUS,
     SYMMETRIC_RANGER_OFFSETS,
     SYMMETRIC_RESOURCE_BLOCK_SIZE,
@@ -242,12 +243,15 @@ def plan_resource_cap(
     stop_ring: int,
     current_position: Position | None = None,
     excluded_blocks: frozenset[Position] = frozenset(),
+    beacon_position: Position | None = None,
 ) -> MigrationPlan | None:
-    """Plan one inward cardinal hop without crossing a quota ceiling.
+    """Plan one cardinal hop toward the quota goal or a high-quota Beacon.
 
     A blocked or unsafe forward block never justifies a same-ring lateral hop.
     The Core stays at its current centre, keeps harvesting, and retries only
-    when an inward block becomes available again.
+    when a forward block becomes available again. Beacon approaches reduce
+    block distance, remain inward below quota seven, and stay within the
+    quota-seven region once entered.
     """
 
     origin = (
@@ -260,7 +264,19 @@ def plan_resource_cap(
     current_block = resource_block_index(origin)
     current_ring = resource_block_ring(current_block)
     current_quota = resource_block_quota(current_block)
-    if current_quota > target_quota or current_ring <= stop_ring:
+    if current_quota > target_quota:
+        return None
+    beacon_block = (
+        resource_block_index(beacon_position) if beacon_position is not None else None
+    )
+    if beacon_block is None:
+        if current_ring <= stop_ring:
+            return None
+    elif (
+        resource_block_quota(beacon_block) < CAMPAIGN_BEACON_MIN_QUOTA
+        or resource_block_quota(beacon_block) > target_quota
+        or beacon_block == current_block
+    ):
         return None
 
     def candidates() -> list[tuple[int, int, int, int, int, int, Position, Position]]:
@@ -269,8 +285,19 @@ def plan_resource_cap(
             ring = resource_block_ring(block)
             if block in excluded_blocks or resource_block_quota(block) > target_quota:
                 continue
-            if ring >= current_ring:
-                continue
+            if beacon_block is None:
+                if ring >= current_ring:
+                    continue
+                progress = ring
+            else:
+                progress = manhattan(block, beacon_block)
+                if progress >= manhattan(current_block, beacon_block):
+                    continue
+                if current_quota < CAMPAIGN_BEACON_MIN_QUOTA:
+                    if ring >= current_ring:
+                        continue
+                elif resource_block_quota(block) < CAMPAIGN_BEACON_MIN_QUOTA:
+                    continue
             block_rocks = sum(cell in memory.obstacles for cell in _block_cells(block))
             for target in _resource_block_home_cells(
                 (
@@ -300,7 +327,7 @@ def plan_resource_cap(
                 )
                 found.append(
                     (
-                        ring,
+                        progress,
                         int(target in memory.resource_cells),
                         blocked_posts,
                         block_rocks,
@@ -345,8 +372,14 @@ def plan_resource_cap(
         target_block=block,
         target_ring=resource_block_ring(block),
         target_quota=resource_block_quota(block),
-        goal_ring=stop_ring,
-        goal_quota=target_quota,
+        goal_ring=(
+            resource_block_ring(beacon_block) if beacon_block is not None else stop_ring
+        ),
+        goal_quota=(
+            resource_block_quota(beacon_block)
+            if beacon_block is not None
+            else target_quota
+        ),
         target=target,
         estimated_cells=distance,
         block_rocks=block_rocks,
