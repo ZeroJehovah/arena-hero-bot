@@ -2335,7 +2335,6 @@ class AggressiveStrategy:
             and self.memory.campaign_scout_target is not None
             and self._patrol_team_from_role(role) is not None
             and offensive
-            and not fighters
             and not context.all_hands_defense
             and not context.combat_assault
             and ranger.id not in context.campaign_patrol_recall_ids
@@ -2343,26 +2342,33 @@ class AggressiveStrategy:
             # A migration scout is a deliberate forward task, not a defensive
             # firing post. Run it before frontier cover fire can consume the
             # Ranger's Tick and leave stale claimed cells blocking the patrol.
+            # Existing shots and necessary retreats were resolved earlier;
+            # an unengaged forward contact does not recall this scout to Core.
             goal = self._campaign_scout_goal(ranger, context.turn, context)
-            if goal != ranger.position:
-                self._move_or_wait(
-                    ranger,
-                    goal,
-                    context,
-                    reason=(
-                        "scout the next migration block for enemies and blind cells"
-                    ),
-                    wait_at_goal=True,
-                    avoid_new_threats=True,
-                    offensive=offensive,
-                    # A target block can extend just beyond the generic
-                    # Core-centred combat leash, especially at a far corner.
-                    # Sweeping the whole destination block is an explicit,
-                    # bounded campaign task, so that leash must not leave the
-                    # last two cells permanently unreachable.
-                    allow_outside_combat_leash=True,
-                )
+            if goal == ranger.position:
+                if not self._defensive_cover_fire(ranger, context, recent_enemies):
+                    self._hold_defensive_ranger(
+                        ranger,
+                        context,
+                        reason="hold the migration scout for a safe goal",
+                    )
                 return
+            self._move_or_wait(
+                ranger,
+                goal,
+                context,
+                reason="scout the next migration block for enemies and blind cells",
+                wait_at_goal=True,
+                avoid_new_threats=True,
+                offensive=offensive,
+                # A target block can extend just beyond the generic
+                # Core-centred combat leash, especially at a far corner.
+                # Sweeping the whole destination block is an explicit,
+                # bounded campaign task, so that leash must not leave the
+                # last two cells permanently unreachable.
+                allow_outside_combat_leash=True,
+            )
+            return
         if self._defensive_cover_fire(ranger, context, recent_enemies):
             return
         if (

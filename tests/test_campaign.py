@@ -2853,15 +2853,16 @@ def test_forward_patrols_are_all_recalled_when_the_defense_ring_is_hit() -> None
 
 @pytest.mark.parametrize("enemy_type", ["RANGER", "VANGUARD"])
 @pytest.mark.parametrize("restart", [False, True])
-def test_forward_scout_keeps_advancing_past_a_remote_ring_projection(
-    tmp_path, enemy_type, restart
+@pytest.mark.parametrize("patrol_position", [(-19, 299), (-25, 281)])
+def test_forward_scout_keeps_advancing_without_core_pressure(
+    tmp_path, enemy_type, restart, patrol_position
 ) -> None:
     center = (-17, 303)
     target = (-17, 271)
     core_object = core(position=center)
     workers, rangers, roles = _gathered_roster(60, center=center)
     patrol = rangers[30]
-    patrol["position"] = [-19, 299]
+    patrol["position"] = list(patrol_position)
     enemy = unit(9000, enemy_type, controlled=False, position=(-31, 273))
     memory = WorldMemory(
         core_home_position=center,
