@@ -7787,10 +7787,25 @@ class AggressiveStrategy:
             # An equally lethal step only forfeits the shot. Let the caller
             # attack when no escape can reduce the incoming volley.
             return False
+        safe_recovery = (
+            ranger.hp == 1
+            and not current_attackers
+            and not self._future_attackers_at(ranger.position, context.turn, obstacles)
+            and self.memory.incoming_damage.get(ranger.position, (-1, 0))[1] < ranger.hp
+        )
+        future_attackers = {
+            position: self._future_attackers_at(position, context.turn, obstacles)
+            for position in preferred
+        }
         ordered = sorted(
             preferred,
             key=lambda position: (
-                len(self._future_attackers_at(position, context.turn, obstacles)),
+                len(future_attackers[position]),
+                # A sheltered patient should make safe progress home before
+                # preferring distant cover that can pull it back every Tick.
+                manhattan(position, core.position)
+                if safe_recovery and not future_attackers[position]
+                else 0,
                 -self._ranger_covering_allies(ranger, position, threats, context)
                 if self.memory.unit_roles.get(str(ranger.id)) == DEFENSE_ROLE
                 else 0,
