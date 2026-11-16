@@ -11052,6 +11052,28 @@ class AggressiveStrategy:
             )
             if losses > kills or not survivors_can_kill:
                 continue
+            if (
+                len(group) - losses == 1
+                and all(
+                    sum(
+                        self._enemy_can_attack_position(enemy, position, rocks)
+                        for enemy in opponents
+                    )
+                    >= max(2, hp)
+                    for position, hp in group.values()
+                )
+                and not context.threat.recent_core_attack
+                and not context.threat.projected_core_damage
+                and not any(
+                    self._enemy_can_attack_position(enemy, core.position, rocks)
+                    for enemy in risks
+                )
+            ):
+                # Concentrated entry fire can leave only an isolated shooter
+                # facing multiple current rays. Ordinary defense withdraws
+                # that survivor, so its nominal arrow at a wounded target is
+                # not a credible return volley for sacrificing an entrant.
+                continue
             # MOVE cannot shoot on entry. The same local group must retain a
             # killing volley after its shared hostile arrows. Reserve every
             # entrance atomically so a missing arrival cannot strand a duel.
