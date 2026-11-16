@@ -120,6 +120,136 @@ def test_different_route_lengths_cover_from_safe_stages_before_a_joint_entry(
         pytest.fail("bounded assembly never reached its complete opening")
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_unrelated_casualties_preserve_assembled_flank_roles_and_opening(
+    restart, tmp_path
+):
+    strategy, encounter = standoff()
+    encounter.friends[object_id(3)]["position"] = [4, -3]
+    for index, position, role in (
+        (30, (1, 1), "defense"),
+        (31, (-1, 1), "patrol-3"),
+    ):
+        actor = unit(index, "RANGER", position=position)
+        encounter.friends[actor["id"]] = actor
+        encounter.friendly_ids.add(actor["id"])
+        strategy.memory.unit_roles[actor["id"]] = role
+    seed_contact(strategy, encounter)
+    turn = encounter.turn()
+    strategy.decide(turn)
+    operation = strategy.memory.flank.operation
+    assert operation is not None and operation.phase is flank.Phase.ASSEMBLE
+    members = operation.member_ids
+    fronts = operation.front_ids
+    assert set(members) == {object_id(2), object_id(3)}
+    previous = strategy.memory.unit_roles.copy()
+    started, deadline = operation.parent.started, operation.parent.deadline
+    encounter.settle(turn.plan, encounter.response(encounter.view(enemy=True)))
+    # Two unrelated patrol casualties require exactly one defender transfer.
+    # An idle defender is available closer to the Core than the ready flank.
+    del encounter.friends[object_id(21)]
+    del encounter.friends[object_id(22)]
+    if restart:
+        path = tmp_path / "memory.json"
+        strategy.memory.save(path)
+        strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    turn = encounter.turn()
+    strategy.decide(turn)
+    roles = strategy.memory.unit_roles
+    assert sum(role == "defense" for role in roles.values()) == 3
+    assert sum(roles[uid] != previous[uid] for uid in roles) == 1
+    assert all(roles[uid] == previous[uid] for uid in (*members, *fronts))
+    operation = strategy.memory.flank.operation
+    assert operation is not None and operation.phase is flank.Phase.ENTER
+    assert operation.parent.started == started and operation.parent.deadline == deadline
+    assert operation.member_ids == members
+    assert all(turn.plan.unit_actions[UUID(uid)].type == "MOVE" for uid in members)
+    encounter.settle(turn.plan, encounter.response(encounter.view(enemy=True)))
+    turn = encounter.turn()
+    strategy.decide(turn)
+    assert operation.first_shot == started + 2
+    assert all(turn.plan.unit_actions[UUID(uid)].type == "SHOOT" for uid in members)
+    encounter.settle(turn.plan, encounter.response(encounter.view(enemy=True)))
+    assert encounter.kills >= 1 and encounter.losses == 0
+
+
+@pytest.mark.parametrize("recruit", [False, True])
+def test_defender_vacancies_use_idle_patrols_before_active_flank_members(recruit):
+    strategy, encounter = standoff()
+    seed_contact(strategy, encounter)
+    strategy.decide(encounter.turn())
+    operation = strategy.memory.flank.operation
+    assert operation is not None
+    strategy.memory.unit_roles = {
+        object_id(2): "patrol-2",
+        object_id(3): "patrol-2",
+        object_id(20): "defense",
+        object_id(21): "defense",
+        object_id(22): "defense",
+        object_id(23): "patrol-3",
+    }
+    encounter.friends[object_id(23)]["position"] = [4, 4]
+    del encounter.friends[object_id(21)]
+    del encounter.friends[object_id(22)]
+    if recruit:
+        actor = unit(35, "RANGER", position=(20, 20))
+        encounter.friends[actor["id"]] = actor
+    previous = strategy.memory.unit_roles.copy()
+    strategy._reconcile_unit_roles(encounter.turn())
+    roles = strategy.memory.unit_roles
+    assert roles[object_id(2)] == roles[object_id(3)] == "patrol-2"
+    assert roles[object_id(23)] == "defense"
+    assert sum(role == "defense" for role in roles.values()) == (3 if recruit else 2)
+    assert (
+        sum(roles[uid] != previous[uid] for uid in roles.keys() & previous.keys()) == 1
+    )
+    if recruit:
+        assert roles[object_id(35)] == "defense"
+
+
+@pytest.mark.parametrize("boundary", ["quota", "expired", "orphan", "core_changed"])
+def test_flank_role_preference_never_bypasses_quota_or_stale_task_boundaries(boundary):
+    strategy, encounter = standoff()
+    seed_contact(strategy, encounter)
+    strategy.decide(encounter.turn())
+    operation = strategy.memory.flank.operation
+    assert operation is not None
+    strategy.memory.unit_roles = {
+        object_id(2): "defense",
+        object_id(3): "defense",
+        object_id(20): "defense",
+        object_id(21): "patrol-1",
+        object_id(22): "patrol-1",
+        object_id(23): "patrol-2",
+    }
+    if boundary != "quota":
+        for index, position, role in (
+            (30, (1, 1), "defense"),
+            (31, (-1, 1), "patrol-3"),
+        ):
+            actor = unit(index, "RANGER", position=position)
+            encounter.friends[actor["id"]] = actor
+            strategy.memory.unit_roles[actor["id"]] = role
+    previous = strategy.memory.unit_roles.copy()
+    del encounter.friends[object_id(21)]
+    del encounter.friends[object_id(22)]
+    if boundary == "expired":
+        encounter.tick = operation.parent.deadline
+    elif boundary == "orphan":
+        strategy.memory.skirmish = None
+    elif boundary == "core_changed":
+        encounter.core["id"] = object_id(99)
+    strategy._reconcile_unit_roles(encounter.turn())
+    roles = strategy.memory.unit_roles
+    assert sum(role == "defense" for role in roles.values()) == (
+        2 if boundary == "quota" else 3
+    )
+    assert sum(roles[uid] != previous[uid] for uid in roles) == 1
+    # All three defenders are committed; the exact roster still needs one
+    # transfer. Expired/orphaned tasks must also fall back to proximity.
+    assert roles[object_id(3)].startswith("patrol-")
+
+
 def test_safe_assembly_keeps_wait_when_the_fixed_target_neighbor_ray_is_blocked():
     strategy, encounter = standoff()
     encounter.friends[object_id(3)]["position"] = [5, -3]

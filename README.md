@@ -77,6 +77,9 @@ Ranger production does not choose a role. After births or losses, the local
 Ranger roster splits evenly between defense and patrol, assigning an odd extra
 Ranger to defense. Recruits fill vacancies first; only the minimum necessary
 survivors change roles, and existing patrol team identities remain stable.
+When the quota permits, active flank members and their front observers keep
+their roles before proximity decides which idle Rangers transfer. New recruits
+still fill vacancies first, and urgent Core defence can still cancel a flank.
 While a visible hostile combat unit is inside the Core assault ring, the next
 production slot temporarily becomes a Ranger; the normal sequence resumes as
 soon as that local threat is gone.

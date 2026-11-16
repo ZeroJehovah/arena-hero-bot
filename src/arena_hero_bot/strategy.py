@@ -12238,7 +12238,8 @@ class AggressiveStrategy:
         """Split local Rangers evenly with the fewest existing role changes.
 
         New UUIDs fill vacancies first. When a casualty makes a transfer
-        necessary, keep the nearest defenders and recall the nearest patrols.
+        necessary, preserve an active flank's participants where the quota
+        permits, then keep the nearest defenders and recall the nearest patrols.
         Surviving patrol members retain their team numbers across restarts.
         Legacy expeditions finish their recall before joining this roster.
         """
@@ -12249,6 +12250,18 @@ class AggressiveStrategy:
             if str(unit.id) not in expedition_ids
         }
         defense_quota = (len(rangers) + 1) // 2
+        operation = self.memory.flank.operation
+        committed = (
+            frozenset((*operation.member_ids, *operation.front_ids))
+            if operation is not None
+            and turn.core is not None
+            and str(turn.core.id) == operation.core_id
+            and turn.core.position == operation.core_position
+            and turn.core.view.state is CoreState.NORMAL
+            and turn.tick < operation.parent.deadline
+            and self._flank_parent_valid(operation)
+            else frozenset()
+        )
 
         def nearby(unit_id: str) -> tuple[int, bytes]:
             return (
@@ -12259,7 +12272,8 @@ class AggressiveStrategy:
             )
 
         defenders = sorted(
-            (uid for uid in rangers if roles.get(uid) == DEFENSE_ROLE), key=nearby
+            (uid for uid in rangers if roles.get(uid) == DEFENSE_ROLE),
+            key=lambda uid: (uid not in committed, *nearby(uid)),
         )
         unassigned = sorted(
             (
@@ -12279,7 +12293,7 @@ class AggressiveStrategy:
                     for uid in rangers
                     if self._patrol_team_from_role(roles.get(uid)) is not None
                 ),
-                key=nearby,
+                key=lambda uid: (uid in committed, *nearby(uid)),
             )
             keep_defense.update(patrols[: defense_quota - len(keep_defense)])
 
