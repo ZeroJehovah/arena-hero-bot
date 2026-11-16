@@ -334,6 +334,8 @@ CAMPAIGN_STAGE2_WORKERS = 16
 CAMPAIGN_STAGE2_RANGERS = 8
 CAMPAIGN_MAX_RANGERS = 20
 CAMPAIGN_RANGERS_PER_QUOTA = 10
+CAMPAIGN_FULL_MIGRATION_RANGERS = 60
+CAMPAIGN_MAX_RESOURCE_QUOTA = 16
 CAMPAIGN_DEFENSE_RADIUS = 8
 CAMPAIGN_DEFENSE_COMPRESSED_RADIUS = 4
 CAMPAIGN_DEFENSE_PRESSURE_ENEMIES = ALL_HANDS_DEFENSE_MIN_ENEMIES
@@ -14242,7 +14244,7 @@ class AggressiveStrategy:
         if self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE4:
             # The destination tier follows the surviving Ranger total;
             # old fixed goals are repaired even without a phase transition.
-            cap = max(2, rangers // CAMPAIGN_RANGERS_PER_QUOTA + 1)
+            cap = self._campaign_ranger_quota_cap(rangers)
             self.memory.campaign_target_quota = cap + 1 if cap < 4 else cap
         elif self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE3:
             self.memory.campaign_target_quota = 4
@@ -14754,7 +14756,11 @@ class AggressiveStrategy:
         if (
             cap is None
             or resource_block_quota(block) > cap
-            or (origin_quota >= 4 and cap <= origin_quota)
+            or (
+                origin_quota >= 4
+                and cap <= origin_quota
+                and cap != CAMPAIGN_MAX_RESOURCE_QUOTA
+            )
             or (
                 resource_block_index(target) != block
                 and not self._campaign_cross_block_allowed(
@@ -14777,7 +14783,7 @@ class AggressiveStrategy:
         return (
             current <= cap
             and resource_block_quota(block) <= cap
-            and (current < 4 or current < cap)
+            and (current < 4 or current < cap or cap == CAMPAIGN_MAX_RESOURCE_QUOTA)
         )
 
     def _campaign_patrols_to_recall(
@@ -14818,12 +14824,21 @@ class AggressiveStrategy:
         stop_ring = campaign_stop_ring(movement_cap)
         return stop_ring is not None and resource_block_ring(block) > stop_ring
 
+    @staticmethod
+    def _campaign_ranger_quota_cap(rangers: int) -> int:
+        """Unlock every natural quota with a full sixty-Ranger migration roster."""
+
+        if rangers >= CAMPAIGN_FULL_MIGRATION_RANGERS:
+            return CAMPAIGN_MAX_RESOURCE_QUOTA
+        return max(2, rangers // CAMPAIGN_RANGERS_PER_QUOTA + 1)
+
     def _campaign_movement_cap(self, turn: Turn) -> int | None:
         """Return the maximum quota this live formation may enter.
 
         Formation access is evaluated from the surviving roster rather than
         the persisted phase alone.  A phase never rolls back, but casualties
         can temporarily withdraw the movement permission they earned.
+        Sixty local Rangers unlock all natural quotas through the world center.
         """
 
         if not self.config.campaign_mode:
@@ -14833,7 +14848,7 @@ class AggressiveStrategy:
         if workers < CAMPAIGN_STAGE2_WORKERS:
             return None
         if rangers >= CAMPAIGN_MAX_RANGERS:
-            return rangers // CAMPAIGN_RANGERS_PER_QUOTA + 1
+            return self._campaign_ranger_quota_cap(rangers)
         if rangers >= CAMPAIGN_STAGE2_RANGERS:
             return 2
         return None
@@ -14842,7 +14857,8 @@ class AggressiveStrategy:
         """Return whether the roster matches the quota of the current block.
 
         With 16 Workers, eight Rangers permit quota 2 and twenty permit
-        quota 3. Every further ten Rangers unlock one more quota level.
+        quota 3. Each further ten Rangers unlocks one more quota through
+        fifty Rangers; sixty unlock every natural quota, up to sixteen.
         """
 
         return self._campaign_movement_cap(turn) is not None

@@ -92,8 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--campaign-mode",
         action="store_true",
         help=(
-            "stage-gated campaign: build 8W, 16W+8R and 16W+20R, add the "
-            "8R patrol screen, then migrate toward the quota-8 block; "
+            "stage-gated campaign: build 8W, 16W+8R and 16W+20R; "
+            "60 Rangers unlock all natural quotas through quota 16; "
             "enables formation management with no population cap"
         ),
     )

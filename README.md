@@ -192,8 +192,12 @@ With sixteen Workers, eight Rangers permit quota 2 travel and twenty permit
 travel through quota 3 to the quota 4 boundary. Thirty Rangers permit
 entry into quota 4, stopping at the first block center. Forty permit travel
 through quota 4 and entry into quota 5; fifty permit travel through quota 5 and
-entry into quota 6, and so on. There is no fixed quota-8 destination. Casualties
-immediately revoke unauthorized hops and scouts. After a major defensive battle
+entry into quota 6. Sixty local Rangers form a complete migration roster and
+permit travel through quota 6 and every higher natural quota, up to quota 16
+at the world center. Further quota levels do not require additional Rangers.
+This migration threshold retains the `16W+20R` production baseline and full-bank
+growth policy. Casualties immediately revoke unauthorized hops and scouts.
+After a major defensive battle
 and the eight-Tick calm window, an insufficient roster cancels the old journey
 and refits at a reachable center in the Core's current block, including the old
 destination if the Core has already crossed into it.

@@ -15,7 +15,7 @@ from arena_hero_bot.migration import (
 from arena_hero_bot.strategy import CORE_LAYOUT_VERSION
 
 from .factories import core, make_turn, object_id, unit
-from .test_campaign import _rangers, _roster, _strategy, _workers
+from .test_campaign import _gathered_roster, _rangers, _roster, _strategy, _workers
 
 
 @pytest.mark.parametrize("phase", [1, 2, 3, 4])
@@ -134,9 +134,15 @@ def test_simultaneous_birth_and_defender_loss_uses_recruit_first():
         (16, 30, 4),
         (16, 39, 4),
         (16, 40, 5),
-        (16, 69, 7),
-        (16, 70, 8),
-        (16, 80, 9),
+        (16, 49, 5),
+        (16, 50, 6),
+        (16, 59, 6),
+        (15, 60, None),
+        (16, 60, 16),
+        (16, 62, 16),
+        (16, 69, 16),
+        (16, 70, 16),
+        (16, 80, 16),
         (16, 150, 16),
     ],
 )
@@ -184,7 +190,7 @@ def test_low_quotas_reach_the_frontier_and_high_quotas_stop_on_entry(cap):
 
 @pytest.mark.parametrize(
     ("ranger_count", "phase", "frontier"),
-    [(19, 3, 4), (20, 4, 4), (30, 4, 4), (80, 4, 9)],
+    [(19, 3, 4), (20, 4, 4), (30, 4, 4), (59, 4, 6), (60, 4, 16), (80, 4, 16)],
 )
 def test_full_decision_advances_stage_and_replaces_legacy_quota_goal(
     ranger_count, phase, frontier
@@ -230,6 +236,120 @@ def test_twentieth_ranger_switches_to_full_bank_growth(count, full_bank):
         assert turn.plan.core_action is None or turn.plan.core_action.type != "SPAWN"
 
 
+@pytest.mark.parametrize("ring", range(11))
+@pytest.mark.parametrize("ranger_count", [59, 60])
+def test_sixty_rangers_authorize_every_high_quota_without_a_next_tier(
+    ring, ranger_count
+):
+    center = (ring * 32 + 15, 15)
+    workers, rangers, roles = _gathered_roster(ranger_count, center=center)
+    strategy = _strategy(WorldMemory(campaign_phase=4, unit_roles=roles))
+    turn = make_turn(objects=[core(position=center), *workers, *rangers])
+    target_block = (ring - 1, 0)
+
+    assert resource_block_quota(resource_block_index(center)) >= 7
+    assert resource_block_quota(target_block) >= 7
+    assert strategy._campaign_cross_block_allowed(turn, target_block) == (
+        ranger_count == 60
+    )
+
+
+@pytest.mark.parametrize("ring", [10, 9, 8, 5, 2, 1])
+@pytest.mark.parametrize("restart", [False, True])
+def test_sixty_rangers_scout_before_releasing_a_high_quota_hop(tmp_path, ring, restart):
+    center = (ring * 32 + 15, 15)
+    workers, rangers, roles = _gathered_roster(60, center=center)
+    memory = WorldMemory(
+        campaign_phase=4,
+        campaign_target_quota=7,
+        campaign_last_core_id=object_id(1),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_home_position=center,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    if restart:
+        path = tmp_path / "memory.json"
+        memory.save(path)
+        memory = WorldMemory.load(path)
+    strategy = _strategy(memory)
+    turn = make_turn(tick=100, objects=[core(position=center), *workers, *rangers])
+
+    report = strategy.decide(turn)
+
+    target = memory.campaign_scout_target
+    assert not any("planning time limit" in item.reason for item in report.decisions)
+    assert target is not None
+    assert resource_block_index(target) == (ring - 1, 0)
+    assert memory.campaign_target_quota == 16
+    assert memory.core_home_position == center
+    assert turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
+    for actor in rangers:
+        uid = str(actor["id"])
+        assert memory.unit_roles[uid] == roles[uid]
+
+    memory.campaign_scout_seen_ticks = {
+        (x, y): 100 for x in range((ring - 1) * 32, ring * 32) for y in range(32)
+    }
+    if restart:
+        memory.save(path)
+        memory = WorldMemory.load(path)
+        strategy = _strategy(memory)
+    ready = make_turn(tick=101, objects=[core(position=center), *workers, *rangers])
+
+    report = strategy.decide(ready)
+
+    assert not any("planning time limit" in item.reason for item in report.decisions)
+    assert memory.campaign_scout_target is None
+    assert memory.core_home_position == target
+    assert memory.core_migration_start_position == center
+    assert ready.plan.core_action is not None
+    assert ready.plan.core_action.type == "START_MOVE"
+    assert ready.plan.core_action.direction.value == "LEFT"
+
+
+@pytest.mark.parametrize("loss", ["ranger", "worker"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_full_migration_permission_is_revoked_with_its_scout_after_a_loss(
+    tmp_path, loss, restart
+):
+    center, target = (335, 15), (303, 15)
+    workers, rangers, roles = _gathered_roster(60, center=center)
+    memory = WorldMemory(
+        campaign_phase=4,
+        campaign_target_quota=16,
+        campaign_last_core_id=object_id(1),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_home_position=center,
+        campaign_scout_target=target,
+        campaign_scout_started_tick=90,
+        campaign_scout_seen_ticks={target: 99},
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    if loss == "ranger":
+        rangers.pop()
+    else:
+        workers.pop()
+    if restart:
+        path = tmp_path / "memory.json"
+        memory.save(path)
+        memory = WorldMemory.load(path)
+    strategy = _strategy(memory)
+    turn = make_turn(tick=100, objects=[core(position=center), *workers, *rangers])
+
+    report = strategy.decide(turn)
+
+    assert not any("planning time limit" in item.reason for item in report.decisions)
+    assert memory.campaign_phase == 4
+    assert memory.campaign_target_quota == (6 if loss == "ranger" else 16)
+    assert memory.campaign_scout_target is None
+    assert memory.campaign_scout_started_tick == 0
+    assert not memory.campaign_scout_seen_ticks
+    assert memory.core_home_position == center
+    assert turn.plan.core_action is None or turn.plan.core_action.type != "START_MOVE"
+
+
 @pytest.mark.parametrize(
     ("count", "may_travel"), [(30, False), (39, False), (40, True)]
 )
@@ -263,6 +383,8 @@ _BATTLE_ROUTES = [
     ((783, 15), (751, 15), 40),
     ((815, 15), (783, 15), 30),
     ((591, 15), (559, 15), 40),
+    ((335, 15), (303, 15), 60),
+    ((47, 15), (15, 15), 60),
 ]
 
 
@@ -318,7 +440,7 @@ def _assert_recovered_journey(memory, origin, destination, position, crossed, lo
 def test_battle_recovery_rechecks_every_roster_and_route_combination(
     tmp_path, crossed, loss, restart, origin, destination, ranger_count
 ):
-    # All 36 recovery transitions run directly. The full decisions below
+    # All roster/route recovery transitions run directly. The full decisions below
     # separately cover pressure detection, call ordering and Core moves.
     strategy, position, workers, rangers, enemies = _battle_migration_scenario(
         origin, destination, ranger_count, crossed
@@ -382,6 +504,10 @@ def test_battle_recovery_rechecks_every_roster_and_route_combination(
         (1, True, "worker", False),
         (2, False, "worker", True),
         (2, True, "none", True),
+        (3, False, "none", True),
+        (3, True, "ranger", False),
+        (4, True, "none", True),
+        (4, True, "worker", False),
     ],
 )
 def test_major_battle_refits_in_current_block_when_journey_is_no_longer_authorized(
