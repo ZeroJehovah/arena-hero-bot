@@ -853,6 +853,39 @@ def test_ring_contact_alert_uses_clockwise_path_distance() -> None:
     assert not strategy._combat_target_is_local(member, route[20], second)
 
 
+@pytest.mark.parametrize("enemy_type", ["RANGER", "VANGUARD"])
+@pytest.mark.parametrize(
+    ("ring_index", "offset"),
+    [(0, (0, 32)), (25, (32, 0)), (50, (0, -32)), (75, (-32, 0))],
+)
+def test_ring_projection_does_not_make_a_remote_fighter_local(
+    enemy_type, ring_index, offset
+) -> None:
+    route = _single_chunk_outer_ring(HOME, set())
+    position = route[ring_index]
+    enemy_position = (position[0] + offset[0], position[1] + offset[1])
+    patrol = unit(100, "RANGER", position=position)
+    memory = WorldMemory(
+        core_home_position=HOME,
+        unit_roles={str(patrol["id"]): "patrol-1"},
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    turn = make_turn(
+        objects=[
+            core(position=HOME),
+            patrol,
+            unit(900, enemy_type, controlled=False, position=enemy_position),
+        ]
+    )
+    member = turn.rangers[0]
+
+    assert strategy._patrol_ring_distance(position, enemy_position, turn) == 0
+    assert manhattan(position, enemy_position) > strategy.config.combat_alert_radius
+    assert not strategy._combat_target_is_local(member, enemy_position, turn)
+    assert not strategy._visible_combat_targets(member, turn)
+
+
 def test_first_ring_assignment_preserves_circular_order_with_minimal_travel() -> None:
     memory = WorldMemory(core_home_position=HOME)
     strategy = _strategy(memory)

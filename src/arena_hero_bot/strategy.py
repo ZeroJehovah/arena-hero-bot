@@ -11652,8 +11652,11 @@ class AggressiveStrategy:
             is None
         ):
             return False
+        # Nearest ring indices can project a remote fighter onto the home
+        # edge. Require physical proximity before using the along-ring alert.
         return (
-            self._patrol_ring_distance(unit.position, target, turn)
+            manhattan(unit.position, target) <= self.config.combat_alert_radius
+            and self._patrol_ring_distance(unit.position, target, turn)
             <= self.config.combat_alert_radius
         )
 

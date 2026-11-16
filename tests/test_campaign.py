@@ -2851,6 +2851,75 @@ def test_forward_patrols_are_all_recalled_when_the_defense_ring_is_hit() -> None
     )
 
 
+@pytest.mark.parametrize("enemy_type", ["RANGER", "VANGUARD"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_forward_scout_keeps_advancing_past_a_remote_ring_projection(
+    tmp_path, enemy_type, restart
+) -> None:
+    center = (-17, 303)
+    target = (-17, 271)
+    core_object = core(position=center)
+    workers, rangers, roles = _gathered_roster(60, center=center)
+    patrol = rangers[30]
+    patrol["position"] = [-19, 299]
+    enemy = unit(9000, enemy_type, controlled=False, position=(-31, 273))
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=16,
+        campaign_last_core_id=core_object["id"],
+        campaign_scout_target=target,
+        campaign_scout_started_tick=90,
+        campaign_scout_last_gain_tick=90,
+        unit_roles=roles.copy(),
+        unit_roles_initialized=True,
+    )
+    strategy = _strategy(memory)
+    starting_position = (patrol["position"][0], patrol["position"][1])
+    first_goal = None
+
+    for tick in range(100, 103):
+        turn = make_turn(tick=tick, objects=[core_object, *workers, *rangers, enemy])
+        report = strategy.decide(turn)
+        decision = next(
+            item for item in report.decisions if item.actor_id == patrol["id"]
+        )
+        assert decision.action == "MOVE"
+        assert decision.reason == (
+            "scout the next migration block for enemies and blind cells"
+        )
+        goal = memory.goal_for(str(patrol["id"]))
+        assert goal is not None
+        if first_goal is None:
+            first_goal = goal.position
+        assert goal.position == first_goal
+        assert resource_block_index(goal.position) == resource_block_index(target)
+        assert memory.campaign_scout_target == target
+        assert memory.core_home_position == center
+        assert not memory.defense_compressed
+        positions = {
+            str(unit_id): position
+            for unit_id, position in settled_positions(turn).items()
+        }
+        for friendly in (*workers, *rangers):
+            friendly["position"] = list(positions[str(friendly["id"])])
+        if restart and tick == 100:
+            path = tmp_path / "memory.json"
+            memory.save(path)
+            memory = WorldMemory.load(path)
+            strategy = _strategy(memory)
+
+    assert first_goal is not None
+    final_position = (patrol["position"][0], patrol["position"][1])
+    assert manhattan(final_position, first_goal) < manhattan(
+        starting_position, first_goal
+    )
+    assert memory.unit_roles == {
+        unit_id: role for unit_id, role in roles.items() if role != "staged"
+    }
+
+
 def test_legacy_expedition_recall_keeps_fighting_before_it_returns() -> None:
     core_object = core(position=(0, 0))
     recalled = unit(2, "RANGER", position=(30, 0))
