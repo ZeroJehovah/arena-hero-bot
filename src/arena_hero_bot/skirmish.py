@@ -34,6 +34,7 @@ class Skirmish:
     slots: dict[str, AssaultSlot]
     origins: dict[str, Position]
     entered: int | None = None
+    scout_target: Position | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -53,6 +54,9 @@ class Skirmish:
             },
             origins={key: tuple(value) for key, value in raw["origins"].items()},
             entered=raw.get("entered"),
+            scout_target=tuple(raw["scout_target"])
+            if raw.get("scout_target") is not None
+            else None,
         )
 
 
@@ -62,6 +66,8 @@ def entry_viable(
     targets: Sequence[UnitView],
     enemies: Sequence[UnitView],
     rocks: Container[Position],
+    *,
+    allow_vanguard_two_volley: bool = False,
 ) -> bool:
     """Count the MOVE exposure before promising next-Tick killing arrows."""
     positions = {
@@ -90,6 +96,16 @@ def entry_viable(
         # This short two-volley calculation models arrows, not Vanguard sweeps.
         # Mixed forces retain the existing defensive/counterattack rules.
         return False
+    if (
+        allow_vanguard_two_volley
+        and len(targets) == 1
+        and targets[0].unit_type is UnitType.VANGUARD
+        and opposition == 0
+    ):
+        # No known fighter can hit these cells now or after one MOVE.
+        # The stationary scout target can therefore take two actual volleys;
+        # any observed move is handled by the parent's cancellation rule.
+        return len(members) * 2 >= targets[0].hp
     ingress_arrows = sum(
         any(can_attack(enemy, cell, rocks) for cell in cells) for enemy in enemies
     )
@@ -155,11 +171,13 @@ def choose_slots(
     origins: Mapping[str, Position] | None = None,
     min_party: int = 2,
     route_budget: int = MAX_STEPS,
+    route_anchor: Position | None = None,
+    allow_vanguard_two_volley: bool = False,
 ) -> dict[str, AssaultSlot]:
     """Bounded beam search for a safe assembly and simultaneous arrival."""
     if turn.core is None or not targets or max_party < 2:
         return {}
-    core = turn.core.position
+    core = turn.core.position if route_anchor is None else route_anchor
     target = targets[0].position
     candidates = sorted(
         allies, key=lambda ally: (manhattan(ally.position, target), ally.id)
@@ -177,10 +195,19 @@ def choose_slots(
             firing in blocked
             or manhattan(core, firing) > CONTACT_RADIUS + 4
             or not all(line_of_fire(firing, foe.position, rocks) for foe in targets)
+            or any(
+                enemy.unit_type is UnitType.VANGUARD
+                and reachable_opposition((firing,), (enemy,), rocks)
+                for enemy in enemies
+            )
         ):
             continue
         for stage in adjacent_positions(firing):
-            if stage in blocked or any(can_attack(e, stage, rocks) for e in enemies):
+            if (
+                stage in blocked
+                or any(can_attack(e, stage, rocks) for e in enemies)
+                or any(line_of_fire(stage, foe.position, rocks) for foe in targets)
+            ):
                 continue
             for ally in candidates:
                 route = routes[ally.id].get(stage)
@@ -240,7 +267,12 @@ def choose_slots(
                 for _, actor_id, stage, firing in group
             }
             if entry_viable(
-                [by_id[item[1]] for item in group], slots, targets, enemies, rocks
+                [by_id[item[1]] for item in group],
+                slots,
+                targets,
+                enemies,
+                rocks,
+                allow_vanguard_two_volley=allow_vanguard_two_volley,
             ):
                 return slots
     return {}

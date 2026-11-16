@@ -70,7 +70,7 @@ class CounterattackState:
     retry_after: int = -1
     reason: str = "observing standoff"
 
-    def observe(self, turn: Turn) -> None:
+    def observe(self, turn: Turn, *, scout_target: Position | None = None) -> None:
         core = turn.core
         if core is None:
             self.operation = None
@@ -107,7 +107,15 @@ class CounterattackState:
             }:
                 continue
             key = str(enemy.id)
-            if manhattan(core.position, enemy.position) > CONTACT_RADIUS:
+            # Published forward scouting also needs durable contact evidence.
+            # Counterattack launch selection still uses its Core-local radius.
+            in_scout_block = scout_target is not None and tuple(
+                value // 32 for value in enemy.position
+            ) == tuple(value // 32 for value in scout_target)
+            if (
+                manhattan(core.position, enemy.position) > CONTACT_RADIUS
+                and not in_scout_block
+            ):
                 self.contacts.pop(key, None)
                 continue
             old = self.contacts.get(key)

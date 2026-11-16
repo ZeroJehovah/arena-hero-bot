@@ -9845,6 +9845,123 @@ class AggressiveStrategy:
         self.memory.skirmish = None
         self.memory.skirmish_cooldown_until = tick + skirmish.COOLDOWN_TICKS
 
+    def _scout_clearance_rangers(
+        self, context: _TurnContext, target: Position
+    ) -> tuple[Ranger, ...]:
+        """Use forward patrols while leaving the Core-local roster untouched."""
+        core = context.turn.core
+        if core is None:
+            return ()
+        area = _single_chunk_resource_block(target)
+        return tuple(
+            ranger
+            for ranger in context.turn.rangers
+            if ranger.hp == 2
+            and area.contains(ranger.position)
+            and manhattan(core.position, ranger.position) > skirmish.CONTACT_RADIUS
+            and self._patrol_team_from_role(self.memory.unit_roles.get(str(ranger.id)))
+            is not None
+            and not self._is_expedition_member(ranger, context.turn)
+            and ranger.id not in context.core_hunt_ids
+        )
+
+    def _choose_scout_clearance(
+        self,
+        context: _TurnContext,
+        enemies: tuple[UnitView, ...],
+        rocks: Container[Position],
+        blocked: Container[Position],
+    ) -> skirmish.Skirmish | None:
+        """Clear one stationary scout contact with the existing bounded entry."""
+        turn = context.turn
+        core = turn.core
+        scout = self.memory.campaign_scout_target
+        if (
+            core is None
+            or scout is None
+            or core.position != self.memory.core_home_position
+            or context.core_hunt_ids
+            or self.memory.flank.operation is not None
+        ):
+            return None
+        if (
+            manhattan(
+                (core.position[0] // 32, core.position[1] // 32),
+                (scout[0] // 32, scout[1] // 32),
+            )
+            != 1
+        ):
+            return None
+        home_guards = sum(
+            ranger.hp == 2
+            and manhattan(core.position, ranger.position) <= skirmish.CONTACT_RADIUS
+            and not self._is_expedition_member(ranger, turn)
+            for ranger in turn.rangers
+        )
+        healthy = self._scout_clearance_rangers(context, scout)
+        reserve = max(2, (len(healthy) + 2) // 3)
+        available = tuple(
+            ranger
+            for ranger in healthy
+            if not self._has_unit_action(ranger, context)
+            and not any(
+                line_of_fire(ranger.position, enemy.position, rocks)
+                for enemy in enemies
+            )
+        )
+        max_party = min(6, len(healthy) - reserve, len(available))
+        if home_guards < 2 or max_party < 2:
+            return None
+        area = _single_chunk_resource_block(scout)
+        bounded = overlay_blockers(blocked, _OutsidePatrolArea(area, scout))
+        targets = sorted(
+            (
+                enemy
+                for enemy in turn.visible_enemies
+                if isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+                and area.contains(enemy.position)
+            ),
+            key=lambda enemy: (enemy.hp, enemy.position, enemy.id),
+        )
+        for target in targets[:2]:
+            contact = self.memory.counterattack.contacts.get(str(target.id))
+            if (
+                contact is None
+                or contact.seen != turn.tick
+                or turn.tick - contact.since < 8
+                or contact.still < 3
+            ):
+                continue
+            slots = skirmish.choose_slots(
+                turn,
+                available,
+                (target,),
+                enemies,
+                rocks,
+                bounded,
+                max_party,
+                route_anchor=target.position,
+                allow_vanguard_two_volley=True,
+            )
+            if slots:
+                return skirmish.Skirmish(
+                    str(core.id),
+                    core.position,
+                    (str(target.id),),
+                    target.position,
+                    turn.tick,
+                    turn.tick,
+                    slots,
+                    {
+                        str(member.id): member.position
+                        for member in available
+                        if str(member.id) in slots
+                    },
+                    scout_target=scout,
+                )
+        return None
+
     def _prepare_skirmish(self, context: _TurnContext) -> None:
         """Clear a nearby small contact with a fixed, time-bounded group."""
         if (
@@ -9857,6 +9974,13 @@ class AggressiveStrategy:
         operation = self.memory.skirmish
         rocks = self._rock_map(turn)
         enemies = self._counterattack_enemies(turn)
+        if self.memory.campaign_scout_target is not None:
+            # The Core-local threat set excludes a far corner of the next
+            # block. Scouts need current and unconfirmed recent fighters at
+            # their own contact, including the target's actual sweep reach.
+            known = {str(enemy.id): enemy for enemy in enemies}
+            known.update((str(enemy.id), enemy) for enemy in self._ranger_threats(turn))
+            enemies = tuple(known.values())
         if (
             core is None
             or core.view.state is not CoreState.NORMAL
@@ -9875,6 +9999,10 @@ class AggressiveStrategy:
             operation.core_id != str(core.id)
             or operation.core_position != core.position
             or turn.tick - operation.started >= skirmish.MAX_TICKS
+            or (
+                operation.scout_target is not None
+                and operation.scout_target != self.memory.campaign_scout_target
+            )
         ):
             self._finish_skirmish(turn.tick)
             return
@@ -9901,6 +10029,31 @@ class AggressiveStrategy:
             turn.resource_cells,
             {core.position},
         )
+        if (
+            operation is None
+            and turn.tick
+            >= max(
+                self.memory.skirmish_cooldown_until, self.memory.skirmish_retry_after
+            )
+            and not any(
+                isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+                and manhattan(core.position, enemy.position) <= skirmish.CONTACT_RADIUS
+                for enemy in turn.visible_enemies
+            )
+        ):
+            operation = self._choose_scout_clearance(context, enemies, rocks, blocked)
+            if operation is not None:
+                self.memory.skirmish = operation
+        if operation is not None and operation.scout_target is not None:
+            healthy = self._scout_clearance_rangers(context, operation.scout_target)
+            blocked = overlay_blockers(
+                blocked,
+                _OutsidePatrolArea(
+                    _single_chunk_resource_block(operation.scout_target),
+                    operation.scout_target,
+                ),
+            )
         if operation is None:
             if turn.tick < self.memory.skirmish_cooldown_until:
                 return
@@ -10053,6 +10206,12 @@ class AggressiveStrategy:
         )
         if seen_targets:
             operation.last_seen = turn.tick
+            if operation.scout_target is not None:
+                # Task members skip ordinary Ranger dispatch. Keep the same
+                # contact clock fresh so leaving this task cannot manufacture
+                # a sighting gap and renew their exhausted patrol pursuit.
+                for member in members:
+                    self._update_patrol_contact(member, seen_targets, context)
         if (
             not targets
             or turn.tick - operation.last_seen > skirmish.LOST_TICKS
@@ -10065,6 +10224,12 @@ class AggressiveStrategy:
             or any(
                 manhattan(target.position, operation.target_position) > 2
                 for target in targets
+            )
+            or (
+                operation.scout_target is not None
+                and any(
+                    target.position != operation.target_position for target in targets
+                )
             )
         ):
             self._finish_skirmish(turn.tick)
@@ -10098,6 +10263,10 @@ class AggressiveStrategy:
                     skirmish.MAX_STEPS,
                     skirmish.MAX_TICKS - (turn.tick - operation.started) - 2,
                 ),
+                route_anchor=operation.target_position
+                if operation.scout_target is not None
+                else None,
+                allow_vanguard_two_volley=operation.scout_target is not None,
             )
             if set(adjusted) != set(operation.slots):
                 self._finish_skirmish(turn.tick)
@@ -10120,7 +10289,12 @@ class AggressiveStrategy:
                 for slot in operation.slots.values()
             )
             or not skirmish.entry_viable(
-                members, operation.slots, targets, enemies, rocks
+                members,
+                operation.slots,
+                targets,
+                enemies,
+                rocks,
+                allow_vanguard_two_volley=operation.scout_target is not None,
             )
         ):
             self._finish_skirmish(turn.tick)
@@ -10150,7 +10324,9 @@ class AggressiveStrategy:
                     continue
                 route = counter.safe_routes(
                     member.position,
-                    core.position,
+                    operation.target_position
+                    if operation.scout_target is not None
+                    else core.position,
                     overlay_blockers(
                         blocked,
                         {
@@ -10252,6 +10428,28 @@ class AggressiveStrategy:
             rocks,
             shooter_hp={member.id: member.hp for member in ready},
         )
+        if (
+            not volley
+            and operation.scout_target is not None
+            and len(targets) == 1
+            and targets[0].unit_type is UnitType.VANGUARD
+        ):
+            firing = tuple(
+                member
+                for member in ready
+                if member.hp == 2
+                and line_of_fire(member.position, targets[0].position, rocks)
+            )
+            remaining_ticks = 3 - (context.turn.tick - operation.entered)
+            if (
+                len(firing) >= 2
+                and len(firing) * remaining_ticks >= targets[0].hp
+                and counter.reachable_opposition(
+                    tuple(member.position for member in firing), enemies, rocks
+                )
+                == 0
+            ):
+                volley = {member.id: targets[0] for member in firing}
         losses = casualty_bound(
             {member.id: (member.position, member.hp) for member in ready},
             enemies,

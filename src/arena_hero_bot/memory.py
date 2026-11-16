@@ -378,7 +378,7 @@ class WorldMemory:
         self._observe_campaign_scout_coverage(turn)
         self._observe_resource_cells(turn)
         self._observe_incoming_damage(turn)
-        self.counterattack.observe(turn)
+        self.counterattack.observe(turn, scout_target=self.campaign_scout_target)
         destroyed_enemy_ids = {
             str(event.target_id)
             for event in turn.events
