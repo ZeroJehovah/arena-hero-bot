@@ -391,13 +391,26 @@ class Operation:
 
 
 @dataclass(slots=True)
+class FailedEntry:
+    """A zero-damage arrival disproved while this target group held position."""
+
+    targets: dict[str, Position]
+    seen: int
+
+
+@dataclass(slots=True)
 class State:
     core_id: str | None = None
     contacts: dict[str, Contact] = field(default_factory=dict)
     operation: Operation | None = None
     returns: dict[str, int] = field(default_factory=dict)
     prefire_cells: dict[Position, int] = field(default_factory=dict)
+    failed_entries: dict[Position, FailedEntry] = field(default_factory=dict)
     last_result: dict[str, Any] | None = None
+
+    @property
+    def entry_fire_cells(self) -> frozenset[Position]:
+        return frozenset(self.prefire_cells) | frozenset(self.failed_entries)
 
     def observe(
         self,
@@ -416,6 +429,7 @@ class State:
             self.contacts.clear()
             self.returns.clear()
             self.prefire_cells.clear()
+            self.failed_entries.clear()
         self.contacts = {
             key: value
             for key, value in self.contacts.items()
@@ -462,6 +476,38 @@ class State:
                 ]
             )
         self._settlement(turn)
+        visible = {str(enemy.id): enemy.position for enemy in turn.visible_enemies}
+        destroyed = {
+            str(event.target_id)
+            for event in turn.events
+            if event.event_type
+            in {"UNIT_DESTROYED", "DESTRUCTION_PARTICIPATION", "CORE_DESTROYED"}
+        }
+        for cell, failure in list(self.failed_entries.items()):
+            if (
+                not failure.targets
+                or not 0 <= turn.tick - failure.seen <= CONTACT_TTL
+                or any(
+                    key in destroyed or (key in visible and visible[key] != position)
+                    for key, position in failure.targets.items()
+                )
+            ):
+                del self.failed_entries[cell]
+            elif all(
+                visible.get(key) == position
+                for key, position in failure.targets.items()
+            ):
+                # Ordinary damage expires before the parent task's cooldown.
+                # An unchanged, observed group must not certify the same
+                # already-shot cell as a zero-damage arrival on every retry.
+                failure.seen = turn.tick
+        if len(self.failed_entries) > CONTACT_LIMIT:
+            self.failed_entries = dict(
+                sorted(
+                    self.failed_entries.items(),
+                    key=lambda item: (item[1].seen, item[0]),
+                )[-CONTACT_LIMIT:]
+            )
         live = {str(ranger.id): ranger for ranger in turn.rangers}
         self.returns = {
             key: tick
@@ -518,10 +564,19 @@ class State:
             if (
                 event.event_type == "UNIT_DAMAGED"
                 and isinstance(damage, int)
+                and not isinstance(damage, bool)
                 and damage > 0
             ):
                 if target_id in operation.member_ids:
                     operation.flank_damage += damage
+                    if (
+                        event.reason_code == "ATTACK"
+                        and event.tick == operation.entry_tick
+                        and event.position == operation.slots[target_id].firing
+                    ):
+                        self.failed_entries[event.position] = FailedEntry(
+                            dict(operation.target_positions), event.tick
+                        )
                 elif target_id in operation.front_ids:
                     operation.front_damage += damage
                 if target_id in operation.friendly_ids and values.get("hp") == 0:
@@ -585,6 +640,10 @@ class State:
             "prefire_cells": [
                 [*cell, tick] for cell, tick in self.prefire_cells.items()
             ],
+            "failed_entries": [
+                {"position": cell, "targets": value.targets, "seen": value.seen}
+                for cell, value in self.failed_entries.items()
+            ],
             "last_result": self.last_result,
         }
 
@@ -611,6 +670,16 @@ class State:
             result.prefire_cells = {
                 (int(x), int(y)): int(tick)
                 for x, y, tick in raw.get("prefire_cells", ())[-CONTACT_LIMIT:]
+            }
+            result.failed_entries = {
+                (int(value["position"][0]), int(value["position"][1])): FailedEntry(
+                    {
+                        str(UUID(key)): (int(position[0]), int(position[1]))
+                        for key, position in value["targets"].items()
+                    },
+                    int(value["seen"]),
+                )
+                for value in raw.get("failed_entries", ())[-CONTACT_LIMIT:]
             }
             if raw.get("operation"):
                 result.operation = Operation.from_dict(raw["operation"])
@@ -1164,7 +1233,7 @@ def choose(
     if {target.id for target in current.values()} == {target.id for target in targets}:
         budget.reject("existing_volley")
         return None
-    prefire = prefire_cells(targets, front, rocks) | state.prefire_cells.keys()
+    prefire = prefire_cells(targets, front, rocks) | state.entry_fire_cells
     firing = []
     for cell in sorted(
         {cell for target in targets for cell in firing_positions(target.position)}

@@ -2920,7 +2920,7 @@ class AggressiveStrategy:
                 risks,
                 rocks,
                 flank.prefire_cells(targets, fronts, rocks, planned_front)
-                | self.memory.flank.prefire_cells.keys(),
+                | self.memory.flank.entry_fire_cells,
             )
             is None
         )
@@ -3200,7 +3200,7 @@ class AggressiveStrategy:
             operation.front_ids = tuple(str(ranger.id) for ranger in stable_front)
             prefire = (
                 flank.prefire_cells(targets, fronts, rocks, planned_front)
-                | self.memory.flank.prefire_cells.keys()
+                | self.memory.flank.entry_fire_cells
             )
             observers = self._flank_observers(turn)
             for member in members:
@@ -3459,6 +3459,7 @@ class AggressiveStrategy:
                 else None,
                 "last_result": self.memory.flank.last_result,
                 "contacts": len(self.memory.flank.contacts),
+                "failed_entry_cells": sorted(self.memory.flank.failed_entries),
                 "search": {
                     "groups": budget.groups,
                     "extensions": budget.extensions,

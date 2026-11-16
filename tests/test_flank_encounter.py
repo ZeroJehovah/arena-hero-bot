@@ -578,6 +578,62 @@ def test_actual_arrival_damage_replaces_the_zero_damage_forecast():
         assert strategy.memory.flank.last_result["flank_damage"] == 1
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_retry_remembers_a_shot_blind_entry_while_the_same_targets_hold_position(
+    restart, tmp_path
+):
+    strategy, encounter, entry = _launched()
+    operation = strategy.memory.flank.operation
+    assert operation is not None
+    victim = operation.member_ids[0]
+    failed_cell = operation.slots[victim].firing
+    original_friends = deepcopy(encounter.friends)
+    encounter.settle(
+        entry.plan,
+        {
+            key: {
+                "type": "SHOOT",
+                "target_id": victim,
+                "expected_cell": list(failed_cell),
+            }
+            for key in encounter.foes
+        },
+    )
+    # The live server reports aggregate damage with no attacker identity.
+    encounter.events = [
+        event for event in encounter.events if event["event_type"] != "SHOT_HIT"
+    ]
+    strategy.decide(encounter.turn())
+    assert strategy.memory.flank.last_result["reason"] == "arrival_incomplete"
+    assert victim not in encounter.friends
+    retry_tick = strategy.memory.skirmish_cooldown_until
+    assert retry_tick > encounter.tick + 16
+    encounter.events = []
+    # Replacements and surviving shooters are ready for the next attempt.
+    replacement = unit(90, "RANGER", position=original_friends[victim]["position"])
+    encounter.friends = {
+        key: actor for key, actor in original_friends.items() if key != victim
+    }
+    encounter.friends[replacement["id"]] = replacement
+    strategy.memory.unit_roles[replacement["id"]] = "defense"
+    if restart:
+        path = tmp_path / "memory.json"
+        strategy.memory.save(path)
+        strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    for tick in range(encounter.tick + 1, retry_tick):
+        encounter.tick = tick
+        observed = encounter.turn()
+        strategy.memory.observe(observed)
+        strategy._observe_flank_contacts(observed)
+    assert failed_cell not in strategy.memory.incoming_damage
+    encounter.tick = retry_tick
+    strategy.decide(encounter.turn())
+    retry = strategy.memory.flank.operation
+    assert retry is None or all(
+        slot.firing != failed_cell for slot in retry.slots.values()
+    )
+
+
 def test_an_unexecuted_opening_does_not_count_a_kill_or_refresh_the_fire_budget():
     strategy, encounter, entry = _launched()
     operation = strategy.memory.flank.operation
@@ -630,7 +686,7 @@ def test_finish_can_use_current_worker_observation_after_front_mutual_sight_ends
 
 
 @pytest.mark.parametrize(
-    "gate", ["rock", "enemy", "service", "capacity", "unknown_damage"]
+    "gate", ["rock", "enemy", "service", "capacity", "unknown_damage", "failed_entry"]
 )
 def test_exact_entry_permit_does_not_bypass_physical_or_service_gates(gate):
     strategy, encounter, _turn = _launched()
@@ -657,6 +713,10 @@ def test_exact_entry_permit_does_not_bypass_physical_or_service_gates(gate):
         context.core_migration_lane = (cell,)
     elif gate == "capacity":
         context.friendly_occupancy[cell] = 1
+    elif gate == "failed_entry":
+        strategy.memory.flank.failed_entries[cell] = flank.FailedEntry(
+            dict(operation.target_positions), turn.tick
+        )
     else:
         strategy.memory.incoming_damage[cell] = (turn.tick - 1, 2)
     before = deepcopy(turn.plan.model_dump())

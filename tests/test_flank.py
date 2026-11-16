@@ -414,10 +414,65 @@ def test_contact_and_prefire_caches_are_bounded_and_aged():
         for index in range(200)
     }
     state.prefire_cells = {(index, 0): 99 for index in range(200)}
+    state.failed_entries = {
+        (index, 1): flank.FailedEntry({object_id(50): (0, -7)}, 99)
+        for index in range(200)
+    }
     state.observe(make_turn(objects=[core()]), [], [], set())
     assert len(state.contacts) == len(state.prefire_cells) == 128
+    assert len(state.failed_entries) == 128
+    restored = flank.State.from_dict(state.to_dict())
+    assert restored.failed_entries == state.failed_entries
     state.observe(make_turn(tick=133, objects=[core()]), [], [], set())
     assert not state.contacts and not state.prefire_cells
+    assert not state.failed_entries
+
+
+@pytest.mark.parametrize(
+    "change,retained",
+    [
+        ("stationary", True),
+        ("briefly_hidden", True),
+        ("expired", False),
+        ("moved", False),
+        ("destroyed", False),
+        ("core_changed", False),
+        ("respawned", False),
+    ],
+)
+def test_failed_blind_entry_follows_the_original_enemy_contact(change, retained):
+    cell = (3, -4)
+    state = flank.State(core_id=object_id(1))
+    state.failed_entries[cell] = flank.FailedEntry({object_id(50): (0, -7)}, 99)
+    objects = [core(number=2 if change == "core_changed" else 1)]
+    events = []
+    if change not in {"briefly_hidden", "expired"}:
+        objects.append(
+            unit(
+                50,
+                "RANGER",
+                controlled=False,
+                position=(1, -7) if change == "moved" else (0, -7),
+            )
+        )
+    if change in {"destroyed", "respawned"}:
+        events.append(
+            {
+                "event_id": object_id(900),
+                "tick": 99,
+                "event_type": (
+                    "CORE_RESPAWNED" if change == "respawned" else "UNIT_DESTROYED"
+                ),
+                "target_id": object_id(1 if change == "respawned" else 50),
+            }
+        )
+    turn = make_turn(
+        tick=132 if change == "expired" else 100, objects=objects, events=events
+    )
+    state.observe(turn, [], [], set())
+    assert (cell in state.entry_fire_cells) is retained
+    if change == "stationary":
+        assert state.failed_entries[cell].seen == turn.tick
 
 
 @pytest.mark.parametrize("invalid", ["tick", "member", "cell", "task", "phase"])
