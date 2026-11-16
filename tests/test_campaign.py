@@ -1512,7 +1512,7 @@ def test_quota_two_block_departs_after_the_full_stage_two_formation() -> None:
 
 
 def test_campaign_rest_holds_the_center_until_nearby_cargo_lands() -> None:
-    """The rest ends when the Core neighbourhood has nothing left to deliver."""
+    """Adjacent cargo holds the hop until the next snapshot confirms delivery."""
 
     center = (-945, -945)
     core_object = core(position=center)
@@ -1527,7 +1527,7 @@ def test_campaign_rest_holds_the_center_until_nearby_cargo_lands() -> None:
     workers, rangers, _roles = _gathered_roster(8, center=center)
     for ranger in rangers:
         memory.unit_roles[str(ranger["id"])] = "defense"
-    loaded = unit(500, "WORKER", position=(-943, -945), cargo=1)
+    loaded = unit(500, "WORKER", position=(-944, -945), cargo=1)
     turn = make_turn(tick=100, objects=[core_object, *workers, loaded, *rangers])
 
     report = _strategy(memory).decide(turn)
@@ -1553,6 +1553,73 @@ def test_campaign_rest_holds_the_center_until_nearby_cargo_lands() -> None:
     assert memory.core_home_position != center
     assert delivered.plan.core_action is not None
     assert delivered.plan.core_action.type == "START_MOVE"
+
+
+@pytest.mark.parametrize("offset", [(2, 0), (1, 1), (4, 0)])
+def test_campaign_next_hop_ignores_cargo_beyond_adjacent_cells(offset) -> None:
+    """Cargo in the wider service queue no longer holds an otherwise ready hop."""
+
+    center = (-945, -945)
+    core_object = core(position=center)
+    workers, rangers, roles = _gathered_roster(8, center=center)
+    workers[0]["position"] = [center[0] + offset[0], center[1] + offset[1]]
+    workers[0]["cargo"] = 1
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE3,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+        campaign_resting=True,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(tick=100, objects=[core_object, *workers, *rangers])
+
+    _strategy(memory).decide(turn)
+
+    assert any(worker.cargo > 0 for worker in turn.workers)
+    assert memory.campaign_resting is False
+    assert memory.core_home_position != center
+    assert turn.plan.core_action is not None
+    assert turn.plan.core_action.type == "START_MOVE"
+
+
+@pytest.mark.parametrize("distance,holds", [(0, True), (1, True), (2, False)])
+def test_campaign_scout_waits_only_for_cargo_on_or_adjacent_to_core(
+    distance, holds
+) -> None:
+    """The same backlog gate precedes forward scouting from a reached center."""
+
+    center = (815, 15)
+    core_object = core(position=center)
+    workers, rangers, roles = _gathered_roster(30, center=center)
+    workers[0]["position"] = [center[0] + distance, center[1]]
+    workers[0]["cargo"] = 1
+    memory = WorldMemory(
+        core_home_position=center,
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=center,
+        campaign_phase=CAMPAIGN_PHASE_STAGE4,
+        campaign_target_quota=4,
+        campaign_last_core_id=core_object["id"],
+        campaign_resting=True,
+        unit_roles=roles,
+        unit_roles_initialized=True,
+    )
+    turn = make_turn(tick=100, objects=[core_object, *workers, *rangers])
+
+    _strategy(memory).decide(turn)
+
+    assert memory.campaign_resting is holds
+    assert memory.core_home_position == center
+    assert turn.plan.core_action is None
+    if holds:
+        assert memory.campaign_scout_target is None
+    else:
+        assert memory.campaign_scout_target is not None
+        assert memory.campaign_scout_started_tick == turn.tick
 
 
 def test_campaign_rest_clears_the_service_cell_for_the_next_delivery() -> None:

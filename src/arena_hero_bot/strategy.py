@@ -382,10 +382,10 @@ SYMMETRIC_RANGER_OFFSETS: tuple[Position, ...] = (
 )
 CORE_QUEUE_RADIUS = 4
 CORE_TRAFFIC_RADIUS = 8
-# Only nearby cargo holds service open. The next-hop rest also waits for all
-# live Workers and Rangers to enter the Core's current block; cargo deeper
-# within that block can keep walking with the Core on the following hop.
-CAMPAIGN_REST_RADIUS = CORE_QUEUE_RADIUS
+# Only cargo on the Core cell or its cardinal neighbours holds the next hop.
+# The four-cell service queue stays unchanged. All live Workers and Rangers
+# must still enter the Core's current block before the next hop can begin.
+CAMPAIGN_REST_RADIUS = 1
 # A moving Core must not have its next completion cell occupied.  Keep the
 # four immediate neighbours available between steps, but do not push Workers
 # two cells away from a resource they are harvesting or deliver on a broad
@@ -6871,9 +6871,8 @@ class AggressiveStrategy:
         elif self._core_migration_in_progress(core.view):
             service_window = any(worker.cargo > 0 for worker in context.turn.workers)
         elif self.memory.campaign_resting:
-            # A resting Core only has to free its cell for cargo that is
-            # already inside the service neighbourhood; the rest ends on that
-            # same queue, so distant cargo never justifies the churn.
+            # Keep preparing service for the existing four-cell neighbourhood;
+            # the next-hop backlog gate separately counts only adjacent cargo.
             service_window = self._campaign_pending_deliveries(context.turn) > 0
         else:
             # A stationary Core can stay in combat posture for many hours.
@@ -14933,8 +14932,10 @@ class AggressiveStrategy:
 
         return self._campaign_movement_cap(turn) is not None
 
-    def _campaign_pending_deliveries(self, turn: Turn) -> int:
-        """Count Workers that are close enough to hand cargo in right now."""
+    def _campaign_pending_deliveries(
+        self, turn: Turn, *, radius: int = CORE_QUEUE_RADIUS
+    ) -> int:
+        """Count live loaded Workers within the requested Manhattan radius."""
 
         core = turn.core
         if core is None:
@@ -14942,8 +14943,7 @@ class AggressiveStrategy:
         return sum(
             1
             for worker in turn.workers
-            if worker.cargo > 0
-            and manhattan(worker.position, core.position) <= CAMPAIGN_REST_RADIUS
+            if worker.cargo > 0 and manhattan(worker.position, core.position) <= radius
         )
 
     def _campaign_rest_complete(self, turn: Turn) -> bool:
@@ -14966,7 +14966,7 @@ class AggressiveStrategy:
             for unit in (*turn.workers, *turn.rangers)
         ):
             return False
-        if self._campaign_pending_deliveries(turn):
+        if self._campaign_pending_deliveries(turn, radius=CAMPAIGN_REST_RADIUS):
             return False
         if self._campaign_spawn_ready(turn, turn.resources):
             return False
