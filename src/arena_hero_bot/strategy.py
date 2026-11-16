@@ -10431,8 +10431,17 @@ class AggressiveStrategy:
                         )
         for member in members:
             if not self._has_unit_action(member, context):
-                member.wait()
                 context.planned_ids.add(member.id)
+                # Waiting at a verified safe stage can still cover a
+                # visible fixed target's empty neighbor. This does not
+                # begin the volley or spend the joint entrance Tick.
+                if member.position == operation.slots[str(member.id)].stage and (
+                    self._defensive_cover_fire(
+                        member, context, (), fixed_targets=seen_targets
+                    )
+                ):
+                    continue
+                member.wait()
                 self._record_wait(member, context, "hold for local clearance readiness")
 
     def _skirmish_enter(
