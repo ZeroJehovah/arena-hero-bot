@@ -10617,6 +10617,14 @@ class AggressiveStrategy:
         if enemies:
             memory.layered_defense_last_contact_tick = context.turn.tick
         elif context.turn.tick - memory.layered_defense_last_contact_tick > 8:
+            if (
+                core.view.state is not CoreState.MOVING
+                and memory.layered_retreat_destination == core.position
+            ):
+                # Returning after a finished retreat is a new journey. Its
+                # first step may retrace the escape route; carrying that
+                # history into home routing would force an unnecessary loop.
+                memory.position_history[str(core.id)] = [core.position]
             memory.layered_defense_posts.clear()
             memory.layered_defense_ready_sides.clear()
             memory.layered_defense_anchor = None
