@@ -50,6 +50,51 @@ def _ranger_action(strategy, context, ranger):
     return context.turn.plan.unit_actions[ranger.id]
 
 
+@pytest.mark.parametrize(
+    "blocker", [None, "middle_rock", "rock_cell", "friendly", "arrival", "enemy"]
+)
+def test_fixed_flank_cover_respects_terrain_occupancy_and_target_scope(blocker):
+    objects = [
+        core(position=(10, 10)),
+        unit(2, "RANGER", position=(4, 3)),
+        unit(50, "RANGER", controlled=False, position=(0, 0)),
+        # An unrelated fighter has a different, unobstructed next-cell ray.
+        unit(60, "RANGER", controlled=False, position=(4, 7)),
+    ]
+    rocks = (
+        [(3, 2)]
+        if blocker == "middle_rock"
+        else [(1, 0)]
+        if blocker == "rock_cell"
+        else []
+    )
+    if blocker in {"friendly", "enemy"}:
+        objects.append(
+            unit(3, "WORKER", controlled=blocker == "friendly", position=(1, 0))
+        )
+    turn = make_turn(objects=objects, obstacles=rocks)
+    strategy, context = _context(turn)
+    if blocker == "arrival":
+        context.arrival_counts[(1, 0)] = 1
+    ranger = turn.rangers[0]
+    targets = tuple(enemy for enemy in turn.visible_enemies if enemy.id.int == 50)
+    assert strategy._defensive_cover_fire(
+        ranger,
+        context,
+        strategy.memory.recent_enemies(turn.tick, 32),
+        frontier=True,
+        fixed_targets=targets,
+    ) is (blocker is None)
+    if blocker is None:
+        action = turn.plan.unit_actions[ranger.id]
+        assert action.type == "SHOOT" and action.expected_cell == (1, 0)
+        assert action.target_id is None
+        assert context.damage_ledger.planned_damage == {}
+    else:
+        assert ranger.id not in turn.plan.unit_actions
+        assert not context.report.decisions
+
+
 def test_recalled_patrol_shoots_before_returning_to_its_post():
     turn = make_turn(
         objects=[

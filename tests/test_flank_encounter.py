@@ -11,6 +11,7 @@ from arena_hero import Direction, UnitView
 
 from arena_hero_bot import flank
 from arena_hero_bot.counterattack import paired_cells
+from arena_hero_bot.geometry import adjacent_positions, line_of_fire
 from arena_hero_bot.memory import EnemySighting, WorldMemory
 from arena_hero_bot.models import DecisionReport
 from arena_hero_bot.runtime import _identity_snapshot, _turn_record
@@ -58,12 +59,16 @@ def test_same_initial_state_recomputes_fog_responses_and_preserves_economic_serv
     assert baseline.trace[9]["enemy"] != changed.trace[9]["enemy"]
 
 
-def test_different_route_lengths_wait_at_safe_stages_before_a_joint_entry():
+@pytest.mark.parametrize("restart", [False, True])
+def test_different_route_lengths_cover_from_safe_stages_before_a_joint_entry(
+    restart, tmp_path
+):
     strategy, encounter = standoff()
     encounter.friends[object_id(3)]["position"] = [4, -3]
     seed_contact(strategy, encounter)
     start = encounter.tick
     saw_assembly = False
+    restarted = False
     for _ in range(5):
         turn = encounter.turn()
         strategy.decide(turn)
@@ -77,20 +82,108 @@ def test_different_route_lengths_wait_at_safe_stages_before_a_joint_entry():
             saw_assembly = True
             assert sorted(action.type for action in actions.values()) == [
                 "MOVE",
-                "WAIT",
+                "SHOOT",
             ]
+            assert operation.first_shot is None and operation.entry_tick is None
+            assert strategy.memory.skirmish is not None
+            assert strategy.memory.skirmish.entered is None
+            for key, action in actions.items():
+                if action.type == "SHOOT":
+                    assert action.target_id is None
+                    assert action.expected_cell in adjacent_positions((0, -7))
+                    assert tuple(encounter.friends[key]["position"]) == (
+                        operation.slots[key].stage
+                    )
+                    assert line_of_fire(
+                        operation.slots[key].stage,
+                        action.expected_cell,
+                        encounter.rocks,
+                    )
             assert all(
                 encounter.friends[key]["hp"] == 2 for key in operation.member_ids
             )
+            if restart and not restarted:
+                path = tmp_path / "memory.json"
+                strategy.memory.save(path)
+                strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+                restarted = True
         if operation.phase is flank.Phase.ENTER:
             assert all(action.type == "MOVE" for action in actions.values())
         if operation.first_shot is not None:
             assert saw_assembly
+            assert operation.first_shot == start + 2
             assert all(action.type == "SHOOT" for action in actions.values())
+            assert all(action.target_id is not None for action in actions.values())
             break
         encounter.settle(turn.plan, encounter.response(encounter.view(enemy=True)))
     else:
         pytest.fail("bounded assembly never reached its complete opening")
+
+
+def test_safe_assembly_keeps_wait_when_the_fixed_target_neighbor_ray_is_blocked():
+    strategy, encounter = standoff()
+    encounter.friends[object_id(3)]["position"] = [5, -3]
+    seed_contact(strategy, encounter)
+    turn = encounter.turn()
+    strategy.decide(turn)
+    operation = strategy.memory.flank.operation
+    assert operation is not None and operation.phase is flank.Phase.ASSEMBLE
+    assert turn.plan.unit_actions[UUID(int=2)].type == "SHOOT"
+    encounter.settle(turn.plan, encounter.response(encounter.view(enemy=True)))
+    encounter.rocks |= {(2, -4)}
+    turn = encounter.turn()
+    strategy.decide(turn)
+    assert strategy.memory.flank.operation is operation
+    assert operation.phase is flank.Phase.ASSEMBLE
+    assert operation.slots[object_id(2)].stage == (3, -3)
+    assert turn.plan.unit_actions[UUID(int=2)].type == "WAIT"
+    assert turn.plan.unit_actions[UUID(int=3)].type == "MOVE"
+    assert operation.first_shot is None and operation.entry_tick is None
+
+
+def test_failed_atomic_entry_covers_from_stages_then_retries_in_the_original_budget(
+    monkeypatch,
+):
+    strategy, encounter = standoff()
+    seed_contact(strategy, encounter)
+    queue_move = strategy._queue_move
+
+    def fail_second_entry(member, direction, context, **kwargs):
+        if (
+            member.id.int == 3
+            and kwargs.get("reason") == "synchronized qualified blind flank entry"
+        ):
+            return False
+        return queue_move(member, direction, context, **kwargs)
+
+    monkeypatch.setattr(strategy, "_queue_move", fail_second_entry)
+    turn = encounter.turn()
+    report = strategy.decide(turn)
+    operation = strategy.memory.flank.operation
+    assert operation is not None and operation.phase is flank.Phase.ASSEMBLE
+    assert operation.first_shot is None and operation.entry_tick is None
+    assert report.flank["reason"] == "capacity_failed"
+    for key in operation.member_ids:
+        action = turn.plan.unit_actions[UUID(key)]
+        assert action.type == "SHOOT" and action.target_id is None
+        assert action.expected_cell in adjacent_positions((0, -7))
+        assert key not in strategy.memory.pending_move_targets
+    assert all(
+        decision.action != "MOVE"
+        for decision in report.decisions
+        if decision.actor_id in operation.member_ids
+    )
+    started, deadline = operation.parent.started, operation.parent.deadline
+    encounter.settle(turn.plan, encounter.response(encounter.view(enemy=True)))
+    monkeypatch.setattr(strategy, "_queue_move", queue_move)
+    turn = encounter.turn()
+    strategy.decide(turn)
+    assert operation.phase is flank.Phase.ENTER
+    assert operation.entry_tick == started + 1
+    assert operation.parent.started == started and operation.parent.deadline == deadline
+    assert all(
+        turn.plan.unit_actions[UUID(key)].type == "MOVE" for key in operation.member_ids
+    )
 
 
 @pytest.mark.parametrize("service", ["spawn", "deposit", "heal"])
@@ -840,7 +933,9 @@ def test_one_extra_assembly_tick_can_win_a_complete_opening_volley():
     assert operation.phase is flank.Phase.ASSEMBLE
     assert sorted(
         turn.plan.unit_actions[UUID(key)].type for key in operation.member_ids
-    ) == ["MOVE", "MOVE", "WAIT", "WAIT"]
+    ) == ["MOVE", "MOVE", "SHOOT", "SHOOT"]
+    assert strategy.memory.skirmish is not None
+    assert operation.first_shot is None and strategy.memory.skirmish.entered is None
     for _ in range(5):
         encounter.settle(turn.plan, encounter.response(encounter.view(enemy=True)))
         turn = encounter.turn()

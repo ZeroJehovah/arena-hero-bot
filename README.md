@@ -104,6 +104,8 @@ of rotating shots through known-empty ground. Repositioning requires a
 threatened ally or Core, stays within the defensive layers, and avoids new
 firing sources. A necessary withdrawal is planned before rear-rank shots and
 prefers an equally safe cell that preserves supporting fire.
+Rangers waiting at a safe flank assembly cell can cover legal neighbouring cells
+of their fixed targets while preserving joint entry and opening-volley timing.
 
 In a one- or two-fighter campaign contact, a stationary wounded fighter
 with one or two HP may pull

@@ -3261,13 +3261,16 @@ class AggressiveStrategy:
                     context.flank_entry_permit = None
                     context.report.flank["reason"] = "capacity_failed"
                     for member in members:
-                        member.wait()
                         context.planned_ids.add(member.id)
-                        self._record_wait(
-                            member,
-                            context,
-                            "wait for complete blind flank entry capacity",
-                        )
+                        if not self._defensive_cover_fire(
+                            member, context, (), fixed_targets=targets
+                        ):
+                            member.wait()
+                            self._record_wait(
+                                member,
+                                context,
+                                "wait for complete blind flank entry capacity",
+                            )
                 return
             assembly_routes: dict[UUID, tuple[Position, ...]] = {}
             for member in members:
@@ -3316,11 +3319,19 @@ class AggressiveStrategy:
                             target=slot.stage,
                         )
                 if not self._has_unit_action(member, context):
-                    member.wait()
                     context.planned_ids.add(member.id)
-                    self._record_wait(
-                        member, context, "wait at safe blind flank assembly position"
-                    )
+                    # Holding a safe stage does not spend the movement Tick.
+                    # Cover only fixed targets' empty next cells; the complete
+                    # group's actual entry and opening volley still wait.
+                    if member.position != slot.stage or not self._defensive_cover_fire(
+                        member, context, (), fixed_targets=targets
+                    ):
+                        member.wait()
+                        self._record_wait(
+                            member,
+                            context,
+                            "wait at safe blind flank assembly position",
+                        )
             return
         if operation.phase is flank.Phase.ENTER:
             if operation.entry_tick == turn.tick:
@@ -4031,6 +4042,7 @@ class AggressiveStrategy:
         recent_enemies: tuple[EnemySighting, ...],
         *,
         frontier: bool = False,
+        fixed_targets: tuple[UnitView, ...] | None = None,
     ) -> tuple[dict[Position, float], bool]:
         """Rank legal contact cells before unknown frontier entries."""
 
@@ -4040,18 +4052,31 @@ class AggressiveStrategy:
         # A visible fighter can stop or take a cardinal step even after a
         # stationary observation. Its legal nearby cells outrank old contacts
         # and unknown frontier entries when no direct shot is available.
-        for enemy in context.turn.visible_enemies:
+        enemies = (
+            context.turn.visible_enemies if fixed_targets is None else fixed_targets
+        )
+        for enemy in enemies:
             if not isinstance(enemy, UnitView) or enemy.unit_type is UnitType.WORKER:
                 continue
-            for cell in (enemy.position, *adjacent_positions(enemy.position)):
+            cells = (
+                (enemy.position, *adjacent_positions(enemy.position))
+                if fixed_targets is None
+                else adjacent_positions(enemy.position)
+            )
+            for cell in cells:
                 if (
                     (cell == enemy.position or cell not in positions)
+                    and (fixed_targets is None or cell not in context.enemy_positions)
                     and self._line_of_fire_clear(
                         ranger.position, cell, obstacles, positions
                     )
                     and self._aim_cell_has_enemy_opportunity(cell, context.turn)
                 ):
                     candidates[cell] = 100 if cell == enemy.position else 50
+        if fixed_targets is not None:
+            # Assembly cover cannot begin the opening volley, attack bycatch,
+            # or fall back to old contacts and unrelated frontier cells.
+            return candidates, bool(candidates)
         contacts = tuple(
             enemy
             for enemy in recent_enemies
@@ -4153,10 +4178,15 @@ class AggressiveStrategy:
         recent_enemies: tuple[EnemySighting, ...],
         *,
         frontier: bool = False,
+        fixed_targets: tuple[UnitView, ...] | None = None,
     ) -> bool:
         """Cover cells that can still receive an enemy without pursuing."""
         candidates, contact_shot = self._defensive_cover_cells(
-            ranger, context, recent_enemies, frontier=frontier
+            ranger,
+            context,
+            recent_enemies,
+            frontier=frontier,
+            fixed_targets=fixed_targets,
         )
         if not candidates:
             return False
