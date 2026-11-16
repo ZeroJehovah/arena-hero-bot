@@ -747,6 +747,18 @@ class AggressiveStrategy:
         # The roaming squad, cached against the roster it was drawn from so
         # membership only changes when a combat unit is built or dies.
         self._offensive_squad: tuple[frozenset[UUID], frozenset[UUID]] | None = None
+        # Patrol ownership is stable between queries in one planning pass.
+        # Keep role and squad snapshots so an in-Turn transfer still refreshes
+        # the roster before it is used for reserve or task membership checks.
+        self._patrol_ids_cache: (
+            tuple[
+                Turn,
+                dict[str, str],
+                tuple[tuple[frozenset[UUID], int], ...],
+                frozenset[UUID],
+            ]
+            | None
+        ) = None
         self._combat_focus_id: str | None = None
         self._intruder_hunt_id: str | None = None
         self._combat_policy = CombatPolicy()
@@ -796,9 +808,12 @@ class AggressiveStrategy:
         # inherit an answer.
         self._unreachable_claims: dict[Position, int] = {}
         # The rock map holds over a million cells once exploration has spread.
-        # Rebuilding ``memory.obstacles | turn.obstacle_cells`` per Unit made
-        # planning time grow with the explored map, so cache it per Tick.
-        self._rock_map_cache: tuple[int, set[Position]] | None = None
+        # Treat shared rock sets as read-only. Observe merges the current
+        # rocks into memory, so ordinary planning can reuse that set directly.
+        # A different Turn or changed durable map invalidates the cached view.
+        self._rock_map_cache: tuple[Turn, set[Position], int, set[Position]] | None = (
+            None
+        )
         # The current fleet vision disc is shared by every firing decision.
         # Cache its union for the Tick so checking whether an empty cell can
         # actually receive an unseen enemy does not rebuild every Unit's view.
@@ -867,6 +882,7 @@ class AggressiveStrategy:
         self._expedition_routes: dict[frozenset[UUID], ExplorationRoute] = {}
         self._expedition_regroup_orders: dict[frozenset[UUID], tuple[UUID, ...]] = {}
         self._expedition_navigation_turn: Turn | None = None
+        self._expedition_navigation_members: tuple[frozenset[UUID], ...] = ()
         self._patrol_ring_cache: tuple[int, Position, tuple[Position, ...]] | None = (
             None
         )
@@ -921,6 +937,8 @@ class AggressiveStrategy:
         """Queue one complete aggressive plan for the current Turn."""
 
         turn.clear()
+        self._patrol_ids_cache = None
+        self._rock_map_cache = None
         # ``observe`` drops destroyed enemies from memory, taking the only
         # record of what they were with them, so log the kills first.
         self._record_combat_kills(turn)
@@ -1309,13 +1327,20 @@ class AggressiveStrategy:
         return report
 
     def _rock_map(self, turn: Turn) -> set[Position]:
-        """Return this Tick's rock cells without copying the map per Unit."""
+        """Return a read-only rock view, copying only for unobserved extras."""
 
         cached = self._rock_map_cache
-        if cached is not None and cached[0] == turn.tick:
-            return cached[1]
-        obstacles = self.memory.obstacles | set(turn.obstacle_cells)
-        self._rock_map_cache = (turn.tick, obstacles)
+        rocks = self.memory.obstacles
+        if (
+            cached is not None
+            and cached[0] is turn
+            and cached[1] is rocks
+            and cached[2] == len(rocks)
+        ):
+            return cached[3]
+        extra = set(turn.obstacle_cells) - rocks
+        obstacles = rocks | extra if extra else rocks
+        self._rock_map_cache = (turn, rocks, len(rocks), obstacles)
         return obstacles
 
     def _fleet_visible_cells(self, turn: Turn) -> frozenset[Position]:
@@ -12094,6 +12119,8 @@ class AggressiveStrategy:
 
     def _expedition_member_ids(self, turn: Turn) -> frozenset[UUID]:
         """Return every live combat unit already bound to an expedition."""
+        if not self._expedition_squads:
+            return frozenset()
         live = {unit.id for unit in (*turn.vanguards, *turn.rangers)}
         return frozenset(
             unit_id
@@ -12115,13 +12142,28 @@ class AggressiveStrategy:
     def _patrol_ids(self, turn: Turn) -> frozenset[UUID]:
         """Return the live members of the configured fixed patrol teams."""
 
+        squads = tuple(
+            (members, self._expedition_serial_by_members.get(members, index))
+            for index, (members, _bearing) in enumerate(self._expedition_squads, 1)
+        )
+        cached = self._patrol_ids_cache
+        if (
+            cached is not None
+            and cached[0] is turn
+            and self.memory.unit_roles_initialized
+            and cached[1] == self.memory.unit_roles
+            and cached[2] == squads
+        ):
+            return cached[3]
         self._ensure_unit_roles(turn)
         live_ids = {str(unit.id) for unit in (*turn.vanguards, *turn.rangers)}
-        return frozenset(
+        result = frozenset(
             UUID(unit_id)
             for unit_id, role in self.memory.unit_roles.items()
             if unit_id in live_ids and self._patrol_team_from_role(role) is not None
         )
+        self._patrol_ids_cache = (turn, self.memory.unit_roles.copy(), squads, result)
+        return result
 
     def _patrol_team_for(self, unit_id: UUID, turn: Turn) -> int | None:
         """Return the stable patrol team owning ``unit_id``."""
@@ -12319,10 +12361,18 @@ class AggressiveStrategy:
     def _refresh_expedition_navigation(self, turn: Turn) -> None:
         """Select and reserve one information-gathering route per whole squad."""
 
-        if self._expedition_navigation_turn is turn:
+        members_snapshot = tuple(members for members, _ in self._expedition_squads)
+        if (
+            self._expedition_navigation_turn is turn
+            and self._expedition_navigation_members == members_snapshot
+        ):
             return
         self._expedition_navigation_turn = turn
+        self._expedition_navigation_members = members_snapshot
         self.memory.observe_exploration(turn)
+        if not self._expedition_squads:
+            self._persist_expedition_pursuits()
+            return
         obstacles = self._rock_map(turn)
         blocked = (
             obstacles
@@ -18588,6 +18638,10 @@ class AggressiveStrategy:
 
         core = turn.core
         if core is None:
+            return None
+        if target is None and not any(
+            isinstance(enemy, CoreView) for enemy in turn.visible_enemies
+        ):
             return None
         block = resource_block_index(core.position)
         hunters = tuple(
