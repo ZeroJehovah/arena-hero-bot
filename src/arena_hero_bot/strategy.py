@@ -15657,10 +15657,14 @@ class AggressiveStrategy:
             self.config.campaign_mode
             and core.view.state is CoreState.NORMAL
             and self.memory.core_home_position in {None, core_position}
-            and self.memory.campaign_scout_target is None
             and not self.memory.defense_compressed
             and (
-                self.memory.defense_spread_version == defense_layout.LAYOUT_VERSION
+                # A held forward scout does not shrink a calm Core's layout.
+                # Local contact restores scout cover even after spreading.
+                (
+                    self.memory.defense_spread_version == defense_layout.LAYOUT_VERSION
+                    and self.memory.campaign_scout_target is None
+                )
                 or not any(
                     manhattan(core_position, enemy.position)
                     <= defense_layout.MAX_RADIUS + RANGER_VISION_RADIUS

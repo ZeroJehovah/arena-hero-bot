@@ -172,7 +172,9 @@ def test_first_spread_waits_for_current_and_recent_combat_to_clear(contact):
     assert max(manhattan(HOME, p) for p in posts.values()) <= 8
 
 
-@pytest.mark.parametrize("mode", ["moving", "pending", "scouting", "compressed"])
+@pytest.mark.parametrize(
+    "mode", ["moving", "pending", "scouting-contact", "compressed"]
+)
 def test_migration_and_compressed_postures_keep_their_existing_rules(mode):
     guards = [
         unit(100 + n, "RANGER", position=(12 + n % 5, 12 + n // 5)) for n in range(20)
@@ -190,16 +192,176 @@ def test_migration_and_compressed_postures_keep_their_existing_rules(mode):
         )
     elif mode == "pending":
         strategy.memory.core_home_position = (47, 15)
-    elif mode == "scouting":
+    elif mode == "scouting-contact":
         strategy.memory.campaign_scout_target = (47, 15)
     else:
         strategy.memory.defense_compressed = True
-    turn = make_turn(objects=[obj, *guards])
+    turn = make_turn(
+        objects=[
+            obj,
+            *guards,
+            *(
+                [unit(500, "RANGER", position=(15, 6), controlled=False)]
+                if mode == "scouting-contact"
+                else []
+            ),
+        ]
+    )
     posts = strategy._defensive_perimeter_assignments(context_for(turn))
     assert strategy.memory.defense_spread_version == 0
     assert max(manhattan(HOME, p) for p in posts.values()) <= (
         4 if mode == "compressed" else 8
     )
+
+
+def compact_guards(count, rocks=(), center=HOME):
+    template, _radius = strategy_for([])._symmetric_defense_posts(center, set(rocks))
+    extras = sorted(
+        (
+            (center[0] + dx, center[1] + dy)
+            for dx in range(-8, 9)
+            for dy in range(-8, 9)
+            if 0 < abs(dx) + abs(dy) <= 8
+            and (center[0] + dx, center[1] + dy) not in template
+            and (center[0] + dx, center[1] + dy) not in rocks
+        ),
+        key=lambda p: (-manhattan(center, p), p),
+    )
+    return [
+        unit(100 + n, "RANGER", position=p)
+        for n, p in enumerate((*template, *extras)[:count])
+    ]
+
+
+@pytest.mark.parametrize("rocky", [False, True])
+@pytest.mark.parametrize("far_contact", [None, "RANGER", "VANGUARD"])
+def test_quiet_scout_uses_the_normal_stationary_layout(tmp_path, rocky, far_contact):
+    rocks = {(17, 16), (18, 16), (13, 13), (11, 18)} if rocky else set()
+    guards = compact_guards(25, rocks)
+    scout = (47, 15)
+    strategy = strategy_for(
+        guards,
+        campaign_scout_target=scout,
+        campaign_scout_started_tick=80,
+        campaign_scout_last_gain_tick=90,
+        campaign_scout_seen_ticks={(45, 15): 90},
+    )
+    objects = [core(position=HOME), *guards]
+    if far_contact:
+        objects.append(unit(500, far_contact, position=scout, controlled=False))
+    turn = make_turn(objects=objects, obstacles=list(rocks))
+    posts = strategy._defensive_perimeter_assignments(context_for(turn))
+    normal = strategy_for(guards)
+    expected = normal._defensive_perimeter_assignments(context_for(turn))
+    assert posts == expected
+    assert max(manhattan(HOME, p) for p in posts.values()) > 8
+    assert (
+        strategy.memory.defense_coverage_radius == normal.memory.defense_coverage_radius
+    )
+    assert_covered(
+        HOME, tuple(posts.values()), rocks, strategy.memory.defense_coverage_radius
+    )
+    assert strategy.memory.campaign_scout_target == scout
+    assert strategy.memory.campaign_scout_started_tick == 80
+    assert strategy.memory.campaign_scout_seen_ticks == {(45, 15): 90}
+    path = tmp_path / "memory.json"
+    strategy.memory.save(path)
+    resumed = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    resumed_turn = make_turn(tick=101, objects=objects, obstacles=list(rocks))
+    assert resumed._defensive_perimeter_assignments(context_for(resumed_turn)) == posts
+    assert resumed.memory.campaign_scout_target == scout
+    assert resumed.memory.campaign_scout_started_tick == 80
+    assert resumed.memory.campaign_scout_last_gain_tick == 90
+
+
+@pytest.mark.parametrize("spread", [False, True])
+@pytest.mark.parametrize("remembered", [False, True])
+@pytest.mark.parametrize("enemy_type", ["RANGER", "VANGUARD"])
+def test_scout_local_contact_keeps_compact_cover_even_after_spreading(
+    spread, remembered, enemy_type
+):
+    guards = compact_guards(25)
+    strategy = strategy_for(guards)
+    strategy.memory.observe(make_turn(tick=98, objects=[core(position=HOME), *guards]))
+    if spread:
+        quiet = make_turn(tick=98, objects=[core(position=HOME), *guards])
+        strategy._stationary_defense_assignments(quiet.rangers, context_for(quiet))
+        assert strategy.memory.defense_spread_version == defense_layout.LAYOUT_VERSION
+    strategy.memory.campaign_scout_target = (47, 15)
+    strategy.memory.campaign_scout_started_tick = 80
+    enemy = unit(500, enemy_type, position=(30, 15), controlled=False)
+    if remembered:
+        strategy.memory.observe(
+            make_turn(tick=99, objects=[core(position=HOME), *guards, enemy])
+        )
+    turn = make_turn(
+        tick=100,
+        objects=[core(position=HOME), *guards, *([] if remembered else [enemy])],
+    )
+    posts = strategy._defensive_perimeter_assignments(context_for(turn))
+    assert strategy.memory.defense_spread_version == 0
+    assert max(manhattan(HOME, p) for p in posts.values()) <= 8
+    assert strategy.memory.campaign_scout_target == (47, 15)
+    assert strategy.memory.campaign_scout_started_tick == 80
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_quiet_scout_full_plans_spread_without_opening_inner_gaps(tmp_path, restart):
+    home = (-17, 303)
+    scout = (-17, 271)
+    guards = compact_guards(30, center=home)
+    patrols = [
+        unit(200 + n, "RANGER", position=(-29 + n % 6, 262 + n // 6)) for n in range(30)
+    ]
+    workers = [
+        unit(300 + n, "WORKER", position=(-30 + n % 8, 313 + n // 8)) for n in range(16)
+    ]
+    roles = {
+        **{g["id"]: "defense" for g in guards},
+        **{p["id"]: f"patrol-{n // 2 + 1}" for n, p in enumerate(patrols)},
+    }
+    strategy = AggressiveStrategy(
+        WorldMemory(
+            core_home_position=home,
+            core_layout_version=CORE_LAYOUT_VERSION,
+            campaign_phase=4,
+            campaign_target_quota=16,
+            campaign_last_core_id=core()["id"],
+            campaign_scout_target=scout,
+            campaign_scout_started_tick=80,
+            unit_roles=roles.copy(),
+            unit_roles_initialized=True,
+            defense_posts={g["id"]: tuple(g["position"]) for g in guards},
+            defense_anchor=home,
+        ),
+        StrategyConfig(target_workers=16, campaign_mode=True, expedition_mode=True),
+    )
+    roster = [*guards, *patrols, *workers]
+    previous_radius = 8
+    final_posts = None
+    for tick in range(100, 125):
+        if restart and tick == 103:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+        turn = make_turn(tick=tick, objects=[core(position=home), *roster])
+        report = strategy.decide(turn)
+        assert not any("deadline" in d.reason for d in report.decisions)
+        assert strategy.memory.campaign_scout_target == scout
+        assert strategy.memory.campaign_scout_started_tick == 80
+        assert strategy.memory.unit_roles == roles
+        positions = settled_positions(turn)
+        actual_guards = tuple(positions[UUID(g["id"])] for g in guards)
+        assert_covered(home, actual_guards, set(), previous_radius)
+        previous_radius = strategy.memory.defense_established_radius
+        if final_posts is None:
+            final_posts = dict(strategy.memory.defense_posts)
+        assert strategy.memory.defense_posts == final_posts
+        for member in roster:
+            member["position"] = list(positions[UUID(member["id"])])
+    assert previous_radius == 12
+    assert final_posts is not None
+    assert all(tuple(g["position"]) == final_posts[g["id"]] for g in guards)
 
 
 @pytest.mark.parametrize("restart", [False, True])
