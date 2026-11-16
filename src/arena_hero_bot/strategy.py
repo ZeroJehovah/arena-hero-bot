@@ -7620,6 +7620,33 @@ class AggressiveStrategy:
         if core is None:
             return False
         reason = "return critical unit to Core for healing"
+        if (
+            isinstance(unit, Worker)
+            and unit.cargo == 0
+            and self._stationary_core_traffic(context)
+            and unit.position != core.position
+            and not self._heal_available(
+                unit, maximum_hp=maximum_hp, critical_hp=critical_hp, context=context
+            )
+            and self._core_service_distances(unit, context).get(
+                unit.position, CORE_QUEUE_RADIUS + 1
+            )
+            <= CORE_QUEUE_RADIUS
+            and not self._worker_combat_threats(unit, context)
+            and not self._ranger_attackers_at(
+                unit.position, context.turn, self._rock_map(context.turn)
+            )
+            and not self._future_attackers_at(
+                unit.position, context.turn, self._rock_map(context.turn)
+            )
+            and self.memory.incoming_damage.get(unit.position, (-1, 0))[1] < unit.hp
+        ):
+            # An unfunded patient already in the safe waiting circle should
+            # not approach the service cell only to be queued back out. Keep
+            # it eligible for real traffic capacity exchanges, like cargo
+            # waiters, so arriving deposits can fund the eventual heal.
+            self._record_wait(unit, context, "hold safely for Worker healing resources")
+            return True
         if unit.position == core.position:
             if not self._move_to_core_queue(
                 unit,

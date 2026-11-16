@@ -163,6 +163,12 @@ bounded to eight cells around the Core, twelve dependent moves and 1,024 search
 attempts per Tick. Migration lanes still keep one slot available for the moving
 Core.
 
+An empty wounded Worker already within four safe walking steps of a stationary
+Core waits in place when healing cannot be funded. Actual enemy fire, possible
+next-step attacks and recent lethal damage still require a safe exit. Waiting
+Workers remain available for capacity exchanges that let cargo reach the Core;
+they resume healing when resources arrive.
+
 Idle Worker coverage and routine Ranger patrols keep their entire routes inside
 the assigned resource area. They prefer positions and paths three cells inside
 the boundary; rocks may require a detour through the edge strip. Workers and
