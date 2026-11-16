@@ -8,7 +8,7 @@ decision, plan, and resolution event for later analysis.
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.14.7 (pinned in `.python-version` for development and live runs)
 - An Arena Hero API key for live observation or play
 - [`uv`](https://docs.astral.sh/uv/)
 
@@ -17,6 +17,10 @@ decision, plan, and resolution event for later analysis.
 ```bash
 uv sync
 ```
+
+`uv` uses the pinned interpreter for both the bot and development commands,
+downloading it when needed. Run tests with the same Python version as the live
+bot; Python 3.14 supports low-overhead branch coverage collection.
 
 Put the API key in an untracked `.env` file:
 
