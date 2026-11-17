@@ -17127,6 +17127,14 @@ class AggressiveStrategy:
     ) -> bool:
         if self.memory.incoming_damage.get(resource, (-1, 0))[1] >= worker.hp:
             return False
+        if (
+            worker.cargo == 0
+            and worker.position == resource
+            and resource in turn.resource_cells
+        ):
+            # Arrival needs no extra travel. Keep the live underfoot harvest
+            # even outside the Core window; combat avoidance still runs first.
+            return True
         area = self._worker_activity_area(turn)
         if area is None or area.contains(resource):
             return True

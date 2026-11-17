@@ -193,6 +193,145 @@ def test_only_a_nearby_empty_worker_can_claim_a_live_exterior_mine(
         assert settled_positions(turn)[turn.workers[0].id] == (position[0] - 1, 12)
 
 
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("moving", [False, True])
+def test_remote_underfoot_harvest_finishes_before_returning_cargo(
+    tmp_path, restart, moving
+):
+    mine, home = (-14, 12), (16, 16)
+    core_position = (8, 16) if moving else home
+    memory = WorldMemory(
+        core_home_position=home,
+        core_migration_start_position=core_position if moving else None,
+        campaign_last_core_id=object_id(1),
+        campaign_phase=CAMPAIGN_PHASE_STAGE2,
+    )
+    memory.set_goal(object_id(2), UnitGoal((20, 12), 99, RESOURCE_CLAIM_PURPOSE))
+    strategy = strategy_for(memory, campaign=True)
+    for tick in (100, 101):
+        if restart and tick == 101:
+            path = tmp_path / "memory.json"
+            memory.save(path)
+            memory = WorldMemory.load(path)
+            strategy = strategy_for(memory, campaign=True)
+        turn = make_turn(
+            tick=tick,
+            objects=[
+                core(
+                    position=core_position,
+                    state="MOVING",
+                    destination=[9, 16],
+                    move_direction="RIGHT",
+                    move_progress=tick - 99,
+                    move_required_ticks=4,
+                )
+                if moving
+                else core(position=home),
+                unit(2, "WORKER", position=mine, cargo=tick - 100),
+            ],
+            resource_cells=[mine, (20, 12)] if tick == 100 else [],
+        )
+        report = strategy.decide(turn)
+        worker = turn.workers[0]
+        action = turn.plan.unit_actions[worker.id]
+        if tick == 100:
+            assert action.type == "HARVEST"
+            assert settled_positions(turn)[worker.id] == mine
+            assert memory.goal_for(str(worker.id)) is None
+            assert any(
+                decision.actor_id == str(worker.id)
+                and decision.action == "HARVEST"
+                and decision.target == mine
+                for decision in report.decisions
+            )
+        else:
+            assert action.type == "MOVE"
+            assert manhattan(settled_positions(turn)[worker.id], core_position) < (
+                manhattan(mine, core_position)
+            )
+
+
+@pytest.mark.parametrize("mine", [(-14, 12), (46, 12), (12, -14), (12, 46)])
+def test_remote_underfoot_mine_keeps_one_harvester_and_no_remote_dispatch(mine):
+    memory = WorldMemory(core_home_position=(16, 16))
+    strategy = strategy_for(memory)
+    turn = make_turn(
+        objects=[
+            core(position=(16, 16)),
+            unit(2, "WORKER", position=mine),
+            unit(3, "WORKER", position=mine),
+            unit(4, "WORKER", position=(mine[0] + 1, mine[1])),
+        ],
+        resource_cells=[mine],
+    )
+    assert strategy._assign_resources(turn) == {turn.workers[0].id: mine}
+    strategy.decide(turn)
+    harvesters = {
+        worker_id
+        for worker_id, action in turn.plan.unit_actions.items()
+        if action.type == "HARVEST"
+    }
+    assert harvesters == {turn.workers[0].id}
+
+
+@pytest.mark.parametrize(
+    ("enemy_type", "visible", "damage"),
+    [
+        ("RANGER", True, 0),
+        ("VANGUARD", True, 0),
+        ("RANGER", False, 0),
+        ("VANGUARD", False, 0),
+        (None, False, 2),
+        (None, False, 1),
+    ],
+)
+def test_remote_underfoot_harvest_yields_to_combat_danger(enemy_type, visible, damage):
+    mine = (-14, 12)
+    memory = WorldMemory(core_home_position=(16, 16))
+    enemy = (
+        [unit(3, enemy_type, position=(-14, 11), controlled=False)]
+        if enemy_type is not None
+        else []
+    )
+    if enemy:
+        memory.observe(
+            make_turn(
+                tick=99,
+                objects=[core(position=(16, 16)), *enemy],
+            )
+        )
+    else:
+        memory.incoming_damage[mine] = (99, damage)
+    turn = make_turn(
+        objects=[
+            core(position=(16, 16)),
+            unit(2, "WORKER", position=mine, hp=1 if damage == 1 else 2),
+            *(enemy if visible else []),
+        ],
+        resource_cells=[mine],
+    )
+    strategy_for(memory).decide(turn)
+    worker = turn.workers[0]
+    assert turn.plan.unit_actions[worker.id].type == "MOVE"
+    assert settled_positions(turn)[worker.id] != mine
+
+
+@pytest.mark.parametrize(("live", "cargo"), [(False, 0), (True, 1)])
+def test_remote_arrival_requires_a_live_mine_and_an_empty_worker(live, cargo):
+    mine = (-14, 12)
+    memory = WorldMemory(core_home_position=(16, 16), resource_cells={mine: 99})
+    memory.set_goal(object_id(2), UnitGoal(mine, 99, RESOURCE_CLAIM_PURPOSE))
+    turn = make_turn(
+        objects=[
+            core(position=(16, 16)),
+            unit(2, "WORKER", position=mine, cargo=cargo),
+        ],
+        resource_cells=[mine] if live else [],
+    )
+    strategy_for(memory).decide(turn)
+    assert turn.plan.unit_actions[turn.workers[0].id].type != "HARVEST"
+
+
 def test_live_six_cell_claim_completes_its_eight_step_rock_detour():
     mine, position = (-2, 12), (4, 12)
     memory = WorldMemory(core_home_position=(16, 16))
