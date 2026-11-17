@@ -91,7 +91,7 @@ def plan_posts(
     masks = {
         cell: view(cell)
         for cell in cells
-        if 2 <= manhattan(center, cell) <= maximum and cell in reachable
+        if 1 <= manhattan(center, cell) <= maximum and cell in reachable
     }
     nearby = {
         p: tuple(
@@ -110,7 +110,15 @@ def plan_posts(
         target = sum(
             1 << indexes[cell] for cell in cells if manhattan(center, cell) <= radius
         )
-        candidates = tuple(p for p in masks if manhattan(center, p) <= radius)
+        # Severe occlusion can leave only the Core's adjacent disk complete.
+        # Keep a real post there instead of returning an empty assignment;
+        # wider layouts leave them unassigned unless already owned.
+        candidates = tuple(
+            p
+            for p in masks
+            if manhattan(center, p) <= radius
+            and (radius == 1 or manhattan(center, p) >= 2 or p in retained)
+        )
         if len(candidates) < count:
             continue
         chosen = list(dict.fromkeys(p for p in retained if p in candidates))[:count]

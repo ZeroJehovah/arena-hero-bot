@@ -90,6 +90,80 @@ def test_no_legal_roster_is_never_reported_as_a_gap_free_template():
     assert defense_layout.plan_posts(HOME, 4, rocks, BOUNDS) == ((), 0)
 
 
+@pytest.mark.parametrize("rotation", range(4))
+def test_single_guard_keeps_a_real_post_when_rocks_limit_the_ring_to_one(rotation):
+    offsets = ((0, 1), (-1, 2), (1, -1), (0, -2))
+    for _ in range(rotation):
+        offsets = tuple((-dy, dx) for dx, dy in offsets)
+    rocks = {(HOME[0] + dx, HOME[1] + dy) for dx, dy in offsets}
+    posts, radius = defense_layout.plan_posts(HOME, 1, tuple(sorted(rocks)), BOUNDS)
+
+    assert len(posts) == 1
+    assert radius == manhattan(HOME, posts[0]) == 1
+    assert posts[0] not in rocks
+    assert_covered(HOME, posts, rocks, radius)
+    core_view = visible_cells(HOME, 5, rocks) - rocks
+    legal_neighbors = {
+        (HOME[0] + dx, HOME[1] + dy) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+    } - rocks
+    assert len(core_view | (visible_cells(posts[0], 5, rocks) - rocks)) == max(
+        len(core_view | (visible_cells(p, 5, rocks) - rocks)) for p in legal_neighbors
+    )
+
+
+def test_single_guard_still_spreads_when_the_terrain_allows_it():
+    posts, radius = defense_layout.plan_posts(HOME, 1, (), BOUNDS)
+    assert len(posts) == 1
+    assert manhattan(HOME, posts[0]) == radius == 4
+    assert_covered(HOME, posts, set(), radius)
+
+
+def test_reinforcements_can_keep_an_owned_adjacent_post_while_expanding():
+    rocks = {(15, 16), (14, 17), (16, 14), (15, 13)}
+    posts, radius = defense_layout.plan_posts(HOME, 1, tuple(sorted(rocks)), BOUNDS)
+    expanded, expanded_radius = defense_layout.plan_posts(
+        HOME, 4, tuple(sorted(rocks)), BOUNDS, posts
+    )
+    assert expanded_radius > radius
+    assert len(expanded) == 4
+    assert set(posts) <= set(expanded)
+    assert_covered(HOME, expanded, rocks, expanded_radius)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_single_guard_reaches_and_retains_a_rock_limited_post(tmp_path, restart):
+    guard = unit(100, "RANGER", position=(12, 15))
+    rocks = {(15, 16), (14, 17), (16, 14), (15, 13)}
+    strategy = strategy_for(
+        [guard],
+        defense_anchor=HOME,
+        defense_spread_version=defense_layout.LAYOUT_VERSION,
+    )
+    assigned = None
+    for tick in range(100, 114):
+        if restart and tick == 101:
+            path = tmp_path / "memory.json"
+            strategy.memory.save(path)
+            strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+        turn = make_turn(
+            tick=tick, objects=[core(position=HOME), guard], obstacles=rocks
+        )
+        strategy.decide(turn)
+        assert strategy.memory.unit_roles == {guard["id"]: "defense"}
+        post = strategy.memory.defense_posts[guard["id"]]
+        if assigned is None:
+            assigned = post
+        assert post == assigned
+        assert manhattan(HOME, post) == 1
+        assert strategy.memory.defense_coverage_radius == 1
+        assert strategy.memory.defense_visible_radius == 1
+        assert strategy.memory.defense_established_radius == 1
+        positions = settled_positions(turn)
+        guard["position"] = list(positions[UUID(guard["id"])])
+        assert_covered(HOME, (tuple(guard["position"]),), rocks, 1)
+    assert tuple(guard["position"]) == assigned
+
+
 def test_posts_remain_owned_across_restart_new_recruit_and_casualty(tmp_path):
     guards = [
         unit(100 + n, "RANGER", position=(12 + n % 5, 12 + n // 5)) for n in range(25)
