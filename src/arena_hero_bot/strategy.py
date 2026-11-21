@@ -16773,7 +16773,8 @@ class AggressiveStrategy:
         unit_id = str(unit.id)
         purpose = f"{CAMPAIGN_SCOUT_PURPOSE}-{target[0]}-{target[1]}"
         detour_purpose = f"{purpose}-detour"
-        purposes = {purpose, detour_purpose}
+        support_purpose = f"{purpose}-support"
+        purposes = {purpose, detour_purpose, support_purpose}
         current = self.memory.goal_for(unit_id)
         claimed = {
             goal.position
@@ -16812,6 +16813,7 @@ class AggressiveStrategy:
                 visible_cells(goal.position, RANGER_VISION_RADIUS, obstacles)
                 & target_cells
             )
+        gaps = self._campaign_scout_gaps(turn, target, obstacles, target_cells)
 
         if (
             current is not None
@@ -16884,7 +16886,7 @@ class AggressiveStrategy:
         # The anchor pass could find no useful reachable post. Sweep remaining
         # unseen cells, including those near a blocked or unreachable anchor;
         # a hypothetical view from that anchor is not observed coverage.
-        for cell in self._campaign_scout_gaps(turn, target, obstacles, target_cells):
+        for cell in gaps:
             if cell in reserved_views:
                 continue
             # Observe a blind cell from inside whenever possible. Walking
@@ -16920,7 +16922,7 @@ class AggressiveStrategy:
         # point that sees them. Keeping goals target-driven prevents this
         # exception from becoming ordinary patrol outside the assigned blocks.
         detour_candidates: set[Position] = set()
-        for cell in self._campaign_scout_gaps(turn, target, obstacles, target_cells):
+        for cell in gaps:
             if cell not in reserved_views:
                 detour_candidates.update(
                     position
@@ -16959,6 +16961,65 @@ class AggressiveStrategy:
                 position=candidate,
                 assigned_tick=turn.tick,
                 purpose=detour_purpose,
+                last_progress_position=unit.position,
+            )
+            self.memory.set_goal(unit_id, goal)
+            return candidate
+
+        # The primary scouts may already own every remaining blind-cell view.
+        # Other patrol members still move forward as a distributed screening
+        # group instead of falling back to perimeter waiting or edge fire.
+        # Their positions approach the unresolved cells from reachable ground;
+        # these support slots never replace the primary detour objectives.
+        if (
+            current is not None
+            and current.purpose == support_purpose
+            and current.position in target_cells
+            and inner.contains(current.position)
+            and turn.tick - current.assigned_tick <= 80
+            and has_route(current.position)
+        ):
+            return current.position
+
+        if not gaps:
+            return unit.position
+        support_positions = {
+            (x, y)
+            for x in range(inner.min_x, inner.max_x + 1, 4)
+            for y in range(inner.min_y, inner.max_y + 1, 4)
+        }
+        support_scored: list[tuple[int, int, int, Position]] = []
+        for candidate in support_positions:
+            if (
+                candidate not in target_cells
+                or candidate in claimed
+                or (
+                    context is not None
+                    and (
+                        candidate in context.enemy_positions
+                        or self._predicted_friendly_occupancy(candidate, context) > 0
+                    )
+                )
+            ):
+                continue
+            if not has_route(candidate, allow_goal=True):
+                continue
+            gap_distance = min(manhattan(candidate, cell) for cell in gaps)
+            support_scored.append(
+                (
+                    -gap_distance,
+                    -manhattan(unit.position, candidate),
+                    -candidate[0],
+                    candidate,
+                )
+            )
+        for _gap_distance, _travel_distance, _negative_x, candidate in sorted(
+            support_scored, reverse=True
+        ):
+            goal = UnitGoal(
+                position=candidate,
+                assigned_tick=turn.tick,
+                purpose=support_purpose,
                 last_progress_position=unit.position,
             )
             self.memory.set_goal(unit_id, goal)

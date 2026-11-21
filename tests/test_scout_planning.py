@@ -160,6 +160,38 @@ def test_scout_uses_detour_when_retained_route_becomes_contested():
     assert memory.goal_for(str(turn.rangers[0].id)).purpose == f"{PURPOSE}-detour"
 
 
+def test_patrol_scouts_advance_to_distinct_support_posts_when_gaps_are_reserved():
+    memory = scout_memory()
+    unseen = (789, 15)
+    memory.campaign_scout_seen_ticks = {
+        position: 100
+        for position in ((x, y) for x in range(768, 800) for y in range(32))
+        if position not in memory.obstacles and position != unseen
+    }
+    scouts = [
+        unit(300 + index, "RANGER", position=(776 + index % 4, 8 + index // 4))
+        for index in range(8)
+    ]
+    turn = make_turn(objects=[core(position=HOME), *scouts])
+    strategy = AggressiveStrategy(memory, StrategyConfig(campaign_mode=True))
+    context = context_for(turn)
+
+    goals = [
+        strategy._campaign_scout_goal(ranger, turn, context) for ranger in turn.rangers
+    ]
+
+    assert memory.goal_for(str(turn.rangers[0].id)).purpose == f"{PURPOSE}-detour"
+    assert all(
+        memory.goal_for(str(ranger.id)).purpose == f"{PURPOSE}-support"
+        for ranger in turn.rangers[1:]
+    )
+    assert all(
+        goal != ranger.position
+        for goal, ranger in zip(goals, turn.rangers, strict=True)
+    )
+    assert len(set(goals)) == len(goals)
+
+
 def test_distant_scout_can_return_to_its_reachable_goal():
     memory = scout_memory()
     memory.set_goal(object_id(2), UnitGoal((787, 15), 99, PURPOSE))
@@ -194,7 +226,9 @@ def test_scout_observation_planning_preserves_worker_harvest_and_deposit(monkeyp
         **{obj["id"]: f"patrol-{index // 2 + 1}" for index, obj in enumerate(scouts)},
     }
     memory.unit_roles_initialized = True
-    strategy = AggressiveStrategy(memory, StrategyConfig(campaign_mode=True))
+    strategy = AggressiveStrategy(
+        memory, StrategyConfig(campaign_mode=True, expedition_mode=True)
+    )
     search_work = 0.0
 
     def costed_search(*args, **kwargs):
@@ -210,6 +244,7 @@ def test_scout_observation_planning_preserves_worker_harvest_and_deposit(monkeyp
         obj["id"]: tuple(obj["position"]) for obj in [*workers, *defenders, *scouts]
     }
     actions = []
+    scout_moves = []
     for tick in range(100, 103):
         for obj in [*workers, *defenders, *scouts]:
             obj["position"] = list(positions[obj["id"]])
@@ -231,6 +266,15 @@ def test_scout_observation_planning_preserves_worker_harvest_and_deposit(monkeyp
         }
         assert len(worker_actions) == 16
         actions.append(worker_actions)
+        scout_ids = {obj["id"] for obj in scouts}
+        scout_moves.append(
+            sum(
+                decision.actor_id in scout_ids
+                and decision.action == "MOVE"
+                and "scout the next migration block" in decision.reason
+                for decision in report.decisions
+            )
+        )
         for uid, action in turn.plan.unit_actions.items():
             if action.type == "MOVE":
                 positions[str(uid)] = add(positions[str(uid)], action.direction)
@@ -242,3 +286,4 @@ def test_scout_observation_planning_preserves_worker_harvest_and_deposit(monkeyp
     assert any(
         action == "MOVE" for tick_actions in actions for action in tick_actions.values()
     )
+    assert scout_moves[0] >= len(scouts) // 2
