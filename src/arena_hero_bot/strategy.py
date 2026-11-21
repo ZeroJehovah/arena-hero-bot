@@ -345,6 +345,7 @@ CAMPAIGN_SCOUT_SETTLE_TICKS = 8
 CAMPAIGN_SCOUT_RANGERS_PER_UNSEEN_CELL = 4
 CAMPAIGN_RECALL_RADIUS = 8
 CAMPAIGN_SCOUT_PURPOSE = "campaign-migration-scout-v1"
+CAMPAIGN_SCOUT_DETOUR_MARGIN = SYMMETRIC_RESOURCE_BLOCK_SIZE
 # The clear-terrain template covers a radius-20 Manhattan disk.  On a remembered
 # rock map the same roster is reflowed inside successively smaller rings until
 # every traversable cell inside the ring is visible.  Ten is the floor at which
@@ -8027,7 +8028,10 @@ class AggressiveStrategy:
         target = self.memory.campaign_scout_target
         if target is None:
             return area
-        return self._campaign_scout_area(unit, target, turn)
+        scout_area = self._campaign_scout_area(unit, target, turn)
+        if current.purpose.endswith("-detour") or not scout_area.contains(goal):
+            return self._campaign_scout_detour_area(unit, target, turn)
+        return scout_area
 
     def _campaign_scout_area(
         self, unit: Unit, target: Position, turn: Turn
@@ -8039,6 +8043,24 @@ class AggressiveStrategy:
         # A published forward scout may cross from the source into its
         # adjacent destination. Once there it stays within that block.
         return area
+
+    def _campaign_scout_detour_area(
+        self, unit: Unit, target: Position, turn: Turn
+    ) -> _ActivityArea:
+        """Bound rock-avoidance routes around the destination block."""
+
+        area = self._campaign_scout_area(unit, target, turn)
+        regions = area.regions if isinstance(area, _ActivityArea) else (area,)
+        destination = _single_chunk_resource_block(target)
+        margin = CAMPAIGN_SCOUT_DETOUR_MARGIN
+        detour = _ResourceBlock(
+            destination.index,
+            destination.min_x - margin,
+            destination.max_x + margin,
+            destination.min_y - margin,
+            destination.max_y + margin,
+        )
+        return _ActivityArea((*regions, detour))
 
     def _retreat_worker(
         self,
@@ -16684,21 +16706,30 @@ class AggressiveStrategy:
             unit.position,
             0 if patrol_area.contains(unit.position) else PATROL_EDGE_INSET,
         )
-        reachable: set[Position] | None = None
-        reachability_complete = False
+        detour_area = self._campaign_scout_detour_area(unit, target, turn)
+        detour_route_bounds = _OutsidePatrolArea(
+            detour_area,
+            unit.position,
+            0 if detour_area.contains(unit.position) else PATROL_EDGE_INSET,
+        )
+        reachability: dict[_OutsidePatrolArea, tuple[set[Position], bool]] = {}
 
-        def has_route(goal: Position, *, allow_goal: bool = False) -> bool:
-            nonlocal reachable, reachability_complete
+        def has_route(
+            goal: Position,
+            *,
+            bounds: _OutsidePatrolArea = route_bounds,
+            allow_goal: bool = False,
+        ) -> bool:
             if context is None:
                 return True
-            if goal in obstacles or goal in route_bounds:
+            if goal in obstacles or goal in bounds:
                 return False
-            if reachable is None:
+            if bounds not in reachability:
                 # Many unseen viewpoints can lie across the same rock wall.
                 # Flood this scout's permitted terrain once instead of running
-                # a complete failed A* search for every candidate. The source
-                # and destination contain at most two blocks; retain a bound
-                # for an already displaced scout's return margin as well.
+                # a complete failed A* search for every candidate. Large
+                # detour areas fall back to a bounded A* check if this flood
+                # reaches its cap.
                 blocked = self._static_blockers(unit, context)
                 reachable = {unit.position}
                 frontier = deque([unit.position])
@@ -16707,7 +16738,7 @@ class AggressiveStrategy:
                     for neighbor in adjacent_positions(position):
                         if (
                             neighbor in reachable
-                            or neighbor in route_bounds
+                            or neighbor in bounds
                             or neighbor in blocked
                         ):
                             continue
@@ -16715,7 +16746,8 @@ class AggressiveStrategy:
                         frontier.append(neighbor)
                         if len(reachable) >= 4096:
                             break
-                reachability_complete = not frontier
+                reachability[bounds] = (reachable, not frontier)
+            reachable, reachability_complete = reachability[bounds]
             return (
                 goal in reachable
                 or (
@@ -16733,20 +16765,22 @@ class AggressiveStrategy:
                         goal,
                         context,
                         allow_goal=allow_goal,
-                        extra_blockers=route_bounds,
+                        extra_blockers=bounds,
                     )
                 )
             )
 
         unit_id = str(unit.id)
         purpose = f"{CAMPAIGN_SCOUT_PURPOSE}-{target[0]}-{target[1]}"
+        detour_purpose = f"{purpose}-detour"
+        purposes = {purpose, detour_purpose}
         current = self.memory.goal_for(unit_id)
         claimed = {
             goal.position
             for other in (*turn.rangers, *turn.vanguards)
             if other.id != unit.id
             if (goal := self.memory.goal_for(str(other.id))) is not None
-            and goal.purpose == purpose
+            and goal.purpose in purposes
         }
         if (
             current is not None
@@ -16772,12 +16806,40 @@ class AggressiveStrategy:
             if other.id == unit.id:
                 continue
             goal = self.memory.goal_for(str(other.id))
-            if goal is None or goal.purpose != purpose:
+            if goal is None or goal.purpose not in purposes:
                 continue
             reserved_views.update(
                 visible_cells(goal.position, RANGER_VISION_RADIUS, obstacles)
                 & target_cells
             )
+
+        if (
+            current is not None
+            and current.purpose == detour_purpose
+            and detour_area.contains(current.position)
+            and unit.position != current.position
+            and turn.tick - current.assigned_tick <= 80
+            and any(
+                seen_age(cell) > 0 and cell not in reserved_views
+                for cell in visible_cells(
+                    current.position, RANGER_VISION_RADIUS, obstacles
+                )
+                & target_cells
+            )
+        ):
+            if has_route(current.position):
+                self.memory.set_goal(
+                    unit_id,
+                    UnitGoal(
+                        position=current.position,
+                        assigned_tick=turn.tick,
+                        purpose=purpose,
+                        last_progress_position=unit.position,
+                    ),
+                )
+                return current.position
+            if has_route(current.position, bounds=detour_route_bounds):
+                return current.position
 
         candidates = {
             (min_x + 4 + column * 8, min_y + 4 + row * 8)
@@ -16836,7 +16898,7 @@ class AggressiveStrategy:
                     position,
                 ),
             )
-            for position in viewpoints[:8]:
+            for position in viewpoints:
                 if context is not None and (
                     position in context.enemy_positions
                     or self._predicted_friendly_occupancy(position, context) >= 2
@@ -16851,6 +16913,56 @@ class AggressiveStrategy:
                 )
                 self.memory.set_goal(unit_id, goal)
                 return position
+
+        # A rock wall can split traversable cells inside the destination
+        # block. If its remaining blind cells have no safe in-block viewpoint,
+        # route a scout through the bounded exterior margin to an observation
+        # point that sees them. Keeping goals target-driven prevents this
+        # exception from becoming ordinary patrol outside the assigned blocks.
+        detour_candidates: set[Position] = set()
+        for cell in self._campaign_scout_gaps(turn, target, obstacles, target_cells):
+            if cell not in reserved_views:
+                detour_candidates.update(
+                    position
+                    for position in visible_cells(cell, RANGER_VISION_RADIUS, obstacles)
+                    if detour_area.contains(position) and position not in claimed
+                )
+        detour_scored: list[tuple[int, int, int, Position]] = []
+        for candidate in detour_candidates:
+            if context is not None and candidate in context.enemy_positions:
+                continue
+            if patrol_area.contains(candidate) and has_route(candidate):
+                continue
+            gain = sum(
+                seen_age(cell)
+                for cell in visible_cells(candidate, RANGER_VISION_RADIUS, obstacles)
+                & target_cells
+                if cell not in reserved_views
+            )
+            if gain > 0:
+                detour_scored.append(
+                    (
+                        gain,
+                        -manhattan(unit.position, candidate),
+                        -candidate[0],
+                        candidate,
+                    )
+                )
+        detour_scored.sort(reverse=True)
+        for _gain, _distance, _negative_x, candidate in detour_scored[:16]:
+            if context is not None and (
+                self._predicted_friendly_occupancy(candidate, context) >= 2
+                or not has_route(candidate, bounds=detour_route_bounds)
+            ):
+                continue
+            goal = UnitGoal(
+                position=candidate,
+                assigned_tick=turn.tick,
+                purpose=detour_purpose,
+                last_progress_position=unit.position,
+            )
+            self.memory.set_goal(unit_id, goal)
+            return candidate
         return unit.position
 
     def _campaign_scout_gaps(

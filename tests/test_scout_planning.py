@@ -10,6 +10,7 @@ from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
     AggressiveStrategy,
     StrategyConfig,
+    _OutsidePatrolArea,
 )
 
 from .factories import core, make_turn, object_id, unit
@@ -44,7 +45,9 @@ def scout_memory():
     )
 
 
-def test_unreachable_scout_gaps_do_not_repeat_complete_path_searches(monkeypatch):
+def test_scout_routes_around_a_wall_only_when_in_block_views_are_unreachable(
+    monkeypatch,
+):
     memory = scout_memory()
     strategy = AggressiveStrategy(memory, StrategyConfig(campaign_mode=True))
     turn = make_turn(objects=[core(position=HOME), unit(2, "RANGER", position=ORIGIN)])
@@ -57,10 +60,31 @@ def test_unreachable_scout_gaps_do_not_repeat_complete_path_searches(monkeypatch
 
     monkeypatch.setattr(strategy_module, "next_step", counted_search)
 
-    goal = strategy._campaign_scout_goal(turn.rangers[0], turn, context_for(turn))
+    ranger = turn.rangers[0]
+    context = context_for(turn)
+    goal = strategy._campaign_scout_goal(ranger, turn, context)
 
-    assert goal == ORIGIN
-    assert searches <= 1
+    assert goal != ORIGIN
+    assert 768 <= goal[0] <= 799 and 0 <= goal[1] <= 31
+    assert any(
+        (789, y) in visible_cells(goal, 5, memory.obstacles) for y in range(10, 22)
+    )
+    assert memory.goal_for(str(ranger.id)).purpose == f"{PURPOSE}-detour"
+    inner_area = strategy._campaign_scout_area(ranger, TARGET, turn)
+    detour_area = strategy._campaign_scout_detour_area(ranger, TARGET, turn)
+    assert not strategy._has_static_route(
+        ranger,
+        goal,
+        context,
+        extra_blockers=_OutsidePatrolArea(inner_area, ranger.position),
+    )
+    assert strategy._has_static_route(
+        ranger,
+        goal,
+        context,
+        extra_blockers=_OutsidePatrolArea(detour_area, ranger.position),
+    )
+    assert searches <= 2
     assert memory.campaign_scout_target == TARGET
     assert (789, 15) not in memory.campaign_scout_seen_ticks
 
@@ -69,16 +93,18 @@ def test_opening_a_scout_passage_refreshes_reachability_in_the_same_tick():
     memory = scout_memory()
     strategy = AggressiveStrategy(memory, StrategyConfig(campaign_mode=True))
     turn = make_turn(objects=[core(position=HOME), unit(2, "RANGER", position=ORIGIN)])
-    assert (
-        strategy._campaign_scout_goal(turn.rangers[0], turn, context_for(turn))
-        == ORIGIN
-    )
+    ranger = turn.rangers[0]
+    first_goal = strategy._campaign_scout_goal(ranger, turn, context_for(turn))
+    assert first_goal != ORIGIN
+    assert memory.goal_for(str(ranger.id)).purpose == f"{PURPOSE}-detour"
 
     memory.obstacles.remove((784, 15))
-    goal = strategy._campaign_scout_goal(turn.rangers[0], turn, context_for(turn))
+    goal = strategy._campaign_scout_goal(ranger, turn, context_for(turn))
 
-    assert goal != ORIGIN
+    assert goal == first_goal
+    assert memory.goal_for(str(ranger.id)).purpose == PURPOSE
     assert 768 <= goal[0] <= 799 and 0 <= goal[1] <= 31
+    assert memory.goal_for(str(ranger.id)).purpose == PURPOSE
     assert any(
         (789, y) in visible_cells(goal, 5, memory.obstacles) for y in range(10, 22)
     )
@@ -91,10 +117,10 @@ def test_scout_reachability_follows_actual_origin_after_restart(tmp_path):
     memory = scout_memory()
     strategy = AggressiveStrategy(memory, StrategyConfig(campaign_mode=True))
     first = make_turn(objects=[core(position=HOME), unit(2, "RANGER", position=ORIGIN)])
-    assert (
-        strategy._campaign_scout_goal(first.rangers[0], first, context_for(first))
-        == ORIGIN
+    first_goal = strategy._campaign_scout_goal(
+        first.rangers[0], first, context_for(first)
     )
+    assert first_goal != ORIGIN
     path = tmp_path / "memory.json"
     memory.save(path)
     strategy = AggressiveStrategy(
@@ -108,13 +134,14 @@ def test_scout_reachability_follows_actual_origin_after_restart(tmp_path):
 
     assert goal != ORIGIN
     assert goal[0] > 784
+    assert 0 <= goal[1] <= 31
     assert (
         next_step((794, 25), goal, blocked=memory.obstacles, require_path=True)
         is not None
     )
 
 
-def test_retained_scout_goal_rejects_a_new_contested_route():
+def test_scout_uses_detour_when_retained_route_becomes_contested():
     memory = scout_memory()
     memory.obstacles.remove((784, 15))
     memory.set_goal(object_id(2), UnitGoal((787, 15), 99, PURPOSE))
@@ -128,7 +155,9 @@ def test_retained_scout_goal_rejects_a_new_contested_route():
     memory.contested_positions[(784, 15)] = turn.tick
     goal = strategy._campaign_scout_goal(turn.rangers[0], turn, context_for(turn))
 
-    assert goal == ORIGIN
+    assert goal != ORIGIN
+    assert goal != (787, 15)
+    assert memory.goal_for(str(turn.rangers[0].id)).purpose == f"{PURPOSE}-detour"
 
 
 def test_distant_scout_can_return_to_its_reachable_goal():
