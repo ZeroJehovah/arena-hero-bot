@@ -16684,6 +16684,60 @@ class AggressiveStrategy:
             unit.position,
             0 if patrol_area.contains(unit.position) else PATROL_EDGE_INSET,
         )
+        reachable: set[Position] | None = None
+        reachability_complete = False
+
+        def has_route(goal: Position, *, allow_goal: bool = False) -> bool:
+            nonlocal reachable, reachability_complete
+            if context is None:
+                return True
+            if goal in obstacles or goal in route_bounds:
+                return False
+            if reachable is None:
+                # Many unseen viewpoints can lie across the same rock wall.
+                # Flood this scout's permitted terrain once instead of running
+                # a complete failed A* search for every candidate. The source
+                # and destination contain at most two blocks; retain a bound
+                # for an already displaced scout's return margin as well.
+                blocked = self._static_blockers(unit, context)
+                reachable = {unit.position}
+                frontier = deque([unit.position])
+                while frontier and len(reachable) < 4096:
+                    position = frontier.popleft()
+                    for neighbor in adjacent_positions(position):
+                        if (
+                            neighbor in reachable
+                            or neighbor in route_bounds
+                            or neighbor in blocked
+                        ):
+                            continue
+                        reachable.add(neighbor)
+                        frontier.append(neighbor)
+                        if len(reachable) >= 4096:
+                            break
+                reachability_complete = not frontier
+            return (
+                goal in reachable
+                or (
+                    allow_goal
+                    and any(
+                        neighbor in reachable for neighbor in adjacent_positions(goal)
+                    )
+                )
+                or (
+                    # A far-displaced scout can have a larger return area than
+                    # the flood limit. Absence from that partial map is inconclusive.
+                    not reachability_complete
+                    and self._has_static_route(
+                        unit,
+                        goal,
+                        context,
+                        allow_goal=allow_goal,
+                        extra_blockers=route_bounds,
+                    )
+                )
+            )
+
         unit_id = str(unit.id)
         purpose = f"{CAMPAIGN_SCOUT_PURPOSE}-{target[0]}-{target[1]}"
         current = self.memory.goal_for(unit_id)
@@ -16701,12 +16755,7 @@ class AggressiveStrategy:
             and inner.contains(current.position)
             and unit.position != current.position
             and turn.tick - current.assigned_tick <= 80
-            and (
-                context is None
-                or self._has_static_route(
-                    unit, current.position, context, extra_blockers=route_bounds
-                )
-            )
+            and has_route(current.position)
         ):
             return current.position
 
@@ -16759,13 +16808,7 @@ class AggressiveStrategy:
             for _gain, _distance, _negative_x, candidate in ordered[:8]:
                 if context is not None and (
                     self._predicted_friendly_occupancy(candidate, context) >= 2
-                    or not self._has_static_route(
-                        unit,
-                        candidate,
-                        context,
-                        allow_goal=True,
-                        extra_blockers=route_bounds,
-                    )
+                    or not has_route(candidate, allow_goal=True)
                 ):
                     continue
                 goal = UnitGoal(
@@ -16797,9 +16840,7 @@ class AggressiveStrategy:
                 if context is not None and (
                     position in context.enemy_positions
                     or self._predicted_friendly_occupancy(position, context) >= 2
-                    or not self._has_static_route(
-                        unit, position, context, extra_blockers=route_bounds
-                    )
+                    or not has_route(position)
                 ):
                     continue
                 goal = UnitGoal(
