@@ -11348,6 +11348,9 @@ class AggressiveStrategy:
             context,
             offensive=False,
             reason=reason,
+            # A return trip may retrace the approach. Penalizing that history
+            # can send a recalled defender sideways into a closing enemy.
+            avoid_recent=False,
             avoid_new_threats=True,
             intent=_MoveIntent.STAND,
         ):
@@ -18280,6 +18283,7 @@ class AggressiveStrategy:
         offensive: bool,
         reason: str,
         extra_blockers: Container[Position] | None = None,
+        avoid_recent: bool = True,
         avoid_new_threats: bool = False,
         intent: _MoveIntent = _MoveIntent.TRANSIT,
         allow_outside_combat_leash: bool = False,
@@ -18296,6 +18300,7 @@ class AggressiveStrategy:
             context,
             reason=reason,
             extra_blockers=extra_blockers,
+            avoid_recent=avoid_recent,
             avoid_new_threats=avoid_new_threats,
             intent=intent,
         )

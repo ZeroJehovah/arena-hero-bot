@@ -80,6 +80,9 @@ survivors change roles, and existing patrol team identities remain stable.
 When the quota permits, active flank members and their front observers keep
 their roles before proximity decides which idle Rangers transfer. New recruits
 still fill vacancies first, and urgent Core defence can still cancel a flank.
+Local Rangers returning to reinforcement posts can retrace their recent route.
+Their return path still checks terrain, enemy fire and cell capacity before
+each step.
 While a visible hostile combat unit is inside the Core assault ring, the next
 production slot temporarily becomes a Ranger; the normal sequence resumes as
 soon as that local threat is gone.
