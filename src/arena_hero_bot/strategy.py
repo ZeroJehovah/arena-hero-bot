@@ -10739,9 +10739,16 @@ class AggressiveStrategy:
         if not enemies:
             return
         obstacles = self._rock_map(context.turn)
+        preemptive_multi_source = (
+            context.threat.level is ThreatLevel.PRE_EVADE
+            and context.threat.minimum_ticks_to_range is not None
+            and context.threat.minimum_ticks_to_range <= 1
+            and len(enemies) >= 2
+        )
         if (
             len(allies) < 4
             and context.core_build_priority
+            and not preemptive_multi_source
             and maximum_core_damage(
                 (core.position,) * 4,
                 self._core_retreat_threats(context.turn, enemies),
@@ -10777,7 +10784,11 @@ class AggressiveStrategy:
             ):
                 breached.add(direction)
         if core.view.state is not CoreState.MOVING:
-            if breached or context.threat.projected_core_damage > 0:
+            if (
+                breached
+                or context.threat.projected_core_damage > 0
+                or preemptive_multi_source
+            ):
                 direction = self._layered_core_retreat(
                     context, enemies, breached or set(sides)
                 )
@@ -20409,11 +20420,22 @@ class AggressiveStrategy:
                     if abs(dx) + abs(dy) > radius:
                         continue
                     cell = core.position[0] + dx, core.position[1] + dy
+                    # A static Core's service cell may sit one step beyond
+                    # the normal three-cell guard cover.  Allow the fourth
+                    # cell only for that one-cell service neighborhood; a
+                    # moving Core keeps the tighter economy cover while its
+                    # route and arrival lane are handled separately.
+                    service_cell = (
+                        core.view.state is CoreState.NORMAL
+                        and manhattan(cell, core.position) <= 1
+                    )
+                    cover_distance = 4 if service_cell else 3
                     if (
                         cell in obstacles
                         or cell in enemy_cells
                         or not any(
-                            manhattan(cell, ally.position) <= 3 for ally in cover
+                            manhattan(cell, ally.position) <= cover_distance
+                            for ally in cover
                         )
                         or any(
                             manhattan(cell, enemy) <= self.config.worker_threat_radius

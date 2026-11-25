@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 from arena_hero import Direction, MoveAction, StartMoveAction, UnitView
 
+from arena_hero_bot.combat_policy import ThreatLevel
 from arena_hero_bot.defense import (
     FRONT_DEPTH,
     REAR_DEPTH,
@@ -479,6 +480,124 @@ def test_core_does_not_start_a_fatal_four_tick_move():
         )
         is None
     )
+
+
+def test_pre_evade_multi_source_contact_starts_a_bounded_retreat_before_hit():
+    strategy = _strategy()
+    friends = [
+        unit(2, "RANGER", position=(-2, -3)),
+        unit(3, "RANGER", position=(2, -3)),
+        unit(4, "RANGER", position=(-2, 3)),
+        unit(5, "RANGER", position=(2, 3)),
+    ]
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            *friends,
+            unit(50, "RANGER", controlled=False, position=(-4, 1)),
+            unit(51, "RANGER", controlled=False, position=(-4, 1)),
+        ],
+    )
+    _context(strategy, first)
+    second = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            *friends,
+            unit(50, "RANGER", controlled=False, position=(-3, 1)),
+            unit(51, "RANGER", controlled=False, position=(-3, 1)),
+        ],
+    )
+    context = _context(strategy, second)
+
+    assert context.threat.level is ThreatLevel.PRE_EVADE
+    assert context.threat.minimum_ticks_to_range == 1
+    assert context.threat.projected_core_damage == 0
+    strategy._prepare_layered_defense(context)
+
+    assert context.core_escape_direction is not None
+    enemies = tuple(
+        enemy for enemy in second.visible_enemies if isinstance(enemy, UnitView)
+    )
+    rocks = strategy._rock_map(second)
+    stay_damage = maximum_core_damage((context.turn.core.position,) * 4, enemies, rocks)
+    retreat_damage = maximum_core_damage(
+        (context.turn.core.position,) * 3
+        + (add(context.turn.core.position, context.core_escape_direction),),
+        enemies,
+        rocks,
+    )
+    assert retreat_damage < stay_damage
+    strategy._decide_core(context)
+    assert isinstance(second.plan.core_action, StartMoveAction)
+
+
+def test_pre_evade_single_enemy_does_not_trigger_the_new_retreat():
+    strategy = _strategy()
+    friends = [
+        unit(2, "RANGER", position=(-2, -3)),
+        unit(3, "RANGER", position=(2, -3)),
+        unit(4, "RANGER", position=(-2, 3)),
+        unit(5, "RANGER", position=(2, 3)),
+    ]
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            *friends,
+            unit(50, "RANGER", controlled=False, position=(-4, 1)),
+        ],
+    )
+    _context(strategy, first)
+    second = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            *friends,
+            unit(50, "RANGER", controlled=False, position=(-3, 1)),
+        ],
+    )
+    context = _context(strategy, second)
+
+    assert context.threat.level is ThreatLevel.PRE_EVADE
+    assert context.threat.minimum_ticks_to_range == 1
+    strategy._prepare_layered_defense(context)
+
+    assert context.core_escape_direction is None
+
+
+def test_preemptive_retreat_is_not_deferred_for_an_affordable_guard_spawn():
+    strategy = _strategy()
+    friends = [
+        unit(2, "RANGER", position=(-2, -3)),
+        unit(3, "RANGER", position=(2, -3)),
+    ]
+    first = make_turn(
+        tick=100,
+        objects=[
+            core(),
+            *friends,
+            unit(50, "RANGER", controlled=False, position=(-4, 1)),
+            unit(51, "RANGER", controlled=False, position=(-4, 1)),
+        ],
+    )
+    _context(strategy, first)
+    second = make_turn(
+        tick=101,
+        objects=[
+            core(),
+            *friends,
+            unit(50, "RANGER", controlled=False, position=(-3, 1)),
+            unit(51, "RANGER", controlled=False, position=(-3, 1)),
+        ],
+    )
+    context = _context(strategy, second)
+    context.core_build_priority = True
+
+    strategy._prepare_layered_defense(context)
+
+    assert context.core_escape_direction is not None
 
 
 class Encounter:

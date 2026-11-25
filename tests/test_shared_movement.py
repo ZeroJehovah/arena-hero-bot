@@ -166,6 +166,57 @@ def test_stationary_core_cargo_queue_keeps_one_service_head():
     assert [item.actor_id for item in returns] == [str(head.id)]
 
 
+def test_guarded_core_service_cell_can_accept_cargo_inside_enemy_danger_disk():
+    memory = WorldMemory(
+        core_home_position=(0, 0),
+        core_layout_version=CORE_LAYOUT_VERSION,
+        core_migration_last_position=(0, 0),
+    )
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, -1), cargo=1),
+            unit(3, "RANGER", position=(-2, -2)),
+            unit(4, "RANGER", position=(4, 0)),
+            unit(50, "RANGER", controlled=False, position=(-3, 1)),
+        ]
+    )
+    strategy = AggressiveStrategy(
+        memory,
+        StrategyConfig(target_workers=0, max_population=None, expedition_mode=True),
+    )
+
+    strategy.decide(turn)
+
+    loaded = next(worker for worker in turn.workers if worker.cargo > 0)
+    action = turn.plan.unit_actions[loaded.id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.DOWN
+    safe_cells = strategy._worker_safe_defense_cells(turn)
+    assert (0, 0) in safe_cells
+    assert (0, 2) not in safe_cells
+
+
+def test_core_service_remains_blocked_by_a_real_enemy_firing_ray():
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(2, "WORKER", position=(0, -1), cargo=1),
+            unit(3, "RANGER", position=(-2, -2)),
+            unit(4, "RANGER", position=(4, 0)),
+            unit(50, "RANGER", controlled=False, position=(-3, 0)),
+        ]
+    )
+    strategy = AggressiveStrategy(WorldMemory(), StrategyConfig())
+    strategy.memory.observe(turn)
+    context = context_for(turn)
+    worker = turn.workers[0]
+    context.core_queue_head_id = worker.id
+
+    assert strategy._future_attackers_at((0, 0), turn, set())
+    assert not strategy._core_traffic_step_safe(worker, (0, 0), context, target=(0, 0))
+
+
 def test_busy_stationary_core_cargo_queue_does_not_shuffle_slots():
     """Waiting cargo may compact into shared cells without moving outward."""
 
