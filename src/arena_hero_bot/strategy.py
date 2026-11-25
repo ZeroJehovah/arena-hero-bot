@@ -347,6 +347,7 @@ CAMPAIGN_SCOUT_SETTLE_TICKS = 8
 CAMPAIGN_SCOUT_RANGERS_PER_UNSEEN_CELL = 4
 CAMPAIGN_RECALL_RADIUS = 8
 CAMPAIGN_SCOUT_PURPOSE = "campaign-migration-scout-v1"
+CAMPAIGN_CLEARANCE_PURPOSE = "campaign-block-clearance-v1"
 CAMPAIGN_SCOUT_DETOUR_MARGIN = SYMMETRIC_RESOURCE_BLOCK_SIZE
 # The clear-terrain template covers a radius-20 Manhattan disk.  On a remembered
 # rock map the same roster is reflowed inside successively smaller rings until
@@ -953,7 +954,43 @@ class AggressiveStrategy:
         self._worker_safe_cells_cache = None
         if self.config.campaign_mode:
             self.memory.recovery.observe(turn)
+            restore_known_cores = (
+                self.memory.block_clearance.core_id is None
+                and turn.core is not None
+                and self.memory.campaign_last_core_id == str(turn.core.id)
+                and not any(
+                    event.event_type == "CORE_RESPAWNED"
+                    and event.target_id == turn.core.id
+                    for event in turn.events
+                )
+            )
             self._observe_campaign_state(turn)
+            self.memory.block_clearance.observe(
+                turn,
+                (
+                    self.memory.core_home_position,
+                    self.memory.core_migration_start_position,
+                    self.memory.campaign_scout_target,
+                ),
+                (
+                    cell
+                    for observations in (
+                        self.memory.worker_seen_ticks,
+                        self.memory.campaign_scout_seen_ticks,
+                    )
+                    for cell, tick in observations.items()
+                    if tick == turn.tick
+                ),
+            )
+            if restore_known_cores:
+                from .block_clearance import block_at
+
+                for enemy in self.memory.enemies.values():
+                    survey = self.memory.block_clearance.blocks.get(
+                        block_at(enemy.position)
+                    )
+                    if enemy.kind == "CORE" and survey is not None:
+                        survey.cores[enemy.object_id] = enemy.position
         if self.config.expedition_mode:
             self._reconcile_unit_roles(turn)
             if self.config.campaign_mode:
@@ -2340,7 +2377,10 @@ class AggressiveStrategy:
             return
         if (
             self.config.campaign_mode
-            and self.memory.campaign_scout_target is not None
+            and (
+                self._campaign_clearance_target(context.turn) is not None
+                or self.memory.campaign_scout_target is not None
+            )
             and self._patrol_team_from_role(role) is not None
             and offensive
             and not context.all_hands_defense
@@ -2352,7 +2392,8 @@ class AggressiveStrategy:
             # Ranger's Tick and leave stale claimed cells blocking the patrol.
             # Existing shots and necessary retreats were resolved earlier;
             # an unengaged forward contact does not recall this scout to Core.
-            goal = self._campaign_scout_goal(ranger, context.turn, context)
+            local = self._campaign_clearance_target(context.turn) is not None
+            goal = self._campaign_scout_goal(ranger, context.turn, context, local=local)
             if goal == ranger.position:
                 if not self._defensive_cover_fire(ranger, context, recent_enemies):
                     self._hold_defensive_ranger(
@@ -2365,7 +2406,11 @@ class AggressiveStrategy:
                 ranger,
                 goal,
                 context,
-                reason="scout the next migration block for enemies and blind cells",
+                reason=(
+                    "finish exploring the current block before migration"
+                    if local
+                    else "scout the next migration block for enemies and blind cells"
+                ),
                 wait_at_goal=True,
                 avoid_new_threats=True,
                 offensive=offensive,
@@ -8208,10 +8253,12 @@ class AggressiveStrategy:
         if current is None or current.position != goal:
             return None
         scouting = current.purpose.startswith(f"{CAMPAIGN_SCOUT_PURPOSE}-")
+        clearing = current.purpose.startswith(f"{CAMPAIGN_CLEARANCE_PURPOSE}-")
         if not (
             _is_worker_patrol_goal(current)
             or current.purpose == PATROL_RING_PURPOSE
             or scouting
+            or clearing
         ):
             return None
         area = (
@@ -8219,9 +8266,13 @@ class AggressiveStrategy:
             if isinstance(unit, Worker)
             else self._ranger_activity_area(turn)
         )
-        if not scouting:
+        if not scouting and not clearing:
             return area
-        target = self.memory.campaign_scout_target
+        target = (
+            self._campaign_clearance_target(turn)
+            if clearing
+            else self.memory.campaign_scout_target
+        )
         if target is None:
             return area
         scout_area = self._campaign_scout_area(unit, target, turn)
@@ -14461,12 +14512,23 @@ class AggressiveStrategy:
                 if (
                     offensive
                     and self.config.campaign_mode
-                    and self.memory.campaign_scout_target is not None
+                    and (
+                        self._campaign_clearance_target(turn) is not None
+                        or self.memory.campaign_scout_target is not None
+                    )
                     and self._patrol_team_from_role(role) is not None
                 ):
+                    local = self._campaign_clearance_target(turn) is not None
                     return (
-                        self._campaign_scout_goal(unit, turn, context),
-                        "scout the next migration block for enemies and blind cells",
+                        self._campaign_scout_goal(unit, turn, context, local=local),
+                        (
+                            "finish exploring the current block before migration"
+                            if local
+                            else (
+                                "scout the next migration block "
+                                "for enemies and blind cells"
+                            )
+                        ),
                     )
         if (
             context is not None
@@ -15032,10 +15094,10 @@ class AggressiveStrategy:
     def _continue_campaign_migration(self, turn: Turn) -> None:
         """Publish the next hop after the reached block center has been served.
 
-        The rest gate is the only hold between hops. While a Worker or Ranger
-        is outside this block, the Core owes a nearby delivery or affordable
-        build, or the quota gate owes roster, the published home stays at the
-        reached center. This gate also precedes a new forward scouting task.
+        Hold the reached center until its observable ground has been explored
+        and all Cores discovered there are confirmed destroyed. Gathering,
+        nearby deliveries, affordable builds and the quota roster gate must
+        also be complete before starting a new hop or forward scouting task.
         """
 
         if self._continue_campaign_recovery(turn):
@@ -15380,6 +15442,15 @@ class AggressiveStrategy:
         self.memory.campaign_scout_unobservable_obstacle_count = 0
 
     def _cache_campaign_scout_unobservable(self, turn: Turn, target: Position) -> None:
+        self.memory.campaign_scout_unobservable = self._campaign_unobservable(
+            turn, target
+        )
+        self.memory.campaign_scout_unobservable_target = target
+        self.memory.campaign_scout_unobservable_obstacle_count = len(
+            self.memory.obstacles
+        )
+
+    def _campaign_unobservable(self, turn: Turn, target: Position) -> set[Position]:
         """Remember target-block cells that no friendly unit can ever see.
 
         A 32x32 block can hold free-looking cells sealed inside rock walls.
@@ -15443,11 +15514,7 @@ class AggressiveStrategy:
                         continue
                     observable.update(visible_cells(position, radius, obstacles))
                 unobservable.update(cell for cell in stranded if cell not in observable)
-        self.memory.campaign_scout_unobservable = unobservable
-        self.memory.campaign_scout_unobservable_target = target
-        self.memory.campaign_scout_unobservable_obstacle_count = len(
-            self.memory.obstacles
-        )
+        return unobservable
 
     def _update_campaign_scout(self, turn: Turn) -> None:
         """Publish the held hop only after the target block is visibly clear."""
@@ -15534,7 +15601,7 @@ class AggressiveStrategy:
             last_enemy < started
             or turn.tick - last_enemy >= CAMPAIGN_SCOUT_SETTLE_TICKS
         )
-        if safety_covered and enemy_cleared:
+        if safety_covered and enemy_cleared and self._campaign_block_cleared(turn):
             self._set_campaign_hop_target(target)
             self._clear_campaign_scout()
             return
@@ -15846,10 +15913,10 @@ class AggressiveStrategy:
     def _campaign_rest_complete(self, turn: Turn) -> bool:
         """Return whether the Core may leave the block center it stands on.
 
-        Every live Worker and Ranger must already be in the Core's current
-        block. The nearby service queue must be drained, affordable formation
-        slots built, and the quota gate satisfied. Cargo deeper within this
-        block can keep walking with the Core on the next hop.
+        Require complete local exploration and confirmed Core clearance, plus
+        every live Worker and Ranger inside this block, nearby deliveries,
+        affordable builds and the quota gate. Distant cargo can keep walking
+        with the Core on the next hop.
         """
 
         from .migration import resource_block_index
@@ -15867,7 +15934,53 @@ class AggressiveStrategy:
             return False
         if self._campaign_spawn_ready(turn, turn.resources):
             return False
-        return self._campaign_quota_gate_complete(turn)
+        return self._campaign_quota_gate_complete(
+            turn
+        ) and self._campaign_block_cleared(turn)
+
+    def _campaign_block_gaps(self, turn: Turn) -> set[Position]:
+        from .block_clearance import block_at, cells_in
+
+        core = turn.core
+        if core is None:
+            return set()
+        state = self.memory.block_clearance
+        block = block_at(core.position)
+        survey = state.blocks.get(block)
+        gaps = set(cells_in(block) - self._rock_map(turn))
+        if survey is not None:
+            gaps.difference_update(survey.seen)
+        if not gaps:
+            state.unseen_cells = 0
+            return gaps
+        key = (core.position, len(self.memory.obstacles))
+        if state.terrain_key != key:
+            state.excluded = self._campaign_unobservable(turn, core.position)
+            state.terrain_key = key
+        gaps.difference_update(state.excluded)
+        state.unseen_cells = len(gaps)
+        return gaps
+
+    def _campaign_block_cleared(self, turn: Turn) -> bool:
+        from .block_clearance import block_at
+
+        if turn.core is None:
+            return False
+        survey = self.memory.block_clearance.blocks.get(block_at(turn.core.position))
+        gaps = self._campaign_block_gaps(turn)
+        return survey is not None and not survey.cores and not gaps
+
+    def _campaign_clearance_target(self, turn: Turn) -> Position | None:
+        core = turn.core
+        if (
+            self.config.campaign_mode
+            and core is not None
+            and core.view.state is CoreState.NORMAL
+            and core.position == self.memory.core_home_position
+            and not self._campaign_block_cleared(turn)
+        ):
+            return core.position
+        return None
 
     def _campaign_spawn_ready(self, turn: Turn, resources: int) -> bool:
         """Return whether the campaign owes and can fund its next formation slot."""
@@ -17165,12 +17278,34 @@ class AggressiveStrategy:
         unit: Ranger | Vanguard,
         turn: Turn,
         context: _TurnContext | None = None,
+        *,
+        local: bool = False,
     ) -> Position:
         """Spread the patrol over the held destination block until it is seen."""
 
-        target = self.memory.campaign_scout_target
+        target = (
+            self._campaign_clearance_target(turn)
+            if local
+            else self.memory.campaign_scout_target
+        )
         if target is None:
             return unit.position
+        if local:
+            from .block_clearance import block_at
+
+            self._reconcile_patrol_ring_slots(turn)
+            survey = self.memory.block_clearance.blocks.get(block_at(target))
+            seen_ticks = survey.seen if survey is not None else {}
+            # Once fully explored, keep revisiting the block to rediscover
+            # unresolved Cores. Re-observation never counts as destruction.
+            started = turn.tick - 16 if not self._campaign_block_gaps(turn) else 0
+            excluded = self.memory.block_clearance.excluded
+            task_purpose = CAMPAIGN_CLEARANCE_PURPOSE
+        else:
+            seen_ticks = self.memory.campaign_scout_seen_ticks
+            started = self.memory.campaign_scout_started_tick
+            excluded = self.memory.campaign_scout_unobservable
+            task_purpose = CAMPAIGN_SCOUT_PURPOSE
         size = SYMMETRIC_RESOURCE_BLOCK_SIZE
         min_x = (target[0] // size) * size
         min_y = (target[1] // size) * size
@@ -17180,7 +17315,7 @@ class AggressiveStrategy:
             for y in range(min_y, min_y + size)
         )
         obstacles = self._rock_map(turn)
-        target_cells = block_cells - obstacles - self.memory.campaign_scout_unobservable
+        target_cells = block_cells - obstacles - excluded
         inner = _single_chunk_resource_block(target).inset(PATROL_EDGE_INSET)
         patrol_area = self._campaign_scout_area(unit, target, turn)
         route_bounds = _OutsidePatrolArea(
@@ -17253,7 +17388,7 @@ class AggressiveStrategy:
             )
 
         unit_id = str(unit.id)
-        purpose = f"{CAMPAIGN_SCOUT_PURPOSE}-{target[0]}-{target[1]}"
+        purpose = f"{task_purpose}-{target[0]}-{target[1]}"
         detour_purpose = f"{purpose}-detour"
         support_purpose = f"{purpose}-support"
         purposes = {purpose, detour_purpose, support_purpose}
@@ -17277,8 +17412,8 @@ class AggressiveStrategy:
             return current.position
 
         def seen_age(position: Position) -> int:
-            observed = self.memory.campaign_scout_seen_ticks.get(position)
-            if observed is None or observed < self.memory.campaign_scout_started_tick:
+            observed = seen_ticks.get(position)
+            if observed is None or observed < started:
                 return WORKER_PATROL_AGE_CAP
             # This sweep measures coverage since it began. Aging a covered
             # anchor must not keep it ahead of the remaining blind gaps.
@@ -17295,7 +17430,14 @@ class AggressiveStrategy:
                 visible_cells(goal.position, RANGER_VISION_RADIUS, obstacles)
                 & target_cells
             )
-        gaps = self._campaign_scout_gaps(turn, target, obstacles, target_cells)
+        gaps = self._campaign_scout_gaps(
+            turn,
+            target,
+            obstacles,
+            target_cells,
+            seen_ticks=seen_ticks,
+            started=started,
+        )
 
         if (
             current is not None
@@ -17514,6 +17656,9 @@ class AggressiveStrategy:
         target: Position,
         obstacles: set[Position],
         target_cells: Iterable[Position],
+        *,
+        seen_ticks: dict[Position, int] | None = None,
+        started: int | None = None,
     ) -> tuple[Position, ...]:
         """Return all unseen cells, prioritizing gaps between anchor discs."""
 
@@ -17532,8 +17677,11 @@ class AggressiveStrategy:
         anchor_view: set[Position] = set()
         for anchor in anchors:
             anchor_view |= visible_cells(anchor, RANGER_VISION_RADIUS, obstacles)
-        started = self.memory.campaign_scout_started_tick
-        seen = self.memory.campaign_scout_seen_ticks
+        if started is None:
+            started = self.memory.campaign_scout_started_tick
+        seen = (
+            self.memory.campaign_scout_seen_ticks if seen_ticks is None else seen_ticks
+        )
         gaps = [cell for cell in target_cells if seen.get(cell, -1) < started]
         # Deep gaps retain priority, but an unusable anchor must not hide its
         # unseen neighborhood from the fallback. Actual movement still checks
@@ -19842,6 +19990,8 @@ class AggressiveStrategy:
         )
         rocks = self._rock_map(turn)
         choices = []
+        survey = self.memory.block_clearance.blocks.get(block)
+        pending_cores = survey.cores if survey is not None else {}
         for enemy in enemies:
             aim = self._core_hunt_aim_position(enemy)
             for hunter in hunters:
@@ -19858,6 +20008,7 @@ class AggressiveStrategy:
                     continue
                 choices.append(
                     (
+                        str(enemy.id) not in pending_cores,
                         route[0],
                         manhattan(hunter.position, enemy.position),
                         manhattan(core.position, enemy.position),
@@ -19869,7 +20020,7 @@ class AggressiveStrategy:
                 )
         if not choices:
             return None
-        selected = min(choices, key=lambda choice: choice[:5])
+        selected = min(choices, key=lambda choice: choice[:6])
         return selected[-2], selected[-1]
 
     def _core_hunt_routes(

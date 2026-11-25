@@ -10,6 +10,7 @@ from typing import Any
 
 from arena_hero import CoreView, Position, Turn, UnitType, UnitView
 
+from .block_clearance import BlockClearance
 from .counterattack import CounterattackState
 from .exploration import ExplorationMap, ExplorationRoute, visible_cells
 from .flank import State as FlankState
@@ -303,6 +304,7 @@ class WorldMemory:
     # The flag is recomputed every Turn from the live stance, so it can never
     # act as durable progress that parks the Core short of its target.
     campaign_resting: bool = False
+    block_clearance: BlockClearance = field(default_factory=BlockClearance)
     recovery: Recovery = field(default_factory=Recovery)
     # A quota-4+ hop is held while patrol Rangers sweep the destination block.
     # The exact per-cell ages are separate from the Worker economy map, which
@@ -1010,6 +1012,7 @@ class WorldMemory:
             ),
             "campaign_last_core_id": self.campaign_last_core_id,
             "campaign_resting": self.campaign_resting,
+            "block_clearance": self.block_clearance.to_dict(),
             "recovery": self.recovery.to_dict(),
             "campaign_scout_target": (
                 list(self.campaign_scout_target)
@@ -1293,6 +1296,7 @@ class WorldMemory:
                 else None
             ),
             campaign_resting=bool(raw.get("campaign_resting", False)),
+            block_clearance=BlockClearance.from_dict(raw.get("block_clearance", {})),
             recovery=Recovery.from_dict(raw.get("recovery", {})),
             campaign_scout_target=_optional_position(raw.get("campaign_scout_target")),
             campaign_scout_started_tick=int(raw.get("campaign_scout_started_tick", 0)),

@@ -13,6 +13,26 @@ def object_id(number: int) -> str:
     return str(UUID(int=number))
 
 
+def explored_campaign_block(memory, center=None):
+    """Prerequisite for scenarios testing gates after a completed local survey."""
+    from arena_hero_bot.block_clearance import (
+        BlockClearance,
+        Survey,
+        block_at,
+        cells_in,
+    )
+
+    center = center or memory.core_home_position
+    if center is None or memory.block_clearance.core_id is not None:
+        return
+    block = block_at(center)
+    memory.block_clearance = BlockClearance(
+        core_id=memory.campaign_last_core_id or object_id(1),
+        current=block,
+        blocks={block: Survey(seen=dict.fromkeys(cells_in(block), 1))},
+    )
+
+
 def core(
     number: int = 1,
     *,

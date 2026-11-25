@@ -13,7 +13,7 @@ from arena_hero_bot.strategy import (
     _OutsidePatrolArea,
 )
 
-from .factories import core, make_turn, object_id, unit
+from .factories import core, explored_campaign_block, make_turn, object_id, unit
 from .test_shared_movement import context_for
 
 HOME = (815, 15)
@@ -207,6 +207,7 @@ def test_distant_scout_can_return_to_its_reachable_goal():
 
 def test_scout_observation_planning_preserves_worker_harvest_and_deposit(monkeypatch):
     memory = scout_memory()
+    explored_campaign_block(memory)
     workers = [
         unit(100 + index, "WORKER", position=(808 + index, 14)) for index in range(16)
     ]

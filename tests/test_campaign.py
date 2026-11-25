@@ -29,7 +29,7 @@ from arena_hero_bot.strategy import (
     _uncovered_symmetric_cells,
 )
 
-from .factories import core, make_turn, object_id, unit
+from .factories import core, explored_campaign_block, make_turn, object_id, unit
 from .test_core_traffic import settled_positions
 
 
@@ -42,6 +42,10 @@ def require_complete_campaign_plans(monkeypatch):
 
 
 def _strategy(memory: WorldMemory) -> AggressiveStrategy:
+    # These scenarios isolate roster, service and forward-scout gates after
+    # the current block has already been explored. Local surveys are tested
+    # independently in test_block_clearance.py.
+    explored_campaign_block(memory)
     return AggressiveStrategy(
         memory,
         StrategyConfig(

@@ -15,7 +15,7 @@ from arena_hero_bot.strategy import (
     StrategyConfig,
 )
 
-from .factories import core, make_turn, unit
+from .factories import core, explored_campaign_block, make_turn, unit
 from .test_core_traffic import settled_positions
 from .test_shared_movement import context_for
 
@@ -410,6 +410,7 @@ def test_quiet_scout_full_plans_spread_without_opening_inner_gaps(tmp_path, rest
         ),
         StrategyConfig(target_workers=16, campaign_mode=True, expedition_mode=True),
     )
+    explored_campaign_block(strategy.memory)
     roster = [*guards, *patrols, *workers]
     previous_radius = 8
     final_posts = None
