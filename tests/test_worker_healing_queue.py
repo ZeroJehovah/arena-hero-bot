@@ -4,6 +4,7 @@ from uuid import UUID
 
 import pytest
 
+from arena_hero_bot.geometry import add, line_of_fire
 from arena_hero_bot.memory import WorldMemory
 from arena_hero_bot.strategy import (
     CORE_LAYOUT_VERSION,
@@ -148,6 +149,78 @@ def test_wounded_loaded_worker_delivers_before_waiting_for_healing():
             break
     assert encounter.deposits == encounter.heals == 1
     assert encounter.friends[object_id(2)]["hp"] == 2
+
+
+@pytest.mark.parametrize("cargo", [0, 1])
+@pytest.mark.parametrize("restart", [False, True])
+def test_exposed_patient_leaves_fire_before_retrying_blocked_service(
+    tmp_path, cargo, restart
+):
+    strategy = _strategy()
+    encounter = Encounter(
+        [unit(2, "WORKER", position=(14, 3), hp=1, cargo=cargo)],
+        [unit(50, "RANGER", controlled=False, position=(14, 6))],
+        resources=0,
+    )
+    if restart:
+        strategy.memory.observe(encounter.turn())
+        path = tmp_path / "memory.json"
+        strategy.memory.save(path)
+        strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    turn = encounter.turn()
+    strategy.decide(turn)
+    worker = turn.workers[0]
+    action = turn.plan.unit_actions.get(worker.id)
+
+    assert action is not None and action.type == "MOVE"
+    destination = add(worker.position, action.direction)
+    assert not line_of_fire((14, 6), destination, set())
+    encounter.settle(
+        turn.plan,
+        {
+            object_id(50): {
+                "type": "SHOOT",
+                "target_id": object_id(2),
+                "expected_cell": [14, 3],
+            }
+        },
+    )
+    assert encounter.losses == 0
+    assert encounter.friends[object_id(2)]["hp"] == 1
+    assert encounter.friends[object_id(2)]["cargo"] == cargo
+
+
+@pytest.mark.parametrize(
+    "blocked_by", ["open", "rock", "capacity", "incoming", "enemy"]
+)
+def test_patient_escape_keeps_actual_destination_constraints(blocked_by):
+    strategy = _strategy()
+    origin, exit_cell = (14, 3), (14, 2)
+    rocks = {(13, 3), (15, 3), (14, 4)}
+    objects = [
+        core(),
+        unit(2, "WORKER", position=origin, hp=1),
+        unit(50, "RANGER", controlled=False, position=(17, 6)),
+    ]
+    if blocked_by == "rock":
+        rocks.add(exit_cell)
+    elif blocked_by == "capacity":
+        objects.extend(unit(n, "WORKER", position=exit_cell) for n in (3, 4))
+    elif blocked_by == "incoming":
+        strategy.memory.incoming_damage[exit_cell] = (99, 1)
+    elif blocked_by == "enemy":
+        objects.append(unit(51, "WORKER", controlled=False, position=exit_cell))
+    turn = make_turn(objects=objects, obstacles=rocks)
+    strategy.memory.observe(turn)
+    context = context_for(turn)
+    strategy._decide_worker(turn.workers[0], context)
+
+    action = turn.plan.unit_actions.get(turn.workers[0].id)
+    if blocked_by == "open":
+        assert action is not None and action.type == "MOVE"
+        assert add(origin, action.direction) == exit_cell
+    else:
+        assert action is None or action.type == "WAIT"
 
 
 @pytest.mark.parametrize("restart", [False, True])

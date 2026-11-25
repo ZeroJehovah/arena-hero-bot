@@ -7716,6 +7716,23 @@ class AggressiveStrategy:
             return True
 
         if (
+            isinstance(unit, Worker)
+            and context.turn.core is not None
+            and (threats := self._worker_combat_threats(unit, context))
+            and self._retreat_worker(
+                unit,
+                context.turn.core.position,
+                context,
+                threats,
+                require_reduced_fire=True,
+            )
+        ):
+            # A blocked healing/delivery route must not park a patient on a
+            # lethal ray when a legal adjacent step leaves that fire. Safe
+            # patients retain their ordinary service and funding decisions.
+            return True
+
+        if (
             isinstance(unit, Ranger)
             and unit.id in context.core_migration_healing_ids
             and self._recover_during_migration(unit, context)
@@ -8226,6 +8243,8 @@ class AggressiveStrategy:
         core_position: Position,
         context: _TurnContext,
         threats: tuple[Position, ...],
+        *,
+        require_reduced_fire: bool = False,
     ) -> bool:
         """Prefer surviving actual rays before increasing enemy distance.
 
@@ -8288,6 +8307,8 @@ class AggressiveStrategy:
             ):
                 continue
             damage = damage_at(destination)
+            if require_reduced_fire and damage >= min(current_damage, worker.hp):
+                continue
             if damage >= worker.hp and current_damage < worker.hp:
                 continue
             nearest_enemy = min(manhattan(destination, enemy) for enemy in threats)
@@ -8345,6 +8366,8 @@ class AggressiveStrategy:
                     ),
                 ):
                     return True
+            return False
+        if require_reduced_fire:
             return False
         return self._move(
             worker,
@@ -11312,6 +11335,25 @@ class AggressiveStrategy:
                 for enemy in targets
             )
             if losses > kills or not survivors_can_kill:
+                continue
+            if (
+                entrants == members
+                and len(opponents) >= 2
+                and not context.threat.recent_core_attack
+                and not context.threat.projected_core_damage
+                and not any(
+                    self._enemy_can_attack_position(enemy, core.position, rocks)
+                    for enemy in risks
+                )
+                and casualty_bound(group, (*opponents, *opponents), rocks) > kills
+            ):
+                # With the whole local group moving into multiple fire
+                # sources, no arrow can remove one on entry. Budget ingress
+                # and simultaneous return fire on its first volley. Three
+                # healthy entrants
+                # against two full-health Rangers otherwise approve a one-
+                # loss entry, then pay a second loss for their single kill.
+                # Existing firing support and Core defense keep their gates.
                 continue
             if (
                 len(group) - losses == 1
