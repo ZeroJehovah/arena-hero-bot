@@ -412,6 +412,19 @@ class State:
     def entry_fire_cells(self) -> frozenset[Position]:
         return frozenset(self.prefire_cells) | frozenset(self.failed_entries)
 
+    def entry_disproved(self, targets: Sequence[UnitView]) -> bool:
+        """Do not retry another blind corner against an unchanged failed group.
+
+        Ordinary combat still evaluates its real arrival damage. This only
+        withdraws the zero-damage permit, across parent tasks and restarts;
+        observation already expires evidence when the original group changes.
+        """
+        return any(
+            failure.targets.get(str(target.id)) == target.position
+            for failure in self.failed_entries.values()
+            for target in targets
+        )
+
     def observe(
         self,
         turn: Turn,
@@ -1143,6 +1156,9 @@ def choose(
     known: Callable[[Position], bool],
 ) -> Operation | None:
     """Produce a complete proposal; callers own all mutations and reservations."""
+    if state.entry_disproved(targets):
+        budget.reject("group_entry_disproved")
+        return None
     contact = state.contacts.get(group_key(parent.kind, targets))
     if contact is None or contact.seen != turn.tick or contact.ticks < STABLE_TICKS:
         budget.reject("contact_unstable")

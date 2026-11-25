@@ -13,6 +13,7 @@ from arena_hero import CoreView, Position, Turn, UnitType, UnitView
 from .counterattack import CounterattackState
 from .exploration import ExplorationMap, ExplorationRoute, visible_cells
 from .flank import State as FlankState
+from .recovery import Recovery
 from .skirmish import Skirmish
 
 SCHEMA_VERSION = 1
@@ -302,6 +303,7 @@ class WorldMemory:
     # The flag is recomputed every Turn from the live stance, so it can never
     # act as durable progress that parks the Core short of its target.
     campaign_resting: bool = False
+    recovery: Recovery = field(default_factory=Recovery)
     # A quota-4+ hop is held while patrol Rangers sweep the destination block.
     # The exact per-cell ages are separate from the Worker economy map, which
     # follows only the active one- or two-block harvest area.
@@ -1008,6 +1010,7 @@ class WorldMemory:
             ),
             "campaign_last_core_id": self.campaign_last_core_id,
             "campaign_resting": self.campaign_resting,
+            "recovery": self.recovery.to_dict(),
             "campaign_scout_target": (
                 list(self.campaign_scout_target)
                 if self.campaign_scout_target is not None
@@ -1290,6 +1293,7 @@ class WorldMemory:
                 else None
             ),
             campaign_resting=bool(raw.get("campaign_resting", False)),
+            recovery=Recovery.from_dict(raw.get("recovery", {})),
             campaign_scout_target=_optional_position(raw.get("campaign_scout_target")),
             campaign_scout_started_tick=int(raw.get("campaign_scout_started_tick", 0)),
             campaign_scout_last_gain_tick=int(

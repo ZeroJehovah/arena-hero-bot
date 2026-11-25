@@ -816,7 +816,16 @@ def test_finish_can_use_current_worker_observation_after_front_mutual_sight_ends
 
 
 @pytest.mark.parametrize(
-    "gate", ["rock", "enemy", "service", "capacity", "unknown_damage", "failed_entry"]
+    "gate",
+    [
+        "rock",
+        "enemy",
+        "service",
+        "capacity",
+        "unknown_damage",
+        "failed_entry",
+        "other_corner_failed",
+    ],
 )
 def test_exact_entry_permit_does_not_bypass_physical_or_service_gates(gate):
     strategy, encounter, _turn = _launched()
@@ -843,8 +852,9 @@ def test_exact_entry_permit_does_not_bypass_physical_or_service_gates(gate):
         context.core_migration_lane = (cell,)
     elif gate == "capacity":
         context.friendly_occupancy[cell] = 1
-    elif gate == "failed_entry":
-        strategy.memory.flank.failed_entries[cell] = flank.FailedEntry(
+    elif gate in {"failed_entry", "other_corner_failed"}:
+        failed_cell = cell if gate == "failed_entry" else (100, 100)
+        strategy.memory.flank.failed_entries[failed_cell] = flank.FailedEntry(
             dict(operation.target_positions), turn.tick
         )
     else:
@@ -853,6 +863,25 @@ def test_exact_entry_permit_does_not_bypass_physical_or_service_gates(gate):
     assert not strategy._flank_atomic_moves(context, members, destinations)
     assert turn.plan.model_dump() == before
     assert not context.arrival_counts and not context.departure_counts
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_another_failed_corner_prevents_new_blind_assembly(tmp_path, restart):
+    strategy, encounter = standoff()
+    seed_contact(strategy, encounter)
+    turn = encounter.turn()
+    strategy.memory.flank.failed_entries[(100, 100)] = flank.FailedEntry(
+        {str(enemy.id): enemy.position for enemy in turn.visible_enemies}, turn.tick
+    )
+    if restart:
+        path = tmp_path / "memory.json"
+        strategy.memory.save(path)
+        strategy = AggressiveStrategy(WorldMemory.load(path), strategy.config)
+    report = strategy.decide(turn)
+    assert strategy.memory.flank.operation is None
+    assert all(
+        d.reason != "synchronized qualified blind flank entry" for d in report.decisions
+    )
 
 
 def test_last_move_failure_restores_all_action_capacity_fire_and_member_ledgers(

@@ -32,8 +32,9 @@ from arena_hero import (
 )
 
 from . import counterattack as counter
-from . import defense_layout, flank, skirmish
+from . import defense_layout, flank, recovery, skirmish
 from .combat_policy import (
+    PREEMPTIVE_EVADE_HORIZON,
     CombatPolicy,
     CombatTargetLedger,
     ThreatAssessment,
@@ -950,6 +951,7 @@ class AggressiveStrategy:
         self._worker_local_resource_cache = None
         self._worker_safe_cells_cache = None
         if self.config.campaign_mode:
+            self.memory.recovery.observe(turn)
             self._observe_campaign_state(turn)
         if self.config.expedition_mode:
             self._reconcile_unit_roles(turn)
@@ -2858,6 +2860,8 @@ class AggressiveStrategy:
             for enemy in context.turn.visible_enemies
             if isinstance(enemy, UnitView) and str(enemy.id) in operation.target_ids
         )
+        if self.memory.flank.entry_disproved(targets):
+            return False
         contact = self.memory.flank.contacts.get(
             flank.group_key(operation.parent.kind, targets)
         )
@@ -3137,6 +3141,9 @@ class AggressiveStrategy:
             self._end_flank(context, "reserved_by_other_task")
             return
         if operation.phase is flank.Phase.ASSEMBLE:
+            if self.memory.flank.entry_disproved(targets):
+                self._end_flank(context, "group_entry_disproved")
+                return
             contact = self.memory.flank.contacts.get(
                 flank.group_key(parent.kind, targets)
             )
@@ -5807,7 +5814,10 @@ class AggressiveStrategy:
             return
         if (
             core.view.state is not CoreState.MOVING
-            and (context.layered_assignments or context.counterattack_ids)
+            and (
+                context.counterattack_ids
+                or (context.layered_assignments and self.memory.recovery.target is None)
+            )
             and context.core_escape_direction is None
         ):
             # Layered defense deliberately holds a stationary Core behind its
@@ -5860,6 +5870,10 @@ class AggressiveStrategy:
         core = context.turn.core
         if core is None:
             return ()
+        route = self.memory.recovery.route
+        if target == self.memory.recovery.target and destination in route:
+            index = route.index(destination)
+            return route[index : index + CORE_MIGRATION_LANE_LENGTH]
         blocked = (
             self._rock_map(context.turn)
             | set(context.turn.resource_cells)
@@ -7365,7 +7379,13 @@ class AggressiveStrategy:
                 target=core.position,
             )
             return
-        if context.layered_assignments or context.counterattack_ids:
+        if context.counterattack_ids or (
+            context.layered_assignments
+            and (
+                self.memory.recovery.target is None
+                or self._core_home_direction(context) is None
+            )
+        ):
             core.wait()
             context.report.add(
                 actor_id=str(core.id),
@@ -9798,6 +9818,10 @@ class AggressiveStrategy:
         turn = context.turn
         core = turn.core
         state = self.memory.counterattack
+        if (
+            self.memory.recovery.holding or self.memory.recovery.underfunded
+        ) and state.operation is None:
+            return
         enemies = self._counterattack_enemies(turn)
         rocks = self._rock_map(turn)
         if (
@@ -10315,6 +10339,10 @@ class AggressiveStrategy:
         turn = context.turn
         core = turn.core
         operation = self.memory.skirmish
+        if (
+            self.memory.recovery.holding or self.memory.recovery.underfunded
+        ) and operation is None:
+            return
         rocks = self._rock_map(turn)
         enemies = self._counterattack_enemies(turn)
         if self.memory.campaign_scout_target is not None:
@@ -14852,6 +14880,9 @@ class AggressiveStrategy:
         )
         if emergency:
             self.memory.campaign_emergency_target = target
+            if self.memory.recovery.target == previous:
+                self.memory.recovery.target = target
+                self.memory.recovery.route = ()
             if target is None:
                 self.memory.campaign_emergency_started_tick = 0
         if target is None:
@@ -14958,6 +14989,12 @@ class AggressiveStrategy:
 
         workers = len(turn.workers)
         rangers = self._campaign_rangers(turn)
+        evidence = self.memory.recovery
+        if (
+            rangers >= CAMPAIGN_MAX_RANGERS
+            or self.memory.campaign_phase >= CAMPAIGN_PHASE_STAGE4
+        ) and evidence.danger_tick == turn.tick:
+            evidence.reserve = max(evidence.reserve, self._campaign_local_reserve(turn))
         if (
             self.memory.campaign_phase == CAMPAIGN_PHASE_STAGE1
             and workers >= CAMPAIGN_STAGE1_WORKERS
@@ -15000,6 +15037,8 @@ class AggressiveStrategy:
         reached center. This gate also precedes a new forward scouting task.
         """
 
+        if self._continue_campaign_recovery(turn):
+            return
         if self._continue_emergency_migration(turn):
             return
         if self.memory.defense_compressed:
@@ -15060,6 +15099,165 @@ class AggressiveStrategy:
         self.memory.campaign_emergency_started_tick = turn.tick
         self._set_campaign_hop_target(target)
         return True
+
+    def _continue_campaign_recovery(self, turn: Turn) -> bool:
+        """Publish at most one known, safe recovery hop after sustained losses."""
+        from .migration import (
+            cardinal_block_neighbors,
+            resource_block_index,
+            resource_block_quota,
+        )
+
+        state = self.memory.recovery
+        core = turn.core
+        if core is None:
+            return False
+        target_roster = min(state.reserve, self._campaign_local_reserve(turn))
+        state.underfunded = target_roster > CAMPAIGN_MAX_RANGERS and state.deficit(
+            turn.resources, self._campaign_rangers(turn), target_roster
+        )
+        if state.target is not None:
+            if state.target != self.memory.campaign_emergency_target:
+                state.target = None
+                state.route = ()
+            elif core.position == state.target:
+                state.target = None
+                state.route = ()
+                self.memory.campaign_emergency_target = None
+                self.memory.campaign_emergency_started_tick = 0
+            elif turn.tick - self.memory.campaign_emergency_started_tick > 512:
+                state.target = None
+                state.route = ()
+                self._cancel_campaign_migration(turn)
+            else:
+                state.route = self._campaign_recovery_route(turn, state.target)
+                return True
+        if state.holding:
+            if (
+                core.position == self.memory.core_home_position
+                and turn.tick >= state.retry_after
+                and turn.tick - state.danger_tick > 32
+                and len(turn.workers) >= CAMPAIGN_STAGE2_WORKERS
+                and self._campaign_rangers(turn) >= self._campaign_local_reserve(turn)
+            ):
+                state.holding = False
+                state.samples.clear()
+            return True
+        if (
+            turn.tick < state.retry_after
+            or state.danger is None
+            or turn.tick - state.danger_tick > recovery.WINDOW
+            or not state.underfunded
+            or core.view.state is not CoreState.NORMAL
+            or core.position != self.memory.core_home_position
+            or core.hp < 5
+            or core.shield < 5
+            or self.memory.campaign_emergency_target is not None
+        ):
+            return False
+        state.retry_after = turn.tick + recovery.RETRY_TICKS
+        block = resource_block_index(core.position)
+        if any(resource_block_index(unit.position) != block for unit in turn.units):
+            return False
+        danger_distance = manhattan(core.position, state.danger)
+        choices = []
+        for adjacent in cardinal_block_neighbors(block):
+            if resource_block_quota(adjacent) > resource_block_quota(block):
+                continue
+            for target in _resource_block_home_cells(
+                (adjacent[0] * 32, adjacent[1] * 32),
+                origin=core.position,
+                obstacles=self._rock_map(turn),
+            ):
+                if manhattan(target, state.danger) <= danger_distance:
+                    continue
+                route = self._campaign_recovery_route(turn, target)
+                if route:
+                    choices.append(
+                        (
+                            resource_block_quota(adjacent),
+                            -manhattan(target, state.danger),
+                            len(route),
+                            target,
+                            route,
+                        )
+                    )
+        if not choices:
+            return False
+        *_, target, route = min(choices)
+        state.holding = True
+        state.target = target
+        state.route = route
+        state.retry_after = turn.tick + recovery.WINDOW
+        self._clear_campaign_scout()
+        self.memory.campaign_emergency_target = target
+        self.memory.campaign_emergency_started_tick = turn.tick
+        self._set_campaign_hop_target(target)
+        return True
+
+    def _campaign_recovery_route(
+        self, turn: Turn, target: Position
+    ) -> tuple[Position, ...]:
+        """Search only observed terrain within the current and adjacent blocks."""
+        from .migration import blocks_are_cardinally_adjacent, resource_block_index
+
+        core = turn.core
+        if core is None:
+            return ()
+        origin = core.position
+        blocks = {resource_block_index(origin), resource_block_index(target)}
+        if len(blocks) == 2 and not blocks_are_cardinally_adjacent(*sorted(blocks)):
+            return ()
+        rocks = self._rock_map(turn)
+        enemies = self._ranger_threats(turn)
+        blocked = (
+            rocks
+            | set(turn.resource_cells)
+            | {enemy.position for enemy in turn.visible_enemies}
+        )
+        blocked.update(self.memory.incoming_damage)
+        for enemy in enemies:
+            positions = (
+                enemy.position,
+                *(
+                    cell
+                    for cell in adjacent_positions(enemy.position)
+                    if cell not in rocks
+                ),
+            )
+            for position in positions:
+                if enemy.unit_type is UnitType.RANGER:
+                    blocked.update(
+                        cell
+                        for cell in firing_positions(position)
+                        if line_of_fire(position, cell, rocks)
+                    )
+                else:
+                    blocked.update(adjacent_positions(position))
+        queue = deque([origin])
+        parents: dict[Position, Position | None] = {origin: None}
+        distances = {origin: 0}
+        while queue:
+            cell = queue.popleft()
+            if cell == target:
+                path = [cell]
+                while (previous := parents[path[-1]]) is not None:
+                    path.append(previous)
+                return tuple(reversed(path))
+            if distances[cell] >= recovery.MAX_ROUTE:
+                continue
+            for following in adjacent_positions(cell):
+                if (
+                    following in parents
+                    or following in blocked
+                    or resource_block_index(following) not in blocks
+                    or not self.memory.exploration.seen(following)
+                ):
+                    continue
+                parents[following] = cell
+                distances[following] = distances[cell] + 1
+                queue.append(following)
+        return ()
 
     def _emergency_migration_target(
         self,
@@ -15389,8 +15587,18 @@ class AggressiveStrategy:
         return (
             self.config.campaign_mode
             and len(turn.workers) >= CAMPAIGN_STAGE2_WORKERS
-            and self._campaign_rangers(turn) >= CAMPAIGN_MAX_RANGERS
+            and self._campaign_rangers(turn)
+            >= min(self.memory.recovery.reserve, self._campaign_local_reserve(turn))
         )
+
+    @staticmethod
+    def _campaign_local_reserve(turn: Turn) -> int:
+        from .migration import resource_block_index, resource_block_quota
+
+        if turn.core is None:
+            return CAMPAIGN_MAX_RANGERS
+        quota = resource_block_quota(resource_block_index(turn.core.position))
+        return max(CAMPAIGN_MAX_RANGERS, min(60, (quota - 1) * 10))
 
     def _campaign_defense_pressure(
         self,
@@ -15481,6 +15689,8 @@ class AggressiveStrategy:
         from .migration import resource_block_index, resource_block_quota
 
         core = turn.core
+        if self.memory.recovery.target is not None:
+            return
         target = self.memory.campaign_scout_target or self.memory.core_home_position
         if core is None or target is None or target == core.position:
             return
@@ -15941,6 +16151,25 @@ class AggressiveStrategy:
             )
         if target is None or core.position == target:
             return None
+        if target == self.memory.recovery.target:
+            route = self.memory.recovery.route
+            if len(route) < 2 or route[0] != core.position:
+                return None
+            destination = route[1]
+            if (
+                destination in obstacles
+                or destination in context.turn.resource_cells
+                or destination in context.enemy_positions
+                or destination in self.memory.incoming_damage
+                or maximum_core_damage(
+                    (core.position,) * 3 + (destination,),
+                    self._ranger_threats(context.turn),
+                    obstacles,
+                )
+                > 0
+            ):
+                return None
+            return direction_between(core.position, destination)
         blocked = (
             obstacles | set(context.turn.resource_cells) | context.enemy_positions
         ) - {core.position}
@@ -18752,7 +18981,60 @@ class AggressiveStrategy:
         core = turn.core
         if core is None:
             return True
-        return threat.should_evacuate_core or core.hp < 5 or core.shield < 5
+        if self.memory.recovery.target is not None:
+            return True
+        if (
+            core.hp < 5
+            or core.shield < 5
+            or threat.recent_core_attack
+            or threat.threatening_core_enemy_ids
+            or threat.projected_core_damage
+            or threat.preemptive_enemy_ids
+        ):
+            return True
+        if not threat.pursuing_enemy_ids:
+            return False
+        rocks = self._rock_map(turn)
+        enemies = self._ranger_threats(turn)
+        visible = {str(enemy.id): enemy for enemy in self._visible_combat_enemies(turn)}
+        available = {
+            ranger.id: ranger
+            for ranger in turn.rangers
+            if ranger.hp == 2
+            and self.memory.incoming_damage.get(ranger.position, (-1, 0))[1] < 2
+            and not any(
+                counter.can_attack(enemy, ranger.position, rocks) for enemy in enemies
+            )
+            and (
+                (action := turn._builder.unit_actions.get(ranger.id)) is None
+                or action.type == "SHOOT"
+            )
+        }
+        for enemy_id in sorted(threat.pursuing_enemy_ids):
+            motion = self._combat_policy.enemy_motion.get(enemy_id)
+            enemy = visible.get(enemy_id)
+            if (
+                enemy is None
+                or motion is None
+                or motion.ticks_to_attack_range is None
+                or motion.ticks_to_attack_range <= PREEMPTIVE_EVADE_HORIZON
+                or manhattan(core.position, enemy.position) <= 12
+            ):
+                return True
+            shooters = [
+                ranger
+                for ranger in available.values()
+                if line_of_fire(ranger.position, enemy.position, rocks)
+            ]
+            # Reserve distinct, healthy current shooters for each pursuer.
+            # A distant Vanguard may need two volleys; no moving or exposed
+            # ally and no unrelated group can provide imaginary interception.
+            needed = max(2, (enemy.hp + 1) // 2)
+            if len(shooters) < needed:
+                return True
+            for ranger in sorted(shooters, key=lambda unit: unit.id)[:needed]:
+                del available[ranger.id]
+        return False
 
     def _worker_area_protection_candidates(
         self,
@@ -20831,6 +21113,16 @@ class AggressiveStrategy:
         if self._local_core_attackers(turn):
             return (UnitType.RANGER,)
         workers = len(turn.workers)
+        evidence = self.memory.recovery
+        reserve = min(evidence.reserve, self._campaign_local_reserve(turn))
+        if (
+            reserve > CAMPAIGN_MAX_RANGERS
+            and workers >= CAMPAIGN_STAGE1_WORKERS
+            and (evidence.holding or turn.tick - evidence.danger_tick <= 32)
+            and self._campaign_rangers(turn) * CAMPAIGN_STAGE2_WORKERS
+            < workers * reserve
+        ):
+            return (UnitType.RANGER,)
         if workers < CAMPAIGN_STAGE2_WORKERS:
             return (UnitType.WORKER,)
         return (UnitType.RANGER,)

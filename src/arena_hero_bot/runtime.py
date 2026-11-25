@@ -367,6 +367,7 @@ def _identity_snapshot(memory: WorldMemory) -> dict[str, Any]:
                 else None
             ),
             "resting": memory.campaign_resting,
+            "recovery": memory.recovery.summary(),
         },
         "core_migration": {
             "last_position": (

@@ -475,6 +475,36 @@ def test_failed_blind_entry_follows_the_original_enemy_contact(change, retained)
         assert state.failed_entries[cell].seen == turn.tick
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_a_failed_group_loses_all_blind_corners_but_unrelated_targets_keep_them(
+    restart,
+):
+    state = flank.State(core_id=object_id(1))
+    state.failed_entries[(3, -4)] = flank.FailedEntry({object_id(50): (0, -7)}, 99)
+    if restart:
+        state = flank.State.from_dict(state.to_dict())
+    turn = make_turn(
+        objects=[
+            core(),
+            unit(50, "RANGER", controlled=False, position=(0, -7)),
+            unit(51, "RANGER", controlled=False, position=(0, -7)),
+        ]
+    )
+    state.observe(turn, [], [], set())
+    failed = tuple(
+        enemy
+        for enemy in turn.visible_enemies
+        if isinstance(enemy, UnitView) and str(enemy.id) == object_id(50)
+    )
+    unrelated = tuple(
+        enemy
+        for enemy in turn.visible_enemies
+        if isinstance(enemy, UnitView) and str(enemy.id) == object_id(51)
+    )
+    assert state.entry_disproved(failed)
+    assert not state.entry_disproved(unrelated)
+
+
 @pytest.mark.parametrize("invalid", ["tick", "member", "cell", "task", "phase"])
 def test_arrival_permit_is_exact_and_cannot_survive_a_tick(invalid):
     strategy, encounter = standoff()
