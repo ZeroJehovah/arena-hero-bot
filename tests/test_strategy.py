@@ -5,6 +5,7 @@ from itertools import pairwise
 from unittest.mock import patch
 from uuid import UUID
 
+import pytest
 from arena_hero import (
     Direction,
     SpawnAction,
@@ -5580,7 +5581,7 @@ def test_massed_core_assault_pulls_the_far_side_into_the_fight() -> None:
         shared_defense=True,
     )
     assert all(reasons[number] != PERIMETER_REASON for number in (2, 4, 5)), reasons
-    assert "close firing angle on" in reasons[2]
+    assert reasons[2] == "move to fire on an attacker in current Core range"
     action = turn.plan.unit_actions[ranger.id]
     assert action.type == "MOVE"
     destination = add(ranger.position, action.direction)
@@ -5680,8 +5681,8 @@ def test_two_contacts_do_not_empty_the_far_side_of_the_ring() -> None:
             unit(2, "RANGER", position=(0, 10)),
             unit(4, "RANGER", position=(-1, 10)),
             unit(5, "RANGER", position=(1, 10)),
-            unit(30, "RANGER", controlled=False, position=(0, 3)),
-            unit(31, "RANGER", controlled=False, position=(1, 3)),
+            unit(30, "RANGER", controlled=False, position=(0, 4)),
+            unit(31, "RANGER", controlled=False, position=(1, 4)),
         ],
     )
 
@@ -6711,14 +6712,20 @@ def test_expedition_members_never_heal_or_retreat() -> None:
     assert not strategy._recover_if_critical(ranger_view, maximum_hp=2, context=context)
 
 
-def test_massed_core_assault_does_not_recall_an_expedition_member() -> None:
+@pytest.mark.parametrize("direct_core_fire", [False, True])
+def test_only_current_core_fire_overrides_expedition_movement(direct_core_fire) -> None:
     strategy = _expedition_strategy()
     strategy._expedition_squads = [(frozenset({UUID(int=2)}), (1, 0))]
     turn = make_turn(
         objects=[
             core(),
             unit(2, "RANGER", position=(20, 0)),
-            unit(30, "RANGER", controlled=False, position=(0, 3)),
+            unit(
+                30,
+                "RANGER",
+                controlled=False,
+                position=(0, 3 if direct_core_fire else 4),
+            ),
             unit(31, "RANGER", controlled=False, position=(1, 3)),
             unit(32, "VANGUARD", controlled=False, position=(0, 4)),
         ]
@@ -6737,8 +6744,15 @@ def test_massed_core_assault_does_not_recall_an_expedition_member() -> None:
     decision = next(
         item for item in context.report.decisions if item.actor_id == str(ranger.id)
     )
-    assert "Core" not in decision.reason
     action = turn.plan.unit_actions.get(ranger.id)
+    if direct_core_fire:
+        assert decision.reason == "move to fire on an attacker in current Core range"
+        assert action is not None and action.type == "MOVE"
+        assert manhattan(add(ranger.position, action.direction), (0, 3)) < manhattan(
+            ranger.position, (0, 3)
+        )
+        return
+    assert "Core" not in decision.reason
     if action is not None and action.type == "MOVE":
         destination = add(ranger.position, action.direction)
         assert manhattan(destination, (0, 0)) >= manhattan(ranger.position, (0, 0))

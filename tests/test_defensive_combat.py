@@ -90,8 +90,8 @@ def test_a_far_side_defender_closes_on_a_massed_assault() -> None:
     # The Core-loss replay at Tick 475541 left two Rangers seventeen cells
     # away holding the ring: every range-one-to-three cell around the enemy
     # formation was already covered, so no firing position existed and the
-    # static post was the idle fallback.  All-hands defence must at least
-    # walk them towards the fight until their next step would enter fire.
+    # static post was the idle fallback. Current Core fire now forces every
+    # Ranger towards a firing position regardless of the trade.
     turn = make_turn(
         resources=0,
         objects=[
@@ -114,7 +114,7 @@ def test_a_far_side_defender_closes_on_a_massed_assault() -> None:
     report = strategy.decide(turn)
 
     reasons = _decisions_by_number(report)
-    assert "close" in reasons[2]
+    assert reasons[2] == "move to fire on an attacker in current Core range"
     assert "perimeter" not in reasons[2]
     action = turn.plan.unit_actions[UUID(int=2)]
     assert action.type == "MOVE"
@@ -128,14 +128,14 @@ def test_a_far_side_defender_closes_on_a_massed_assault() -> None:
 
 
 def test_a_far_side_defender_holds_when_no_massed_assault_exists() -> None:
-    # Two contacts keep the far side on station; only a real mass release it.
+    # Two contacts outside current Core range retain the ordinary ring policy.
     turn = make_turn(
         resources=0,
         objects=[
             core(),
             unit(2, "RANGER", position=(0, 17)),
-            unit(30, "RANGER", controlled=False, position=(0, 3)),
-            unit(31, "RANGER", controlled=False, position=(1, 3)),
+            unit(30, "RANGER", controlled=False, position=(0, 4)),
+            unit(31, "RANGER", controlled=False, position=(1, 4)),
         ],
     )
     strategy = _strategy()
@@ -160,7 +160,7 @@ def test_a_wounded_ranger_fires_a_safe_shot_instead_of_withdrawing() -> None:
             core(),
             unit(2, "RANGER", position=(5, 0), hp=1),
             unit(30, "VANGUARD", controlled=False, position=(8, 0)),
-            unit(31, "RANGER", controlled=False, position=(0, 2)),
+            unit(31, "RANGER", controlled=False, position=(1, 2)),
         ],
     )
     strategy = _strategy()
@@ -192,7 +192,7 @@ def test_wounded_ranger_still_withdraws_when_the_target_can_shoot_back() -> None
             core(),
             unit(2, "RANGER", position=(5, 0), hp=1),
             unit(30, "RANGER", controlled=False, position=(8, 0)),
-            unit(31, "RANGER", controlled=False, position=(0, 2)),
+            unit(31, "RANGER", controlled=False, position=(1, 2)),
         ],
     )
     strategy = _strategy()

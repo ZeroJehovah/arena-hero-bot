@@ -1163,6 +1163,7 @@ class AggressiveStrategy:
         self._prepare_counterattack(context)
         self._prepare_skirmish(context)
         self._prepare_worker_flank(context)
+        self._force_core_defense(context)
         self._prepare_layered_defense(context)
 
         def within_budget() -> bool:
@@ -1402,6 +1403,8 @@ class AggressiveStrategy:
         *,
         offensive: bool = False,
     ) -> None:
+        if self._force_core_defense(context):
+            return
         if ranger.id in context.flank_ids:
             # The complete group is resolved after ordinary combat and Core
             # traffic, against their actual actions and service reservations.
@@ -3973,6 +3976,160 @@ class AggressiveStrategy:
                         ),
                     )
         return None
+
+    def _current_core_attackers(self, context: _TurnContext) -> tuple[UnitView, ...]:
+        """Only current visible attack geometry grants the sacrifice exception."""
+        core = context.turn.core
+        if core is None:
+            return ()
+        return self._visible_attackers_at(
+            core.position, context.turn, self._rock_map(context.turn)
+        )
+
+    def _force_core_defense(self, context: _TurnContext) -> bool:
+        """Attack actual Core fire sources before retreat, service or posts.
+
+        This permission lasts for this snapshot only. Recent damage, remembered
+        fighters and predicted movement never authorize a losing forced entry.
+        """
+        targets = self._current_core_attackers(context)
+        core = context.turn.core
+        if not targets or core is None:
+            return False
+        rocks = self._rock_map(context.turn)
+        available = {
+            ranger.id: ranger
+            for ranger in context.turn.rangers
+            if not self._has_unit_action(ranger, context)
+        }
+        # Lock complete kills first, including separate UUIDs sharing a cell.
+        # Every remaining shooter still fires even if it cannot win the trade.
+        volley = precision_volley(
+            {actor_id: ranger.position for actor_id, ranger in available.items()},
+            targets,
+            core.position,
+            rocks,
+        )
+        for ranger in sorted(
+            available.values(), key=lambda unit: (unit.id not in volley, unit.id.int)
+        ):
+            shootable = tuple(
+                enemy
+                for enemy in targets
+                if self._line_of_fire_clear(ranger.position, enemy.position, rocks)
+            )
+            if not shootable:
+                continue
+            target = volley.get(ranger.id) or min(
+                shootable,
+                key=lambda enemy: (
+                    context.damage_ledger.remaining(enemy) == 0,
+                    context.damage_ledger.remaining(enemy),
+                    enemy.id.int,
+                ),
+            )
+            ranger.shoot(target, expected_cell=target.position)
+            context.damage_ledger.record(target)
+            self._reserve_ranger_firing_lane(ranger.position, target.position, context)
+            context.defensive_fire_cells[target.position] = (
+                context.defensive_fire_cells.get(target.position, 0) + 1
+            )
+            context.report.add(
+                actor_id=str(ranger.id),
+                actor_kind="RANGER",
+                action="SHOOT",
+                reason="force fire on an attacker in current Core range",
+                target=target.position,
+            )
+        pending = sorted(
+            (
+                ranger
+                for ranger in available.values()
+                if not self._has_unit_action(ranger, context)
+            ),
+            key=lambda ranger: (
+                min(manhattan(ranger.position, enemy.position) for enemy in targets),
+                ranger.id.int,
+            ),
+        )
+        # A nearer defender's executed departure can release the next slot.
+        # Retry blocked followers only while actual moves are making progress.
+        while pending:
+            blocked = [
+                ranger
+                for ranger in pending
+                if not self._move_to_core_attacker(ranger, targets, context)
+            ]
+            if len(blocked) == len(pending):
+                for ranger in blocked:
+                    self._record_wait(
+                        ranger,
+                        context,
+                        "wait for a legal firing route to current Core attackers",
+                    )
+                    ranger.wait()
+                break
+            pending = blocked
+        return True
+
+    def _move_to_core_attacker(
+        self,
+        ranger: Ranger,
+        targets: tuple[UnitView, ...],
+        context: _TurnContext,
+    ) -> bool:
+        """Find a shortest firing route without imposing a casualty threshold."""
+        rocks = self._rock_map(context.turn)
+        blocked = overlay_blockers(
+            self._static_blockers(ranger, context),
+            context.enemy_positions,
+        )
+        goals = {
+            cell
+            for enemy in targets
+            for cell in firing_positions(enemy.position)
+            if cell not in blocked
+            and self._line_of_fire_clear(cell, enemy.position, rocks)
+        }
+        if not goals:
+            return False
+        rejected: set[Direction] = set()
+        for _ in DIRECTIONS:
+            frontier: deque[tuple[Position, Direction]] = deque()
+            seen = {ranger.position}
+            for direction in DIRECTIONS:
+                cell = add(ranger.position, direction)
+                if (
+                    direction not in rejected
+                    and cell not in blocked
+                    and self._predicted_friendly_occupancy(cell, context) < 2
+                ):
+                    frontier.append((cell, direction))
+                    seen.add(cell)
+            route: tuple[Position, Direction] | None = None
+            while frontier and len(seen) <= 4096:
+                cell, direction = frontier.popleft()
+                if cell in goals:
+                    route = cell, direction
+                    break
+                for neighbor in adjacent_positions(cell):
+                    if neighbor not in seen and neighbor not in blocked:
+                        seen.add(neighbor)
+                        frontier.append((neighbor, direction))
+            if route is None:
+                return False
+            goal, direction = route
+            if self._queue_move(
+                ranger,
+                direction,
+                context,
+                reason="move to fire on an attacker in current Core range",
+                target=goal,
+                force_core_attack=True,
+            ):
+                return True
+            rejected.add(direction)
+        return False
 
     def _hold_defensive_ranger(
         self,
@@ -8529,13 +8686,20 @@ class AggressiveStrategy:
         # Escape planning may retry one remembered contested cell after it has
         # verified a strict reduction in current fire.
         allow_contested: bool = False,
+        force_core_attack: bool = False,
     ) -> bool:
         destination = add(unit.position, direction)
+        force_core_attack = (
+            force_core_attack
+            and isinstance(unit, Ranger)
+            and bool(self._current_core_attackers(context))
+        )
         if self._has_unit_action(unit, context):
             return False
         if (
             destination in context.counterattack_reserved
             and unit.id not in context.counterattack_ids
+            and not force_core_attack
         ):
             return False
         # Also protect direct retreat moves and permissive goal paths.
@@ -8559,6 +8723,7 @@ class AggressiveStrategy:
         core = context.turn.core
         if (
             context.core_build_priority
+            and not force_core_attack
             and core is not None
             and destination
             == (
@@ -8573,6 +8738,7 @@ class AggressiveStrategy:
             return False
         if (
             isinstance(unit, Ranger)
+            and not force_core_attack
             and not self._is_expedition_member(unit, context.turn)
             and (
                 unit.id not in context.counterattack_ids or unit.id in context.flank_ids
@@ -8608,6 +8774,7 @@ class AggressiveStrategy:
         migration_healer = unit.id in context.core_migration_healing_ids
         if (
             migration_healer
+            and not force_core_attack
             and isinstance(unit, Ranger)
             and not self._migration_healing_cell_safe(unit, destination, context)
         ):
@@ -8616,6 +8783,7 @@ class AggressiveStrategy:
             core is not None
             and destination == core.position
             and isinstance(unit, Ranger)
+            and not force_core_attack
             and not self._is_expedition_member(unit, context.turn)
             and (
                 self.memory.unit_roles.get(str(unit.id)) == DEFENSE_ROLE
@@ -8637,6 +8805,7 @@ class AggressiveStrategy:
         if (
             destination in context.core_migration_lane
             and not loaded_worker
+            and not force_core_attack
             and not (
                 arrival_healer and destination == context.core_migration_destination
             )
@@ -8684,11 +8853,12 @@ class AggressiveStrategy:
             # Reserve one slot for the Core and one for its selected service.
             if predicted >= 1:
                 return False
-            if not loaded_worker and not arrival_healer:
+            if not loaded_worker and not arrival_healer and not force_core_attack:
                 return False
         elif (
             core is not None
             and self._core_approach_locked(context.turn)
+            and not force_core_attack
             and not stationary_core_service
             and not (isinstance(unit, Worker) and unit.cargo > 0)
             and not migration_healer
@@ -8702,7 +8872,7 @@ class AggressiveStrategy:
             # inside may still move outward; nobody may enter or move laterally
             # within it.
             return False
-        if self._collect_core_move(unit, context):
+        if not force_core_attack and self._collect_core_move(unit, context):
             if not self._core_traffic_step_safe(
                 unit, destination, context, target=target
             ):

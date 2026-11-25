@@ -181,7 +181,9 @@ def test_retreat_uses_only_a_successful_safe_formation_departure(blocker):
         )
     turn = make_turn(
         objects=[core(), *friends, *foes],
-        obstacles=[(-1, -4), (0, -5)],
+        # Keep the Core safe from the third shooter's diagonal. This tests
+        # ordinary retreat capacity, outside the forced Core response.
+        obstacles=[(-1, -4), (0, -5), (1, -1)],
     )
     strategy = _strategy(
         WorldMemory(unit_roles={friend["id"]: "defense" for friend in friends})

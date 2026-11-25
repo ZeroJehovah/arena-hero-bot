@@ -1082,7 +1082,7 @@ def test_crowded_rear_cell_is_cleared_for_core_retreat_without_moving_shooters()
     assert not strategy._has_unit_action(turn.rangers[1], context)
 
 
-def test_full_controller_reforms_northern_front_instead_of_rear_wandering():
+def test_full_controller_forces_northern_response_during_core_withdrawal():
     positions = [(x, y) for y in (1, 2, 3, 4) for x in (-2, -1, 0, 1)]
     turn = make_turn(
         resources=1,
@@ -1102,7 +1102,7 @@ def test_full_controller_reforms_northern_front_instead_of_rear_wandering():
     assert turn.plan.core_action.direction is Direction.DOWN
     assert any(
         d.action == "MOVE"
-        and "two defensive firing ranks" in d.reason
+        and "fire on an attacker in current Core range" in d.reason
         and d.target[1] < 0
         for d in report.decisions
     )
