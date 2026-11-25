@@ -3364,6 +3364,38 @@ def test_worker_area_protection_uses_shared_worker_sighting() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("sighting_age", "starts_task"),
+    [(7, True), (8, False), (24, False)],
+)
+def test_worker_area_protection_requires_a_fresh_sighting_to_start(
+    sighting_age: int,
+    starts_task: bool,
+) -> None:
+    core_object = core(position=CLEARANCE_HOME)
+    rangers = _clearance_rangers(8)
+    fighter = _sealed_fighters(1)[0]
+    memory = _sealed_memory(core_object, rangers)
+    memory.observe(
+        make_turn(
+            tick=100,
+            objects=[core_object, *rangers, fighter],
+            resource_cells=CLEARANCE_NODES,
+        )
+    )
+    memory.worker_area_protection_cooldowns[str(fighter["id"])] = 100 + sighting_age - 1
+
+    _strategy(memory).decide(
+        make_turn(
+            tick=100 + sighting_age,
+            objects=[core_object, *rangers],
+            resource_cells=CLEARANCE_NODES,
+        )
+    )
+
+    assert (memory.worker_area_protection is not None) is starts_task
+
+
 def test_fighters_outside_every_worker_area_cell_do_not_create_a_task() -> None:
     core_object = core(position=CLEARANCE_HOME)
     rangers = _clearance_rangers(8)

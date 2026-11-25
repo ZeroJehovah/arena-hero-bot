@@ -96,6 +96,7 @@ WORKER_AREA_PROTECTION_MAX_TARGETS = 2
 WORKER_AREA_PROTECTION_MAX_TICKS = 32
 WORKER_AREA_PROTECTION_ASSEMBLY_TICKS = 24
 WORKER_AREA_PROTECTION_FIRE_TICKS = 4
+WORKER_AREA_PROTECTION_SIGHT_TTL = 8
 WORKER_AREA_PROTECTION_RETURN_TICKS = 24
 WORKER_AREA_PROTECTION_COOLDOWN_TICKS = 32
 WORKER_AREA_PROTECTION_TARGET_RADIUS = 4
@@ -18873,7 +18874,7 @@ class AggressiveStrategy:
                     and turn.tick - mission.entered >= WORKER_AREA_PROTECTION_FIRE_TICKS
                 )
                 or displaced
-                or turn.tick - mission.last_seen > 8
+                or turn.tick - mission.last_seen > WORKER_AREA_PROTECTION_SIGHT_TTL
                 or role_changed
                 or self._clearance_recall_needed(turn, threat)
                 or self.memory.campaign_scout_target is not None
@@ -18930,6 +18931,21 @@ class AggressiveStrategy:
         )
         if candidate is None:
             return frozenset()
+        target_last_seen = {
+            enemy.object_id: enemy.tick
+            for enemy in self.memory.recent_enemies(
+                turn.tick,
+                self.config.worker_threat_memory_ttl,
+            )
+            if enemy.object_id in candidate.target_ids
+        }
+        if any(
+            enemy_id not in target_last_seen
+            or turn.tick - target_last_seen[enemy_id]
+            >= WORKER_AREA_PROTECTION_SIGHT_TTL
+            for enemy_id in candidate.target_ids
+        ):
+            return frozenset()
         # Require enough healthy patrol arrows for one simultaneous volley.
         # This is deliberately conservative for Vanguards: a four-HP sweep
         # unit cannot be approached by a two-Ranger task that would need a
@@ -18975,14 +18991,6 @@ class AggressiveStrategy:
             )
             return frozenset()
         origins = dict(zip(candidate.target_ids, candidate.positions, strict=True))
-        target_last_seen = {
-            enemy.object_id: enemy.tick
-            for enemy in self.memory.recent_enemies(
-                turn.tick,
-                self.config.worker_threat_memory_ttl,
-            )
-            if enemy.object_id in candidate.target_ids
-        }
         self.memory.worker_area_protection = WorkerAreaProtection(
             core_id=str(core.id),
             started=turn.tick,
