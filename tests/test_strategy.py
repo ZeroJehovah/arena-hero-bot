@@ -968,6 +968,28 @@ def test_worker_retreat_prefers_distance_from_enemy_over_shortest_path() -> None
     assert action.direction is Direction.LEFT
 
 
+def test_worker_retreat_can_reuse_a_contested_cell_to_leave_fire() -> None:
+    memory = WorldMemory(contested_positions={(-24, -112): 99})
+    turn = make_turn(
+        tick=100,
+        objects=[
+            core(position=(-17, -113)),
+            unit(2, "WORKER", position=(-24, -111), hp=2),
+            unit(3, "RANGER", controlled=False, position=(-27, -111), hp=2),
+        ],
+    )
+
+    report = decide(turn, memory=memory)
+
+    action = turn.plan.unit_actions[turn.workers[0].id]
+    assert action.type == "MOVE"
+    assert action.direction is Direction.UP
+    assert any(
+        item.reason == "retreat from visible enemy pressure"
+        for item in report.decisions
+    )
+
+
 def test_cargo_worker_does_not_oscillate_around_enemy() -> None:
     memory = WorldMemory()
     strategy = AggressiveStrategy(memory)

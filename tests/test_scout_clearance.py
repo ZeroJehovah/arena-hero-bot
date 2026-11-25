@@ -3,6 +3,7 @@
 import pytest
 from arena_hero import Direction, UnitView
 
+import arena_hero_bot.strategy as strategy_module
 from arena_hero_bot.counterattack import AssaultSlot
 from arena_hero_bot.geometry import add, manhattan
 from arena_hero_bot.memory import PatrolContact, WorldMemory
@@ -37,7 +38,7 @@ ROCKS = (
 )
 
 
-def _scout_case():
+def _scout_case(*, stacked: bool = False):
     workers, rangers, roles = _gathered_roster(60, center=HOME)
     positions = (
         (-32, 275),
@@ -51,7 +52,14 @@ def _scout_case():
     )
     for ranger, position in zip(rangers[30:38], positions, strict=True):
         ranger["position"] = list(position)
-    enemy = unit(9000, "VANGUARD", controlled=False, position=TARGET)
+    enemies = (
+        [
+            unit(9000 + index, "RANGER", controlled=False, position=TARGET)
+            for index in range(2)
+        ]
+        if stacked
+        else [unit(9000, "VANGUARD", controlled=False, position=TARGET)]
+    )
     c = core(position=HOME)
     memory = WorldMemory(
         core_home_position=HOME,
@@ -67,7 +75,7 @@ def _scout_case():
     for tick in (90, 98, 99):
         memory.observe(
             make_turn(
-                tick=tick, objects=[c, *workers, *rangers, enemy], obstacles=ROCKS
+                tick=tick, objects=[c, *workers, *rangers, *enemies], obstacles=ROCKS
             )
         )
     for ranger, origin in zip(rangers[30:38], positions, strict=True):
@@ -75,13 +83,32 @@ def _scout_case():
             origin=origin,
             started_tick=20,
             last_contact_tick=99,
-            target_id=enemy["id"],
+            target_id=enemies[0]["id"],
         )
     config = StrategyConfig(campaign_mode=True, max_population=None)
     strategy = AggressiveStrategy(memory, config)
-    encounter = Encounter([*workers, *rangers], [enemy], resources=0, rocks=ROCKS)
+    encounter = Encounter([*workers, *rangers], enemies, resources=0, rocks=ROCKS)
     encounter.core = c
     return strategy, encounter
+
+
+def test_forward_scout_clearance_groups_same_cell_targets(monkeypatch):
+    strategy, encounter = _scout_case(stacked=True)
+    original = strategy_module.skirmish.choose_slots
+    grouped: list[tuple[str, ...]] = []
+
+    def capture(*args, **kwargs):
+        targets = args[2]
+        if len(targets) == 2 and targets[0].position == targets[1].position:
+            grouped.append(tuple(str(target.id) for target in targets))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_module.skirmish, "choose_slots", capture)
+
+    strategy.decide(encounter.turn())
+
+    assert grouped
+    assert set(grouped[0]) == {object_id(9000), object_id(9001)}
 
 
 @pytest.mark.parametrize("restart", [False, True])

@@ -8069,10 +8069,13 @@ class AggressiveStrategy:
         context: _TurnContext,
         threats: tuple[Position, ...],
     ) -> bool:
-        """Prefer surviving actual rays before increasing enemy distance."""
+        """Prefer surviving actual rays before increasing enemy distance.
+
+        A stale contested-cell record may be retried only when the candidate
+        strictly reduces current hostile fire. Normal routing still avoids it.
+        """
 
         blocked = set(self.memory.obstacles)
-        blocked.update(self.memory.contested_positions)
         blocked.update(context.turn.obstacle_cells)
         blocked.update(context.enemy_positions)
         blocked.discard(worker.position)
@@ -8116,7 +8119,8 @@ class AggressiveStrategy:
             )
 
         current_damage = damage_at(worker.position)
-        candidates: list[tuple[int, int, int, int, int, int, Direction]] = []
+        contested = set(self.memory.contested_positions)
+        candidates: list[tuple[int, int, int, int, int, int, int, Direction]] = []
         for order, direction in enumerate(directions):
             destination = add(worker.position, direction)
             if (
@@ -8147,6 +8151,7 @@ class AggressiveStrategy:
             candidates.append(
                 (
                     -damage,
+                    int(destination in contested),
                     nearest_enemy,
                     direct_away,
                     int(destination not in recent),
@@ -8169,12 +8174,17 @@ class AggressiveStrategy:
 
         if candidates:
             for *_, direction in sorted(candidates, reverse=True):
+                destination = add(worker.position, direction)
                 if self._queue_move(
                     worker,
                     direction,
                     context,
                     reason="retreat from visible enemy pressure",
                     target=core_position,
+                    allow_contested=(
+                        destination in contested
+                        and damage_at(destination) < current_damage
+                    ),
                 ):
                     return True
             return False
@@ -8515,6 +8525,9 @@ class AggressiveStrategy:
         reason: str,
         target: Position,
         intent: _MoveIntent = _MoveIntent.TRANSIT,
+        # Escape planning may retry one remembered contested cell after it has
+        # verified a strict reduction in current fire.
+        allow_contested: bool = False,
     ) -> bool:
         destination = add(unit.position, direction)
         if self._has_unit_action(unit, context):
@@ -8532,7 +8545,10 @@ class AggressiveStrategy:
             or (
                 isinstance(unit, Worker)
                 and (
-                    destination in self.memory.contested_positions
+                    (
+                        destination in self.memory.contested_positions
+                        and not allow_contested
+                    )
                     or self.memory.incoming_damage.get(destination, (-1, 0))[1]
                     >= unit.hp
                 )
@@ -10038,42 +10054,51 @@ class AggressiveStrategy:
             return None
         area = _single_chunk_resource_block(scout)
         bounded = overlay_blockers(blocked, _OutsidePatrolArea(area, scout))
-        targets = sorted(
-            (
-                enemy
-                for enemy in turn.visible_enemies
-                if isinstance(enemy, UnitView)
+        by_cell: dict[Position, list[UnitView]] = {}
+        for enemy in turn.visible_enemies:
+            if (
+                isinstance(enemy, UnitView)
                 and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
                 and area.contains(enemy.position)
+            ):
+                by_cell.setdefault(enemy.position, []).append(enemy)
+        for cell, cell_targets in sorted(
+            by_cell.items(),
+            key=lambda item: (
+                sum(target.hp for target in item[1]),
+                item[0],
+                min(target.id for target in item[1]),
             ),
-            key=lambda enemy: (enemy.hp, enemy.position, enemy.id),
-        )
-        for target in targets[:2]:
-            contact = self.memory.counterattack.contacts.get(str(target.id))
-            if (
-                contact is None
-                or contact.seen != turn.tick
-                or turn.tick - contact.since < 8
-                or contact.still < 3
+        ):
+            targets = tuple(sorted(cell_targets, key=lambda target: target.id))
+            if len(targets) > 2 or not all(
+                (contact := self.memory.counterattack.contacts.get(str(target.id)))
+                is not None
+                and contact.seen == turn.tick
+                and turn.tick - contact.since >= 8
+                and contact.still >= 3
+                for target in targets
             ):
                 continue
             slots = skirmish.choose_slots(
                 turn,
                 available,
-                (target,),
+                targets,
                 enemies,
                 rocks,
                 bounded,
                 max_party,
-                route_anchor=target.position,
-                allow_vanguard_two_volley=True,
+                route_anchor=cell,
+                allow_vanguard_two_volley=(
+                    len(targets) == 1 and targets[0].unit_type is UnitType.VANGUARD
+                ),
             )
             if slots:
                 return skirmish.Skirmish(
                     str(core.id),
                     core.position,
-                    (str(target.id),),
-                    target.position,
+                    tuple(str(target.id) for target in targets),
+                    cell,
                     turn.tick,
                     turn.tick,
                     slots,
