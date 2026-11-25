@@ -3895,11 +3895,11 @@ def test_enemy_core_hunt_is_vetoed_by_a_nearby_fighter() -> None:
     assert not _core_hunt_reasons(report)
 
 
-def test_enemy_core_hunt_keeps_a_pair_on_station() -> None:
+def test_enemy_core_hunt_keeps_a_pair_on_station_when_leaving_patrol_bounds() -> None:
     core_object = core(1, position=CLEARANCE_HOME)
     rangers = _clearance_rangers(2)
     memory = _sealed_memory(core_object, rangers)
-    turn = make_turn(objects=[core_object, *rangers, _rival_core()])
+    turn = make_turn(objects=[core_object, *rangers, _rival_core((-476, 719))])
 
     report = _strategy(memory).decide(turn)
 

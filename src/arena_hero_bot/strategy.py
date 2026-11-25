@@ -852,7 +852,8 @@ class AggressiveStrategy:
         # its trail or a higher-priority safety task. Role and patrol slot stay
         # intact; target, handoffs and the pursuit budget live in WorldMemory.
         self._core_hunt_route_cache: (
-            tuple[Turn, Position, dict[Position, tuple[int, Position]]] | None
+            tuple[Turn, Position, dict[bool, dict[Position, tuple[int, Position]]]]
+            | None
         ) = None
         self._local_fireline_target_id: str | None = None
         self._local_fireline_ranger_ids: frozenset[UUID] = frozenset()
@@ -19640,7 +19641,10 @@ class AggressiveStrategy:
                 or self._clearance_ids
                 or self.memory.counterattack.operation is not None
                 or self.memory.skirmish is not None
-                or not self._core_hunt_has_reserves(turn, ranger.id)
+                or not (
+                    self._core_hunt_has_reserves(turn, ranger.id)
+                    or self._core_hunt_has_reserves(turn, ranger.id, local_only=True)
+                )
                 or self._core_hunt_contested(turn, ranger, target)
                 or (target is None and not self._core_hunt_search_cells(turn))
             ):
@@ -19652,9 +19656,10 @@ class AggressiveStrategy:
                     # Only a strictly shorter safe route replaces the hunter.
                     # Equal routes keep ownership and cannot bounce the task.
                     aim = self._core_hunt_aim_position(target)
-                    routes = self._core_hunt_routes(turn, aim)
-                    old_cost = routes.get(ranger.position, (2**63 - 1, aim))[0]
-                    new_cost = routes[candidate[1].position][0]
+                    old_routes = self._core_hunt_routes(turn, aim, hunter=ranger)
+                    new_routes = self._core_hunt_routes(turn, aim, hunter=candidate[1])
+                    old_cost = old_routes.get(ranger.position, (2**63 - 1, aim))[0]
+                    new_cost = new_routes[candidate[1].position][0]
                     if new_cost < old_cost:
                         self._mark_core_hunt_return(ranger.id, turn)
                         hunt.ranger_id = str(candidate[1].id)
@@ -19738,23 +19743,40 @@ class AggressiveStrategy:
             else None
         )
 
-    def _core_hunt_has_reserves(self, turn: Turn, hunter_id: UUID) -> bool:
+    def _core_hunt_has_reserves(
+        self, turn: Turn, hunter_id: UUID, *, local_only: bool = False
+    ) -> bool:
+        """Count the hunter locally only with a route confined to patrol bounds."""
         core = turn.core
         if core is None:
             return False
+        area = self._ranger_activity_area(turn) if local_only else None
+        if local_only and (
+            area is None
+            or not any(
+                unit.id == hunter_id and area.contains(unit.position)
+                for unit in turn.rangers
+            )
+        ):
+            return False
         return (
             sum(
-                unit.id != hunter_id
+                (unit.id != hunter_id or local_only)
                 and unit.hp > 1
                 and not self._is_expedition_member(unit, turn)
                 and str(unit.id) not in self.memory.core_hunt_returns
                 and (
                     self.memory.core_hunt is None
                     or str(unit.id) != self.memory.core_hunt.ranger_id
+                    or (local_only and unit.id == hunter_id)
                 )
                 and unit.id not in self._clearance_ids | self._raid_ids
-                and manhattan(unit.position, core.position)
-                <= self.config.combat_pursuit_radius
+                and (
+                    area.contains(unit.position)
+                    if area is not None
+                    else manhattan(unit.position, core.position)
+                    <= self.config.combat_pursuit_radius
+                )
                 for unit in (*turn.rangers, *turn.vanguards)
             )
             >= 2
@@ -19789,7 +19811,10 @@ class AggressiveStrategy:
             )
             and str(unit.id) not in self.memory.core_hunt_returns
             and not self._is_expedition_member(unit, turn)
-            and self._core_hunt_has_reserves(turn, unit.id)
+            and (
+                self._core_hunt_has_reserves(turn, unit.id)
+                or self._core_hunt_has_reserves(turn, unit.id, local_only=True)
+            )
         )
         if not hunters:
             return None
@@ -19819,8 +19844,8 @@ class AggressiveStrategy:
         choices = []
         for enemy in enemies:
             aim = self._core_hunt_aim_position(enemy)
-            routes = self._core_hunt_routes(turn, aim)
             for hunter in hunters:
+                routes = self._core_hunt_routes(turn, aim, hunter=hunter)
                 route = routes.get(hunter.position)
                 if (
                     route is None
@@ -19848,15 +19873,24 @@ class AggressiveStrategy:
         return selected[-2], selected[-1]
 
     def _core_hunt_routes(
-        self, turn: Turn, aim: Position
+        self, turn: Turn, aim: Position, *, hunter: Ranger
     ) -> dict[Position, tuple[int, Position]]:
         """Share a bounded safe terrain map; capacity is checked on each step."""
+        local_only = not self._core_hunt_has_reserves(turn, hunter.id)
+        if local_only and not self._core_hunt_has_reserves(
+            turn, hunter.id, local_only=True
+        ):
+            return {}
         cached = self._core_hunt_route_cache
-        if cached is not None and cached[0] is turn and cached[1] == aim:
-            return cached[2]
+        if cached is None or cached[0] is not turn or cached[1] != aim:
+            cached = (turn, aim, {})
+            self._core_hunt_route_cache = cached
+        if local_only in cached[2]:
+            return cached[2][local_only]
         core = turn.core
         if core is None:
             return {}
+        area = self._ranger_activity_area(turn) if local_only else None
         rocks = self._rock_map(turn)
         danger: set[Position] = set()
         for enemy in self._ranger_threats(turn):
@@ -19892,6 +19926,7 @@ class AggressiveStrategy:
                 and manhattan(cell, aim) <= RANGER_VISION_RADIUS
                 and self._line_of_fire_clear(cell, aim, rocks)
                 and manhattan(core.position, cell) <= reach
+                and (area is None or area.contains(cell))
             ),
             key=lambda cell: (-self._ranger_range(cell, aim), cell),
         )
@@ -19907,13 +19942,14 @@ class AggressiveStrategy:
                     neighbor in routes
                     or neighbor in blocked
                     or manhattan(core.position, neighbor) > reach
+                    or (area is not None and not area.contains(neighbor))
                 ):
                     continue
                 routes[neighbor] = (cost + 1, goal)
                 frontier.append(neighbor)
                 if len(routes) >= 4096:
                     break
-        self._core_hunt_route_cache = (turn, aim, routes)
+        cached[2][local_only] = routes
         return routes
 
     def _core_hunt_search_cells(self, turn: Turn) -> tuple[Position, ...]:
@@ -20029,7 +20065,7 @@ class AggressiveStrategy:
             )
         )
         for aim in aims:
-            routes = self._core_hunt_routes(context.turn, aim)
+            routes = self._core_hunt_routes(context.turn, aim, hunter=ranger)
             route = routes.get(ranger.position)
             if route is None or route[0] == 0:
                 continue

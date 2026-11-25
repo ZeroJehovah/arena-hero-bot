@@ -294,7 +294,7 @@ def test_nearer_patrol_takes_over_without_resetting_the_original_budget(
 
 def test_handoff_cannot_count_the_departing_old_hunter_as_a_home_reserve():
     memory = _memory()
-    roster = _roster()[:3]
+    roster = _roster()[:2]
     roster[1]["position"] = [7, 10]
     memory.core_hunt = CoreHunt(
         object_id(1), object_id(900), object_id(3), 80, 220, TARGET, 99
@@ -309,7 +309,7 @@ def test_handoff_cannot_count_the_departing_old_hunter_as_a_home_reserve():
 
 def test_far_survivors_do_not_satisfy_the_home_cover_reserve():
     memory = _memory()
-    roster = _roster()
+    roster = _roster()[:3]
     roster[1]["position"] = [100, 100]
     roster[2]["position"] = [100, 102]
     turn = make_turn(objects=[core(position=HOME), *roster, _rival()])
@@ -350,7 +350,7 @@ def test_a_wounded_hunter_or_loss_of_home_reserves_aborts_the_task(loss):
     if loss == "wounded_hunter":
         roster[0]["hp"] = 1
     else:
-        roster = roster[:2]
+        roster = roster[:1]
     turn = make_turn(tick=101, objects=[core(position=HOME), *roster, _rival()])
 
     strategy.decide(turn)
